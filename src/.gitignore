@@ -1,0 +1,7 @@
+.vs/ 
+**/.vs/ 
+**/ipch/ 
+**/.vscode/ 
+**/build/ 
+**/__pycache__/ 
+**/.vscode/ 

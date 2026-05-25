@@ -87,6 +87,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "C:/Users/domin/anaconda3/envs/overlay/Lib/site-packages/pybind11/include" /external:I "C:/Users/domin/anaconda3/envs/overlay/Include" /external:I "C:/Users/domin/vcpkg/installed/x64-windows/include/opencv4" /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
@@ -115,10 +116,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_DEBUG;_WINDOWS;CMAKE_INTDIR=\"Debug\";hydramarker_cpp_EXPORTS</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -157,6 +158,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "C:/Users/domin/anaconda3/envs/overlay/Lib/site-packages/pybind11/include" /external:I "C:/Users/domin/anaconda3/envs/overlay/Include" /external:I "C:/Users/domin/vcpkg/installed/x64-windows/include/opencv4" /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -188,10 +190,10 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"Release\";hydramarker_cpp_EXPORTS</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -231,6 +233,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "C:/Users/domin/anaconda3/envs/overlay/Lib/site-packages/pybind11/include" /external:I "C:/Users/domin/anaconda3/envs/overlay/Include" /external:I "C:/Users/domin/vcpkg/installed/x64-windows/include/opencv4" /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -262,10 +265,10 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"MinSizeRel\";hydramarker_cpp_EXPORTS</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -305,6 +308,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "C:/Users/domin/anaconda3/envs/overlay/Lib/site-packages/pybind11/include" /external:I "C:/Users/domin/anaconda3/envs/overlay/Include" /external:I "C:/Users/domin/vcpkg/installed/x64-windows/include/opencv4" /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -334,10 +338,10 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"RelWithDebInfo\";hydramarker_cpp_EXPORTS</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp;C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\include;C:\Users\domin\anaconda3\envs\overlay\Lib\site-packages\pybind11\include;C:\Users\domin\anaconda3\envs\overlay\Include;C:\Users\domin\vcpkg\installed\x64-windows\include\opencv4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -433,9 +437,21 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\bindings.cpp" />
-    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\marker_field.cpp" />
-    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\checkerboard_detector.cpp" />
-    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\dot_detector.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\marker_field.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\checkerboard_detector.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\dot_detector.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\patch_extractor.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\patch_decoder.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\marker_geometry.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\correspondence_builder.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\generator_HydraMarker.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\corner_detection.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\corner_refinement.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\lattice_model.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\grid_builder.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\lk_tracker.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\tracking_validator.cpp" />
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\geometry_utils.cpp" />
   </ItemGroup>
   <ItemGroup />
   <ItemGroup>

@@ -1,35 +1,22 @@
 """
-Interactive CheckerboardDetector test.
+Debug-Version des CheckerboardDetector-Tests.
 
-This script opens a RealSense RGB stream, runs the C++ HydraMarker
-CheckerboardDetector on every frame, and visualizes the current detection result.
-
-The goal of this test is NOT marker decoding yet. It only verifies that the
-CheckerboardDetector produces the data required for the next pipeline stage:
-
-    1. image-space checkerboard/grid corners
-    2. local grid indices for each corner
-    3. valid cells formed by four neighboring corners
+Visualisierung:
+    - BLAU:    Recovery/Debug-Corners
+    - GRÜN:    Finale Corners
+    - GELB:    Recovery-Corners, die final nicht übernommen werden
+    - MAGENTA: Cells exakt aus C++ cell.corner_uv
 
 Controls:
-    t   Toggle visualization mode
-    ESC Exit
-
-Visualization modes:
-    0: corners only
-       Shows only detected corner points.
-
-    1: cells only
-       Shows valid cells formed from four neighboring corners.
-       The magenta point marks the cell center, which will later be sampled
-       by the DotDetector.
-
-    2: corners + cells
-       Shows both the cell structure and the local corner indices.
+    t       Toggle visualization mode
+    d       Toggle debug overlay
+    SPACE   Save current frame + visualization
+    ESC     Exit
 """
 
 import sys
 from pathlib import Path
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -39,15 +26,23 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 import hydramarker_cpp
 
 
-def select_file(title: str, file_filter: str) -> Path | None:
-    """
-    Open a Qt file dialog and return the selected path.
+# ============================================================
+# Output
+# ============================================================
 
-    The field file is required because the CheckerboardDetector is constructed
-    from a MarkerField. At this stage, the field is mainly used to define the
-    expected marker/grid configuration.
-    """
-    app = QApplication.instance() or QApplication(sys.argv)
+OUT_DIR = Path("hydramarker_saved_frames")
+OUT_DIR.mkdir(exist_ok=True)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def select_file(title: str, file_filter: str) -> Path | None:
+    app = QApplication.instance()
+
+    if app is None:
+        app = QApplication(sys.argv)
 
     path, _ = QFileDialog.getOpenFileName(
         None,
@@ -56,82 +51,61 @@ def select_file(title: str, file_filter: str) -> Path | None:
         file_filter,
     )
 
-    if not path:
-        return None
-
-    return Path(path)
+    return Path(path) if path else None
 
 
-def draw_corners(vis: np.ndarray, det, draw_indices: bool = False) -> None:
-    """
-    Draw detected grid corners.
+def get_xy(p):
+    if hasattr(p, "x") and hasattr(p, "y"):
+        return float(p.x), float(p.y)
 
-    Parameters
-    ----------
-    vis:
-        Image used for visualization.
-    det:
-        CheckerboardDetection returned by the C++ detector.
-    draw_indices:
-        If True, draw the local grid index (i, j) next to each assigned corner.
-        This is useful for debugging the grid reconstruction, but should be
-        disabled in "corners only" mode to keep the view clean.
-    """
+    return float(p[0]), float(p[1])
+
+
+def draw_corners(
+    vis: np.ndarray,
+    det,
+    color=(0, 255, 0),
+    radius=4,
+    draw_indices=False,
+) -> None:
     for corner in det.corners:
-        u, v = corner.uv
+        u, v = get_xy(corner.uv)
 
         cv2.circle(
             vis,
             (int(round(u)), int(round(v))),
-            4,
-            (0, 255, 0),
+            radius,
+            color,
             -1,
             lineType=cv2.LINE_AA,
         )
 
-        if draw_indices and corner.i >= 0 and corner.j >= 0:
+        if draw_indices:
             cv2.putText(
                 vis,
                 f"{corner.i},{corner.j}",
                 (int(round(u)) + 6, int(round(v)) - 6),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.35,
-                (0, 255, 0),
+                color,
                 1,
                 cv2.LINE_AA,
             )
 
 
-def draw_cells(vis: np.ndarray, det, draw_indices: bool = True) -> None:
-    """
-    Draw valid checkerboard cells.
-
-    A cell is defined by four neighboring corners:
-
-        0: (i,   j)
-        1: (i+1, j)
-        2: (i,   j+1)
-        3: (i+1, j+1)
-
-    These cells are the direct input for the DotDetector. The DotDetector will
-    later sample the image around each cell center to decide whether this cell
-    contains a dot, no dot, or is uncertain/invalid.
-    """
+def draw_cells(
+    vis: np.ndarray,
+    det,
+    draw_indices=True,
+) -> None:
     for cell in det.cells:
-        corner_ids = cell.corner_indices
-
         pts = []
-        for idx in corner_ids:
-            corner = det.corners[idx]
-            u, v = corner.uv
+
+        for p in cell.corner_uv:
+            u, v = get_xy(p)
             pts.append((int(round(u)), int(round(v))))
 
-        p00 = pts[0]
-        p10 = pts[1]
-        p01 = pts[2]
-        p11 = pts[3]
-
-        polygon = np.array([p00, p10, p11, p01], dtype=np.int32)
+        polygon = np.array(pts, dtype=np.int32)
 
         cv2.polylines(
             vis,
@@ -142,11 +116,11 @@ def draw_cells(vis: np.ndarray, det, draw_indices: bool = True) -> None:
             lineType=cv2.LINE_AA,
         )
 
-        center_u, center_v = cell.center_uv
+        cu, cv_ = get_xy(cell.center_uv)
 
         cv2.circle(
             vis,
-            (int(round(center_u)), int(round(center_v))),
+            (int(round(cu)), int(round(cv_))),
             3,
             (255, 0, 255),
             -1,
@@ -157,7 +131,7 @@ def draw_cells(vis: np.ndarray, det, draw_indices: bool = True) -> None:
             cv2.putText(
                 vis,
                 f"{cell.i},{cell.j}",
-                (int(round(center_u)) + 5, int(round(center_v)) - 5),
+                (int(round(cu)) + 5, int(round(cv_)) - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.35,
                 (255, 0, 255),
@@ -166,42 +140,109 @@ def draw_cells(vis: np.ndarray, det, draw_indices: bool = True) -> None:
             )
 
 
-def draw_status(vis: np.ndarray, mode_name: str, det) -> None:
-    """
-    Draw a small status overlay with the current mode and detection statistics.
-    """
-    text = f"mode: {mode_name} | press t to toggle | ESC to quit"
+def draw_status(vis, mode_name, det, debug_det, debug_on) -> None:
+    normal_n = len(det.corners) if det else 0
+    normal_c = len(det.cells) if det else 0
+    debug_n = len(debug_det.corners) if debug_det else 0
+    debug_c = len(debug_det.cells) if debug_det else 0
 
-    if det is not None:
-        text += f" | corners: {len(det.corners)} | cells: {len(det.cells)}"
+    line1 = f"mode: {mode_name} | t=toggle d=debug SPACE=save ESC=quit"
+    line2 = f"final corners: {normal_n} | final cells: {normal_c}"
+    line3 = f"recovery/debug corners: {debug_n} | cells: {debug_c} | debug {'ON' if debug_on else 'OFF'}"
 
-    cv2.putText(
-        vis,
-        text,
-        (30, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 255),
-        2,
-        cv2.LINE_AA,
+    if debug_on and debug_det and det:
+        final_uvs = []
+
+        for c in det.corners:
+            u, v = get_xy(c.uv)
+            final_uvs.append((u, v))
+
+        lost = 0
+
+        for c in debug_det.corners:
+            u, v = get_xy(c.uv)
+
+            found = any(
+                abs(u - fu) < 10 and abs(v - fv) < 10
+                for fu, fv in final_uvs
+            )
+
+            if not found:
+                lost += 1
+
+        line3 += f" | lost in final: {lost}"
+
+    for i, line in enumerate([line1, line2, line3]):
+        cv2.putText(
+            vis,
+            line,
+            (20, 35 + i * 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def save_current_frame(img, vis, det, debug_det, mode_name, debug_on):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+    raw_path = OUT_DIR / f"{stamp}_raw.png"
+    vis_path = OUT_DIR / f"{stamp}_vis.png"
+    npz_path = OUT_DIR / f"{stamp}_data.npz"
+
+    cv2.imwrite(str(raw_path), img)
+    cv2.imwrite(str(vis_path), vis)
+
+    final_corners = []
+    final_cells = []
+    debug_corners = []
+    debug_cells = []
+
+    if det:
+        for c in det.corners:
+            u, v = get_xy(c.uv)
+            final_corners.append([u, v, c.i, c.j])
+
+        for cell in det.cells:
+            cu, cv_ = get_xy(cell.center_uv)
+            final_cells.append([cu, cv_, cell.i, cell.j])
+
+    if debug_det:
+        for c in debug_det.corners:
+            u, v = get_xy(c.uv)
+            debug_corners.append([u, v, c.i, c.j])
+
+        for cell in debug_det.cells:
+            cu, cv_ = get_xy(cell.center_uv)
+            debug_cells.append([cu, cv_, cell.i, cell.j])
+
+    np.savez_compressed(
+        npz_path,
+        raw_image_bgr=img,
+        vis_image_bgr=vis,
+        final_corners=np.asarray(final_corners, dtype=np.float32),
+        final_cells=np.asarray(final_cells, dtype=np.float32),
+        debug_corners=np.asarray(debug_corners, dtype=np.float32),
+        debug_cells=np.asarray(debug_cells, dtype=np.float32),
+        mode_name=np.asarray(mode_name),
+        debug_on=np.asarray(debug_on),
     )
 
+    print(f"Saved:")
+    print(f"  {raw_path}")
+    print(f"  {vis_path}")
+    print(f"  {npz_path}")
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main() -> None:
-    """
-    Start the RealSense stream and run the detector continuously.
-    """
-    field_path = select_file(
-        "Select HydraMarker field file",
-        "HydraMarker Field (*.field);;All Files (*)",
-    )
-
-    if field_path is None:
-        print("No field file selected.")
-        return
-
-    field = hydramarker_cpp.MarkerField(str(field_path))
-    detector = hydramarker_cpp.CheckerboardDetector(field)
+    detector = hydramarker_cpp.CheckerboardDetector()
+    debug_detector = hydramarker_cpp.CheckerboardDetector()
 
     pipe = rs.pipeline()
     cfg = rs.config()
@@ -224,11 +265,14 @@ def main() -> None:
     )
 
     mode = 0
+
     mode_names = {
         0: "corners",
         1: "cells",
-        2: "corners + cells",
+        2: "corners+cells",
     }
+
+    debug_on = False
 
     try:
         while True:
@@ -243,18 +287,82 @@ def main() -> None:
 
             det = detector.detect(img)
 
-            if det is not None:
+            debug_detector.reset_tracking()
+            debug_det = debug_detector.detect(img)
+
+            if debug_on and debug_det:
+                draw_corners(
+                    vis,
+                    debug_det,
+                    color=(255, 100, 0),
+                    radius=3,
+                    draw_indices=False,
+                )
+
+                if det:
+                    final_uvs = []
+
+                    for c in det.corners:
+                        u, v = get_xy(c.uv)
+                        final_uvs.append((u, v))
+
+                    for c in debug_det.corners:
+                        u, v = get_xy(c.uv)
+
+                        found = any(
+                            abs(u - fu) < 10 and abs(v - fv) < 10
+                            for fu, fv in final_uvs
+                        )
+
+                        if not found:
+                            cv2.circle(
+                                vis,
+                                (int(round(u)), int(round(v))),
+                                5,
+                                (0, 255, 255),
+                                2,
+                                lineType=cv2.LINE_AA,
+                            )
+
+            if det:
                 if mode == 0:
-                    draw_corners(vis, det, draw_indices=False)
+                    draw_corners(
+                        vis,
+                        det,
+                        color=(0, 255, 0),
+                        radius=4,
+                        draw_indices=False,
+                    )
 
                 elif mode == 1:
-                    draw_cells(vis, det, draw_indices=True)
+                    draw_cells(
+                        vis,
+                        det,
+                        draw_indices=True,
+                    )
 
                 elif mode == 2:
-                    draw_cells(vis, det, draw_indices=True)
-                    draw_corners(vis, det, draw_indices=True)
+                    draw_cells(
+                        vis,
+                        det,
+                        draw_indices=True,
+                    )
 
-            draw_status(vis, mode_names[mode], det)
+                    draw_corners(
+                        vis,
+                        det,
+                        color=(0, 255, 0),
+                        radius=4,
+                        draw_indices=True,
+                    )
+
+            draw_status(
+                vis,
+                mode_names[mode],
+                det,
+                debug_det,
+                debug_on,
+            )
 
             cv2.imshow("det", vis)
 
@@ -263,8 +371,22 @@ def main() -> None:
             if key == 27:
                 break
 
-            if key == ord("t"):
+            elif key == ord("t"):
                 mode = (mode + 1) % 3
+
+            elif key == ord("d"):
+                debug_on = not debug_on
+                debug_detector.reset_tracking()
+
+            elif key == ord(" "):
+                save_current_frame(
+                    img=img,
+                    vis=vis,
+                    det=det,
+                    debug_det=debug_det,
+                    mode_name=mode_names[mode],
+                    debug_on=debug_on,
+                )
 
     finally:
         pipe.stop()

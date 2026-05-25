@@ -6,7 +6,12 @@ rest of the project. The goal is to keep the public Python code independent of
 the exact C++ binding details.
 """
 
-from hydramarker_cpp import MarkerField as _MarkerField
+import numpy as np
+
+from hydramarker_cpp import (
+    MarkerField as _MarkerField,
+    generate_planar_field as _generate_planar_field,
+)
 
 
 class MarkerFieldCpp:
@@ -47,3 +52,51 @@ class MarkerFieldCpp:
             }
             for match in self._mf.find_patch(patch)
         ]
+
+
+def generate_planar_field(
+    rows: int,
+    cols: int,
+    patch_size: int,
+    max_ms: float = 60000.0,
+    max_trial: int = 100000,
+    is_print: bool = False,
+) -> np.ndarray:
+    """
+    Generate a planar HydraMarker field using the C++ backend.
+
+    Parameters
+    ----------
+    rows:
+        Number of marker rows (cells).
+
+    cols:
+        Number of marker cols (cells).
+
+    patch_size:
+        k for k x k patches.
+
+    max_ms:
+        Maximum generation time in milliseconds.
+
+    max_trial:
+        Maximum number of generation trials.
+
+    is_print:
+        Whether to print generation progress.
+
+    Returns
+    -------
+    np.ndarray
+        Binary uint8 array with shape (rows, cols).
+    """
+    field = _generate_planar_field(
+        rows=rows,
+        cols=cols,
+        patch_size=patch_size,
+        max_ms=max_ms,
+        max_trial=max_trial,
+        is_print=is_print,
+    )
+
+    return np.asarray(field, dtype=np.uint8)

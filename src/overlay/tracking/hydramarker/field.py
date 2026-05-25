@@ -11,7 +11,10 @@ actual lookup is performed by the C++ backend through pybind11.
 
 import numpy as np
 
-from .backend.cpp_impl import MarkerFieldCpp
+from .backend.cpp_impl import (
+    MarkerFieldCpp,
+    generate_planar_field,
+)
 
 
 class MarkerField:
@@ -46,6 +49,52 @@ class MarkerField:
             Python wrapper around the C++ MarkerField backend.
         """
         return cls(MarkerFieldCpp(path))
+
+    @staticmethod
+    def generate_planar(
+        rows: int,
+        cols: int,
+        patch_size: int,
+        max_ms: float = 60000.0,
+        max_trial: int = 100000,
+        is_print: bool = False,
+    ) -> np.ndarray:
+        """
+        Generate a planar HydraMarker field.
+
+        Parameters
+        ----------
+        rows:
+            Number of marker rows (cells).
+
+        cols:
+            Number of marker cols (cells).
+
+        patch_size:
+            k for k x k patches.
+
+        max_ms:
+            Maximum generation time in milliseconds.
+
+        max_trial:
+            Maximum number of generation trials.
+
+        is_print:
+            Whether to print generation progress.
+
+        Returns
+        -------
+        np.ndarray
+            Binary uint8 marker field.
+        """
+        return generate_planar_field(
+            rows=rows,
+            cols=cols,
+            patch_size=patch_size,
+            max_ms=max_ms,
+            max_trial=max_trial,
+            is_print=is_print,
+        )
 
     def find_patch(self, patch: np.ndarray):
         """

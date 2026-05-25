@@ -45,19 +45,19 @@ def compute_reprojection_error_px(
     per_point_px : (N,)
     """
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
-    image_points_uv   = np.asarray(image_points_uv,   dtype=np.float64).reshape(-1, 2)
+    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
     rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
     tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
-    K    = np.asarray(K,    dtype=np.float64).reshape(3, 3)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
     dist = np.asarray(dist, dtype=np.float64).reshape(-1, 1)
 
     uv_proj, _ = cv2.projectPoints(object_points_xyz, rvec, tvec, K, dist)
     uv_proj = uv_proj.reshape(-1, 2)
 
     per_point_px = np.linalg.norm(image_points_uv - uv_proj, axis=1)
-    mean_px   = float(np.mean(per_point_px))
+    mean_px = float(np.mean(per_point_px))
     median_px = float(np.median(per_point_px))
-    max_px    = float(np.max(per_point_px))
+    max_px = float(np.max(per_point_px))
 
     return uv_proj, mean_px, median_px, max_px, per_point_px
 
@@ -73,6 +73,7 @@ def _compute_inlier_idx(
     """
     if inliers is None or len(inliers) == 0:
         return np.arange(num_points, dtype=np.int64)
+
     return np.asarray(inliers, dtype=np.int64).reshape(-1)
 
 
@@ -84,15 +85,21 @@ def _compute_reprojection_stats_from_subset(
     Compute mean / median / max reprojection error on the selected subset.
     """
     reproj_errors_px = np.asarray(reproj_errors_px, dtype=np.float64).reshape(-1)
-    inlier_idx       = np.asarray(inlier_idx,       dtype=np.int64).reshape(-1)
+    inlier_idx = np.asarray(inlier_idx, dtype=np.int64).reshape(-1)
 
     if len(reproj_errors_px) == 0:
         raise ValueError("At least one reprojection error is required.")
+
     if len(inlier_idx) == 0:
         inlier_idx = np.arange(len(reproj_errors_px), dtype=np.int64)
 
     inlier_errs = reproj_errors_px[inlier_idx]
-    return float(np.mean(inlier_errs)), float(np.median(inlier_errs)), float(np.max(inlier_errs))
+
+    return (
+        float(np.mean(inlier_errs)),
+        float(np.median(inlier_errs)),
+        float(np.max(inlier_errs)),
+    )
 
 
 def _refine_pose_iterative(
@@ -108,9 +115,9 @@ def _refine_pose_iterative(
     with useExtrinsicGuess=True.
     """
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
-    image_points_uv   = np.asarray(image_points_uv,   dtype=np.float64).reshape(-1, 2)
-    K    = np.asarray(K,         dtype=np.float64).reshape(3, 3)
-    dist = np.asarray(dist,      dtype=np.float64).reshape(-1, 1)
+    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    dist = np.asarray(dist, dtype=np.float64).reshape(-1, 1)
     rvec_init = np.asarray(rvec_init, dtype=np.float64).reshape(3, 1)
     tvec_init = np.asarray(tvec_init, dtype=np.float64).reshape(3, 1)
 
@@ -141,6 +148,23 @@ def _make_transform(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     return T
 
 
+def make_transform_from_rvec_tvec(
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> np.ndarray:
+    """
+    Build a 4x4 homogeneous transform from OpenCV rvec/tvec.
+
+    This is intentionally public and generic so tracker modules can reuse the
+    same transform construction without duplicating OpenCV Rodrigues logic.
+    """
+    rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+    tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
+
+    R, _ = cv2.Rodrigues(rvec)
+    return _make_transform(R, tvec)
+
+
 def _rotation_angle_deg(R: np.ndarray) -> float:
     R = np.asarray(R, dtype=np.float64).reshape(3, 3)
     c = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
@@ -148,7 +172,10 @@ def _rotation_angle_deg(R: np.ndarray) -> float:
 
 
 def _rotation_deviation_deg(R_ref: np.ndarray, R: np.ndarray) -> float:
-    R_rel = np.asarray(R_ref, dtype=np.float64).reshape(3, 3).T @ np.asarray(R, dtype=np.float64).reshape(3, 3)
+    R_rel = (
+        np.asarray(R_ref, dtype=np.float64).reshape(3, 3).T
+        @ np.asarray(R, dtype=np.float64).reshape(3, 3)
+    )
     return _rotation_angle_deg(R_rel)
 
 
@@ -337,20 +364,34 @@ def _build_ippe_candidates(
 
     if not success or rvecs is None or tvecs is None or len(rvecs) == 0:
         raise RuntimeError("SOLVEPNP_IPPE failed.")
+
     if len(rvecs) != len(tvecs):
         raise RuntimeError("IPPE returned inconsistent candidate counts.")
 
     candidates: list[_IppeCandidate] = []
+
     for rv_raw, tv_raw in zip(rvecs, tvecs):
         rv = np.asarray(rv_raw, dtype=np.float64).reshape(3, 1)
         tv = np.asarray(tv_raw, dtype=np.float64).reshape(3, 1)
         R, _ = cv2.Rodrigues(rv)
+
         _, mean_px, _, _, _ = compute_reprojection_error_px(
             object_points_xyz=object_points_xyz,
             image_points_uv=image_points_uv,
-            rvec=rv, tvec=tv, K=K, dist=dist,
+            rvec=rv,
+            tvec=tv,
+            K=K,
+            dist=dist,
         )
-        candidates.append(_IppeCandidate(rvec=rv, tvec=tv, R=R, reproj_mean_px=mean_px))
+
+        candidates.append(
+            _IppeCandidate(
+                rvec=rv,
+                tvec=tv,
+                R=R,
+                reproj_mean_px=mean_px,
+            )
+        )
 
     return candidates
 
@@ -366,8 +407,12 @@ def _export_ippe_candidate_result(
     uv_proj, mean_px, median_px, max_px, per_point_px = compute_reprojection_error_px(
         object_points_xyz=object_points_xyz,
         image_points_uv=image_points_uv,
-        rvec=candidate.rvec, tvec=candidate.tvec, K=K, dist=dist,
+        rvec=candidate.rvec,
+        tvec=candidate.tvec,
+        K=K,
+        dist=dist,
     )
+
     return IppeCandidateResult(
         candidate_index=int(candidate_index),
         rvec=np.asarray(candidate.rvec, dtype=np.float64).reshape(3, 1),
@@ -405,21 +450,23 @@ def _select_ippe_candidate(
     for i, s in enumerate(candidates):
         R_bx = np.asarray(s.R, dtype=np.float64).reshape(3, 3)
 
-        # X-ray z-axis expressed in board frame
-        # columns of R_bx are board axes in xray frame
-        # rows / columns of R_xb = R_bx.T give xray axes in board frame
+        # X-ray z-axis expressed in board frame.
+        # Columns of R_bx are board axes in xray frame.
+        # Rows / columns of R_xb = R_bx.T give xray axes in board frame.
         R_xb = R_bx.T
         z_x_in_b = R_xb[:, 2]
 
-        # dot close to -1  <=> best antiparallel
+        # dot close to -1 <=> best antiparallel
         dot_z = float(np.dot(z_b, z_x_in_b))
 
-        infos.append({
-            "idx": i,
-            "z_x_in_b": z_x_in_b,
-            "dot_z": dot_z,
-            "reproj_mean_px": float(s.reproj_mean_px),
-        })
+        infos.append(
+            {
+                "idx": i,
+                "z_x_in_b": z_x_in_b,
+                "dot_z": dot_z,
+                "reproj_mean_px": float(s.reproj_mean_px),
+            }
+        )
 
     print("\n=== DEBUG XRAY IPPE SELECTION ===")
     for info in infos:
@@ -452,6 +499,7 @@ def _select_ippe_candidate_rgb(
         raise ValueError(f"Expected exactly 2 IPPE candidates, got {len(candidates)}.")
 
     scores = []
+
     for cand in candidates:
         T_ippe = _make_transform(cand.R, cand.tvec.ravel())
         scores.append(
@@ -489,7 +537,8 @@ def _select_ippe_candidate_rgb(
         return 0 if scores[0]["score"] <= scores[1]["score"] else 1
 
     raise RuntimeError(
-        "RGB IPPE candidate selection failed: neither candidate lies within the depth-based trust region."
+        "RGB IPPE candidate selection failed: neither candidate lies within "
+        "the depth-based trust region."
     )
 
 
@@ -509,26 +558,39 @@ def _solve_pose_iterative(
     refine_with_iterative: bool = True,
 ) -> PoseSolveResult:
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
-    image_points_uv   = np.asarray(image_points_uv,   dtype=np.float64).reshape(-1, 2)
-    K    = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
     dist = normalize_dist_coeffs(dist_coeffs)
 
     if object_points_xyz.shape[0] < 4:
         raise ValueError("At least 4 correspondences are required.")
 
-    used_guess = bool(use_extrinsic_guess and rvec_init is not None and tvec_init is not None)
+    used_guess = bool(
+        use_extrinsic_guess
+        and rvec_init is not None
+        and tvec_init is not None
+    )
 
     if used_guess:
         rvec_init = np.asarray(rvec_init, dtype=np.float64).reshape(3, 1)
         tvec_init = np.asarray(tvec_init, dtype=np.float64).reshape(3, 1)
+
         success, rvec, tvec = cv2.solvePnP(
-            object_points_xyz, image_points_uv, K, dist,
-            rvec=rvec_init, tvec=tvec_init,
-            useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
+            object_points_xyz,
+            image_points_uv,
+            K,
+            dist,
+            rvec=rvec_init,
+            tvec=tvec_init,
+            useExtrinsicGuess=True,
+            flags=cv2.SOLVEPNP_ITERATIVE,
         )
     else:
         success, rvec, tvec = cv2.solvePnP(
-            object_points_xyz, image_points_uv, K, dist,
+            object_points_xyz,
+            image_points_uv,
+            K,
+            dist,
             flags=cv2.SOLVEPNP_ITERATIVE,
         )
 
@@ -540,17 +602,32 @@ def _solve_pose_iterative(
 
     if refine_with_iterative:
         rvec, tvec = _refine_pose_iterative(
-            object_points_xyz, image_points_uv, K, dist, rvec, tvec,
+            object_points_xyz,
+            image_points_uv,
+            K,
+            dist,
+            rvec,
+            tvec,
         )
 
     uv_proj, _, _, _, per_point_px = compute_reprojection_error_px(
-        object_points_xyz, image_points_uv, rvec, tvec, K, dist,
+        object_points_xyz,
+        image_points_uv,
+        rvec,
+        tvec,
+        K,
+        dist,
     )
+
     inlier_idx = _compute_inlier_idx(None, num_points=len(image_points_uv))
-    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(per_point_px, inlier_idx)
+    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(
+        per_point_px,
+        inlier_idx,
+    )
 
     return PoseSolveResult(
-        rvec=rvec, tvec=tvec,
+        rvec=rvec,
+        tvec=tvec,
         method="iterative",
         raw_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE),
         used_extrinsic_guess=used_guess,
@@ -583,8 +660,8 @@ def _solve_pose_iterative_ransac(
     ransac_iterations_count: int = 100,
 ) -> PoseSolveResult:
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
-    image_points_uv   = np.asarray(image_points_uv,   dtype=np.float64).reshape(-1, 2)
-    K    = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
     dist = normalize_dist_coeffs(dist_coeffs)
 
     if object_points_xyz.shape[0] < 4:
@@ -604,23 +681,46 @@ def _solve_pose_iterative_ransac(
     if not success:
         raise RuntimeError("SOLVEPNP_ITERATIVE_RANSAC failed.")
 
-    rvec    = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
-    tvec    = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+    rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+    tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
     inliers = None if inliers is None else np.asarray(inliers, dtype=np.int64)
 
     if refine_with_iterative:
+        inlier_idx_for_refine = _compute_inlier_idx(
+            inliers,
+            num_points=len(image_points_uv),
+        )
+
+        object_refine = object_points_xyz[inlier_idx_for_refine]
+        image_refine = image_points_uv[inlier_idx_for_refine]
+
         rvec, tvec = _refine_pose_iterative(
-            object_points_xyz, image_points_uv, K, dist, rvec, tvec,
+            object_refine,
+            image_refine,
+            K,
+            dist,
+            rvec,
+            tvec,
         )
 
     uv_proj, _, _, _, per_point_px = compute_reprojection_error_px(
-        object_points_xyz, image_points_uv, rvec, tvec, K, dist,
+        object_points_xyz,
+        image_points_uv,
+        rvec,
+        tvec,
+        K,
+        dist,
     )
+
     inlier_idx = _compute_inlier_idx(inliers, num_points=len(image_points_uv))
-    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(per_point_px, inlier_idx)
+    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(
+        per_point_px,
+        inlier_idx,
+    )
 
     return PoseSolveResult(
-        rvec=rvec, tvec=tvec,
+        rvec=rvec,
+        tvec=tvec,
         method="iterative_ransac",
         raw_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE),
         used_extrinsic_guess=False,
@@ -651,8 +751,8 @@ def _solve_pose_ippe(
     use_xray_ippe_selection_rule: bool = False,
 ) -> PoseSolveResult:
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
-    image_points_uv   = np.asarray(image_points_uv,   dtype=np.float64).reshape(-1, 2)
-    K    = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
     dist = normalize_dist_coeffs(dist_coeffs)
 
     if object_points_xyz.shape[0] < 4:
@@ -681,6 +781,7 @@ def _solve_pose_ippe(
         candidates,
         use_xray_ippe_selection_rule=use_xray_ippe_selection_rule,
     )
+
     best = candidates[best_idx]
 
     rvec = best.rvec
@@ -688,17 +789,32 @@ def _solve_pose_ippe(
 
     if refine_with_iterative:
         rvec, tvec = _refine_pose_iterative(
-            object_points_xyz, image_points_uv, K, dist, rvec, tvec,
+            object_points_xyz,
+            image_points_uv,
+            K,
+            dist,
+            rvec,
+            tvec,
         )
 
     uv_proj, _, _, _, per_point_px = compute_reprojection_error_px(
-        object_points_xyz, image_points_uv, rvec, tvec, K, dist,
+        object_points_xyz,
+        image_points_uv,
+        rvec,
+        tvec,
+        K,
+        dist,
     )
+
     inlier_idx = _compute_inlier_idx(None, num_points=len(image_points_uv))
-    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(per_point_px, inlier_idx)
+    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(
+        per_point_px,
+        inlier_idx,
+    )
 
     return PoseSolveResult(
-        rvec=rvec, tvec=tvec,
+        rvec=rvec,
+        tvec=tvec,
         method="ippe",
         raw_pnp_flag=int(cv2.SOLVEPNP_IPPE),
         used_extrinsic_guess=False,
@@ -733,11 +849,14 @@ def _solve_pose_ippe_handeye(
     refine_rgb_iterative: bool = False,
     refine_xray_iterative: bool = False,
 ) -> PoseSolveResult:
-    cam_points_xyz_m        = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
-    image_points_uv         = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
-    K_xray                  = np.asarray(K_xray, dtype=np.float64).reshape(3, 3)
-    checkerboard_corners_uv = np.asarray(checkerboard_corners_uv, dtype=np.float64).reshape(3, 2)
-    K_rgb                   = np.asarray(K_rgb, dtype=np.float64).reshape(3, 3)
+    cam_points_xyz_m = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
+    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
+    K_xray = np.asarray(K_xray, dtype=np.float64).reshape(3, 3)
+    checkerboard_corners_uv = np.asarray(
+        checkerboard_corners_uv,
+        dtype=np.float64,
+    ).reshape(3, 2)
+    K_rgb = np.asarray(K_rgb, dtype=np.float64).reshape(3, 3)
 
     dist_xray = normalize_dist_coeffs(None)
     dist_rgb = normalize_dist_coeffs(dist_coeffs_rgb)
@@ -747,15 +866,17 @@ def _solve_pose_ippe_handeye(
         refine_xray_iterative = True
 
     n_pts = (steps_per_edge + 1) ** 2
+
     if image_points_uv.shape[0] != n_pts:
         raise ValueError(
             f"Expected {n_pts} X-ray image points for steps_per_edge={steps_per_edge}, "
             f"got {image_points_uv.shape[0]}."
         )
+
     if cam_points_xyz_m.shape != (n_pts, 3):
         raise ValueError(
-            f"Expected object_points_xyz with shape ({n_pts}, 3) for pose_method='ippe_handeye', "
-            f"got {cam_points_xyz_m.shape}."
+            f"Expected object_points_xyz with shape ({n_pts}, 3) "
+            f"for pose_method='ippe_handeye', got {cam_points_xyz_m.shape}."
         )
 
     pts3d_board_mm = build_board_xyz_canonical(
@@ -767,11 +888,15 @@ def _solve_pose_ippe_handeye(
     p_tl, p_tr, p_bl = checkerboard_corners_uv
     step_x = (p_tr - p_tl) / float(steps_per_edge)
     step_y = (p_bl - p_tl) / float(steps_per_edge)
-    pts2d_rgb = np.array([
-        p_tl + alpha * step_x + beta * step_y
-        for beta in range(steps_per_edge + 1)
-        for alpha in range(steps_per_edge + 1)
-    ], dtype=np.float64)
+
+    pts2d_rgb = np.array(
+        [
+            p_tl + alpha * step_x + beta * step_y
+            for beta in range(steps_per_edge + 1)
+            for alpha in range(steps_per_edge + 1)
+        ],
+        dtype=np.float64,
+    )
 
     cam_points_xyz_mm = cam_points_xyz_m * 1000.0
     depth_fit = _rigid_fit_kabsch(pts3d_board_mm, cam_points_xyz_mm)
@@ -779,13 +904,20 @@ def _solve_pose_ippe_handeye(
 
     tr = _trust_region_from_depth_rms(depth_fit["rms_mm"])
 
-    candidates_rgb = _build_ippe_candidates(pts3d_board_mm, pts2d_rgb, K_rgb, dist_rgb)
+    candidates_rgb = _build_ippe_candidates(
+        pts3d_board_mm,
+        pts2d_rgb,
+        K_rgb,
+        dist_rgb,
+    )
+
     best_idx_rgb = _select_ippe_candidate_rgb(
         candidates_rgb,
         T_bc_depth=T_bc_depth,
         gamma_t_mm=tr["gamma_t_mm"],
         gamma_r_deg=tr["gamma_r_deg"],
     )
+
     best_rgb = candidates_rgb[best_idx_rgb]
 
     rvec_bc = np.asarray(best_rgb.rvec, dtype=np.float64).reshape(3, 1)
@@ -804,11 +936,18 @@ def _solve_pose_ippe_handeye(
     R_bc, _ = cv2.Rodrigues(rvec_bc)
     T_bc = _make_transform(R_bc, tvec_bc.ravel())
 
-    candidates_xray = _build_ippe_candidates(pts3d_board_mm, image_points_uv, K_xray, dist_xray)
+    candidates_xray = _build_ippe_candidates(
+        pts3d_board_mm,
+        image_points_uv,
+        K_xray,
+        dist_xray,
+    )
+
     best_idx_xray = _select_ippe_candidate(
         candidates_xray,
         use_xray_ippe_selection_rule=True,
     )
+
     best_xray = candidates_xray[best_idx_xray]
 
     rvec_bx = np.asarray(best_xray.rvec, dtype=np.float64).reshape(3, 1)
@@ -840,15 +979,34 @@ def _solve_pose_ippe_handeye(
         K_xray,
         dist_xray,
     )
+
     inlier_idx = _compute_inlier_idx(None, num_points=len(image_points_uv))
-    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(per_point_px, inlier_idx)
+    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(
+        per_point_px,
+        inlier_idx,
+    )
 
     all_candidates_rgb = [
-        _export_ippe_candidate_result(c, pts3d_board_mm, pts2d_rgb, K_rgb, dist_rgb, i)
+        _export_ippe_candidate_result(
+            c,
+            pts3d_board_mm,
+            pts2d_rgb,
+            K_rgb,
+            dist_rgb,
+            i,
+        )
         for i, c in enumerate(candidates_rgb)
     ]
+
     all_candidates_xray = [
-        _export_ippe_candidate_result(c, pts3d_board_mm, image_points_uv, K_xray, dist_xray, i)
+        _export_ippe_candidate_result(
+            c,
+            pts3d_board_mm,
+            image_points_uv,
+            K_xray,
+            dist_xray,
+            i,
+        )
         for i, c in enumerate(candidates_xray)
     ]
 
@@ -862,7 +1020,11 @@ def _solve_pose_ippe_handeye(
         candidate_index_rgb=int(best_idx_rgb),
         candidate_index_xray=int(best_idx_xray),
         refined_with_iterative=bool(refine_rgb_iterative or refine_xray_iterative),
-        refinement_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE) if (refine_rgb_iterative or refine_xray_iterative) else None,
+        refinement_pnp_flag=(
+            int(cv2.SOLVEPNP_ITERATIVE)
+            if (refine_rgb_iterative or refine_xray_iterative)
+            else None
+        ),
         inliers=None,
         inlier_idx=inlier_idx,
         uv_proj=uv_proj,
@@ -936,7 +1098,7 @@ def solve_pose(
     K_rgb : (3, 3) or None
         RGB camera intrinsic matrix. Required for method='ippe_handeye'.
     steps_per_edge : int
-        Grid steps per edge for method='ippe_handeye'. Default 10 → 121 points.
+        Grid steps per edge for method='ippe_handeye'. Default 10 -> 121 points.
 
     Refinement options for ippe_handeye
     -----------------------------------
@@ -988,8 +1150,10 @@ def solve_pose(
     if method == "ippe_handeye":
         if checkerboard_corners_uv is None:
             raise ValueError("pose_method='ippe_handeye' requires checkerboard_corners_uv.")
+
         if K_rgb is None:
             raise ValueError("pose_method='ippe_handeye' requires K_rgb.")
+
         return _solve_pose_ippe_handeye(
             object_points_xyz=object_points_xyz,
             image_points_uv=image_points_uv,

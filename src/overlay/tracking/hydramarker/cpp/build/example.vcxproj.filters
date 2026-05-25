@@ -4,16 +4,49 @@
     <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\example.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\generator_HydraMarker.cpp">
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\marker_field.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\marker_field.cpp">
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\checkerboard_detector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\checkerboard_detector.cpp">
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\dot_detector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\dot_detector.cpp">
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\patch_extractor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\patch_decoder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\marker_geometry.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\correspondence_builder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\generator_HydraMarker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\corner_detection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\corner_refinement.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\lattice_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\grid_builder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\lk_tracker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\tracking_validator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\domin\Documents\Studium\Master\Masterarbeit\Projekt\Overlay\src\overlay\tracking\hydramarker\cpp\src\geometry_utils.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
