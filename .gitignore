@@ -29,3 +29,19 @@ results/
 
 # Packaging / build artifacts
 *.egg-info/
+
+# CMake / C++ build artifacts
+build/
+**/build/
+CMakeCache.txt
+CMakeFiles/
+*.obj
+*.lib
+*.exp
+*.dll
+*.pyd
+*.tlog
+*.recipe
+*.lastbuildstate
+*.vcxproj.user
+.vs/

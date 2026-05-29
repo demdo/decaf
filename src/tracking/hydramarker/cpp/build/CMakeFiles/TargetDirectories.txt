@@ -1,4 +1,0 @@
-C:/Users/domin/Documents/Studium/Master/Masterarbeit/Projekt/Overlay/src/overlay/tracking/hydramarker/cpp/build/CMakeFiles/hydramarker_cpp.dir
-C:/Users/domin/Documents/Studium/Master/Masterarbeit/Projekt/Overlay/src/overlay/tracking/hydramarker/cpp/build/CMakeFiles/example.dir
-C:/Users/domin/Documents/Studium/Master/Masterarbeit/Projekt/Overlay/src/overlay/tracking/hydramarker/cpp/build/CMakeFiles/ALL_BUILD.dir
-C:/Users/domin/Documents/Studium/Master/Masterarbeit/Projekt/Overlay/src/overlay/tracking/hydramarker/cpp/build/CMakeFiles/ZERO_CHECK.dir
