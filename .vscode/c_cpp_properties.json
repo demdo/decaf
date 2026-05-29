@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:/Users/domin/vcpkg/installed/x64-windows/include",
+                "C:/Users/domin/anaconda3/envs/overlay/Include",
+                "C:/Users/domin/anaconda3/envs/overlay/Lib/site-packages/pybind11/include"
+            ],
+            "defines": ["_DEBUG", "UNICODE", "_UNICODE"],
+            "windowsSdkVersion": "10.0.26200.0",
+            "compilerPath": "cl.exe",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}

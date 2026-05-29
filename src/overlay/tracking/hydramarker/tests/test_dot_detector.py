@@ -17,6 +17,9 @@ Controls:
 
 from pathlib import Path
 from datetime import datetime
+import csv
+import json
+import math
 
 import cv2
 import numpy as np
@@ -69,6 +72,10 @@ def cell_pts_np(cell):
     )
 
 
+def dot_for_cell(dot_lookup, cell):
+    return dot_lookup.get((cell.j, cell.i))
+
+
 def draw_checker_corners(vis, detection):
     for corner in detection.corners:
         u, v = pxy(corner.uv)
@@ -94,7 +101,7 @@ def draw_dot_cells(vis, checker_detection, dot_detection):
     dot_lookup = build_dot_lookup(dot_detection)
 
     for cell in checker_detection.cells:
-        dot = dot_lookup.get((cell.i, cell.j))
+        dot = dot_for_cell(dot_lookup, cell)
         pts = cell_pts_np(cell)
 
         if dot is None or not dot.valid:
@@ -150,7 +157,7 @@ def draw_score_heatmap(vis, checker_detection, dot_detection):
     overlay = vis.copy()
 
     for cell in checker_detection.cells:
-        dot = dot_lookup.get((cell.i, cell.j))
+        dot = dot_for_cell(dot_lookup, cell)
         pts = cell_pts_np(cell)
 
         if dot is None or not dot.valid:
@@ -164,7 +171,7 @@ def draw_score_heatmap(vis, checker_detection, dot_detection):
     cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
 
     for cell in checker_detection.cells:
-        dot = dot_lookup.get((cell.i, cell.j))
+        dot = dot_for_cell(dot_lookup, cell)
         if dot is None or not dot.valid:
             continue
 
@@ -183,7 +190,7 @@ def draw_ambiguous_cells(vis, checker_detection, dot_detection):
     dot_lookup = build_dot_lookup(dot_detection)
 
     for cell in checker_detection.cells:
-        dot = dot_lookup.get((cell.i, cell.j))
+        dot = dot_for_cell(dot_lookup, cell)
         pts = cell_pts_np(cell)
 
         if dot is None or not dot.valid:
@@ -214,7 +221,7 @@ def draw_photometry_debug(vis, checker_detection, dot_detection):
     dot_lookup = build_dot_lookup(dot_detection)
 
     for cell in checker_detection.cells:
-        dot = dot_lookup.get((cell.i, cell.j))
+        dot = dot_for_cell(dot_lookup, cell)
         pts = cell_pts_np(cell)
 
         if dot is None or not dot.valid:
@@ -305,6 +312,413 @@ def get_debug_summary(dot_detection):
     )
 
 
+def point_xy(p):
+    return float(p.x), float(p.y)
+
+
+def polygon_area(points):
+    if len(points) < 3:
+        return 0.0
+
+    area = 0.0
+    for idx in range(len(points)):
+        x1, y1 = points[idx]
+        x2, y2 = points[(idx + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+
+    return 0.5 * area
+
+
+def cell_shape_stats(cell):
+    pts = [
+        point_xy(cell.corner_uv[0]),
+        point_xy(cell.corner_uv[1]),
+        point_xy(cell.corner_uv[2]),
+        point_xy(cell.corner_uv[3]),
+    ]
+
+    edges = []
+    for idx in range(4):
+        x1, y1 = pts[idx]
+        x2, y2 = pts[(idx + 1) % 4]
+        edges.append(math.hypot(x2 - x1, y2 - y1))
+
+    d02 = math.hypot(pts[2][0] - pts[0][0], pts[2][1] - pts[0][1])
+    d13 = math.hypot(pts[3][0] - pts[1][0], pts[3][1] - pts[1][1])
+
+    min_edge = min(edges) if edges else 0.0
+    max_edge = max(edges) if edges else 0.0
+    edge_ratio = max_edge / max(min_edge, 1e-6)
+
+    signed_area = polygon_area(pts)
+    area = abs(signed_area)
+
+    return {
+        "area": area,
+        "signed_area": signed_area,
+        "min_edge": min_edge,
+        "max_edge": max_edge,
+        "edge_ratio": edge_ratio,
+        "diag_ratio": max(d02, d13) / max(min(d02, d13), 1e-6),
+    }
+
+
+def checker_stats(checker_detection):
+    stats = {
+        "checker_present": checker_detection is not None,
+        "corners": 0,
+        "cells": 0,
+        "rows": 0,
+        "cols": 0,
+        "tracking": False,
+        "stable": False,
+        "min_i": None,
+        "max_i": None,
+        "min_j": None,
+        "max_j": None,
+        "duplicate_ids": 0,
+        "suspicious_cells": 0,
+        "negative_area_cells": 0,
+        "cell_edge_ratio_max": 0.0,
+        "cell_diag_ratio_max": 0.0,
+    }
+
+    if checker_detection is None:
+        return stats
+
+    corners = list(checker_detection.corners)
+    cells = list(checker_detection.cells)
+
+    stats["corners"] = len(corners)
+    stats["cells"] = len(cells)
+    stats["rows"] = int(checker_detection.rows)
+    stats["cols"] = int(checker_detection.cols)
+    stats["tracking"] = bool(checker_detection.tracking)
+    stats["stable"] = bool(checker_detection.stable)
+
+    if corners:
+        ids = [(int(c.i), int(c.j)) for c in corners]
+        is_ = [p[0] for p in ids]
+        js = [p[1] for p in ids]
+        stats["min_i"] = min(is_)
+        stats["max_i"] = max(is_)
+        stats["min_j"] = min(js)
+        stats["max_j"] = max(js)
+        stats["duplicate_ids"] = len(ids) - len(set(ids))
+
+    suspicious = 0
+    negative_area = 0
+    max_edge_ratio = 0.0
+    max_diag_ratio = 0.0
+
+    for cell in cells:
+        shape = cell_shape_stats(cell)
+        max_edge_ratio = max(max_edge_ratio, shape["edge_ratio"])
+        max_diag_ratio = max(max_diag_ratio, shape["diag_ratio"])
+
+        if shape["signed_area"] < 0.0:
+            negative_area += 1
+
+        if (
+            shape["area"] < 25.0
+            or shape["edge_ratio"] > 2.8
+            or shape["diag_ratio"] > 2.2
+        ):
+            suspicious += 1
+
+    stats["suspicious_cells"] = suspicious
+    stats["negative_area_cells"] = negative_area
+    stats["cell_edge_ratio_max"] = max_edge_ratio
+    stats["cell_diag_ratio_max"] = max_diag_ratio
+
+    return stats
+
+
+def dot_summary_stats(dot_detection):
+    stats = dot_stats(dot_detection)
+
+    stats.update(
+        {
+            "dot_grid_rows": 0,
+            "dot_grid_cols": 0,
+            "score_avg": 0.0,
+            "score_max": 0.0,
+            "contrast_avg": 0.0,
+            "contrast_max": 0.0,
+        }
+    )
+
+    if dot_detection is None or not dot_detection.cells:
+        return stats
+
+    stats["dot_grid_rows"] = int(dot_detection.rows)
+    stats["dot_grid_cols"] = int(dot_detection.cols)
+
+    valid_cells = [c for c in dot_detection.cells if c.valid]
+    if not valid_cells:
+        return stats
+
+    scores = np.array([c.score for c in valid_cells], dtype=np.float32)
+    contrasts = np.array(
+        [abs(float(c.center_mean) - float(c.ring_mean)) for c in valid_cells],
+        dtype=np.float32,
+    )
+
+    stats["score_avg"] = float(np.mean(scores))
+    stats["score_max"] = float(np.max(scores))
+    stats["contrast_avg"] = float(np.mean(contrasts))
+    stats["contrast_max"] = float(np.max(contrasts))
+
+    return stats
+
+
+class CompactDebugLogger:
+    def __init__(self, output_dir, summary_every_n_frames=15, repeat_event_every=30):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.summary_path = self.output_dir / f"hydramarker_lattice_summary_{ts}.csv"
+        self.events_path = self.output_dir / f"hydramarker_lattice_events_{ts}.jsonl"
+
+        self.summary_every_n_frames = int(summary_every_n_frames)
+        self.repeat_event_every = int(repeat_event_every)
+
+        self.summary_file = self.summary_path.open("w", newline="", encoding="utf-8")
+        self.event_file = self.events_path.open("w", encoding="utf-8")
+
+        self.summary_writer = None
+        self.last_signature = None
+        self.last_checker_stats = None
+        self.event_counts = {}
+
+        print(f"[HydraMarkerDebug] summary log: {self.summary_path}")
+        print(f"[HydraMarkerDebug] event log:   {self.events_path}")
+
+    def close(self):
+        if self.summary_file:
+            self.summary_file.flush()
+            self.summary_file.close()
+            self.summary_file = None
+
+        if self.event_file:
+            self.event_file.flush()
+            self.event_file.close()
+            self.event_file = None
+
+    def make_signature(self, checker, dots):
+        return (
+            checker["checker_present"],
+            checker["corners"],
+            checker["cells"],
+            checker["rows"],
+            checker["cols"],
+            checker["tracking"],
+            checker["stable"],
+            checker["min_i"],
+            checker["max_i"],
+            checker["min_j"],
+            checker["max_j"],
+            checker["duplicate_ids"],
+            checker["suspicious_cells"],
+            dots["total"],
+            dots["invalid"],
+            dots["dot"],
+            dots["ambiguous"],
+        )
+
+    def should_write_summary(self, frame_idx, signature):
+        if signature != self.last_signature:
+            return True
+
+        return frame_idx % self.summary_every_n_frames == 0
+
+    def write_summary(self, row):
+        if self.summary_writer is None:
+            self.summary_writer = csv.DictWriter(self.summary_file, fieldnames=list(row.keys()))
+            self.summary_writer.writeheader()
+
+        self.summary_writer.writerow(row)
+        self.summary_file.flush()
+
+    def write_event(self, frame_idx, level, event_type, message, payload=None):
+        payload = payload or {}
+        key = (level, event_type, message)
+
+        count = self.event_counts.get(key, 0) + 1
+        self.event_counts[key] = count
+
+        if count != 1 and count % self.repeat_event_every != 0:
+            return
+
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "frame": int(frame_idx),
+            "level": level,
+            "type": event_type,
+            "repeat_count": count,
+            "message": message,
+            "payload": payload,
+        }
+
+        self.event_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.event_file.flush()
+
+    def detect_events(self, frame_idx, checker, dots):
+        if not checker["checker_present"]:
+            self.write_event(
+                frame_idx,
+                "WARN",
+                "NO_CHECKER_DETECTION",
+                "checker_detector.detect(img) returned None",
+            )
+            self.last_checker_stats = checker
+            return
+
+        if checker["corners"] == 0:
+            self.write_event(
+                frame_idx,
+                "ERROR",
+                "ZERO_CORNERS",
+                "checker detection exists but contains zero corners",
+                checker,
+            )
+
+        if checker["rows"] <= 0 or checker["cols"] <= 0:
+            self.write_event(
+                frame_idx,
+                "WARN",
+                "INVALID_GRID_DIMENSIONS",
+                "grid rows or cols are non-positive",
+                checker,
+            )
+
+        if checker["duplicate_ids"] > 0:
+            self.write_event(
+                frame_idx,
+                "ERROR",
+                "DUPLICATE_GRID_IDS",
+                "multiple detected corners share the same (i,j) ID",
+                {
+                    "duplicate_ids": checker["duplicate_ids"],
+                    "corners": checker["corners"],
+                    "min_i": checker["min_i"],
+                    "max_i": checker["max_i"],
+                    "min_j": checker["min_j"],
+                    "max_j": checker["max_j"],
+                },
+            )
+
+        if checker["suspicious_cells"] > 0:
+            self.write_event(
+                frame_idx,
+                "WARN",
+                "SUSPICIOUS_CELL_GEOMETRY",
+                "one or more cells have extreme shape ratios or tiny area",
+                {
+                    "suspicious_cells": checker["suspicious_cells"],
+                    "negative_area_cells": checker["negative_area_cells"],
+                    "cell_edge_ratio_max": checker["cell_edge_ratio_max"],
+                    "cell_diag_ratio_max": checker["cell_diag_ratio_max"],
+                },
+            )
+
+        prev = self.last_checker_stats
+        if prev is not None and prev["checker_present"]:
+            corner_drop = prev["corners"] - checker["corners"]
+            cell_drop = prev["cells"] - checker["cells"]
+
+            if corner_drop >= max(6, int(0.35 * max(prev["corners"], 1))):
+                self.write_event(
+                    frame_idx,
+                    "WARN",
+                    "CORNER_COUNT_DROP",
+                    "corner count dropped strongly compared to previous frame",
+                    {
+                        "previous_corners": prev["corners"],
+                        "current_corners": checker["corners"],
+                        "drop": corner_drop,
+                    },
+                )
+
+            if cell_drop >= max(6, int(0.35 * max(prev["cells"], 1))):
+                self.write_event(
+                    frame_idx,
+                    "WARN",
+                    "CELL_COUNT_DROP",
+                    "cell count dropped strongly compared to previous frame",
+                    {
+                        "previous_cells": prev["cells"],
+                        "current_cells": checker["cells"],
+                        "drop": cell_drop,
+                    },
+                )
+
+            previous_dims = (prev["rows"], prev["cols"], prev["min_i"], prev["max_i"], prev["min_j"], prev["max_j"])
+            current_dims = (checker["rows"], checker["cols"], checker["min_i"], checker["max_i"], checker["min_j"], checker["max_j"])
+
+            if previous_dims != current_dims and checker["corners"] >= 8 and prev["corners"] >= 8:
+                self.write_event(
+                    frame_idx,
+                    "INFO",
+                    "GRID_INDEX_RANGE_CHANGED",
+                    "grid dimensions or min/max (i,j) changed",
+                    {
+                        "previous": {
+                            "rows": prev["rows"],
+                            "cols": prev["cols"],
+                            "min_i": prev["min_i"],
+                            "max_i": prev["max_i"],
+                            "min_j": prev["min_j"],
+                            "max_j": prev["max_j"],
+                        },
+                        "current": {
+                            "rows": checker["rows"],
+                            "cols": checker["cols"],
+                            "min_i": checker["min_i"],
+                            "max_i": checker["max_i"],
+                            "min_j": checker["min_j"],
+                            "max_j": checker["max_j"],
+                        },
+                    },
+                )
+
+        if dots["total"] > 0 and dots["ambiguous"] >= max(4, int(0.25 * dots["total"])):
+            self.write_event(
+                frame_idx,
+                "INFO",
+                "MANY_AMBIGUOUS_DOTS",
+                "large fraction of dot cells is ambiguous",
+                {
+                    "ambiguous": dots["ambiguous"],
+                    "total": dots["total"],
+                    "score_avg": dots["score_avg"],
+                    "score_max": dots["score_max"],
+                },
+            )
+
+        self.last_checker_stats = checker
+
+    def log_frame(self, frame_idx, checker_detection, dot_detection):
+        checker = checker_stats(checker_detection)
+        dots = dot_summary_stats(dot_detection)
+        signature = self.make_signature(checker, dots)
+
+        row = {
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "frame": int(frame_idx),
+            **checker,
+            **{f"dot_{k}": v for k, v in dots.items()},
+        }
+
+        if self.should_write_summary(frame_idx, signature):
+            self.write_summary(row)
+            self.last_signature = signature
+
+        self.detect_events(frame_idx, checker, dots)
+
+
+
 def get_info_lines(mode_name, checker_detection, dot_detection, paused):
     lines = [
         "HydraMarker DotDetector Live Debug",
@@ -337,9 +751,7 @@ def get_info_lines(mode_name, checker_detection, dot_detection, paused):
     )
 
     if dot_detection is not None:
-        lines.append(
-            f"dot grid={dot_detection.cols} x {dot_detection.rows}"
-        )
+        lines.append(f"dot grid={dot_detection.cols} x {dot_detection.rows}")
         lines.append(get_debug_summary(dot_detection))
 
     lines.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -430,6 +842,9 @@ def main():
     dot_detector = create_dot_detector()
 
     output_dir = Path(__file__).resolve().parent / "dot_detector_live_snapshots"
+    log_dir = Path(__file__).resolve().parent / "dot_detector_live_logs"
+    debug_logger = CompactDebugLogger(log_dir)
+    frame_idx = 0
 
     pipe = rs.pipeline()
     cfg = rs.config()
@@ -471,9 +886,15 @@ def main():
                 checker_detection = checker_detector.detect(img)
 
                 if checker_detection is not None:
+                    if len(checker_detection.corners) == 0:
+                        dot_detector.reset()
                     dot_detection = dot_detector.detect(img, checker_detection)
                 else:
+                    dot_detector.reset()
                     dot_detection = None
+
+                debug_logger.log_frame(frame_idx, checker_detection, dot_detection)
+                frame_idx += 1
 
                 last_img = img.copy()
                 last_checker_detection = checker_detection
@@ -516,6 +937,7 @@ def main():
                 save_png(last_vis, output_dir)
 
     finally:
+        debug_logger.close()
         pipe.stop()
         cv2.destroyAllWindows()
 

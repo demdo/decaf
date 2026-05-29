@@ -21,9 +21,23 @@ public:
         int min_cells
     ) const;
 
+    std::optional<CheckerboardDetection> buildFromCorners(
+        const std::vector<GridCorner>& input_corners,
+        float duplicate_dist_px,
+        int min_corners,
+        int min_cells,
+        bool tracking,
+        bool stable
+    ) const;
+
 private:
     std::vector<GridCorner> makeGridCorners(
         const LatticeResult& lattice,
+        float duplicate_dist_px
+    ) const;
+
+    std::vector<GridCorner> sanitizeGridCorners(
+        const std::vector<GridCorner>& input_corners,
         float duplicate_dist_px
     ) const;
 

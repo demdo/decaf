@@ -1,0 +1,8 @@
+{"timestamp": "2026-05-28T19:29:55.265", "frame": 0, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 1, "message": "checker_detector.detect(img) returned None", "payload": {}}
+{"timestamp": "2026-05-28T19:29:57.691", "frame": 31, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 30, "message": "checker_detector.detect(img) returned None", "payload": {}}
+{"timestamp": "2026-05-28T19:29:59.991", "frame": 61, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 60, "message": "checker_detector.detect(img) returned None", "payload": {}}
+{"timestamp": "2026-05-28T19:30:02.406", "frame": 91, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 90, "message": "checker_detector.detect(img) returned None", "payload": {}}
+{"timestamp": "2026-05-28T19:30:05.219", "frame": 121, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 120, "message": "checker_detector.detect(img) returned None", "payload": {}}
+{"timestamp": "2026-05-28T19:30:08.039", "frame": 151, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 150, "message": "checker_detector.detect(img) returned None", "payload": {}}
+{"timestamp": "2026-05-28T19:30:10.854", "frame": 181, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 180, "message": "checker_detector.detect(img) returned None", "payload": {}}
+{"timestamp": "2026-05-28T19:30:13.643", "frame": 211, "level": "WARN", "type": "NO_CHECKER_DETECTION", "repeat_count": 210, "message": "checker_detector.detect(img) returned None", "payload": {}}

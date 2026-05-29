@@ -1,4 +1,4 @@
-# overlay/pose/pose_filters.py
+# overlay/tracking/pose_filters.py
 
 from __future__ import annotations
 
@@ -6,9 +6,6 @@ import numpy as np
 
 
 def _rotation_angle_deg(R: np.ndarray) -> float:
-    """
-    Return the angle of a relative rotation matrix in degrees.
-    """
     R = np.asarray(R, dtype=np.float64).reshape(3, 3)
     trace = float(np.trace(R))
     cos_theta = (trace - 1.0) / 2.0
@@ -26,35 +23,13 @@ def _compute_motion_score(
     w_tip: float = 0.7,
     w_rot: float = 0.3,
 ) -> float:
-    """
-    Compute a normalized motion score in [0, 1].
-    """
     motion_tip = np.clip(float(tip_step_mm) / float(tip_ref_mm), 0.0, 1.0)
     motion_rot = np.clip(float(rot_step_deg) / float(rot_ref_deg), 0.0, 1.0)
-
     motion_score = float(w_tip) * motion_tip + float(w_rot) * motion_rot
     return float(np.clip(motion_score, 0.0, 1.0))
 
 
 class AdaptiveKalmanFilterCV3D:
-    """
-    Adaptive constant-velocity Kalman filter for 3D position.
-
-    State
-    -----
-        x = [px, py, pz, vx, vy, vz]^T
-
-    Measurement
-    -----------
-        z = [px, py, pz]^T
-
-    Notes
-    -----
-    The filter adapts Q and R based on frame-to-frame motion estimated from:
-    - raw 3D tip displacement
-    - raw rotation change
-    """
-
     def __init__(
         self,
         dt: float,
@@ -226,14 +201,6 @@ class AdaptiveKalmanFilterCV3D:
         measurement_mm: np.ndarray,
         rotation_camera: np.ndarray | None = None,
     ) -> np.ndarray:
-        """
-        Full adaptive filtering step:
-        - compute frame-to-frame motion from raw input
-        - adapt Q and R
-        - predict
-        - update
-        - store current raw input as previous state for the next frame
-        """
         measurement_mm = np.asarray(measurement_mm, dtype=np.float64).reshape(3)
 
         motion_score = self._compute_internal_motion_score(
@@ -255,26 +222,9 @@ class AdaptiveKalmanFilterCV3D:
             ).reshape(3, 3).copy()
 
         return pos_filt
-    
-    
+
+
 class PlaneKalmanFilter:
-    """
-    Kalman filter for a static plane defined by (a, b, c, d) with ax+by+cz+d=0.
-
-    The plane is assumed static (constant model), so the process noise Q is
-    very small. The filter mainly smooths repeated RANSAC estimates of the
-    same physical plane.
-
-    The normal (a, b, c) is re-normalised after each update to stay on S².
-    Sign consistency is enforced so the normal always points toward the camera
-    (negative z-component convention, matching the RealSense coordinate frame).
-
-    Measurements whose normal deviates more than outlier_angle_deg from the
-    current state are rejected entirely — the state is returned unchanged.
-    This handles rare RANSAC failures that land in a false minimum far from
-    the true plane orientation.
-    """
-
     def __init__(
         self,
         *,
@@ -286,15 +236,11 @@ class PlaneKalmanFilter:
         self.measurement_noise = float(measurement_noise)
         self.outlier_angle_deg = float(outlier_angle_deg)
 
-        self._state: np.ndarray | None = None   # (4,)
-        self._P = np.eye(4, dtype=np.float64)   # covariance
+        self._state: np.ndarray | None = None
+        self._P = np.eye(4, dtype=np.float64)
 
         self._Q = np.eye(4, dtype=np.float64) * self.process_noise
         self._R = np.eye(4, dtype=np.float64) * self.measurement_noise
-
-    # ------------------------------------------------------------------ #
-    #  Public API                                                          #
-    # ------------------------------------------------------------------ #
 
     def reset(self) -> None:
         self._state = None
@@ -306,84 +252,257 @@ class PlaneKalmanFilter:
 
     @property
     def state(self) -> np.ndarray | None:
-        """Return a copy of the current filtered plane (a, b, c, d) or None."""
         return self._state.copy() if self._state is not None else None
 
     def update(self, plane: np.ndarray) -> np.ndarray:
-        """
-        Ingest a new RANSAC plane estimate and return the filtered plane.
-
-        Parameters
-        ----------
-        plane : (4,) array  [a, b, c, d]  (need not be normalised)
-
-        Returns
-        -------
-        filtered_plane : (4,) array, normalised so that ||(a,b,c)|| = 1
-        """
         plane = self._normalise(np.asarray(plane, dtype=np.float64))
         plane = self._enforce_sign(plane)
 
         if self._state is None:
             self._state = plane.copy()
-            self._P = np.eye(4, dtype=np.float64)  # reset covariance on first use
+            self._P = np.eye(4, dtype=np.float64)
             return self._state.copy()
 
-        # --- Ausreißer-Reject ---
-        # Messungen die mehr als outlier_angle_deg vom aktuellen State abweichen
-        # werden komplett verworfen — typischerweise RANSAC false minima.
-        # Der State bleibt unverändert; P wächst weiter durch Q (predict-only).
         angle = float(np.degrees(np.arccos(
             np.clip(np.dot(plane[:3], self._state[:3]), -1.0, 1.0)
         )))
+
         if angle > self.outlier_angle_deg:
             print(f"[PlaneKF] Outlier rejected: {angle:.3f}° > {self.outlier_angle_deg}°")
-            self._P = self._P + self._Q  # covariance wächst weiter
+            self._P = self._P + self._Q
             return self._state.copy()
 
-        # --- predict (static model: state unchanged, P grows by Q) -------
         P_pred = self._P + self._Q
 
-        # --- update -------------------------------------------------------
-        y = plane - self._state                        # innovation
-        S = P_pred + self._R                           # innovation covariance
-        K = P_pred @ np.linalg.inv(S)                 # Kalman gain
+        y = plane - self._state
+        S = P_pred + self._R
+        K = P_pred @ np.linalg.inv(S)
 
         self._state = self._state + K @ y
         self._P = (np.eye(4, dtype=np.float64) - K) @ P_pred
 
-        # Re-normalise: Kalman update moves the normal off S²
         self._state = self._normalise(self._state)
 
         return self._state.copy()
 
-    # ------------------------------------------------------------------ #
-    #  Private helpers                                                     #
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _normalise(plane: np.ndarray) -> np.ndarray:
-        """Normalise so ||(a, b, c)|| = 1; d is scaled accordingly."""
         n_norm = float(np.linalg.norm(plane[:3]))
         if n_norm < 1e-9:
             raise ValueError("Plane normal is near-zero — invalid plane.")
         return plane / n_norm
 
     def _enforce_sign(self, plane: np.ndarray) -> np.ndarray:
-        """
-        Ensure the normal is sign-consistent with the previous state.
-
-        If no previous state exists, fall back to the RealSense convention:
-        the board is in front of the camera, so the normal should point
-        *toward* the camera, i.e. n_z < 0 in camera frame.
-        """
         if self._state is not None:
             if np.dot(plane[:3], self._state[:3]) < 0.0:
                 return -plane
         else:
-            if plane[2] > 0.0:   # n_z > 0  →  normal points away from camera
+            if plane[2] > 0.0:
                 return -plane
         return plane
-    
-    
-    
+
+
+class CornerKalmanFilterCA2D:
+    def __init__(
+        self,
+        dt: float,
+        *,
+        process_noise: float = 1.0,
+        measurement_noise: float = 0.03,
+        initial_position_uncertainty: float = 1e-6,
+        initial_velocity_uncertainty: float = 100.0,
+        initial_acceleration_uncertainty: float = 1000.0,
+    ) -> None:
+        self.dt = float(dt)
+        if self.dt <= 0.0:
+            raise ValueError("dt must be > 0.")
+
+        self.process_noise = float(process_noise)
+        self.measurement_noise = float(measurement_noise)
+
+        self.initial_position_uncertainty = float(initial_position_uncertainty)
+        self.initial_velocity_uncertainty = float(initial_velocity_uncertainty)
+        self.initial_acceleration_uncertainty = float(initial_acceleration_uncertainty)
+
+        dt2 = self.dt * self.dt
+
+        self.A = np.array(
+            [
+                [1.0, self.dt, 0.5 * dt2, 0.0, 0.0, 0.0],
+                [0.0, 1.0, self.dt,      0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0,          0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0,          1.0, self.dt, 0.5 * dt2],
+                [0.0, 0.0, 0.0,          0.0, 1.0, self.dt],
+                [0.0, 0.0, 0.0,          0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        self.H = np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+
+        self.Q = np.eye(6, dtype=np.float64) * self.process_noise
+        self.R = np.eye(2, dtype=np.float64) * self.measurement_noise
+
+        self.I = np.eye(6, dtype=np.float64)
+        self.x = np.zeros((6, 1), dtype=np.float64)
+        self.P = self._initial_covariance()
+
+        self.initialized = False
+        self.missed_frames = 0
+
+    def _initial_covariance(self) -> np.ndarray:
+        return np.diag(
+            [
+                self.initial_position_uncertainty,
+                self.initial_velocity_uncertainty,
+                self.initial_acceleration_uncertainty,
+                self.initial_position_uncertainty,
+                self.initial_velocity_uncertainty,
+                self.initial_acceleration_uncertainty,
+            ]
+        ).astype(np.float64)
+
+    def reset(self) -> None:
+        self.x[:] = 0.0
+        self.P = self._initial_covariance()
+        self.initialized = False
+        self.missed_frames = 0
+
+    def initialize(self, uv: np.ndarray) -> np.ndarray:
+        uv = np.asarray(uv, dtype=np.float64).reshape(2)
+
+        self.x[:] = 0.0
+        self.x[0, 0] = uv[0]
+        self.x[3, 0] = uv[1]
+
+        self.P = self._initial_covariance()
+        self.initialized = True
+        self.missed_frames = 0
+
+        return self.filtered_uv()
+
+    def predict(self) -> np.ndarray | None:
+        if not self.initialized:
+            return None
+
+        self.x = self.A @ self.x
+        self.P = self.A @ self.P @ self.A.T + self.Q
+        self.missed_frames += 1
+
+        return self.filtered_uv()
+
+    def update(self, uv: np.ndarray) -> np.ndarray:
+        uv = np.asarray(uv, dtype=np.float64).reshape(2, 1)
+
+        if not self.initialized:
+            return self.initialize(uv.reshape(2))
+
+        y = uv - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ y
+        self.P = (self.I - K @ self.H) @ self.P
+
+        self.missed_frames = 0
+
+        return self.filtered_uv()
+
+    def filter(self, uv: np.ndarray) -> np.ndarray:
+        if not self.initialized:
+            return self.initialize(uv)
+
+        self.predict()
+        return self.update(uv)
+
+    def filtered_uv(self) -> np.ndarray:
+        return np.array(
+            [self.x[0, 0], self.x[3, 0]],
+            dtype=np.float64,
+        )
+
+
+class CornerKalmanBankCA2D:
+    def __init__(
+        self,
+        dt: float,
+        *,
+        process_noise: float = 1.0,
+        measurement_noise: float = 0.03,
+        max_missed_frames: int = 2,
+    ) -> None:
+        self.dt = float(dt)
+        if self.dt <= 0.0:
+            raise ValueError("dt must be > 0.")
+
+        self.process_noise = float(process_noise)
+        self.measurement_noise = float(measurement_noise)
+        self.max_missed_frames = int(max_missed_frames)
+
+        self.filters: dict[tuple[int, int], CornerKalmanFilterCA2D] = {}
+
+    def reset(self) -> None:
+        self.filters.clear()
+
+    def _get_filter(self, key: tuple[int, int]) -> CornerKalmanFilterCA2D:
+        if key not in self.filters:
+            self.filters[key] = CornerKalmanFilterCA2D(
+                dt=self.dt,
+                process_noise=self.process_noise,
+                measurement_noise=self.measurement_noise,
+            )
+        return self.filters[key]
+
+    def filter_uv(
+        self,
+        global_row: int,
+        global_col: int,
+        uv: np.ndarray,
+    ) -> np.ndarray:
+        key = (int(global_row), int(global_col))
+        kf = self._get_filter(key)
+        return kf.filter(uv)
+
+    def filter_corners(self, corners) -> dict[tuple[int, int], np.ndarray]:
+        visible_keys: set[tuple[int, int]] = set()
+        filtered: dict[tuple[int, int], np.ndarray] = {}
+
+        for p in corners:
+            key = (int(p.global_row), int(p.global_col))
+            visible_keys.add(key)
+
+            uv_filt = self.filter_uv(
+                global_row=p.global_row,
+                global_col=p.global_col,
+                uv=np.asarray(p.uv, dtype=np.float64),
+            )
+
+            filtered[key] = uv_filt
+
+        self._prune_missing(visible_keys)
+
+        return filtered
+
+    def _prune_missing(
+        self,
+        visible_keys: set[tuple[int, int]],
+    ) -> None:
+        keys_to_delete: list[tuple[int, int]] = []
+
+        for key, kf in self.filters.items():
+            if key in visible_keys:
+                continue
+
+            kf.missed_frames += 1
+
+            if kf.missed_frames > self.max_missed_frames:
+                keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            del self.filters[key]

@@ -17,6 +17,7 @@ Controls:
 import sys
 from pathlib import Path
 from datetime import datetime
+import csv
 
 import cv2
 import numpy as np
@@ -32,6 +33,73 @@ import hydramarker_cpp
 
 OUT_DIR = Path("hydramarker_saved_frames")
 OUT_DIR.mkdir(exist_ok=True)
+
+# ============================================================
+# Drift logger
+# ============================================================
+
+DRIFT_LOG_PATH = OUT_DIR / "drift_log.csv"
+_drift_log_file = None
+_drift_log_writer = None
+_prev_corners: dict = {}   # {(i,j): (u,v)} from previous frame
+_frame_idx = 0
+
+def drift_log_open():
+    global _drift_log_file, _drift_log_writer
+    _drift_log_file = open(DRIFT_LOG_PATH, "w", newline="")
+    _drift_log_writer = csv.writer(_drift_log_file)
+    _drift_log_writer.writerow([
+        "frame", "n_corners", "n_cells",
+        "drift_mean_px", "drift_max_px", "drift_p90_px",
+        "n_drifting_gt1.5", "n_drifting_gt3", "n_drifting_gt5",
+        "square_med_px", "square_min_px",
+    ])
+
+def drift_log_update(det, frame_idx: int):
+    global _prev_corners, _drift_log_writer
+
+    if det is None or not det.corners:
+        _prev_corners = {}
+        return
+
+    curr = {}
+    for c in det.corners:
+        u, v = get_xy(c.uv)
+        curr[(int(c.i), int(c.j))] = (u, v)
+
+    drifts = []
+    for key, (u, v) in curr.items():
+        if key in _prev_corners:
+            pu, pv = _prev_corners[key]
+            drifts.append(float(np.hypot(u - pu, v - pv)))
+
+    _prev_corners = curr
+
+    if not drifts:
+        return
+
+    drifts = np.array(drifts, dtype=np.float32)
+    stats = estimate_square_stats(det)
+
+    if _drift_log_writer:
+        _drift_log_writer.writerow([
+            frame_idx,
+            len(det.corners),
+            len(det.cells),
+            f"{np.mean(drifts):.2f}",
+            f"{np.max(drifts):.2f}",
+            f"{np.percentile(drifts, 90):.2f}",
+            int(np.sum(drifts > 1.5)),
+            int(np.sum(drifts > 3.0)),
+            int(np.sum(drifts > 5.0)),
+            f"{stats['median']:.1f}" if stats else "",
+            f"{stats['min']:.1f}" if stats else "",
+        ])
+        _drift_log_file.flush()
+
+def drift_log_close():
+    if _drift_log_file:
+        _drift_log_file.close()
 
 
 # ============================================================
@@ -59,6 +127,39 @@ def get_xy(p):
         return float(p.x), float(p.y)
 
     return float(p[0]), float(p[1])
+
+
+def estimate_square_stats(det):
+    if not det or len(det.corners) < 2:
+        return None
+
+    corners = []
+
+    for c in det.corners:
+        u, v = get_xy(c.uv)
+        corners.append((int(c.i), int(c.j), u, v))
+
+    by_idx = {(i, j): (u, v) for i, j, u, v in corners}
+    dists = []
+
+    for i, j, u, v in corners:
+        for ni, nj in ((i + 1, j), (i, j + 1)):
+            if (ni, nj) in by_idx:
+                u2, v2 = by_idx[(ni, nj)]
+                dists.append(float(np.hypot(u2 - u, v2 - v)))
+
+    if not dists:
+        return None
+
+    dists = np.asarray(dists, dtype=np.float32)
+
+    return {
+        "median": float(np.median(dists)),
+        "mean": float(np.mean(dists)),
+        "min": float(np.min(dists)),
+        "max": float(np.max(dists)),
+        "n": int(len(dists)),
+    }
 
 
 def draw_corners(
@@ -140,36 +241,61 @@ def draw_cells(
             )
 
 
+def count_lost_debug_corners(det, debug_det, max_dist_px=10.0):
+    if not debug_det or not det:
+        return 0
+
+    final_uvs = []
+
+    for c in det.corners:
+        u, v = get_xy(c.uv)
+        final_uvs.append((u, v))
+
+    lost = 0
+
+    for c in debug_det.corners:
+        u, v = get_xy(c.uv)
+
+        found = any(
+            abs(u - fu) < max_dist_px and abs(v - fv) < max_dist_px
+            for fu, fv in final_uvs
+        )
+
+        if not found:
+            lost += 1
+
+    return lost
+
+
 def draw_status(vis, mode_name, det, debug_det, debug_on) -> None:
     normal_n = len(det.corners) if det else 0
     normal_c = len(det.cells) if det else 0
     debug_n = len(debug_det.corners) if debug_det else 0
     debug_c = len(debug_det.cells) if debug_det else 0
 
+    final_stats = estimate_square_stats(det)
+    debug_stats = estimate_square_stats(debug_det)
+
     line1 = f"mode: {mode_name} | t=toggle d=debug SPACE=save ESC=quit"
     line2 = f"final corners: {normal_n} | final cells: {normal_c}"
     line3 = f"recovery/debug corners: {debug_n} | cells: {debug_c} | debug {'ON' if debug_on else 'OFF'}"
 
+    if final_stats is not None:
+        line2 += (
+            f" | square med: {final_stats['median']:.1f}px"
+            f" min: {final_stats['min']:.1f}px"
+            f" max: {final_stats['max']:.1f}px"
+        )
+
+    if debug_stats is not None:
+        line3 += (
+            f" | square med: {debug_stats['median']:.1f}px"
+            f" min: {debug_stats['min']:.1f}px"
+            f" max: {debug_stats['max']:.1f}px"
+        )
+
     if debug_on and debug_det and det:
-        final_uvs = []
-
-        for c in det.corners:
-            u, v = get_xy(c.uv)
-            final_uvs.append((u, v))
-
-        lost = 0
-
-        for c in debug_det.corners:
-            u, v = get_xy(c.uv)
-
-            found = any(
-                abs(u - fu) < 10 and abs(v - fv) < 10
-                for fu, fv in final_uvs
-            )
-
-            if not found:
-                lost += 1
-
+        lost = count_lost_debug_corners(det, debug_det)
         line3 += f" | lost in final: {lost}"
 
     for i, line in enumerate([line1, line2, line3]):
@@ -218,6 +344,9 @@ def save_current_frame(img, vis, det, debug_det, mode_name, debug_on):
             cu, cv_ = get_xy(cell.center_uv)
             debug_cells.append([cu, cv_, cell.i, cell.j])
 
+    final_stats = estimate_square_stats(det)
+    debug_stats = estimate_square_stats(debug_det)
+
     np.savez_compressed(
         npz_path,
         raw_image_bgr=img,
@@ -226,11 +355,35 @@ def save_current_frame(img, vis, det, debug_det, mode_name, debug_on):
         final_cells=np.asarray(final_cells, dtype=np.float32),
         debug_corners=np.asarray(debug_corners, dtype=np.float32),
         debug_cells=np.asarray(debug_cells, dtype=np.float32),
+        final_square_median_px=np.asarray(
+            final_stats["median"] if final_stats is not None else np.nan,
+            dtype=np.float32,
+        ),
+        final_square_min_px=np.asarray(
+            final_stats["min"] if final_stats is not None else np.nan,
+            dtype=np.float32,
+        ),
+        final_square_max_px=np.asarray(
+            final_stats["max"] if final_stats is not None else np.nan,
+            dtype=np.float32,
+        ),
+        debug_square_median_px=np.asarray(
+            debug_stats["median"] if debug_stats is not None else np.nan,
+            dtype=np.float32,
+        ),
+        debug_square_min_px=np.asarray(
+            debug_stats["min"] if debug_stats is not None else np.nan,
+            dtype=np.float32,
+        ),
+        debug_square_max_px=np.asarray(
+            debug_stats["max"] if debug_stats is not None else np.nan,
+            dtype=np.float32,
+        ),
         mode_name=np.asarray(mode_name),
         debug_on=np.asarray(debug_on),
     )
 
-    print(f"Saved:")
+    print("Saved:")
     print(f"  {raw_path}")
     print(f"  {vis_path}")
     print(f"  {npz_path}")
@@ -241,8 +394,12 @@ def save_current_frame(img, vis, det, debug_det, mode_name, debug_on):
 # ============================================================
 
 def main() -> None:
+    global _frame_idx
     detector = hydramarker_cpp.CheckerboardDetector()
     debug_detector = hydramarker_cpp.CheckerboardDetector()
+
+    drift_log_open()
+    print(f"Drift log: {DRIFT_LOG_PATH}")
 
     pipe = rs.pipeline()
     cfg = rs.config()
@@ -286,9 +443,14 @@ def main() -> None:
             vis = img.copy()
 
             det = detector.detect(img)
+            _frame_idx += 1
+            drift_log_update(det, _frame_idx)
 
-            debug_detector.reset_tracking()
-            debug_det = debug_detector.detect(img)
+            debug_det = None
+
+            if debug_on:
+                debug_detector.reset_tracking()
+                debug_det = debug_detector.detect(img)
 
             if debug_on and debug_det:
                 draw_corners(
@@ -391,6 +553,8 @@ def main() -> None:
     finally:
         pipe.stop()
         cv2.destroyAllWindows()
+        drift_log_close()
+        print(f"Drift log saved to {DRIFT_LOG_PATH}")
 
 
 if __name__ == "__main__":

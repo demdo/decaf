@@ -26,6 +26,12 @@ struct CornerRefinementConfig {
     float correlation_drop = 0.2f;
 
     float merge_radius_px = 2.0f;
+
+    // Quadrant intensity symmetry filter — see CheckerboardDetectorConfig for
+    // full documentation. Set quadrant_half_r = 0 to disable.
+    int   quadrant_half_r = 3;
+    float quadrant_min_contrast = 12.0f;       // in [0,255]; internally scaled relative to local range
+    float quadrant_max_diagonal_diff = 60.0f;  // in [0,255]; relaxed — relative scaling makes it robust
 };
 
 class CornerRefiner {
@@ -64,6 +70,18 @@ private:
         const std::vector<RefinedCorner>& corners,
         float merge_radius_px
     ) const;
+
+    // Returns false if the candidate clearly lacks checkerboard quadrant
+    // symmetry (e.g. dot centre, cell interior, edge crossing).
+    // Operates directly on the original gray image so the test is independent
+    // of the saddle model.
+    static bool passesQuadrantSymmetry(
+        const cv::Mat& gray_f,
+        const cv::Point2f& uv,
+        int half_r,
+        float min_contrast,
+        float max_diagonal_diff
+    );
 };
 
 } // namespace hydramarker

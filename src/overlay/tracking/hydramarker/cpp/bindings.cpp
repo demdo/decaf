@@ -4,6 +4,9 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 
+#include <optional>
+#include <stdexcept>
+
 #include <opencv2/core.hpp>
 
 #include "marker_field.hpp"
@@ -157,7 +160,9 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def("has_corner", &MarkerGeometry::hasCorner)
         .def("corner_point", &MarkerGeometry::cornerPoint)
         .def("corner_rows", &MarkerGeometry::cornerRows)
-        .def("corner_cols", &MarkerGeometry::cornerCols);
+        .def("corner_cols", &MarkerGeometry::cornerCols)
+        .def("detectable_origin_row", &MarkerGeometry::detectableOriginRow)
+        .def("detectable_origin_col", &MarkerGeometry::detectableOriginCol);
 
     py::class_<GridCorner>(m, "GridCorner")
         .def(py::init<>())
@@ -215,7 +220,17 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("saddle_sigma", &CheckerboardDetectorConfig::saddle_sigma)
         .def_readwrite("saddle_response_threshold", &CheckerboardDetectorConfig::saddle_response_threshold)
         .def_readwrite("saddle_max_angle_bias_deg", &CheckerboardDetectorConfig::saddle_max_angle_bias_deg)
-        .def_readwrite("saddle_correlation_drop", &CheckerboardDetectorConfig::saddle_correlation_drop);
+        .def_readwrite("saddle_correlation_drop", &CheckerboardDetectorConfig::saddle_correlation_drop)
+        .def_readwrite("quadrant_half_r", &CheckerboardDetectorConfig::quadrant_half_r)
+        .def_readwrite("quadrant_min_contrast", &CheckerboardDetectorConfig::quadrant_min_contrast)
+        .def_readwrite("quadrant_max_diagonal_diff", &CheckerboardDetectorConfig::quadrant_max_diagonal_diff)
+        .def_readwrite("refresh_corner_loss_ratio", &CheckerboardDetectorConfig::refresh_corner_loss_ratio)
+        .def_readwrite("refresh_gain_threshold", &CheckerboardDetectorConfig::refresh_gain_threshold)
+        .def_readwrite("tracking_spacing_min_rel", &CheckerboardDetectorConfig::tracking_spacing_min_rel)
+        .def_readwrite("tracking_spacing_max_rel", &CheckerboardDetectorConfig::tracking_spacing_max_rel)
+        .def_readwrite("max_degraded_frames_before_reset", &CheckerboardDetectorConfig::max_degraded_frames_before_reset)
+        .def_readwrite("max_missed_frames", &CheckerboardDetectorConfig::max_missed_frames)
+        .def_readwrite("max_low_corner_frames", &CheckerboardDetectorConfig::max_low_corner_frames);
 
     py::class_<geom::CellGeometryValidationConfig>(m, "CellGeometryValidationConfig")
         .def(py::init<>())
@@ -285,6 +300,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("has_dot", &DotCellObservation::has_dot)
         .def_readwrite("ambiguous", &DotCellObservation::ambiguous)
         .def_readwrite("score", &DotCellObservation::score)
+        .def_readwrite("raw_score", &DotCellObservation::raw_score)
         .def_readwrite("center_mean", &DotCellObservation::center_mean)
         .def_readwrite("ring_mean", &DotCellObservation::ring_mean)
         .def_readwrite("local_mean", &DotCellObservation::local_mean)
@@ -309,7 +325,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("revoke_threshold", &DotDetectorConfig::revoke_threshold)
         .def_readwrite("uncertainty_low", &DotDetectorConfig::uncertainty_low)
         .def_readwrite("uncertainty_high", &DotDetectorConfig::uncertainty_high)
-        .def_readwrite("warmup_frames", &DotDetectorConfig::warmup_frames);
+        .def_readwrite("warmup_frames", &DotDetectorConfig::warmup_frames)
+        .def_readwrite("temporal_alpha", &DotDetectorConfig::temporal_alpha)
+        .def_readwrite("commit_frames", &DotDetectorConfig::commit_frames)
+        .def_readwrite("revoke_frames", &DotDetectorConfig::revoke_frames);
 
     py::class_<RefinedCorner>(m, "RefinedCorner")
         .def(py::init<>())
@@ -386,7 +405,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 cv::Mat mat = numpyToMat(img);
                 return self.detect(mat, checkerboard);
             }
-        );
+        )
+        .def("reset", &DotDetector::reset);
 
     py::class_<LocalPatch>(m, "LocalPatch")
         .def_readonly("row", &LocalPatch::row)
@@ -440,23 +460,33 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def(py::init<>())
         .def_readwrite("min_votes", &CorrespondenceBuilderConfig::min_votes)
         .def_readwrite("discard_conflicts", &CorrespondenceBuilderConfig::discard_conflicts)
-        .def_readwrite("require_detection_stable", &CorrespondenceBuilderConfig::require_detection_stable);
+        .def_readwrite("require_detection_stable", &CorrespondenceBuilderConfig::require_detection_stable)
+        .def_readwrite("enable_dominant_rotation_filter", &CorrespondenceBuilderConfig::enable_dominant_rotation_filter)
+        .def_readwrite("min_rotation_support", &CorrespondenceBuilderConfig::min_rotation_support)
+        .def_readwrite("min_rotation_support_ratio", &CorrespondenceBuilderConfig::min_rotation_support_ratio)
+        .def_readwrite("allow_single_vote_boundary_corners", &CorrespondenceBuilderConfig::allow_single_vote_boundary_corners)
+        .def_readwrite("boundary_margin_cells", &CorrespondenceBuilderConfig::boundary_margin_cells);
 
     py::class_<CorrespondenceBuildResult>(m, "CorrespondenceBuildResult")
         .def(py::init<>())
         .def_readonly("correspondences", &CorrespondenceBuildResult::correspondences)
         .def_readonly("decoded_patches_used", &CorrespondenceBuildResult::decoded_patches_used)
+        .def_readonly("decoded_patches_rejected_by_rotation", &CorrespondenceBuildResult::decoded_patches_rejected_by_rotation)
         .def_readonly("assignments_total", &CorrespondenceBuildResult::assignments_total)
         .def_readonly("assignments_accepted", &CorrespondenceBuildResult::assignments_accepted)
         .def_readonly("assignments_conflicted", &CorrespondenceBuildResult::assignments_conflicted)
         .def_readonly("corners_without_geometry", &CorrespondenceBuildResult::corners_without_geometry)
+        .def_readonly("single_vote_boundary_corners_accepted", &CorrespondenceBuildResult::single_vote_boundary_corners_accepted)
+        .def_readonly("single_vote_non_boundary_corners_rejected", &CorrespondenceBuildResult::single_vote_non_boundary_corners_rejected)
+        .def_readonly("dominant_rotation_deg", &CorrespondenceBuildResult::dominant_rotation_deg)
+        .def_readonly("dominant_rotation_count", &CorrespondenceBuildResult::dominant_rotation_count)
+        .def_readonly("rotation_vote_count", &CorrespondenceBuildResult::rotation_vote_count)
         .def("valid", &CorrespondenceBuildResult::valid);
 
     py::class_<CorrespondenceBuilder>(m, "CorrespondenceBuilder")
         .def(py::init<>())
         .def(py::init<CorrespondenceBuilderConfig>())
         .def("build", &CorrespondenceBuilder::build);
-
 }
 
 } // namespace hydramarker

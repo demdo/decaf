@@ -1,0 +1,487 @@
+frame,wall_ms,mode,success,message,det_valid,det_tracking,det_stable,det_corners,pose_corners,num_points,num_inliers,mean_err,max_err,confidence,persistent_count
+1,89.7,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+2,83.4,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+3,88.3,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+4,81.1,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+5,77.2,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+6,82.4,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+7,81.3,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+8,78.0,DETECTING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+9,428.0,LOST,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+10,78.6,LOST,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+11,75.7,LOST,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+12,73.1,LOST,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+13,75.3,LOST,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+14,75.8,LOST,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,0
+15,79.4,LOST,0,No valid decoded patches.,1,0,0,8,0,0,0,-1.000,-1.000,0.000,0
+16,88.0,TRACKING,1,Pose estimation successful.,1,0,0,30,7,7,7,0.264,0.353,0.514,0
+17,105.3,TRACKING,1,Pose estimation successful.,1,1,0,35,20,20,20,0.185,0.423,0.781,20
+18,86.9,TRACKING,1,Pose estimation successful.,1,1,0,35,20,20,20,0.159,0.337,0.784,20
+19,90.4,TRACKING,1,Pose estimation successful.,1,1,0,35,15,21,15,0.107,0.211,0.689,15
+20,91.1,TRACKING,1,Pose estimation successful.,1,1,0,35,15,21,15,0.136,0.272,0.686,15
+21,89.6,TRACKING,1,Pose estimation successful.,1,1,0,35,15,21,15,0.149,0.401,0.685,15
+22,88.3,TRACKING,1,Pose estimation successful.,1,1,1,35,15,21,15,0.126,0.260,0.687,15
+23,85.7,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.139,0.340,0.986,35
+24,87.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.156,0.391,0.984,35
+25,87.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.356,0.984,35
+26,89.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.196,0.401,0.980,35
+27,88.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.172,0.419,0.983,35
+28,89.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.173,0.354,0.983,35
+29,88.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.138,0.248,0.986,35
+30,88.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.392,0.984,35
+31,87.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.202,0.443,0.980,35
+32,87.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.259,0.582,0.974,35
+33,86.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.170,0.322,0.983,35
+34,86.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.147,0.353,0.985,35
+35,89.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.201,0.459,0.980,35
+36,86.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.172,0.357,0.983,35
+37,90.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.144,0.278,0.986,35
+38,90.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.118,0.327,0.988,35
+39,89.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.131,0.266,0.987,35
+40,87.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.161,0.360,0.984,35
+41,88.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.148,0.317,0.985,35
+42,87.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.183,0.393,0.982,35
+43,87.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.215,0.565,0.979,35
+44,86.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.234,0.471,0.977,35
+45,87.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.261,0.578,0.974,35
+46,89.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.183,0.396,0.982,35
+47,87.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.169,0.414,0.983,35
+48,86.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.188,0.418,0.981,35
+49,88.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.220,0.484,0.978,35
+50,87.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.169,0.326,0.983,35
+51,87.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.209,0.592,0.979,35
+52,87.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.211,0.591,0.979,35
+53,86.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.196,0.412,0.980,35
+54,89.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.199,0.580,0.980,35
+55,87.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.194,0.363,0.981,35
+56,88.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.149,0.360,0.985,35
+57,88.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.183,0.551,0.982,35
+58,89.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.129,0.304,0.987,35
+59,88.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.182,0.341,0.982,35
+60,88.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.144,0.436,0.986,35
+61,86.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.168,0.346,0.983,35
+62,87.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.188,0.404,0.981,35
+63,88.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.152,0.402,0.985,35
+64,86.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.190,0.435,0.981,35
+65,86.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.207,0.443,0.979,35
+66,87.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.251,0.568,0.975,35
+67,88.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.206,0.495,0.979,35
+68,88.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.265,0.605,0.974,35
+69,87.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.184,0.473,0.982,35
+70,90.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.198,0.390,0.980,35
+71,88.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.290,0.652,0.971,35
+72,89.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.323,0.755,0.968,35
+73,88.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.177,0.314,0.982,35
+74,87.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.266,0.627,0.973,35
+75,90.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.146,0.324,0.985,35
+76,88.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.293,0.813,0.971,35
+77,89.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.144,0.332,0.986,35
+78,89.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.161,0.367,0.984,35
+79,88.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.273,0.572,0.973,35
+80,90.3,TRACKING,1,Pose estimation successful.,1,0,0,32,28,28,28,0.279,0.775,0.932,28
+81,97.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.125,0.294,0.988,35
+82,88.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.428,1.018,0.957,35
+83,88.6,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,0,0,29,29,29,29,0.363,1.143,0.802,35
+84,97.4,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,33,30,33,30,0.145,0.416,0.838,35
+85,88.0,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,0,0,26,26,26,26,0.279,0.689,0.758,35
+86,89.4,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,0,0,29,29,29,29,0.207,0.961,0.815,35
+87,95.3,TRACKING,1,Pose estimation successful.,1,1,0,34,7,7,7,0.146,0.236,0.525,35
+88,90.7,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,31,31,31,31,0.214,0.496,0.832,35
+89,94.7,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,31,31,31,31,0.194,0.443,0.834,35
+90,92.1,TRACKING,1,Pose estimation successful.,1,1,0,35,17,17,17,0.183,0.544,0.722,17
+91,90.1,TRACKING,1,Pose estimation successful.,1,1,0,35,17,17,17,0.185,0.319,0.722,17
+92,89.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.164,0.314,0.984,35
+93,89.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.175,0.409,0.982,35
+94,91.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.168,0.487,0.983,35
+95,90.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.167,0.329,0.983,35
+96,87.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.220,0.485,0.978,35
+97,89.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.176,0.394,0.982,35
+98,89.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.212,0.400,0.979,35
+99,90.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.266,0.508,0.973,35
+100,90.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.409,0.881,0.959,35
+101,91.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.296,0.608,0.970,35
+102,87.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.240,0.548,0.976,35
+103,88.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.305,0.684,0.970,35
+104,87.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.273,0.502,0.973,35
+105,91.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.277,0.523,0.972,35
+106,90.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.273,0.512,0.973,35
+107,91.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.261,0.481,0.974,35
+108,90.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.332,0.712,0.967,35
+109,93.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.230,0.520,0.977,35
+110,94.8,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.160,0.338,0.984,35
+111,95.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.149,0.355,0.985,35
+112,90.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.176,0.333,0.982,35
+113,90.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.151,0.576,0.985,35
+114,90.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.194,0.379,0.981,35
+115,90.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.158,0.358,0.984,35
+116,89.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.144,0.325,0.986,35
+117,89.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.207,0.536,0.979,35
+118,87.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.141,0.284,0.986,35
+119,89.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.143,0.325,0.986,35
+120,90.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.179,0.330,0.982,35
+121,93.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.157,0.338,0.984,35
+122,90.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.152,0.510,0.985,35
+123,91.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.144,0.278,0.986,35
+124,90.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.122,0.322,0.988,35
+125,91.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.145,0.347,0.986,35
+126,91.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.117,0.265,0.988,35
+127,93.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.142,0.425,0.986,35
+128,93.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.130,0.275,0.987,35
+129,92.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.132,0.463,0.987,35
+130,94.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.191,0.374,0.981,35
+131,96.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.253,0.478,0.975,35
+132,98.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.277,0.610,0.972,35
+133,97.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.210,0.549,0.979,35
+134,98.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.193,0.435,0.981,35
+135,97.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.208,0.490,0.979,35
+136,96.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.206,0.513,0.979,35
+137,97.7,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.148,0.336,0.985,35
+138,99.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.214,0.522,0.979,35
+139,98.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.279,0.761,0.972,35
+140,100.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.139,0.364,0.986,35
+141,104.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.151,0.425,0.985,35
+142,102.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.161,0.421,0.984,35
+143,104.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.132,0.427,0.987,35
+144,105.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.210,0.473,0.979,35
+145,103.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.199,0.420,0.980,35
+146,106.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.307,0.709,0.969,35
+147,105.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.355,0.986,0.965,35
+148,104.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.213,0.532,0.979,35
+149,106.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.338,0.780,0.966,35
+150,98.8,RECOVERING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,35
+151,87.6,RECOVERING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,35
+152,96.7,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,0,0,19,19,19,19,0.197,0.620,0.646,35
+153,135.5,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.273,0.588,0.973,30
+154,108.7,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,22,22,22,22,0.319,0.630,0.687,30
+155,108.3,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,22,22,22,22,0.255,0.356,0.692,30
+156,114.6,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,24,24,24,24,0.217,0.404,0.730,30
+157,112.4,TRACKING,1,"Pose estimated with merged fresh+persistent correspondences (4 fresh, 24 total).",1,1,0,24,20,24,20,0.272,0.480,0.773,30
+158,113.1,TRACKING,1,"Pose estimated with merged fresh+persistent correspondences (4 fresh, 24 total).",1,1,0,24,20,24,20,0.209,0.376,0.779,30
+159,119.9,TRACKING,1,"Pose estimated with merged fresh+persistent correspondences (4 fresh, 24 total).",1,1,0,25,20,24,20,0.232,0.436,0.777,30
+160,120.2,TRACKING,1,"Pose estimated with merged fresh+persistent correspondences (4 fresh, 23 total).",1,1,0,24,19,23,19,0.260,0.470,0.754,30
+161,112.4,TRACKING,1,Pose estimation successful.,1,1,0,23,18,18,18,0.192,0.412,0.741,18
+162,114.6,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.178,0.293,0.862,24
+163,110.7,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.226,0.456,0.857,24
+164,111.5,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.172,0.374,0.863,24
+165,109.5,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.184,0.311,0.862,24
+166,110.2,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.197,0.491,0.860,24
+167,112.0,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.237,0.563,0.856,24
+168,117.0,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.206,0.348,0.859,24
+169,116.0,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.212,0.408,0.859,24
+170,118.2,TRACKING,1,Pose estimation successful.,1,1,0,24,24,24,24,0.231,0.462,0.857,24
+171,120.1,TRACKING,1,Pose estimation successful.,1,1,1,24,24,24,24,0.172,0.295,0.863,24
+172,138.7,TRACKING,1,Pose estimation successful.,1,1,0,26,21,21,21,0.284,0.593,0.792,21
+173,135.5,TRACKING,1,"Pose estimated with merged fresh+persistent correspondences (4 fresh, 19 total).",1,1,0,25,19,19,19,0.170,0.296,0.763,21
+174,129.4,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,23,18,18,18,0.242,0.485,0.625,21
+175,129.0,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,24,18,19,18,0.177,0.295,0.631,21
+176,116.5,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,0,0,24,20,20,20,0.285,0.568,0.656,21
+177,133.4,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,30,21,21,21,0.224,0.698,0.678,21
+178,119.0,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,30,21,21,21,0.176,0.494,0.682,21
+179,124.6,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,33,21,21,21,0.205,0.444,0.680,21
+180,119.5,TRACKING,1,"Pose estimated with merged fresh+persistent correspondences (4 fresh, 21 total).",1,1,0,32,17,21,17,0.229,0.513,0.717,21
+181,113.6,RECOVERING,0,Too few correspondences: 4.,1,1,1,32,0,4,0,-1.000,-1.000,0.000,21
+182,125.5,RECOVERING,0,Too few correspondences: 4.,1,1,0,35,0,4,0,-1.000,-1.000,0.000,21
+183,114.6,TRACKING,1,Pose estimation successful.,1,1,0,35,20,20,20,0.160,0.349,0.784,20
+184,111.1,TRACKING,1,Pose estimation successful.,1,1,0,35,25,25,25,0.150,0.432,0.885,25
+185,109.3,TRACKING,1,Pose estimation successful.,1,1,0,35,25,25,25,0.149,0.335,0.885,25
+186,109.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.439,0.984,35
+187,107.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.174,0.428,0.983,35
+188,105.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.168,0.372,0.983,35
+189,105.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.153,0.344,0.985,35
+190,104.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.176,0.395,0.982,35
+191,101.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.159,0.456,0.984,35
+192,101.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.182,0.513,0.982,35
+193,99.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.175,0.524,0.982,35
+194,99.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.182,0.468,0.982,35
+195,98.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.184,0.450,0.982,35
+196,98.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.269,0.659,0.973,35
+197,98.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.183,0.408,0.982,35
+198,94.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.388,0.757,0.961,35
+199,97.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.313,0.653,0.969,35
+200,94.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.239,0.643,0.976,35
+201,94.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.244,0.801,0.976,35
+202,94.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.165,0.364,0.984,35
+203,95.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.185,0.460,0.981,35
+204,94.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.225,0.439,0.977,35
+205,94.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.153,0.415,0.985,35
+206,95.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.154,0.389,0.985,35
+207,94.6,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.142,0.326,0.986,35
+208,95.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.203,0.427,0.980,35
+209,96.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.172,0.335,0.983,35
+210,96.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.167,0.395,0.983,35
+211,94.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.189,0.464,0.981,35
+212,93.3,TRACKING,1,Pose estimation successful.,1,1,0,34,34,34,34,0.141,0.351,0.986,34
+213,94.5,TRACKING,1,Pose estimation successful.,1,1,0,32,30,30,30,0.179,0.500,0.982,30
+214,93.7,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.171,0.411,0.983,30
+215,94.2,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.161,0.354,0.984,30
+216,92.4,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.157,0.360,0.984,30
+217,92.0,TRACKING,1,Pose estimation successful.,1,1,1,30,30,30,30,0.192,0.359,0.981,30
+218,92.7,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.162,0.410,0.984,30
+219,92.8,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.170,0.452,0.983,30
+220,93.0,TRACKING,1,Pose estimation successful.,1,1,1,30,30,30,30,0.170,0.324,0.983,30
+221,94.0,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.154,0.325,0.985,30
+222,94.2,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.188,0.423,0.981,30
+223,93.6,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.207,0.553,0.979,30
+224,93.6,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.271,0.663,0.973,30
+225,93.0,TRACKING,1,Pose estimation successful.,1,1,0,30,30,30,30,0.186,0.351,0.981,30
+226,98.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.165,0.410,0.983,35
+227,94.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.143,0.371,0.986,35
+228,94.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.156,0.365,0.984,35
+229,93.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.177,0.444,0.982,35
+230,94.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.128,0.278,0.987,35
+231,93.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.184,0.402,0.982,35
+232,94.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.164,0.321,0.984,35
+233,93.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.126,0.248,0.987,35
+234,94.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.168,0.486,0.983,35
+235,93.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.153,0.352,0.985,35
+236,92.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.193,0.367,0.981,35
+237,94.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.185,0.426,0.981,35
+238,93.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.285,0.526,0.972,35
+239,94.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.148,0.347,0.985,35
+240,94.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.145,0.372,0.986,35
+241,94.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.135,0.344,0.986,35
+242,95.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.162,0.345,0.984,35
+243,92.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.165,0.356,0.984,35
+244,94.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.178,0.450,0.982,35
+245,93.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.281,0.583,0.972,35
+246,94.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.178,0.500,0.982,35
+247,93.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.134,0.378,0.987,35
+248,94.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.138,0.358,0.986,35
+249,92.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.173,0.373,0.983,35
+250,93.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.196,0.576,0.980,35
+251,92.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.126,0.335,0.987,35
+252,92.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.158,0.403,0.984,35
+253,91.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.217,0.461,0.978,35
+254,91.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.229,0.484,0.977,35
+255,93.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.270,0.712,0.973,35
+256,94.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.270,0.703,0.973,35
+257,94.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.288,0.720,0.971,35
+258,94.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.229,0.499,0.977,35
+259,94.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.374,0.767,0.963,35
+260,93.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.467,0.923,0.953,35
+261,94.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.504,1.067,0.950,35
+262,94.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.317,0.732,0.968,35
+263,95.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.203,0.416,0.980,35
+264,97.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.318,0.646,0.968,35
+265,96.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.206,0.488,0.979,35
+266,97.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.455,0.984,35
+267,98.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.215,0.574,0.979,35
+268,102.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.161,0.332,0.984,35
+269,105.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.189,0.376,0.981,35
+270,106.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.154,0.338,0.985,35
+271,101.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.156,0.302,0.984,35
+272,104.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.192,0.428,0.981,35
+273,107.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.158,0.455,0.984,35
+274,104.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.136,0.356,0.986,35
+275,106.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.216,0.451,0.978,35
+276,106.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.176,0.325,0.982,35
+277,104.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.214,0.528,0.979,35
+278,106.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.327,0.984,35
+279,104.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.179,0.358,0.982,35
+280,104.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.193,0.487,0.981,35
+281,100.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.173,0.393,0.983,35
+282,101.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.135,0.243,0.986,35
+283,101.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.245,0.494,0.976,35
+284,99.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.499,1.024,0.950,35
+285,98.8,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,0,0,24,24,24,24,0.428,1.088,0.712,35
+286,114.5,TRACKING,1,Pose estimation successful.,1,1,0,31,20,20,20,0.158,0.454,0.784,20
+287,99.5,TRACKING,1,Pose estimation successful.,1,1,0,28,20,20,20,0.168,0.379,0.783,20
+288,97.8,TRACKING,1,Pose estimation successful.,1,0,0,34,34,34,34,0.304,0.894,0.970,34
+289,99.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.232,0.427,0.977,35
+290,98.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.120,0.256,0.988,35
+291,97.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.171,0.390,0.983,35
+292,99.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.184,0.400,0.982,35
+293,101.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.178,0.330,0.982,35
+294,99.5,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.144,0.265,0.986,35
+295,99.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.110,0.349,0.989,35
+296,99.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.151,0.357,0.985,35
+297,100.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.121,0.246,0.988,35
+298,105.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.114,0.270,0.989,35
+299,107.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.138,0.284,0.986,35
+300,107.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.217,0.475,0.978,35
+301,110.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.195,0.374,0.981,35
+302,109.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.140,0.363,0.986,35
+303,119.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.179,0.361,0.982,35
+304,118.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.125,0.263,0.988,35
+305,129.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.317,0.984,35
+306,126.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.154,0.363,0.985,35
+307,131.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.135,0.297,0.986,35
+308,140.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.229,0.649,0.977,35
+309,140.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.254,0.482,0.975,35
+310,145.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.150,0.280,0.985,35
+311,131.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.141,0.294,0.986,35
+312,130.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.169,0.488,0.983,35
+313,121.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.183,0.385,0.982,35
+314,124.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.108,0.244,0.989,35
+315,121.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.169,0.343,0.983,35
+316,121.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.141,0.338,0.986,35
+317,118.2,TRACKING,1,Pose estimation successful.,1,1,0,32,20,20,20,0.170,0.363,0.783,20
+318,116.4,TRACKING,1,Pose estimation successful.,1,1,0,32,20,20,20,0.140,0.259,0.786,20
+319,115.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.205,1.316,0.980,35
+320,111.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.145,0.308,0.985,35
+321,111.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.137,0.289,0.986,35
+322,108.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.164,0.378,0.984,35
+323,108.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.135,0.380,0.987,35
+324,108.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.387,0.984,35
+325,110.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.120,0.284,0.988,35
+326,109.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.174,0.435,0.983,35
+327,107.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.153,0.423,0.985,35
+328,108.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.209,0.420,0.979,35
+329,107.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.147,0.394,0.985,35
+330,107.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.150,0.235,0.985,35
+331,106.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.131,0.320,0.987,35
+332,104.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.129,0.271,0.987,35
+333,105.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.126,0.293,0.987,35
+334,103.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.168,0.406,0.983,35
+335,103.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.107,0.354,0.989,35
+336,105.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.149,0.497,0.985,35
+337,107.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.180,0.440,0.982,35
+338,106.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.245,0.482,0.976,35
+339,106.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.141,0.368,0.986,35
+340,106.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.148,0.401,0.985,35
+341,105.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.186,0.373,0.981,35
+342,104.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.165,0.367,0.984,35
+343,108.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.145,0.320,0.985,35
+344,104.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.148,0.340,0.985,35
+345,103.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.175,0.432,0.982,35
+346,103.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.140,0.312,0.986,35
+347,101.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.186,0.321,0.981,35
+348,100.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.409,0.984,35
+349,101.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.308,0.984,35
+350,99.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.125,0.375,0.988,35
+351,99.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.141,0.349,0.986,35
+352,111.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.220,0.508,0.978,35
+353,110.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.187,0.345,0.981,35
+354,104.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.162,0.404,0.984,35
+355,106.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.219,0.541,0.978,35
+356,112.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.128,0.238,0.987,35
+357,105.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.149,0.365,0.985,35
+358,107.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.125,0.247,0.988,35
+359,104.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.155,0.321,0.985,35
+360,104.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.129,0.299,0.987,35
+361,105.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.124,0.216,0.988,35
+362,106.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.145,0.316,0.985,35
+363,103.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.171,0.388,0.983,35
+364,101.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.155,0.355,0.985,35
+365,101.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.115,0.270,0.989,35
+366,102.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.139,0.285,0.986,35
+367,103.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.145,0.345,0.985,35
+368,102.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.157,0.356,0.984,35
+369,100.5,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.168,0.346,0.983,35
+370,99.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.196,0.429,0.980,35
+371,100.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.186,0.340,0.981,35
+372,99.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.186,0.410,0.981,35
+373,100.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.234,0.563,0.977,35
+374,100.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.181,0.584,0.982,35
+375,101.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.177,0.420,0.982,35
+376,103.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.212,0.475,0.979,35
+377,102.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.167,0.462,0.983,35
+378,101.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.268,0.531,0.973,35
+379,101.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.182,0.368,0.982,35
+380,103.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.274,0.586,0.973,35
+381,104.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.177,0.453,0.982,35
+382,108.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.148,0.284,0.985,35
+383,106.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.165,0.362,0.984,35
+384,107.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.153,0.412,0.985,35
+385,107.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.132,0.289,0.987,35
+386,105.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.176,0.431,0.982,35
+387,102.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.147,0.301,0.985,35
+388,100.2,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.133,0.359,0.987,35
+389,101.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.129,0.304,0.987,35
+390,101.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.137,0.333,0.986,35
+391,100.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.170,0.314,0.983,35
+392,99.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.155,0.348,0.984,35
+393,99.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.126,0.306,0.987,35
+394,99.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.242,0.553,0.976,35
+395,100.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.160,0.322,0.984,35
+396,98.9,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.146,0.310,0.985,35
+397,99.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.142,0.323,0.986,35
+398,98.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.151,0.285,0.985,35
+399,99.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.138,0.327,0.986,35
+400,97.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.127,0.292,0.987,35
+401,96.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.183,0.327,0.982,35
+402,95.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.129,0.239,0.987,35
+403,95.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.194,0.361,0.981,35
+404,98.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.106,0.184,0.989,35
+405,98.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.140,0.268,0.986,35
+406,97.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.168,0.338,0.983,35
+407,95.6,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.134,0.271,0.987,35
+408,97.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.113,0.205,0.989,35
+409,95.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.141,0.274,0.986,35
+410,96.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.120,0.295,0.988,35
+411,93.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.142,0.321,0.986,35
+412,93.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.122,0.398,0.988,35
+413,93.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.140,0.294,0.986,35
+414,93.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.188,0.382,0.981,35
+415,92.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.149,0.355,0.985,35
+416,93.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.156,0.341,0.984,35
+417,91.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.305,0.746,0.970,35
+418,92.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.117,0.233,0.988,35
+419,91.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.100,0.216,0.990,35
+420,95.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.120,0.248,0.988,35
+421,92.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.128,0.261,0.987,35
+422,91.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.125,0.265,0.988,35
+423,91.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.137,0.265,0.986,35
+424,91.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.179,0.386,0.982,35
+425,91.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.166,0.346,0.983,35
+426,91.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.144,0.321,0.986,35
+427,91.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.136,0.314,0.986,35
+428,90.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.167,0.312,0.983,35
+429,91.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.183,0.441,0.982,35
+430,91.6,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.182,0.375,0.982,35
+431,91.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.153,0.318,0.985,35
+432,90.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.152,0.353,0.985,35
+433,91.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.147,0.311,0.985,35
+434,91.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.181,0.386,0.982,35
+435,90.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.185,0.312,0.982,35
+436,90.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.218,0.449,0.978,35
+437,90.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.190,0.526,0.981,35
+438,90.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.146,0.329,0.985,35
+439,89.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.191,0.395,0.981,35
+440,90.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.161,0.370,0.984,35
+441,94.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.207,0.505,0.979,35
+442,93.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.171,0.356,0.983,35
+443,96.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.154,0.315,0.985,35
+444,95.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.162,0.354,0.984,35
+445,97.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.182,0.453,0.982,35
+446,99.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.164,0.308,0.984,35
+447,99.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.141,0.281,0.986,35
+448,100.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.136,0.247,0.986,35
+449,101.3,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.148,0.314,0.985,35
+450,103.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.238,0.589,0.976,35
+451,104.9,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,0,0,25,25,25,25,0.330,0.762,0.737,35
+452,126.6,TRACKING,1,Pose estimation successful.,1,1,0,32,26,26,26,0.147,0.327,0.905,26
+453,111.5,TRACKING,1,Pose estimation successful.,1,1,0,33,26,26,26,0.111,0.232,0.909,26
+454,109.1,TRACKING,1,Pose estimation successful.,1,1,0,34,34,34,34,0.147,0.388,0.985,34
+455,108.6,TRACKING,1,Pose estimation successful.,1,1,0,34,34,34,34,0.134,0.350,0.987,34
+456,109.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.109,0.249,0.989,35
+457,107.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.117,0.267,0.988,35
+458,107.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.131,0.282,0.987,35
+459,106.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.130,0.317,0.987,35
+460,104.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.107,0.220,0.989,35
+461,106.6,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.126,0.255,0.987,35
+462,104.8,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.138,0.310,0.986,35
+463,101.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.156,0.371,0.984,35
+464,102.1,TRACKING,1,Pose estimation successful.,1,1,1,35,35,35,35,0.167,0.393,0.983,35
+465,103.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.152,0.304,0.985,35
+466,100.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.186,0.427,0.981,35
+467,100.0,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.130,0.294,0.987,35
+468,97.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.122,0.291,0.988,35
+469,97.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.206,0.493,0.979,35
+470,97.7,TRACKING,1,Pose estimated from persistent correspondences after: No valid decoded patches.,1,1,0,22,22,22,22,0.266,0.454,0.691,35
+471,98.2,TRACKING,1,Pose estimation successful.,1,0,0,35,20,20,20,0.189,0.560,0.781,20
+472,97.7,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.291,0.732,0.971,35
+473,95.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.222,0.414,0.978,35
+474,96.5,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.240,0.500,0.976,35
+475,96.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.359,0.695,0.964,35
+476,96.1,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.200,0.413,0.980,35
+477,94.9,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.436,0.834,0.956,35
+478,96.4,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.404,0.879,0.960,35
+479,94.2,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.291,0.714,0.971,35
+480,97.3,TRACKING,1,Pose estimation successful.,1,1,0,35,35,35,35,0.388,0.985,0.961,35
+481,97.5,TRACKING,1,Pose estimation successful.,1,1,0,33,20,20,20,0.473,1.014,0.753,20
+482,94.4,RECOVERING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,20
+483,87.7,RECOVERING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,20
+484,88.2,RECOVERING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,20
+485,89.1,RECOVERING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,20
+486,89.5,RECOVERING,0,No valid checkerboard detection.,0,0,0,0,0,0,0,-1.000,-1.000,0.000,20

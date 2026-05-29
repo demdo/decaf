@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <stdexcept>
+#include <vector>
 
 #include <opencv2/imgproc.hpp>
 
@@ -16,6 +18,11 @@ DotDetector::DotDetector()
 DotDetector::DotDetector(DotDetectorConfig config)
     : config_(config)
 {
+}
+
+void DotDetector::reset()
+{
+    temporal_states_.clear();
 }
 
 DotDetectionResult DotDetector::detect(
@@ -44,26 +51,13 @@ DotDetectionResult DotDetector::detect(
     int max_row = -1;
     int max_col = -1;
 
+    std::set<std::pair<int, int>> visible_keys;
+
     result.cells.reserve(checkerboard.cells.size());
 
     for (const GridCell& cell : checkerboard.cells) {
         DotCellObservation obs;
 
-        /*
-         * IMPORTANT:
-         *
-         * GridCell uses lattice coordinates:
-         *   i = horizontal grid coordinate
-         *   j = vertical grid coordinate
-         *
-         * Dot/Patch grid uses image-style coordinates:
-         *   row = vertical coordinate
-         *   col = horizontal coordinate
-         *
-         * Therefore:
-         *   obs.row = cell.j
-         *   obs.col = cell.i
-         */
         obs.row = cell.j;
         obs.col = cell.i;
 
@@ -77,7 +71,7 @@ DotDetectionResult DotDetector::detect(
             frame_std
         );
 
-        obs.score = score.score;
+        obs.raw_score = score.score;
 
         obs.center_mean = score.fg_mean;
         obs.ring_mean = score.bg_mean;
@@ -86,20 +80,19 @@ DotDetectionResult DotDetector::detect(
         obs.local_std = score.local_std;
 
         obs.polarity = score.polarity;
-
-        /*
-         * The cell itself is valid if it came from the checkerboard detector
-         * and could be evaluated photometrically.
-         *
-         * Empty cell != invalid cell.
-         */
         obs.valid = true;
 
-        obs.ambiguous =
-            score.score >= config_.uncertainty_low &&
-            score.score < config_.uncertainty_high;
+        const std::pair<int, int> key(obs.row, obs.col);
+        visible_keys.insert(key);
 
-        obs.has_dot = score.score >= config_.commit_threshold;
+        TemporalCellState& state = temporal_states_[key];
+
+        obs.has_dot = updateTemporalState(state, score.score);
+        obs.score = state.ema_score;
+
+        obs.ambiguous =
+            obs.score >= config_.uncertainty_low &&
+            obs.score < config_.uncertainty_high;
 
         result.cells.push_back(obs);
 
@@ -107,10 +100,77 @@ DotDetectionResult DotDetector::detect(
         max_col = std::max(max_col, obs.col);
     }
 
+    for (auto it = temporal_states_.begin(); it != temporal_states_.end();) {
+        if (visible_keys.find(it->first) == visible_keys.end()) {
+            it->second.missed_frames += 1;
+
+            if (it->second.missed_frames > 15) {
+                it = temporal_states_.erase(it);
+                continue;
+            }
+        }
+        else {
+            it->second.missed_frames = 0;
+        }
+
+        ++it;
+    }
+
     result.rows = max_row + 1;
     result.cols = max_col + 1;
 
     return result;
+}
+
+bool DotDetector::updateTemporalState(
+    TemporalCellState& state,
+    double raw_score
+) const
+{
+    const double alpha = std::clamp(config_.temporal_alpha, 0.01, 1.0);
+    const int warmup_frames = std::max(config_.warmup_frames, 1);
+    const int commit_frames = std::max(config_.commit_frames, 1);
+    const int revoke_frames = std::max(config_.revoke_frames, 1);
+
+    if (!state.initialized) {
+        state.initialized = true;
+        state.ema_score = raw_score;
+        state.has_dot = raw_score >= config_.commit_threshold;
+        state.seen_frames = 1;
+        state.commit_count = state.has_dot ? commit_frames : 0;
+        state.revoke_count = state.has_dot ? 0 : revoke_frames;
+        return state.has_dot;
+    }
+
+    state.seen_frames += 1;
+    state.ema_score = alpha * raw_score + (1.0 - alpha) * state.ema_score;
+
+    if (state.seen_frames <= warmup_frames) {
+        state.has_dot = state.ema_score >= config_.commit_threshold;
+        return state.has_dot;
+    }
+
+    if (state.ema_score >= config_.commit_threshold) {
+        state.commit_count += 1;
+        state.revoke_count = 0;
+    }
+    else if (state.ema_score <= config_.revoke_threshold) {
+        state.revoke_count += 1;
+        state.commit_count = 0;
+    }
+    else {
+        state.commit_count = 0;
+        state.revoke_count = 0;
+    }
+
+    if (!state.has_dot && state.commit_count >= commit_frames) {
+        state.has_dot = true;
+    }
+    else if (state.has_dot && state.revoke_count >= revoke_frames) {
+        state.has_dot = false;
+    }
+
+    return state.has_dot;
 }
 
 cv::Mat DotDetector::toGray8(const cv::Mat& image)
@@ -176,45 +236,120 @@ DotDetector::LocalScoreResult DotDetector::evaluateCell(
     double frame_std
 ) const
 {
+    (void)frame_mean;
+    (void)frame_std;
+
     LocalScoreResult result;
 
-    const cv::Point2f center = cell.center_uv;
+    const int canonical_size = std::max(config_.canonical_size, 48);
+    const float margin = std::max(config_.canonical_margin_px, 3.0f);
 
-    double fg_sum = 0.0;
-    double bg_sum = 0.0;
+    std::vector<cv::Point2f> src = {
+        cell.corner_uv[0],
+        cell.corner_uv[1],
+        cell.corner_uv[2],
+        cell.corner_uv[3],
+    };
 
-    constexpr int n = 4;
+    std::vector<cv::Point2f> dst = {
+        cv::Point2f(margin, margin),
+        cv::Point2f(canonical_size - 1.0f - margin, margin),
+        cv::Point2f(canonical_size - 1.0f - margin, canonical_size - 1.0f - margin),
+        cv::Point2f(margin, canonical_size - 1.0f - margin),
+    };
 
-    for (int i = 0; i < n; ++i) {
-        const cv::Point2f corner = cell.corner_uv[i];
+    const cv::Mat H = cv::getPerspectiveTransform(src, dst);
 
-        /*
-         * Samu-style sampling:
-         *
-         * foreground samples:
-         *   closer to the cell center
-         *
-         * background samples:
-         *   closer to the cell corners
-         */
-        const cv::Point2f fg =
-            corner * 0.20f + center * 0.80f;
+    cv::Mat warped;
+    cv::warpPerspective(
+        gray_f32,
+        warped,
+        H,
+        cv::Size(canonical_size, canonical_size),
+        cv::INTER_LINEAR,
+        cv::BORDER_REPLICATE
+    );
 
-        const cv::Point2f bg =
-            corner * 0.80f + center * 0.20f;
+    cv::GaussianBlur(warped, warped, cv::Size(3, 3), 0.0);
 
-        fg_sum += sampleBilinearClamp(gray_f32, fg);
-        bg_sum += sampleBilinearClamp(gray_f32, bg);
+    const float cx = 0.5f * static_cast<float>(canonical_size - 1);
+    const float cy = 0.5f * static_cast<float>(canonical_size - 1);
+    const float half = 0.5f * static_cast<float>(canonical_size - 1) - margin;
+
+    std::vector<double> center_values;
+    std::vector<double> ring_values;
+    std::vector<double> local_values;
+
+    center_values.reserve(canonical_size * canonical_size / 16);
+    ring_values.reserve(canonical_size * canonical_size / 8);
+    local_values.reserve(canonical_size * canonical_size / 2);
+
+    for (int y = 0; y < canonical_size; ++y) {
+        const float* row_ptr = warped.ptr<float>(y);
+
+        for (int x = 0; x < canonical_size; ++x) {
+            const float dx = (static_cast<float>(x) - cx) / half;
+            const float dy = (static_cast<float>(y) - cy) / half;
+            const float r = std::sqrt(dx * dx + dy * dy);
+
+            if (r <= 0.55f) {
+                local_values.push_back(static_cast<double>(row_ptr[x]));
+            }
+
+            if (r <= 0.20f) {
+                center_values.push_back(static_cast<double>(row_ptr[x]));
+            }
+            else if (r >= 0.32f && r <= 0.50f) {
+                ring_values.push_back(static_cast<double>(row_ptr[x]));
+            }
+        }
     }
 
-    result.fg_mean = fg_sum / static_cast<double>(n);
-    result.bg_mean = bg_sum / static_cast<double>(n);
+    if (center_values.empty() || ring_values.empty() || local_values.empty()) {
+        result.score = 0.0;
+        result.fg_mean = 0.0;
+        result.bg_mean = 0.0;
+        result.local_mean = 0.0;
+        result.local_std = 1.0;
+        result.signed_contrast = 0.0;
+        result.abs_contrast = 0.0;
+        result.polarity = 0;
+        return result;
+    }
 
-    result.signed_contrast = result.fg_mean - result.bg_mean;
+    auto mean_of = [](const std::vector<double>& values) -> double {
+        double s = 0.0;
+        for (double v : values) {
+            s += v;
+        }
+        return s / static_cast<double>(values.size());
+    };
+
+    auto std_of = [](const std::vector<double>& values, double mean) -> double {
+        double s = 0.0;
+        for (double v : values) {
+            const double d = v - mean;
+            s += d * d;
+        }
+        return std::sqrt(std::max(s / static_cast<double>(values.size()), 1.0));
+    };
+
+    const double center_mean = mean_of(center_values);
+    const double ring_mean = mean_of(ring_values);
+    const double local_mean = mean_of(local_values);
+
+    const double center_std = std_of(center_values, center_mean);
+    const double ring_std = std_of(ring_values, ring_mean);
+    const double local_std = std_of(local_values, local_mean);
+
+    result.fg_mean = center_mean;
+    result.bg_mean = ring_mean;
+
+    result.signed_contrast = center_mean - ring_mean;
     result.abs_contrast = std::abs(result.signed_contrast);
 
-    result.local_mean = 0.5 * (result.fg_mean + result.bg_mean);
-    result.local_std = frame_std;
+    result.local_mean = local_mean;
+    result.local_std = std::max(local_std, 1.0);
 
     if (result.signed_contrast > 0.0) {
         result.polarity = 1;
@@ -226,20 +361,156 @@ DotDetector::LocalScoreResult DotDetector::evaluateCell(
         result.polarity = 0;
     }
 
-    /*
-     * Polarity-independent score.
-     *
-     * 0.0 = no contrast
-     * 1.0 = strong dot contrast
-     */
-    const double denom = std::max(config_.strong_dot_contrast, 1.0);
-    result.score = std::clamp(result.abs_contrast / denom, 0.0, 1.0);
-
-    /*
-     * Optional hard floor:
-     * very weak contrast is considered score 0 but still a valid empty cell.
-     */
     if (result.abs_contrast < config_.min_dot_contrast) {
+        result.score = 0.0;
+        return result;
+    }
+
+    const double adaptive_delta = std::max(
+        0.30 * result.local_std,
+        0.45 * config_.min_dot_contrast
+    );
+
+    auto is_opposite_to_ring = [&](double v) -> bool {
+        if (result.polarity > 0) {
+            return v > ring_mean + adaptive_delta;
+        }
+        if (result.polarity < 0) {
+            return v < ring_mean - adaptive_delta;
+        }
+        return false;
+    };
+
+    int inner_opposite = 0;
+    int inner_total = 0;
+    int mid_opposite = 0;
+    int mid_total = 0;
+    int outer_opposite = 0;
+    int outer_total = 0;
+
+    double radial_edge_sum = 0.0;
+    double radial_edge_weighted = 0.0;
+    double all_inner_edge_sum = 0.0;
+
+    cv::Mat grad_x;
+    cv::Mat grad_y;
+    cv::Sobel(warped, grad_x, CV_32F, 1, 0, 3);
+    cv::Sobel(warped, grad_y, CV_32F, 0, 1, 3);
+
+    for (int y = 1; y < canonical_size - 1; ++y) {
+        const float* row_ptr = warped.ptr<float>(y);
+        const float* gx_ptr = grad_x.ptr<float>(y);
+        const float* gy_ptr = grad_y.ptr<float>(y);
+
+        for (int x = 1; x < canonical_size - 1; ++x) {
+            const float nx = (static_cast<float>(x) - cx) / half;
+            const float ny = (static_cast<float>(y) - cy) / half;
+            const float r = std::sqrt(nx * nx + ny * ny);
+
+            if (r > 0.58f) {
+                continue;
+            }
+
+            const double v = static_cast<double>(row_ptr[x]);
+            const bool opposite = is_opposite_to_ring(v);
+
+            if (r <= 0.20f) {
+                inner_total += 1;
+                if (opposite) {
+                    inner_opposite += 1;
+                }
+            }
+            else if (r > 0.20f && r <= 0.34f) {
+                mid_total += 1;
+                if (opposite) {
+                    mid_opposite += 1;
+                }
+            }
+            else if (r > 0.34f && r <= 0.52f) {
+                outer_total += 1;
+                if (opposite) {
+                    outer_opposite += 1;
+                }
+            }
+
+            const double gx = static_cast<double>(gx_ptr[x]);
+            const double gy = static_cast<double>(gy_ptr[x]);
+            const double mag = std::sqrt(gx * gx + gy * gy);
+
+            if (r >= 0.10f && r <= 0.50f) {
+                all_inner_edge_sum += mag;
+            }
+
+            if (r >= 0.18f && r <= 0.36f && mag > 1e-6) {
+                const double inv_r = 1.0 / std::max(static_cast<double>(r), 1e-6);
+                const double ux = static_cast<double>(nx) * inv_r;
+                const double uy = static_cast<double>(ny) * inv_r;
+                const double radial_alignment = std::abs(gx * ux + gy * uy) / mag;
+
+                radial_edge_sum += mag;
+                radial_edge_weighted += mag * radial_alignment;
+            }
+        }
+    }
+
+    const double inner_ratio =
+        inner_total > 0 ? static_cast<double>(inner_opposite) / static_cast<double>(inner_total) : 0.0;
+    const double mid_ratio =
+        mid_total > 0 ? static_cast<double>(mid_opposite) / static_cast<double>(mid_total) : 0.0;
+    const double outer_ratio =
+        outer_total > 0 ? static_cast<double>(outer_opposite) / static_cast<double>(outer_total) : 0.0;
+
+    const double contrast_score = std::clamp(
+        result.abs_contrast / std::max(config_.strong_dot_contrast, 1.0),
+        0.0,
+        1.0
+    );
+
+    const double area_score = std::clamp(
+        inner_ratio / 0.45,
+        0.0,
+        1.0
+    );
+
+    const double compactness_score = std::clamp(
+        (inner_ratio + 0.5 * mid_ratio - 0.8 * outer_ratio) / 0.65,
+        0.0,
+        1.0
+    );
+
+    const double radial_alignment_score =
+        radial_edge_sum > 1e-6
+            ? std::clamp(radial_edge_weighted / radial_edge_sum, 0.0, 1.0)
+            : 0.0;
+
+    const double edge_strength_score = std::clamp(
+        radial_edge_sum / std::max(18.0 * static_cast<double>(canonical_size), 1.0),
+        0.0,
+        1.0
+    );
+
+    const double edge_localization_score =
+        all_inner_edge_sum > 1e-6
+            ? std::clamp(radial_edge_sum / all_inner_edge_sum, 0.0, 1.0)
+            : 0.0;
+
+    const double edge_ring_score = std::clamp(
+        0.45 * radial_alignment_score +
+        0.35 * edge_strength_score +
+        0.20 * edge_localization_score,
+        0.0,
+        1.0
+    );
+
+    const double raw_score =
+        0.25 * contrast_score +
+        0.25 * area_score +
+        0.25 * compactness_score +
+        0.25 * edge_ring_score;
+
+    result.score = std::clamp(raw_score, 0.0, 1.0);
+
+    if (contrast_score < 0.12 && edge_ring_score < 0.30) {
         result.score = 0.0;
     }
 

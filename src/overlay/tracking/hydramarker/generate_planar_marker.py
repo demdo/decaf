@@ -2,14 +2,20 @@
 HydraMarker planar marker generator.
 
 Creates:
-- .field  : binary HydraMarker state matrix + patch shape
-- .png    : printable marker image with checkerboard + dots
-- .json   : metric marker metadata for 2D-3D correspondences
+- .field : binary HydraMarker state matrix + patch shape
+- .pdf   : printable marker with true physical size
+- .json  : metric marker metadata for tracking, SfM alignment and 2D-3D correspondences
+
+User-facing scale is controlled by square_size_mm.
+The PDF page size is exactly the marker size in millimeters.
+Print the PDF at 100% / actual size.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import cv2
 import numpy as np
@@ -34,10 +40,17 @@ from PySide6.QtWidgets import (
 )
 
 try:
+    from reportlab.lib.colors import black, white
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+except ImportError as exc:
+    raise ImportError(
+        "reportlab is required for PDF export. Install it with: pip install reportlab"
+    ) from exc
+
+try:
     from .field import MarkerField
 except ImportError:
-    # Allows running directly as:
-    # python generate_planar_marker.py
     THIS_DIR = Path(__file__).resolve().parent
     PROJECT_ROOT = THIS_DIR.parent
     if str(PROJECT_ROOT) not in sys.path:
@@ -48,30 +61,45 @@ except ImportError:
 THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = THIS_DIR / "data"
 
+DEFAULT_PREVIEW_DPI = 600
+DEFAULT_DOT_RADIUS_REL = 0.22
+DEFAULT_MAX_MS = 300000.0
+DEFAULT_MAX_TRIAL = 1000000
 
-# -----------------------------------------------------------------------------
-# Rendering
-# -----------------------------------------------------------------------------
 
-def render_marker_image(
-    field: np.ndarray,
-    cell_px: int,
-    dot_radius_rel: float,
-) -> np.ndarray:
-    """
-    Render checkerboard marker with opposite-color dots.
+def mm_to_px(size_mm: float, dpi: int) -> int:
+    return max(1, int(round(size_mm / 25.4 * float(dpi))))
 
-    field[row, col] == 1 -> draw dot in that cell
-    field[row, col] == 0 -> no dot
 
-    No border is added.
-    """
+def format_mm_for_name(value_mm: float) -> str:
+    text = f"{value_mm:.4f}".rstrip("0").rstrip(".")
+    return text.replace(".", "p")
+
+
+def auto_marker_name(rows: int, cols: int, patch_size: int, square_size_mm: float) -> str:
+    return f"marker_{rows}x{cols}_p{patch_size}_{format_mm_for_name(square_size_mm)}mm"
+
+
+def sanitize_marker_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return ""
+
+    safe = []
+    for ch in name:
+        if ch.isalnum() or ch in ("_", "-", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe)
+
+
+def render_marker_image(field: np.ndarray, cell_px: int, dot_radius_rel: float) -> np.ndarray:
     field = np.asarray(field, dtype=np.uint8)
-
     rows, cols = field.shape
+
     img_h = rows * cell_px
     img_w = cols * cell_px
-
     img = np.full((img_h, img_w, 3), 255, dtype=np.uint8)
 
     for row in range(rows):
@@ -109,20 +137,14 @@ def render_marker_image(
     return img
 
 
-# -----------------------------------------------------------------------------
-# Saving
-# -----------------------------------------------------------------------------
+def cv_bgr_to_qpixmap(img_bgr: np.ndarray) -> QPixmap:
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h, w, ch = img_rgb.shape
+    qimg = QImage(img_rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+    return QPixmap.fromImage(qimg)
 
-def save_field_file(path: Path, field: np.ndarray, patch_size: int) -> None:
-    """
-    Save .field in the format used by the current HydraMarker C++ loader:
 
-    cols rows
-    row-major field values
-    number_of_tag_shapes
-    patch_width patch_height
-    row-major patch shape values
-    """
+def write_field_file(path: Path, field: np.ndarray, patch_size: int) -> None:
     field = np.asarray(field, dtype=np.uint8)
 
     if field.ndim != 2:
@@ -145,20 +167,28 @@ def save_field_file(path: Path, field: np.ndarray, patch_size: int) -> None:
             f.write(" ".join(values) + "\n")
 
 
-def save_meta_file(
-    path: Path,
+def build_meta(
     rows: int,
     cols: int,
     patch_size: int,
-    square_size_cm: float,
+    square_size_mm: float,
     cell_px: int,
     dot_radius_rel: float,
     marker_name: str,
-) -> None:
-    square_size_mm = square_size_cm * 10.0
+) -> dict:
+    square_size_cm = square_size_mm / 10.0
+    detectable_corner_rows = rows - 1
+    detectable_corner_cols = cols - 1
 
-    meta = {
+    if detectable_corner_rows < 2 or detectable_corner_cols < 2:
+        raise ValueError(
+            "Need at least 3x3 cells so that the internal detectable corner grid "
+            "contains at least 2x2 corners."
+        )
+
+    return {
         "name": marker_name,
+        "marker_type": "planar",
         "rows": rows,
         "cols": cols,
         "patch_size": patch_size,
@@ -171,59 +201,135 @@ def save_meta_file(
         "z_axis": "out_of_plane",
         "corner_rows": rows + 1,
         "corner_cols": cols + 1,
+        "detectable_corner_rows": detectable_corner_rows,
+        "detectable_corner_cols": detectable_corner_cols,
+        "id_encoding": {
+            "type": "row_major",
+            "id_base": 0,
+            "num_cols": detectable_corner_cols,
+            "origin_row": 1,
+            "origin_col": 1,
+            "formula": (
+                "marker_id = "
+                "(origin_row + local_row) * num_cols + "
+                "(origin_col + local_col)"
+            ),
+        },
+        "alignment_reference": {
+            "origin": {
+                "local_row": 0,
+                "local_col": 0,
+            },
+            "x_axis": {
+                "local_row": 0,
+                "local_col": 1,
+            },
+            "y_axis": {
+                "local_row": 1,
+                "local_col": 0,
+            },
+        },
         "cell_px": cell_px,
         "dot_radius_rel": dot_radius_rel,
         "coordinate_mapping": {
-            "global_corner_row_col_to_xyz_mm": {
-                "X": "col * square_size_mm",
-                "Y": "row * square_size_mm",
+            "detectable_corner_row_col_to_xyz_mm": {
+                "X": "local_col * square_size_mm",
+                "Y": "local_row * square_size_mm",
                 "Z": "0",
             }
         },
     }
 
+
+def write_json_file(path: Path, meta: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
 
-def sanitize_marker_name(name: str) -> str:
-    name = name.strip()
+def write_pdf_file(
+    path: Path,
+    field: np.ndarray,
+    square_size_mm: float,
+    dot_radius_rel: float,
+) -> None:
+    field = np.asarray(field, dtype=np.uint8)
 
-    if not name:
-        return "marker"
+    if field.ndim != 2:
+        raise ValueError("field must be a 2D array")
 
-    safe = []
-    for ch in name:
-        if ch.isalnum() or ch in ("_", "-", "."):
-            safe.append(ch)
-        else:
-            safe.append("_")
+    rows, cols = field.shape
+    width_pt = cols * square_size_mm * mm
+    height_pt = rows * square_size_mm * mm
+    cell_pt = square_size_mm * mm
+    dot_radius_pt = dot_radius_rel * cell_pt
 
-    return "".join(safe)
+    c = canvas.Canvas(str(path), pagesize=(width_pt, height_pt), pageCompression=0)
+    c.setTitle(path.stem)
+
+    for row in range(rows):
+        for col in range(cols):
+            x0 = col * cell_pt
+            y0 = height_pt - (row + 1) * cell_pt
+
+            black_cell = ((row + col) % 2 == 0)
+            c.setFillColor(black if black_cell else white)
+            c.rect(x0, y0, cell_pt, cell_pt, stroke=0, fill=1)
+
+    for row in range(rows):
+        for col in range(cols):
+            if int(field[row, col]) != 1:
+                continue
+
+            cx = (col + 0.5) * cell_pt
+            cy = height_pt - (row + 0.5) * cell_pt
+
+            black_cell = ((row + col) % 2 == 0)
+            c.setFillColor(white if black_cell else black)
+            c.circle(cx, cy, dot_radius_pt, stroke=0, fill=1)
+
+    c.showPage()
+    c.save()
 
 
-# -----------------------------------------------------------------------------
-# Qt helpers
-# -----------------------------------------------------------------------------
+def write_temp_then_replace(writer_func, final_path: Path, suffix: str, *args, **kwargs) -> None:
+    final_path = Path(final_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
 
-def cv_bgr_to_qpixmap(img_bgr: np.ndarray) -> QPixmap:
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    h, w, ch = img_rgb.shape
+    with NamedTemporaryFile(
+        delete=False,
+        dir=str(final_path.parent),
+        prefix=f".{final_path.stem}_",
+        suffix=suffix,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
 
-    qimg = QImage(
-        img_rgb.data,
-        w,
-        h,
-        ch * w,
-        QImage.Format_RGB888,
-    ).copy()
-
-    return QPixmap.fromImage(qimg)
+    try:
+        writer_func(tmp_path, *args, **kwargs)
+        os.replace(tmp_path, final_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
-# -----------------------------------------------------------------------------
-# UI
-# -----------------------------------------------------------------------------
+def estimate_min_patch_warning(rows: int, cols: int, patch_size: int) -> str | None:
+    num_windows = (rows - patch_size + 1) * (cols - patch_size + 1)
+    raw_patterns = 2 ** (patch_size * patch_size)
+
+    if patch_size <= 2:
+        return (
+            "Patch size k is very small. A 2x2 binary patch has too few possible "
+            "patterns for a useful marker field. Use k >= 3, preferably k = 4."
+        )
+
+    if raw_patterns < 4 * num_windows:
+        return (
+            "Patch size may be too small for this marker size. Generation may fail "
+            "or take a long time. Consider increasing k."
+        )
+
+    return None
+
 
 class GeneratePlanarMarkerUI(QWidget):
     def __init__(self):
@@ -233,54 +339,36 @@ class GeneratePlanarMarkerUI(QWidget):
 
         self.current_field: np.ndarray | None = None
         self.current_img: np.ndarray | None = None
+        self.current_params: dict | None = None
 
         self.rows_spin = QSpinBox()
-        self.rows_spin.setRange(2, 500)
-        self.rows_spin.setValue(20)
+        self.rows_spin.setRange(3, 500)
+        self.rows_spin.setValue(12)
 
         self.cols_spin = QSpinBox()
-        self.cols_spin.setRange(2, 500)
+        self.cols_spin.setRange(3, 500)
         self.cols_spin.setValue(20)
 
         self.patch_size_spin = QSpinBox()
         self.patch_size_spin.setRange(2, 20)
         self.patch_size_spin.setValue(4)
 
-        self.square_size_cm_spin = QDoubleSpinBox()
-        self.square_size_cm_spin.setRange(0.001, 1000.0)
-        self.square_size_cm_spin.setDecimals(4)
-        self.square_size_cm_spin.setSingleStep(0.1)
-        self.square_size_cm_spin.setValue(1.25)
-
-        self.cell_px_spin = QSpinBox()
-        self.cell_px_spin.setRange(10, 1000)
-        self.cell_px_spin.setValue(80)
-
-        self.dot_radius_rel_spin = QDoubleSpinBox()
-        self.dot_radius_rel_spin.setRange(0.05, 0.45)
-        self.dot_radius_rel_spin.setDecimals(3)
-        self.dot_radius_rel_spin.setSingleStep(0.01)
-        self.dot_radius_rel_spin.setValue(0.22)
-
-        self.max_ms_spin = QDoubleSpinBox()
-        self.max_ms_spin.setRange(100.0, 3600000000.0)
-        self.max_ms_spin.setDecimals(0)
-        self.max_ms_spin.setSingleStep(1000.0)
-        self.max_ms_spin.setValue(60000.0)
-
-        self.max_trial_spin = QSpinBox()
-        self.max_trial_spin.setRange(1, 2147483647)
-        self.max_trial_spin.setValue(100000)
+        self.square_size_mm_spin = QDoubleSpinBox()
+        self.square_size_mm_spin.setRange(0.1, 1000.0)
+        self.square_size_mm_spin.setDecimals(3)
+        self.square_size_mm_spin.setSingleStep(0.5)
+        self.square_size_mm_spin.setValue(5.0)
+        self.square_size_mm_spin.setSuffix(" mm")
 
         self.marker_name_edit = QLineEdit()
-        self.marker_name_edit.setText("marker_20x20_p4_12p5mm")
+        self.marker_name_edit.setPlaceholderText("Leave empty for automatic name")
 
         self.output_dir_edit = QLineEdit()
         self.output_dir_edit.setText(str(DEFAULT_DATA_DIR))
 
         self.browse_button = QPushButton("Browse")
         self.generate_button = QPushButton("Generate Preview")
-        self.save_button = QPushButton("Save .field / .png / .json")
+        self.save_button = QPushButton("Save .field / .pdf / .json")
         self.save_button.setEnabled(False)
 
         self.status_label = QLabel("Ready.")
@@ -296,17 +384,14 @@ class GeneratePlanarMarkerUI(QWidget):
 
         self._build_layout()
         self._connect_signals()
+        self._update_auto_name_placeholder()
 
     def _build_layout(self) -> None:
         form = QFormLayout()
         form.addRow("Rows / Cells Y", self.rows_spin)
         form.addRow("Cols / Cells X", self.cols_spin)
         form.addRow("Patch size k", self.patch_size_spin)
-        form.addRow("Square size [cm]", self.square_size_cm_spin)
-        form.addRow("Cell pixels", self.cell_px_spin)
-        form.addRow("Dot radius rel.", self.dot_radius_rel_spin)
-        form.addRow("Max generation time [ms]", self.max_ms_spin)
-        form.addRow("Max trials", self.max_trial_spin)
+        form.addRow("Square size [mm]", self.square_size_mm_spin)
         form.addRow("Marker name", self.marker_name_edit)
 
         output_row = QHBoxLayout()
@@ -338,27 +423,66 @@ class GeneratePlanarMarkerUI(QWidget):
         self.generate_button.clicked.connect(self.on_generate)
         self.save_button.clicked.connect(self.on_save)
 
+        self.rows_spin.valueChanged.connect(self.on_params_changed)
+        self.cols_spin.valueChanged.connect(self.on_params_changed)
+        self.patch_size_spin.valueChanged.connect(self.on_params_changed)
+        self.square_size_mm_spin.valueChanged.connect(self.on_params_changed)
+        self.marker_name_edit.textChanged.connect(self._update_auto_name_placeholder)
+
+    def _update_auto_name_placeholder(self) -> None:
+        rows = int(self.rows_spin.value())
+        cols = int(self.cols_spin.value())
+        patch_size = int(self.patch_size_spin.value())
+        square_size_mm = float(self.square_size_mm_spin.value())
+        name = auto_marker_name(rows, cols, patch_size, square_size_mm)
+        self.marker_name_edit.setPlaceholderText(name)
+
+    def on_params_changed(self) -> None:
+        self._update_auto_name_placeholder()
+        self.save_button.setEnabled(False)
+        self.current_field = None
+        self.current_img = None
+        self.current_params = None
+        self.preview_label.setText("Parameters changed. Generate a new marker preview.")
+        self.preview_label.setPixmap(QPixmap())
+
     def _read_params(self) -> dict:
         rows = int(self.rows_spin.value())
         cols = int(self.cols_spin.value())
         patch_size = int(self.patch_size_spin.value())
+        square_size_mm = float(self.square_size_mm_spin.value())
 
         if patch_size > rows or patch_size > cols:
             raise ValueError("Patch size must be <= rows and <= cols.")
 
+        if rows < 3 or cols < 3:
+            raise ValueError("Rows and cols must be at least 3.")
+
+        if square_size_mm <= 0.0:
+            raise ValueError("Square size must be positive.")
+
         marker_name = sanitize_marker_name(self.marker_name_edit.text())
+        if not marker_name:
+            marker_name = auto_marker_name(rows, cols, patch_size, square_size_mm)
+
+        cell_px = mm_to_px(square_size_mm, DEFAULT_PREVIEW_DPI)
+        width_mm = cols * square_size_mm
+        height_mm = rows * square_size_mm
 
         return {
             "rows": rows,
             "cols": cols,
             "patch_size": patch_size,
-            "square_size_cm": float(self.square_size_cm_spin.value()),
-            "cell_px": int(self.cell_px_spin.value()),
-            "dot_radius_rel": float(self.dot_radius_rel_spin.value()),
-            "max_ms": float(self.max_ms_spin.value()),
-            "max_trial": int(self.max_trial_spin.value()),
+            "square_size_mm": square_size_mm,
+            "cell_px": cell_px,
+            "dot_radius_rel": DEFAULT_DOT_RADIUS_REL,
+            "preview_dpi": DEFAULT_PREVIEW_DPI,
+            "width_mm": width_mm,
+            "height_mm": height_mm,
             "marker_name": marker_name,
             "output_dir": Path(self.output_dir_edit.text()).resolve(),
+            "max_ms": DEFAULT_MAX_MS,
+            "max_trial": DEFAULT_MAX_TRIAL,
         }
 
     def on_browse(self) -> None:
@@ -375,7 +499,17 @@ class GeneratePlanarMarkerUI(QWidget):
         try:
             params = self._read_params()
 
-            self.status_label.setText("Generating marker field with C++ backend...")
+            warning = estimate_min_patch_warning(
+                rows=params["rows"],
+                cols=params["cols"],
+                patch_size=params["patch_size"],
+            )
+
+            status = "Generating marker field with C++ backend..."
+            if warning:
+                status += "\n\nWarning: " + warning
+            self.status_label.setText(status)
+
             self.generate_button.setEnabled(False)
             self.save_button.setEnabled(False)
             QApplication.processEvents()
@@ -400,7 +534,8 @@ class GeneratePlanarMarkerUI(QWidget):
             unique_values = set(np.unique(field).tolist())
             if not unique_values.issubset({0, 1}):
                 raise RuntimeError(
-                    f"Generated field contains invalid values: {sorted(unique_values)}"
+                    "Generated field contains unresolved or invalid values: "
+                    f"{sorted(unique_values)}"
                 )
 
             img = render_marker_image(
@@ -411,6 +546,7 @@ class GeneratePlanarMarkerUI(QWidget):
 
             self.current_field = field
             self.current_img = img
+            self.current_params = params
 
             self._update_preview()
 
@@ -418,7 +554,13 @@ class GeneratePlanarMarkerUI(QWidget):
                 "Marker generated successfully.\n"
                 f"Field: {params['rows']} x {params['cols']} cells\n"
                 f"Patch size: {params['patch_size']} x {params['patch_size']}\n"
-                f"Square size: {params['square_size_cm']} cm"
+                f"Square size: {params['square_size_mm']:.3f} mm\n"
+                f"Physical marker size: {params['width_mm']:.3f} x "
+                f"{params['height_mm']:.3f} mm\n"
+                f"Preview raster: {params['cell_px']} px/cell at "
+                f"{params['preview_dpi']} dpi\n"
+                f"Detectable corner grid: {params['rows'] - 1} x {params['cols'] - 1}\n"
+                "Export will save .field, .pdf, and .json. Print the PDF at 100% / actual size."
             )
 
             self.save_button.setEnabled(True)
@@ -426,14 +568,10 @@ class GeneratePlanarMarkerUI(QWidget):
         except Exception as exc:
             self.current_field = None
             self.current_img = None
+            self.current_params = None
             self.save_button.setEnabled(False)
 
-            QMessageBox.critical(
-                self,
-                "Generation failed",
-                str(exc),
-            )
-
+            QMessageBox.critical(self, "Generation failed", str(exc))
             self.status_label.setText("Generation failed.")
 
         finally:
@@ -444,14 +582,12 @@ class GeneratePlanarMarkerUI(QWidget):
             return
 
         pixmap = cv_bgr_to_qpixmap(self.current_img)
-
         scaled = pixmap.scaled(
             self.preview_label.width(),
             self.preview_label.height(),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
-
         self.preview_label.setPixmap(scaled)
 
     def resizeEvent(self, event) -> None:
@@ -459,73 +595,76 @@ class GeneratePlanarMarkerUI(QWidget):
         self._update_preview()
 
     def on_save(self) -> None:
-        if self.current_field is None or self.current_img is None:
-            QMessageBox.warning(
-                self,
-                "Nothing to save",
-                "Generate a marker first.",
-            )
+        if self.current_field is None or self.current_params is None:
+            QMessageBox.warning(self, "Nothing to save", "Generate a marker first.")
             return
 
         try:
             params = self._read_params()
 
+            if params != self.current_params:
+                raise RuntimeError(
+                    "Parameters changed after generation. Generate a new preview before saving."
+                )
+
             output_dir = params["output_dir"]
             output_dir.mkdir(parents=True, exist_ok=True)
 
             name = params["marker_name"]
-
             field_path = output_dir / f"{name}.field"
-            png_path = output_dir / f"{name}.png"
+            pdf_path = output_dir / f"{name}.pdf"
             json_path = output_dir / f"{name}.json"
 
-            save_field_file(
-                path=field_path,
-                field=self.current_field,
-                patch_size=params["patch_size"],
-            )
-
-            ok = cv2.imwrite(str(png_path), self.current_img)
-            if not ok:
-                raise RuntimeError(f"Could not write PNG file: {png_path}")
-
-            save_meta_file(
-                path=json_path,
+            meta = build_meta(
                 rows=params["rows"],
                 cols=params["cols"],
                 patch_size=params["patch_size"],
-                square_size_cm=params["square_size_cm"],
+                square_size_mm=params["square_size_mm"],
                 cell_px=params["cell_px"],
                 dot_radius_rel=params["dot_radius_rel"],
                 marker_name=name,
             )
 
+            # Write to temporary files first. This prevents partial output if one export fails.
+            write_temp_then_replace(
+                write_field_file,
+                field_path,
+                ".field",
+                self.current_field,
+                params["patch_size"],
+            )
+            write_temp_then_replace(
+                write_pdf_file,
+                pdf_path,
+                ".pdf",
+                self.current_field,
+                params["square_size_mm"],
+                params["dot_radius_rel"],
+            )
+            write_temp_then_replace(write_json_file, json_path, ".json", meta)
+
             self.status_label.setText(
                 "Saved marker files:\n"
                 f"{field_path}\n"
-                f"{png_path}\n"
-                f"{json_path}"
+                f"{pdf_path}\n"
+                f"{json_path}\n\n"
+                "Print the PDF at 100% / actual size."
             )
 
             QMessageBox.information(
                 self,
                 "Saved",
-                "Marker files saved successfully.",
+                "Marker files saved successfully.\n\nPrint the PDF at 100% / actual size.",
             )
 
         except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Save failed",
-                str(exc),
-            )
+            QMessageBox.critical(self, "Save failed", str(exc))
 
 
 def main() -> None:
     DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     app = QApplication.instance()
-
     if app is None:
         app = QApplication(sys.argv)
 

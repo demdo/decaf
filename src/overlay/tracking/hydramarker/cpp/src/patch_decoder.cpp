@@ -1,8 +1,80 @@
 #include "patch_decoder.hpp"
 
+#include <algorithm>
 #include <stdexcept>
+#include <tuple>
+#include <vector>
 
 namespace hydramarker {
+
+namespace {
+
+int normalizeRotationDeg(int rotation_deg) {
+    int r = rotation_deg % 360;
+
+    if (r < 0) {
+        r += 360;
+    }
+
+    if (r == 0 || r == 90 || r == 180 || r == 270) {
+        return r;
+    }
+
+    const int allowed[4] = {0, 90, 180, 270};
+
+    int best = allowed[0];
+    int best_dist = std::abs(r - allowed[0]);
+
+    for (int i = 1; i < 4; ++i) {
+        const int d = std::abs(r - allowed[i]);
+
+        if (d < best_dist) {
+            best_dist = d;
+            best = allowed[i];
+        }
+    }
+
+    return best;
+}
+
+std::vector<PatchMatch> normalizeAndDeduplicateMatches(
+    const std::vector<PatchMatch>& matches
+) {
+    std::vector<PatchMatch> cleaned;
+    cleaned.reserve(matches.size());
+
+    for (PatchMatch m : matches) {
+        m.rotation_deg = normalizeRotationDeg(m.rotation_deg);
+        cleaned.push_back(m);
+    }
+
+    std::sort(
+        cleaned.begin(),
+        cleaned.end(),
+        [](const PatchMatch& a, const PatchMatch& b) {
+            return std::tie(a.y, a.x, a.rotation_deg)
+                 < std::tie(b.y, b.x, b.rotation_deg);
+        }
+    );
+
+    cleaned.erase(
+        std::unique(
+            cleaned.begin(),
+            cleaned.end(),
+            [](const PatchMatch& a, const PatchMatch& b) {
+                return a.x == b.x
+                    && a.y == b.y
+                    && normalizeRotationDeg(a.rotation_deg)
+                        == normalizeRotationDeg(b.rotation_deg);
+            }
+        ),
+        cleaned.end()
+    );
+
+    return cleaned;
+}
+
+} // namespace
 
 PatchDecoder::PatchDecoder(PatchDecoderConfig config)
     : config_(config)
@@ -37,6 +109,10 @@ DecodedPatch PatchDecoder::decodeOne(
         return decoded;
     }
 
+    if (patch.k <= 0) {
+        return decoded;
+    }
+
     if (patch.k != field.patchSize()) {
         throw std::runtime_error(
             "PatchDecoder: local patch size does not match MarkerField patch size."
@@ -49,7 +125,9 @@ DecodedPatch PatchDecoder::decodeOne(
         );
     }
 
-    const std::vector<PatchMatch> matches = field.findPatch(patch.bits);
+    const std::vector<PatchMatch> raw_matches = field.findPatch(patch.bits);
+    const std::vector<PatchMatch> matches =
+        normalizeAndDeduplicateMatches(raw_matches);
 
     decoded.num_matches = static_cast<int>(matches.size());
 
@@ -57,22 +135,18 @@ DecodedPatch PatchDecoder::decodeOne(
         return decoded;
     }
 
-    if (matches.size() > 1) {
-        decoded.ambiguous = true;
+    decoded.ambiguous = matches.size() > 1;
 
-        if (!config_.accept_ambiguous) {
-            return decoded;
-        }
+    if (decoded.ambiguous && !config_.accept_ambiguous) {
+        return decoded;
     }
 
     const PatchMatch& match = matches.front();
 
     decoded.valid = true;
-    decoded.ambiguous = matches.size() > 1;
-
     decoded.global_col = match.x;
     decoded.global_row = match.y;
-    decoded.rotation_deg = match.rotation_deg;
+    decoded.rotation_deg = normalizeRotationDeg(match.rotation_deg);
 
     decoded.confidence = decoded.ambiguous ? 0.5 : 1.0;
 

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <map>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -23,6 +25,10 @@ struct DotDetectorConfig {
     double uncertainty_high = 0.45;
 
     int warmup_frames = 1;
+
+    double temporal_alpha = 0.35;
+    int commit_frames = 2;
+    int revoke_frames = 3;
 };
 
 struct DotCellObservation {
@@ -34,6 +40,7 @@ struct DotCellObservation {
     bool ambiguous = false;
 
     double score = 0.0;
+    double raw_score = 0.0;
 
     double center_mean = 0.0;
     double ring_mean = 0.0;
@@ -65,6 +72,8 @@ public:
         const CheckerboardDetection& checkerboard
     );
 
+    void reset();
+
 private:
     struct LocalScoreResult {
         double score = 0.0;
@@ -81,6 +90,18 @@ private:
         int polarity = 0;
     };
 
+    struct TemporalCellState {
+        bool initialized = false;
+        bool has_dot = false;
+
+        double ema_score = 0.0;
+
+        int seen_frames = 0;
+        int commit_count = 0;
+        int revoke_count = 0;
+        int missed_frames = 0;
+    };
+
     static cv::Mat toGray8(const cv::Mat& image);
 
     static double sampleBilinearClamp(
@@ -95,8 +116,14 @@ private:
         double frame_std
     ) const;
 
+    bool updateTemporalState(
+        TemporalCellState& state,
+        double raw_score
+    ) const;
+
 private:
     DotDetectorConfig config_;
+    std::map<std::pair<int, int>, TemporalCellState> temporal_states_;
 };
 
 } // namespace hydramarker
