@@ -6,13 +6,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from overlay.tracking.hydramarker.backend import cpp_impl as hm
-from overlay.tracking.hydramarker.map_pose_tracker import (
+from tracking.hydramarker.backend import cpp_impl as hm
+from tracking.hydramarker.map_pose_tracker import (
     MapPoseTracker,
     MapPoseTrackerConfig,
     PoseTrackPoint,
 )
-from overlay.tracking.hydramarker.tracker_logger import TrackerLogger
+from tracking.hydramarker.tracker_logger import TrackerLogger
 
 
 class TrackerMode(str, Enum):

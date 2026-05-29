@@ -30,7 +30,7 @@ Auswertung:
 
 Hinweise:
     - iterative_ransac und ippe werden ueber solve_pose(...) aus
-      overlay.tracking.pose_solvers ausgefuehrt.
+      tracking.pose_solvers ausgefuehrt.
     - homography ebenfalls zentral ueber solve_pose(...).
     - Fuer homography ist refine_with_iterative standardmaessig deaktiviert,
       damit der reine Homography-Ansatz sichtbar bleibt.
@@ -50,7 +50,7 @@ import matplotlib.pyplot as plt
 
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 
 
 # ============================================================

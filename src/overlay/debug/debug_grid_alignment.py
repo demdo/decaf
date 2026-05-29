@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 
 
 # ============================================================

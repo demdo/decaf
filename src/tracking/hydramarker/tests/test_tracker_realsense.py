@@ -11,7 +11,7 @@ import numpy as np
 import pyrealsense2 as rs
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.hydramarker.tracker import HydraTracker, TrackerConfig
+from tracking.hydramarker.tracker import HydraTracker, TrackerConfig
 
 
 # ============================================================

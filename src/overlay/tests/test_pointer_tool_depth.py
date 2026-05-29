@@ -14,7 +14,7 @@ from overlay.calib.calib_camera_to_pointer import (
 from overlay.calib.calib_xray_to_pointer import (
     extract_depth,
 )
-from overlay.tracking.transforms import (
+from tracking.transforms import (
     invert_transform,
 )
 

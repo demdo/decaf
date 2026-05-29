@@ -6,8 +6,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from overlay.tracking.hydramarker.model.observations import FrameObservation
-from overlay.tracking.hydramarker.model.state import CameraPose, SfMState
+from tracking.hydramarker.model.observations import FrameObservation
+from tracking.hydramarker.model.state import CameraPose, SfMState
 
 
 @dataclass(slots=True)

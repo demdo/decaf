@@ -7,7 +7,7 @@ from datetime import datetime
 
 import numpy as np
 
-from overlay.tracking.hydramarker.model.state import SfMState
+from tracking.hydramarker.model.state import SfMState
 
 
 def _load_json(path: str | Path) -> dict:

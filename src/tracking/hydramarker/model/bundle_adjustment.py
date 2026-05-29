@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import pyceres
 
-from overlay.tracking.hydramarker.model.state import CameraPose, SfMState
+from tracking.hydramarker.model.state import CameraPose, SfMState
 
 
 @dataclass(slots=True)

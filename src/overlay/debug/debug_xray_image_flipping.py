@@ -27,7 +27,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 from overlay.tools.homography import estimate_plane_induced_homography
 from overlay.tools.warp import (
     blend_xray_overlay,

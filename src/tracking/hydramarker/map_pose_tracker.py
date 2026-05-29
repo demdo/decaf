@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from overlay.tracking.pose_solvers import (
+from tracking.pose_solvers import (
     make_transform_from_rvec_tvec,
 )
 

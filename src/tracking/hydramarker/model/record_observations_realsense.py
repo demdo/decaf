@@ -10,8 +10,8 @@ import pyrealsense2 as rs
 
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.hydramarker.tracker import HydraTracker
-from overlay.tracking.hydramarker.model.observations import (
+from tracking.hydramarker.tracker import HydraTracker
+from tracking.hydramarker.model.observations import (
     frame_from_tracker_result,
     save_observations_npz,
 )

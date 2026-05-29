@@ -32,7 +32,7 @@ import numpy as np
 import cv2
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 
 
 # ============================================================

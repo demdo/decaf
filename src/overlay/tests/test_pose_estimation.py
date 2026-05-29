@@ -43,13 +43,13 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 from overlay.tools.checkerboard_corner_detection import interpolate_grid_uv
 from overlay.tools.homography import (
     estimate_homography_dlt,
     decompose_homography_to_pose,
 )
-from overlay.tracking.transforms import invert_transform
+from tracking.transforms import invert_transform
 
 import matplotlib
 matplotlib.use("QtAgg")

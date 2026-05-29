@@ -16,7 +16,7 @@ Ablauf
    - raw ROI-Punkte
    - affine regularisierte Punkte
    - optional homography-regularisierte Punkte
-7) Für jede Variante T_bx über overlay.tracking.pose_solvers.solve_pose(...)
+7) Für jede Variante T_bx über tracking.pose_solvers.solve_pose(...)
    mit pose_method="ippe" und use_xray_ippe_selection_rule=True schätzen
 8) Reprojection-Fehler, Pose-Differenzen und Visualisierung vergleichen
 
@@ -56,7 +56,7 @@ from overlay.tools.xray_marker_selection import (
     compute_roi_from_grid,
 )
 from overlay.tools.homography import build_board_xyz_canonical
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 
 
 # ============================================================

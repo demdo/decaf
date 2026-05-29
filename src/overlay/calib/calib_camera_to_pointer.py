@@ -71,14 +71,14 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from overlay.tracking.transforms import (
+from tracking.transforms import (
     make_transform,
     invert_transform,
     transform_points,
     transform_to_rvec_tvec,
 )
 
-from overlay.tracking.pose_solvers import (
+from tracking.pose_solvers import (
     solve_pose,
     normalize_dist_coeffs,
 )

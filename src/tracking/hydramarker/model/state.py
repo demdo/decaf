@@ -5,11 +5,11 @@ from typing import Dict
 
 import numpy as np
 
-from overlay.tracking.hydramarker.model.bootstrap import (
+from tracking.hydramarker.model.bootstrap import (
     BootstrapResult,
     CameraCalibration,
 )
-from overlay.tracking.hydramarker.model.observations import (
+from tracking.hydramarker.model.observations import (
     FrameObservation,
 )
 

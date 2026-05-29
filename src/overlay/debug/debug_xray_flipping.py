@@ -13,7 +13,7 @@ import cv2
 
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 from overlay.tools.homography import build_board_xyz_canonical
 
 

@@ -5,10 +5,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from overlay.tracking.hydramarker.model.alignment import (
+from tracking.hydramarker.model.alignment import (
     AlignmentResult,
 )
-from overlay.tracking.hydramarker.model.state import CameraPose, SfMState
+from tracking.hydramarker.model.state import CameraPose, SfMState
 
 
 def set_axes_equal(ax) -> None:

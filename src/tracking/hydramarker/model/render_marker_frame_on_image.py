@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.hydramarker.tracker import (
+from tracking.hydramarker.tracker import (
     HydraTracker,
     TrackerConfig,
     TrackerResult,

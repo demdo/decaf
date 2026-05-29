@@ -6,7 +6,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from overlay.tracking.hydramarker.model.observations import FrameObservation
+from tracking.hydramarker.model.observations import FrameObservation
 
 
 @dataclass(slots=True)

@@ -10,7 +10,7 @@ from overlay.calib.calib_camera_to_pointer import (
     calibrate_camera_to_pointer,
     get_default_pointer_tool_model,
 )
-from overlay.tracking.pose_filters import AdaptiveKalmanFilterCV3D
+from tracking.pose_filters import AdaptiveKalmanFilterCV3D
 
 
 # ============================================================

@@ -8,7 +8,7 @@ import json
 import numpy as np
 from scipy.spatial import cKDTree
 
-from overlay.tracking.hydramarker.model.state import CameraPose, SfMState
+from tracking.hydramarker.model.state import CameraPose, SfMState
 
 
 @dataclass(slots=True)

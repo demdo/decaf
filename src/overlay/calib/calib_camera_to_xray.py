@@ -5,7 +5,7 @@ calib_camera_to_xray.py
 Estimate the rigid camera->xray transform.
 
 All supported pose-estimation methods are implemented inside
-overlay.tracking.pose_solvers.solve_pose(...).
+tracking.pose_solvers.solve_pose(...).
 
 This wrapper is intentionally thin:
 - validate / normalize inputs
@@ -21,8 +21,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from overlay.tracking.pose_solvers import solve_pose, PoseSolveResult
-from overlay.tracking.transforms import invert_transform, rvec_tvec_to_transform
+from tracking.pose_solvers import solve_pose, PoseSolveResult
+from tracking.transforms import invert_transform, rvec_tvec_to_transform
 
 
 # ============================================================

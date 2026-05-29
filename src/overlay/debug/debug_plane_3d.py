@@ -35,7 +35,7 @@ import pyrealsense2 as rs
 
 from overlay.tools import checkerboard_corner_detection as cbd
 from overlay.tools import ransac_plane_fitting as rpf
-from overlay.tracking.pose_filters import PlaneKalmanFilter
+from tracking.pose_filters import PlaneKalmanFilter
 
 
 # ============================================================

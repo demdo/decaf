@@ -24,7 +24,7 @@ from overlay.calib.calib_camera_to_pointer import (
     get_default_pointer_tool_model,
 )
 from overlay.calib.calib_xray_to_pointer import extract_depth
-from overlay.tracking.pose_filters import AdaptiveKalmanFilterCV3D
+from tracking.pose_filters import AdaptiveKalmanFilterCV3D
 
 
 # ============================================================

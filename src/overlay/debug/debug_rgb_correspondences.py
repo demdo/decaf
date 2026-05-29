@@ -46,9 +46,9 @@ import pyrealsense2 as rs
 from overlay.tools import checkerboard_corner_detection as cbd
 from overlay.tools import ransac_plane_fitting as rpf
 from overlay.tools.homography import build_board_xyz_canonical
-from overlay.tracking.pose_filters import PlaneKalmanFilter
+from tracking.pose_filters import PlaneKalmanFilter
 
-from overlay.tracking.pose_solvers import (
+from tracking.pose_solvers import (
     _build_ippe_candidates,
     _export_ippe_candidate_result,
     _make_transform,

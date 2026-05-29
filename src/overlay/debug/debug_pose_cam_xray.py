@@ -52,7 +52,7 @@ import numpy as np
 import pyrealsense2 as rs
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 
 
 # ============================================================

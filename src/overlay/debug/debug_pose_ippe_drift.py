@@ -9,12 +9,12 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from overlay.tools.homography import build_board_xyz_canonical
-from overlay.tracking.transforms import (
+from tracking.transforms import (
     rvec_tvec_to_transform,
     invert_transform,
 )
 
-from overlay.tracking.pose_solvers import (
+from tracking.pose_solvers import (
     normalize_dist_coeffs,
     _build_ippe_candidates,
     _select_ippe_candidate,

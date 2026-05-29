@@ -39,7 +39,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from overlay.tools.homography import build_board_xyz_canonical
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 
 
 # ============================================================

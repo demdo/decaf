@@ -8,11 +8,11 @@ import sys
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.hydramarker.model.bootstrap import (
+from tracking.hydramarker.model.bootstrap import (
     CameraCalibration,
     run_bootstrap,
 )
-from overlay.tracking.hydramarker.model.bundle_adjustment import (
+from tracking.hydramarker.model.bundle_adjustment import (
     PyCeresOptions,
     compute_adaptive_observation_weights,
     compute_observation_reprojection_errors,
@@ -21,25 +21,25 @@ from overlay.tracking.hydramarker.model.bundle_adjustment import (
     select_good_frames_for_bundle_adjustment,
     select_observation_outliers,
 )
-from overlay.tracking.hydramarker.model.incremental import (
+from tracking.hydramarker.model.incremental import (
     register_remaining_frames,
 )
-from overlay.tracking.hydramarker.model.observations import (
+from tracking.hydramarker.model.observations import (
     FrameObservation,
     load_observations_npz,
 )
-from overlay.tracking.hydramarker.model.state import (
+from tracking.hydramarker.model.state import (
     SfMState,
     create_state_from_bootstrap,
 )
-from overlay.tracking.hydramarker.model.visualization import (
+from tracking.hydramarker.model.visualization import (
     plot_sfm_state,
     visualize_aligned_state,
 )
-from overlay.tracking.hydramarker.model.alignment import (
+from tracking.hydramarker.model.alignment import (
     align_state_to_marker_frame_inplace,
 )
-from overlay.tracking.hydramarker.model.export_marker_map import (
+from tracking.hydramarker.model.export_marker_map import (
     export_marker_geometry_json,
 )
 

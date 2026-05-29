@@ -26,8 +26,8 @@ import pyrealsense2 as rs
 
 from overlay.calib.calib_camera_to_pointer import calibrate_camera_to_pointer
 from overlay.calib.calib_xray_to_pointer import extract_depth
-from overlay.tracking.pose_filters import AdaptiveKalmanFilterCV3D
-from overlay.tracking.transforms import invert_transform
+from tracking.pose_filters import AdaptiveKalmanFilterCV3D
+from tracking.transforms import invert_transform
 
 
 # ============================================================

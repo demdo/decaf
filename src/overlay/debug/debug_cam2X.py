@@ -42,7 +42,7 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from overlay.tracking.pose_solvers import solve_pose
+from tracking.pose_solvers import solve_pose
 from overlay.calib.calib_camera_to_xray_new import calibrate_camera_to_xray
 
 
