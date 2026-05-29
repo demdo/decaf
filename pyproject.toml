@@ -3,9 +3,9 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "overlay"
+name = "decaf"
 version = "0.1.0"
-description = "X-ray to RGB-D overlay pipeline"
+description = "DeCAF RGB-Xray overlay and tracking framework"
 requires-python = ">=3.10"
 
 [tool.setuptools]
