@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 from datetime import datetime
@@ -29,17 +30,36 @@ def choose_file_qt(title: str, file_filter: str) -> Path:
     return Path(path)
 
 
-def read_field_shape(field_path: Path) -> tuple[int, int]:
-    field_path = Path(field_path)
+def read_num_corner_cols(marker_json_path: Path) -> int:
+    """
+    Read the corner ID encoding stride directly from the marker JSON.
 
-    with field_path.open("r", encoding="utf-8") as f:
-        first_line = f.readline().strip()
+    The correct value is id_encoding.num_cols, which equals the number of
+    corner columns in the detectable grid (cell_cols + 1).
 
-    parts = first_line.split()
-    if len(parts) < 2:
-        raise ValueError(f"Invalid .field header in {field_path}")
+    Do NOT compute this from the .field header — the field format does not
+    reliably encode the corner count, and off-by-one errors there produce
+    a wrong ID stride that silently corrupts all saved observations.
+    """
+    marker_json_path = Path(marker_json_path)
 
-    return int(parts[0]), int(parts[1])
+    with marker_json_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    try:
+        num_cols = int(meta["id_encoding"]["num_cols"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Cannot read id_encoding.num_cols from {marker_json_path}: {exc}"
+        ) from exc
+
+    if num_cols < 2:
+        raise ValueError(
+            f"id_encoding.num_cols={num_cols} in {marker_json_path} is invalid "
+            "(must be >= 2)."
+        )
+
+    return num_cols
 
 
 def realsense_intrinsics_to_cv(profile) -> tuple[np.ndarray, np.ndarray]:
@@ -219,15 +239,11 @@ def main() -> None:
         "Marker JSON (*.json)",
     )
 
-    field_rows, field_cols = read_field_shape(field_path)
+    # Read the ID stride directly from the marker JSON (id_encoding.num_cols).
+    # This is always correct regardless of .field header format or cell count.
+    num_corner_cols = read_num_corner_cols(marker_json_path)
+    print(f"[recorder] num_corner_cols = {num_corner_cols} (from marker JSON)")
 
-    if field_rows < 2 or field_cols < 2:
-        raise ValueError(
-            f"Invalid field size {field_rows}x{field_cols}. "
-            "Need at least 2x2 cells to define corners."
-        )
-
-    num_corner_cols = field_cols - 1
     observations_path, camera_path = make_output_paths()
 
     pipe, profile = create_realsense_pipeline()
@@ -277,7 +293,8 @@ def main() -> None:
             status_1 = (
                 f"{'REC' if recording else 'IDLE'} | "
                 f"saved_frames={len(observations)} | "
-                f"unique_ids={count_unique_marker_ids(observations)}"
+                f"unique_ids={count_unique_marker_ids(observations)} | "
+                f"num_corner_cols={num_corner_cols}"
             )
 
             status_2 = (

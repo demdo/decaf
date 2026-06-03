@@ -68,6 +68,66 @@ float corr1D(const std::vector<float>& a, const std::vector<float>& b) {
     return num / den;
 }
 
+// Gradient-weighted Pearson correlation.
+//
+// Weights each pixel by its local gradient magnitude so that low-contrast
+// regions (e.g. the white background that bleeds into a border-corner patch)
+// contribute almost nothing to the correlation score.  This makes the saddle
+// model fit robust to partial patches — exactly the situation at the physical
+// edge of the checkerboard marker where roughly half the sampling window falls
+// outside the patterned area.
+//
+// Without weighting, a border corner that is a perfect saddle in its inner
+// half gets a correlation of ~0.5 because the outer half is flat white and
+// pulls the Pearson numerator toward zero.  With weighting the flat half is
+// effectively masked and the correlation reflects only the informative pixels.
+float weightedCorr1D(
+    const std::vector<float>& templ,
+    const std::vector<float>& signal,
+    const std::vector<float>& weights
+) {
+    const size_t n = templ.size();
+    if (n == 0 || signal.size() != n || weights.size() != n) {
+        return 0.0f;
+    }
+
+    float w_sum  = 0.0f;
+    float wt_sum = 0.0f;
+    float ws_sum = 0.0f;
+
+    for (size_t i = 0; i < n; ++i) {
+        w_sum  += weights[i];
+        wt_sum += weights[i] * templ[i];
+        ws_sum += weights[i] * signal[i];
+    }
+
+    if (w_sum < 1e-12f) {
+        return 0.0f;
+    }
+
+    const float mean_t = wt_sum / w_sum;
+    const float mean_s = ws_sum / w_sum;
+
+    float num   = 0.0f;
+    float den_t = 0.0f;
+    float den_s = 0.0f;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float dt = templ[i]  - mean_t;
+        const float ds = signal[i] - mean_s;
+        num   += weights[i] * dt * ds;
+        den_t += weights[i] * dt * dt;
+        den_s += weights[i] * ds * ds;
+    }
+
+    const float den = std::sqrt(den_t * den_s);
+    if (den < 1e-12f) {
+        return 0.0f;
+    }
+
+    return num / den;
+}
+
 bool insideWithRadius(const cv::Mat& img, const cv::Point2f& p, int r) {
     return p.x >= r &&
            p.y >= r &&
@@ -104,6 +164,40 @@ std::vector<RefinedCorner> CornerRefiner::refine(
 
     if (refined_points.empty()) {
         return {};
+    }
+
+    // Sub-pixel refinement via cv::cornerSubPix.
+    //
+    // Applied after gradient-intersection refinement and before saddle-feature
+    // computation.  cornerSubPix iterates toward the nearest local gradient
+    // minimum, which is more robust to blur than the single-pass least-squares
+    // solve in refineGradientIntersections.  The combined approach:
+    //   1. Gradient-intersection gives a coarse but topology-aware position.
+    //   2. cornerSubPix refines to true sub-pixel accuracy under blur.
+    //
+    // Window size: auto = max(3, radius-1) so it is large enough to straddle
+    // the gradient transition but small enough not to overlap adjacent cells
+    // on small markers.  Dead zone = (-1,-1) lets OpenCV choose automatically.
+    if (!refined_points.empty()) {
+        const int win = config.subpix_win_size > 0
+            ? config.subpix_win_size
+            : (config.subpix_win_size == 0
+                ? 0
+                : std::max(3, config.radius - 1));
+
+        if (win > 0) {
+            cv::cornerSubPix(
+                gray,
+                refined_points,
+                cv::Size(win, win),
+                cv::Size(-1, -1),
+                cv::TermCriteria(
+                    cv::TermCriteria::COUNT + cv::TermCriteria::EPS,
+                    config.subpix_max_iters,
+                    config.subpix_epsilon
+                )
+            );
+        }
     }
 
     std::vector<RefinedCorner> featured = computeSaddleFeatures(
@@ -368,10 +462,26 @@ std::vector<RefinedCorner> CornerRefiner::computeSaddleFeatures(
         corner.angle_bias_deg = std::abs(angle_diff - 90.0f);
 
         // Build sign template from quadratic part.
+        // Weights are local gradient magnitudes so that low-contrast regions
+        // (e.g. the white background bleeding into a border-corner patch) do
+        // not dilute the correlation score.  Border corners are perfect saddles
+        // in their inner half — the weighted correlation reflects that, whereas
+        // the plain Pearson correlation is pulled toward 0.5 by the flat outer
+        // half and falls below the adaptive_drop threshold in filterBySaddleScore.
         std::vector<float> templ;
         std::vector<float> samples;
+        std::vector<float> grad_weights;
         templ.reserve(patch_size * patch_size);
         samples.reserve(patch_size * patch_size);
+        grad_weights.reserve(patch_size * patch_size);
+
+        // We need the gradient magnitude at each patch pixel.
+        // Approximate it with a simple 3x3 Sobel on the patch itself.
+        // For pixels on the patch border we fall back to a simpler forward-
+        // difference, but those are rare and the weight just keeps them mild.
+        cv::Mat patch_gx, patch_gy;
+        cv::Sobel(patch, patch_gx, CV_32F, 1, 0, 3, 1.0, 0.0, cv::BORDER_REFLECT);
+        cv::Sobel(patch, patch_gy, CV_32F, 0, 1, 3, 1.0, 0.0, cv::BORDER_REFLECT);
 
         for (int v = -r; v <= r; ++v) {
             for (int u = -r; u <= r; ++u) {
@@ -385,10 +495,17 @@ std::vector<RefinedCorner> CornerRefiner::computeSaddleFeatures(
                 const int px = u + r;
                 const int py = v + r;
                 samples.push_back(patch.at<float>(py, px));
+
+                const float gx = patch_gx.at<float>(py, px);
+                const float gy = patch_gy.at<float>(py, px);
+                // Use sqrt of gradient magnitude as weight so that very
+                // strong edges don't dominate everything; a sqrt-compression
+                // keeps the weighting moderate and numerically stable.
+                grad_weights.push_back(std::sqrt(std::sqrt(gx * gx + gy * gy) + 1.0f));
             }
         }
 
-        corner.correlation = corr1D(templ, samples);
+        corner.correlation = weightedCorr1D(templ, samples, grad_weights);
 
         const float sign_k = std::copysign(
             1.0f,
@@ -456,7 +573,7 @@ std::vector<RefinedCorner> CornerRefiner::filterBySaddleScore(
     }
 
     const float adaptive_drop = std::max(config.correlation_drop, 0.35f);
-    const float min_corr = best_corr - adaptive_drop;
+    const float min_corr = std::max(best_corr - adaptive_drop, -0.15f);
 
     std::vector<RefinedCorner> filtered;
     filtered.reserve(corners.size());

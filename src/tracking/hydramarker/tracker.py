@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from tracking.hydramarker.backend import cpp_impl as hm
@@ -78,11 +79,24 @@ class TrackerConfig:
 
     max_translation_jump_mm: float = 120.0
     max_rotation_jump_deg: float = 45.0
+    # Adaptiver Motion Gate: Threshold waechst um diesen Wert pro verlorenem Frame.
+    # Beispiel: 8.0 -> nach 5 Frames: 45 + 40 = 85 deg
+    rotation_gate_scale_per_lost_frame: float = 8.0
+    # Absolutes Maximum fuer den skalierten Rotation-Threshold.
+    rotation_gate_max_deg: float = 120.0
 
     pnp_ransac_iterations: int = 500
     pnp_ransac_reprojection_px: float = 3.0
     pnp_ransac_confidence: float = 0.99
     use_pose_prior: bool = True
+
+    # Frühzeitiger Smoothing-Reset: wenn pts unter diesen Anteil des
+    # letzten guten Wertes fällt, reset_smoothing() präventiv aufrufen.
+    # Verhindert den Totalausfall durch graduellen LK-Drift.
+    # 0.0 = deaktiviert, 0.4 = Reset wenn pts auf 40% des Maximalwerts fällt.
+    dot_early_reset_pts_ratio: float = 0.4
+    # Minimale pts-Anzahl ab der die Ratio überhaupt geprüft wird.
+    dot_early_reset_min_pts: int = 6
 
     dot_canonical_size: int = 80
     dot_canonical_margin_px: float = 4.0
@@ -97,6 +111,11 @@ class TrackerConfig:
     dot_commit_frames: int = 2
     dot_revoke_frames: int = 3
 
+    # Drill/cylinder default: stateless dot decisions. Temporal smoothing at
+    # cell level is unsafe after fast rotations because local cells can refer
+    # to a different physical surface region.
+    dot_use_temporal_smoothing: bool = False
+
     decoder_require_geometry_valid: bool = True
     decoder_accept_ambiguous: bool = False
 
@@ -110,8 +129,31 @@ class TrackerConfig:
 
     enable_temporal_correspondence_persistence: bool = True
     persistence_max_frames: int = 8
-    persistence_min_points: int = 8
+    # Lowered from 8: on a curved/partial marker we often get fewer inliers
+    # per frame. With 8, persistence was never updated on frames with <8
+    # inliers, causing the tracker to freeze on stale correspondences.
+    persistence_min_points: int = 4
     persistence_min_fresh_points_for_merge: int = 3
+
+    # When a persistent-fallback pose is good (below this threshold), refresh
+    # the persistent correspondences so the tracker doesn't run out of time.
+    persistence_refresh_mean_error_px: float = 2.5
+
+    # Maximum UV distance (pixels) to match a persistent corner to a current
+    # detection corner.  Used instead of exact local (i,j) key matching so
+    # that persistent state survives CheckerboardDetector re-indexing events
+    # (lattice drift, LK reset) which change the local coordinate system
+    # without moving the physical corners in the image.
+    persistence_uv_match_dist_px: float = 25.0
+
+    # Pose-Propagation: projiziert bekannte Marker-Corners mit der letzten
+    # guten Pose in den nächsten Frame. Ersetzt LK-Drift-anfällige
+    # CheckerboardDetection wenn die Pose gut genug ist.
+    # Nur aktiv wenn mean_reprojection_error < threshold.
+    enable_pose_propagation: bool = True
+    pose_propagation_max_reproj_px: float = 2.0
+    # Minimaler Bildrand-Abstand für projizierte Corners (px).
+    pose_propagation_border_px: float = 8.0
 
     enable_debug_prints: bool = True
     log_path: str = "hydramarker_tracker.log"
@@ -129,10 +171,23 @@ class HydraTracker:
     ) -> None:
         self.config = config or TrackerConfig()
 
+        self.K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        self.dist_coeffs = (
+            np.zeros((0, 1), dtype=np.float64)
+            if dist_coeffs is None
+            else np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
+        )
+
         self.field = hm.MarkerField.loadFromFile(field_path)
         self.geometry = hm.MarkerGeometry.load_from_json(marker_json_path)
 
-        self.checkerboard_detector = hm.CheckerboardDetector()
+        # CheckerboardDetector mit expliziter Config:
+        # recovery_correction_max_dist_rel erhöht damit LK-Drift-Korrektur
+        # auch bei größerem Offset zwischen LK- und Recovery-Corner greift.
+        _cbd_cfg = hm.CheckerboardDetectorConfig()
+        _cbd_cfg.recovery_correction_weight = 0.5
+        _cbd_cfg.recovery_correction_max_dist_rel = 0.6
+        self.checkerboard_detector = hm.CheckerboardDetector(_cbd_cfg)
         self.dot_detector = self._create_dot_detector()
         self.patch_extractor = hm.PatchExtractor()
         self.patch_decoder = self._create_patch_decoder()
@@ -151,6 +206,8 @@ class HydraTracker:
                 max_max_reproj_px=self.config.max_max_reprojection_error_px,
                 max_translation_jump_mm=self.config.max_translation_jump_mm,
                 max_rotation_jump_deg=self.config.max_rotation_jump_deg,
+                rotation_gate_scale_per_lost_frame=self.config.rotation_gate_scale_per_lost_frame,
+                rotation_gate_max_deg=self.config.rotation_gate_max_deg,
                 use_pose_prior=self.config.use_pose_prior,
             ),
         )
@@ -163,6 +220,15 @@ class HydraTracker:
         self.mode = TrackerMode.LOST
         self.frame_index = 0
         self.lost_frames = 0
+
+        # Höchste bisher gesehene pts-Anzahl — für Frühwarnung LK-Drift.
+        self._max_pts_seen: int = 0
+
+        # Letzter akzeptierter Reprojektionsfehler — für Pose-Propagation.
+        self._last_good_reproj_px: float = -1.0
+
+        # Letzte akzeptierte rvec — für präventiven Rotations-Delta-Check.
+        self._last_accepted_rvec: Optional[np.ndarray] = None
 
         self._persistent_corners: List[TrackerCorner] = []
         self._persistent_frame_index: int = -1
@@ -199,6 +265,7 @@ class HydraTracker:
         cfg.temporal_alpha = self.config.dot_temporal_alpha
         cfg.commit_frames = self.config.dot_commit_frames
         cfg.revoke_frames = self.config.dot_revoke_frames
+        cfg.use_temporal_smoothing = self.config.dot_use_temporal_smoothing
 
         return hm.DotDetector(cfg)
 
@@ -222,10 +289,18 @@ class HydraTracker:
         self.mode = TrackerMode.LOST
         self.frame_index = 0
         self.lost_frames = 0
+        self._max_pts_seen = 0
+        self._last_good_reproj_px = -1.0
+        self._last_accepted_rvec = None
 
         self.pose_tracker.reset()
         self.checkerboard_detector.reset_tracking()
+
+        # Full reset: recreate dot detector to clear all smoothed state.
+        # reset_smoothing() is called on partial resets (_on_tracking_failure)
+        # to preserve warmup state while clearing stale cell scores.
         self.dot_detector = self._create_dot_detector()
+
         self._clear_persistent_correspondences()
 
     def process_frame(self, frame: np.ndarray) -> TrackerResult:
@@ -247,7 +322,15 @@ class HydraTracker:
             self._log_result("NO_DETECTION", result)
             return result
 
-        result = self._decode_and_estimate_pose(frame, detection)
+        # Pose-Propagation: wenn eine gute Pose bekannt ist, ersetze die
+        # LK-Detection durch projizierte Marker-Corners. Das eliminiert
+        # LK-Drift-Akkumulation als Fehlerquelle für den Dot-Decoder.
+        # Fallback auf normale Detection wenn Pose nicht gut genug.
+        h, w = frame.shape[:2]
+        propagated = self._build_pose_propagated_detection((h, w))
+        detection_for_dots = propagated if propagated is not None else detection
+
+        result = self._decode_and_estimate_pose(frame, detection_for_dots)
         self._attach_detection_info(result, detection)
 
         if result.success:
@@ -270,13 +353,213 @@ class HydraTracker:
             self.pose_tracker.reset()
             self._clear_persistent_correspondences()
             self.mode = TrackerMode.LOST
+
+            # Full dot detector reset only on complete loss — recreate to
+            # clear all state including stale cell scores from a different
+            # marker position.
+            self.dot_detector = self._create_dot_detector()
+
         elif self.pose_tracker.rvec is not None and self.pose_tracker.tvec is not None:
             self.mode = TrackerMode.RECOVERING
+
+            # Partial reset: tell the dot detector to clear its smoothed
+            # scores so it re-commits quickly in the next frame, but don't
+            # destroy the detector object (keeps warmup done).
+            if hasattr(self.dot_detector, "reset_smoothing"):
+                self.dot_detector.reset_smoothing()
+
         else:
             self.mode = TrackerMode.DETECTING
 
+            if hasattr(self.dot_detector, "reset_smoothing"):
+                self.dot_detector.reset_smoothing()
+
+
+    def _build_pose_propagated_detection(
+        self,
+        image_shape: Tuple[int, int],
+    ):
+        """
+        Baut eine synthetische CheckerboardDetection aus der letzten bekannten
+        Pose durch Projektion aller MarkerGeometry-Corners in den aktuellen Frame.
+
+        Ersetzt die LK-basierte Detection wenn die letzte Pose gut genug war.
+        Vermeidet LK-Drift-Akkumulation bei längerem Tracking.
+
+        Koordinaten-Mapping (aus correspondence_builder.cpp):
+            global_row = vertikal = corner.j
+            global_col = horizontal = corner.i
+
+        Gibt None zurück wenn:
+            - Keine gültige Pose vorhanden
+            - Letzter Reprojektionsfehler zu hoch
+            - Zu wenige Corners im Bild sichtbar
+        """
+        if not self.config.enable_pose_propagation:
+            return None
+
+        rvec = self.pose_tracker.rvec
+        tvec = self.pose_tracker.tvec
+
+        if rvec is None or tvec is None:
+            return None
+
+        if (
+            self._last_good_reproj_px < 0.0
+            or self._last_good_reproj_px > self.config.pose_propagation_max_reproj_px
+        ):
+            return None
+
+        rows = self.geometry.corner_rows()
+        cols = self.geometry.corner_cols()
+        border = self.config.pose_propagation_border_px
+        h, w = image_shape[0], image_shape[1]
+
+        # Alle gültigen 3D-Corners sammeln
+        obj_pts = []
+        row_col_list = []
+
+        for gr in range(rows):
+            for gc in range(cols):
+                if not self.geometry.has_corner(gr, gc):
+                    continue
+                pt = self.geometry.corner_point(gr, gc)
+                obj_pts.append([pt.x, pt.y, pt.z])
+                row_col_list.append((gr, gc))
+
+        if len(obj_pts) < self.config.min_points:
+            return None
+
+        obj_pts_np = np.array(obj_pts, dtype=np.float64).reshape(-1, 3)
+
+        projected, _ = cv2.projectPoints(
+            obj_pts_np,
+            rvec.reshape(3, 1),
+            tvec.reshape(3, 1),
+            self.K,
+            self.dist_coeffs,
+        )
+        projected = projected.reshape(-1, 2)
+
+        # Synthetische GridCorners bauen — nur sichtbare
+        # global_row -> corner.j, global_col -> corner.i
+        detection = hm.CheckerboardDetection()
+        ij_to_uv: Dict[Tuple[int, int], Tuple[float, float]] = {}
+
+        for idx, (gr, gc) in enumerate(row_col_list):
+            u, v = float(projected[idx, 0]), float(projected[idx, 1])
+
+            if u < border or v < border or u >= w - border or v >= h - border:
+                continue
+
+            corner = hm.GridCorner()
+            corner.j = gr   # row = vertikal = j
+            corner.i = gc   # col = horizontal = i
+            corner.uv = hm.Point2f()
+            corner.uv.x = u
+            corner.uv.y = v
+            corner.visibility_score = 1.0
+
+            detection.corners.append(corner)
+            ij_to_uv[(gc, gr)] = (u, v)  # key: (i,j)
+
+        if len(detection.corners) < self.config.min_points:
+            return None
+
+        # Synthetische Cells aus projizierten Corners bauen
+        # Cell (i,j) hat Corners: (i,j), (i+1,j), (i+1,j+1), (i,j+1)
+        for ci, cj in list(ij_to_uv.keys()):
+            if (ci+1, cj) not in ij_to_uv:
+                continue
+            if (ci+1, cj+1) not in ij_to_uv:
+                continue
+            if (ci, cj+1) not in ij_to_uv:
+                continue
+
+            cell = hm.GridCell()
+            cell.i = ci
+            cell.j = cj
+
+            p00 = ij_to_uv[(ci,   cj)]
+            p10 = ij_to_uv[(ci+1, cj)]
+            p11 = ij_to_uv[(ci+1, cj+1)]
+            p01 = ij_to_uv[(ci,   cj+1)]
+
+            def make_pt(xy):
+                p = hm.Point2f()
+                p.x = xy[0]
+                p.y = xy[1]
+                return p
+
+            cell.corner_uv = [make_pt(p00), make_pt(p10), make_pt(p11), make_pt(p01)]
+            cell.center_uv = make_pt((
+                (p00[0]+p10[0]+p11[0]+p01[0]) * 0.25,
+                (p00[1]+p10[1]+p11[1]+p01[1]) * 0.25,
+            ))
+
+            detection.cells.append(cell)
+
+        if len(detection.cells) == 0:
+            return None
+
+        detection.tracking = True
+        detection.stable = True
+
+        return detection
+
     def _decode_and_estimate_pose(self, frame: np.ndarray, detection) -> TrackerResult:
+        # Präventiver Dot-Detector-Reset bei starker Rotation des Drills.
+        # MUSS vor dot_detector.detect() stehen damit der Reset im selben
+        # Frame wirkt in dem die Rotation erkannt wird.
+        # Zylindersymmetrie: bei rot_delta > 15° ändert sich welche Dots
+        # sichtbar sind. Kompletter Reset damit EMA-Warmup nicht 10+ Frames
+        # dauert.
+        if (
+            self.mode == TrackerMode.TRACKING
+            and self._last_accepted_rvec is not None
+            and self.pose_tracker.rvec is not None
+        ):
+            try:
+                R_prev, _ = cv2.Rodrigues(
+                    np.asarray(self._last_accepted_rvec, dtype=np.float64).reshape(3, 1)
+                )
+                R_curr, _ = cv2.Rodrigues(
+                    np.asarray(self.pose_tracker.rvec, dtype=np.float64).reshape(3, 1)
+                )
+                dR = R_curr @ R_prev.T
+                cos_a = float(np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0))
+                rot_delta_deg = float(np.degrees(np.arccos(cos_a)))
+                if rot_delta_deg > 15.0:
+                    self.dot_detector = self._create_dot_detector()
+                    self._last_accepted_rvec = None  # einmalig triggern
+            except Exception:
+                pass
+
         dots = self.dot_detector.detect(frame, detection)
+
+        # Frühzeitiger Smoothing-Reset bei graduell sinkendem pts.
+        # Wenn die Anzahl der validen Correspondences stark unter den
+        # bisher gesehenen Maximalwert fällt, ist das ein Zeichen für
+        # LK-Drift. reset_smoothing() gibt dem EMA-Smoother Zeit sich
+        # neu zu kalibrieren bevor der Totalausfall eintritt.
+        # Wird nur im TRACKING-Modus geprüft — nicht beim ersten Warmup.
+        if (
+            self.mode == TrackerMode.TRACKING
+            and self.config.dot_early_reset_pts_ratio > 0.0
+            and self._max_pts_seen >= self.config.dot_early_reset_min_pts
+        ):
+            # pts schätzen: Anzahl der gültigen (non-ambiguous) Cells
+            # aus dem aktuellen Dot-Detector-Ergebnis.
+            current_pts = sum(
+                1 for c in dots.cells
+                if c.valid and not c.ambiguous
+            )
+            threshold = int(
+                self._max_pts_seen * self.config.dot_early_reset_pts_ratio
+            )
+            if current_pts < threshold:
+                if hasattr(self.dot_detector, "reset_smoothing"):
+                    self.dot_detector.reset_smoothing()
 
         patches = self.patch_extractor.extract(
             dots,
@@ -392,7 +675,10 @@ class HydraTracker:
         success_message: str,
         update_persistence: bool,
     ) -> TrackerResult:
-        pose = self.pose_tracker.estimate_pose(track_points)
+        pose = self.pose_tracker.estimate_pose(
+            track_points,
+            lost_frames=self.lost_frames,
+        )
 
         if not pose.success:
             return TrackerResult(
@@ -414,6 +700,14 @@ class HydraTracker:
 
         if update_persistence:
             self._store_persistent_correspondences(inlier_corners)
+
+        # Max-pts und Reprojektionsfehler aktualisieren.
+        if pose.num_inliers > self._max_pts_seen:
+            self._max_pts_seen = pose.num_inliers
+        if pose.reprojection_mean_px >= 0.0:
+            self._last_good_reproj_px = pose.reprojection_mean_px
+        if pose.rvec is not None:
+            self._last_accepted_rvec = np.asarray(pose.rvec, dtype=np.float64).reshape(3, 1)
 
         confidence = self._confidence(
             pose.num_inliers,
@@ -460,6 +754,18 @@ class HydraTracker:
 
         if result.success:
             result.confidence *= 0.85
+
+            # If the persistent-fallback pose is good, refresh the persistent
+            # state so the tracker doesn't run out of time budget
+            # (persistence_max_frames) while the main decode is warming up.
+            if (
+                result.mean_reprojection_error_px >= 0.0
+                and result.mean_reprojection_error_px
+                <= self.config.persistence_refresh_mean_error_px
+                and len(result.corners) >= self.config.persistence_min_points
+            ):
+                self._store_persistent_correspondences(result.corners)
+
             return result
 
         return None
@@ -517,24 +823,49 @@ class HydraTracker:
         if age < 0 or age > self.config.persistence_max_frames:
             return [], []
 
-        current_uv_by_local = self._current_uv_by_local_corner(detection)
-        if not current_uv_by_local:
+        # Build a list of all current detection corner UVs for proximity search.
+        # We use UV-proximity matching instead of exact local (i,j) key matching
+        # because the CheckerboardDetector can re-index its corners after a
+        # tracking reset or lattice drift event, silently changing the local
+        # coordinate system while the physical UV positions remain correct.
+        # Local-key lookup would then find 0 matches even though 50+ corners
+        # are visible -- this was the root cause of the 'frozen' failure mode.
+        current_corners = self._detected_corners_from_detection(detection)
+        if not current_corners:
             return [], []
+
+        current_uvs = np.array(
+            [(float(c.uv[0]), float(c.uv[1])) for c in current_corners],
+            dtype=np.float64,
+        )  # shape (N, 2)
+
+        max_dist = float(self.config.persistence_uv_match_dist_px)
+        max_dist_sq = max_dist * max_dist
 
         points: List[PoseTrackPoint] = []
         corners: List[TrackerCorner] = []
         used_globals: set[Tuple[int, int]] = set()
+        used_current_indices: set[int] = set()
 
         for cached in self._persistent_corners:
-            local_key = (int(cached.local_row), int(cached.local_col))
-            if local_key not in current_uv_by_local:
-                continue
-
             global_key = (int(cached.global_row), int(cached.global_col))
             if global_key in used_globals:
                 continue
 
-            uv = current_uv_by_local[local_key]
+            # Find the nearest current detection corner to the stored UV.
+            pu, pv = float(cached.uv[0]), float(cached.uv[1])
+            diff = current_uvs - np.array([pu, pv])
+            dist_sq = (diff * diff).sum(axis=1)
+            best_idx = int(np.argmin(dist_sq))
+
+            if dist_sq[best_idx] > max_dist_sq:
+                continue  # no current corner close enough
+
+            if best_idx in used_current_indices:
+                continue  # already claimed by another persistent corner
+
+            matched = current_corners[best_idx]
+            uv = (float(matched.uv[0]), float(matched.uv[1]))
             xyz = self._point3(cached.xyz_mm)
             votes = max(0, int(cached.votes) - age)
 
@@ -550,8 +881,8 @@ class HydraTracker:
 
             corners.append(
                 TrackerCorner(
-                    local_row=local_key[0],
-                    local_col=local_key[1],
+                    local_row=int(matched.local_row),
+                    local_col=int(matched.local_col),
                     global_row=global_key[0],
                     global_col=global_key[1],
                     xyz_mm=xyz,
@@ -561,6 +892,7 @@ class HydraTracker:
             )
 
             used_globals.add(global_key)
+            used_current_indices.add(best_idx)
 
         return points, corners
 

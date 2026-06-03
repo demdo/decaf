@@ -29,6 +29,12 @@ struct DotDetectorConfig {
     double temporal_alpha = 0.35;
     int commit_frames = 2;
     int revoke_frames = 3;
+
+    // If false, every cell decision is made only from the current frame.
+    // This is the safer mode for fast rotations on cylindrical markers,
+    // because local cell indices and visible surface regions can change
+    // abruptly between frames.
+    bool use_temporal_smoothing = false;
 };
 
 struct DotCellObservation {
@@ -72,7 +78,16 @@ public:
         const CheckerboardDetection& checkerboard
     );
 
+    // Vollstaendiger Reset: loescht alle temporalen Zustaende.
+    // Wird bei komplettem Track-Loss verwendet.
     void reset();
+
+    // Partieller Reset: setzt EMA-Scores und Commit/Revoke-Counter zurueck,
+    // behaelt aber has_dot und initialized.
+    // Dadurch re-committed der Detector schnell im naechsten Frame,
+    // ohne den Warmup-State zu verlieren.
+    // Wird bei kurzzeitigem Track-Loss (RECOVERING-Modus) verwendet.
+    void reset_smoothing();
 
 private:
     struct LocalScoreResult {

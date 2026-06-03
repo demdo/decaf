@@ -1,0 +1,71 @@
+HydraTracker event log
+======================
+
+OUTAGE_START frame=263 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=264 len=2 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_END frame=265 duration=2 pose_available_pct=99.25
+OUTAGE_START frame=301 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=302 len=2 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=34 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
+OUTAGE_END frame=303 duration=2 pose_available_pct=98.68
+OUTAGE_START frame=490 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=40 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=491 len=2 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=39 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=492 len=3 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=42 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=493 len=4 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=41 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=494 len=5 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=41 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=495 len=6 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=49 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=496 len=7 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
+OUTAGE_CONT frame=497 len=8 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
+OUTAGE_CONT frame=498 len=9 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
+OUTAGE_CONT frame=499 len=10 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
+OUTAGE_CONT frame=500 len=11 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=501 len=12 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=502 len=13 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=503 len=14 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=504 len=15 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=505 len=16 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=50 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=506 len=17 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=507 len=18 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=508 len=19 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=509 len=20 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=510 len=21 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=511 len=22 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=512 len=23 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=513 len=24 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=514 len=25 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=515 len=26 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=516 len=27 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=517 len=28 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=518 len=29 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=519 len=30 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=520 len=31 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=521 len=32 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=522 len=33 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=523 len=34 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=524 len=35 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=525 len=36 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=526 len=37 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=527 len=38 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=528 len=39 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=529 len=40 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=530 len=41 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=531 len=42 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=532 len=43 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=533 len=44 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=534 len=45 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=535 len=46 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=536 len=47 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=537 len=48 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=538 len=49 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=539 len=50 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=540 len=51 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=541 len=52 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=542 len=53 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=543 len=54 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=544 len=55 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=545 len=56 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=546 len=57 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=547 len=58 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=548 len=59 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=549 len=60 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=550 len=61 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_CONT frame=551 len=62 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.

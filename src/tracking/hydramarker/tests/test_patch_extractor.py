@@ -28,7 +28,7 @@ import pyrealsense2 as rs
 
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-import hydramarker_cpp
+from tracking.hydramarker.backend import cpp_impl as hydramarker_cpp
 
 
 def round_int(x):

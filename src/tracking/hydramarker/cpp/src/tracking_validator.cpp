@@ -9,8 +9,8 @@ namespace hydramarker {
 
 namespace {
 
-constexpr float kBorderMarginPx = 12.0f;
-constexpr float kMinHomographyInlierRatio = 0.60f;
+constexpr float kBorderMarginPx = 6.0f;
+constexpr float kMinHomographyInlierRatio = 0.45f;
 constexpr float kStableMinDirectRatio = 0.85f;
 
 } // namespace

@@ -8,6 +8,7 @@ the exact C++ binding details.
 
 from pathlib import Path
 import importlib.util
+import os
 
 import numpy as np
 
@@ -16,10 +17,20 @@ def _load_hydramarker_cpp():
     this_dir = Path(__file__).resolve().parent
     pyd_dir = this_dir.parent / "cpp" / "build" / "Release"
 
-    matches = list(pyd_dir.glob("hydramarker_cpp*.pyd"))
+    if not pyd_dir.exists():
+        raise ImportError(f"Build directory does not exist: {pyd_dir}")
+
+    # Required on Windows so that dependent DLLs
+    # (OpenCV, protobuf, etc.) can be found.
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(str(pyd_dir))
+
+    matches = sorted(pyd_dir.glob("hydramarker_cpp*.pyd"))
 
     if not matches:
-        raise ImportError(f"Could not find hydramarker_cpp .pyd in {pyd_dir}")
+        raise ImportError(
+            f"Could not find hydramarker_cpp .pyd in {pyd_dir}"
+        )
 
     pyd_path = matches[0]
 
@@ -29,7 +40,9 @@ def _load_hydramarker_cpp():
     )
 
     if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load hydramarker_cpp from {pyd_path}")
+        raise ImportError(
+            f"Could not load hydramarker_cpp from {pyd_path}"
+        )
 
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

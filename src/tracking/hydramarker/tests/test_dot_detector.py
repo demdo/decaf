@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-import hydramarker_cpp
+from tracking.hydramarker.backend import cpp_impl as hydramarker_cpp
 
 
 def round_int(x):

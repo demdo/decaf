@@ -516,6 +516,9 @@ CheckerboardRecoveryDebug CheckerboardDetector::debugRecoveryStages(
     refine_config.quadrant_half_r            = config_.quadrant_half_r;
     refine_config.quadrant_min_contrast      = config_.quadrant_min_contrast;
     refine_config.quadrant_max_diagonal_diff = config_.quadrant_max_diagonal_diff;
+    refine_config.subpix_win_size  = config_.saddle_subpix_win_size;
+    refine_config.subpix_max_iters = config_.saddle_subpix_max_iters;
+    refine_config.subpix_epsilon   = config_.saddle_subpix_epsilon;
 
     std::vector<RefinedCorner> refined = corner_refiner_.refine(
         work, raw.points, raw.grad_x, raw.grad_y, refine_config);
@@ -618,6 +621,9 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detectRecovery(
     refine_config.quadrant_half_r            = config_.quadrant_half_r;
     refine_config.quadrant_min_contrast      = config_.quadrant_min_contrast;
     refine_config.quadrant_max_diagonal_diff = config_.quadrant_max_diagonal_diff;
+    refine_config.subpix_win_size  = config_.saddle_subpix_win_size;
+    refine_config.subpix_max_iters = config_.saddle_subpix_max_iters;
+    refine_config.subpix_epsilon   = config_.saddle_subpix_epsilon;
 
     std::vector<RefinedCorner> refined = corner_refiner_.refine(
         work, raw.points, raw.grad_x, raw.grad_y, refine_config);
@@ -654,8 +660,18 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detectRecovery(
     auto detection = buildDetectionFromCorners(corners);
     if (!detection || !detection->valid()) return std::nullopt;
 
-    // Lattice-guided completion: fill weak corners inside the detected bbox
-    // using raw.points candidates (already computed, free).
+    // Lattice-guided completion: fill weak corners inside AND on the boundary
+    // of the detected grid using raw.points candidates (already computed, free).
+    //
+    // The loop extends one step BEYOND the detected bbox (min_i-1..max_i+1,
+    // min_j-1..max_j+1) so that physical border corners — which are real saddle
+    // points but have lower saddle scores because their patch overlaps the
+    // featureless white background — are picked up here instead of relying on
+    // the saddle filter.
+    //
+    // Interior missing corners use interpolation (two opposing neighbours).
+    // Border missing corners use extrapolation (one neighbour + lattice step).
+    // Corners that extend beyond the image are skipped silently.
     {
         const float spacing = estimateMedianSpacing(*detection);
 
@@ -809,130 +825,18 @@ CheckerboardDetector::buildVisibleTrackedDetection(
     if (static_cast<int>(tracked_corners.size()) < config_.min_tracking_corners)
         return std::nullopt;
 
-    // ----------------------------------------------------------------
-    // Grid-consistency filter — the authoritative per-corner validity check.
-    //
-    // Strategy: use only corners that have both axis-aligned neighbours
-    // (interpolation possible) as "anchor" corners. For each anchor, compute
-    // the interpolated expected position and accept only if the LK position
-    // is within pred_threshold of it.
-    //
-    // For non-anchor corners (boundary, only one neighbour per axis):
-    // check that the distance to each existing neighbour is within a tight
-    // window relative to the Q75 spacing of the anchor set. This rejects
-    // corners that have been pulled too close (perspective artifact) or too
-    // far (drifted off marker).
-    //
-    // Reference: Q75 of anchor-set spacings — dominated by well-visible
-    // uncompressed corners in the marker interior.
-    // ----------------------------------------------------------------
-
-    // Build fast UV lookup for the current tracked_corners set.
-    auto makeUvMap = [](const std::vector<GridCorner>& cs) {
-        std::vector<std::pair<std::pair<int,int>, cv::Point2f>> m;
-        m.reserve(cs.size());
-        for (const auto& c : cs)
-            m.push_back({{c.i, c.j}, c.uv});
-        return m;
-    };
-
-    auto findInMap = [](
-        const std::vector<std::pair<std::pair<int,int>, cv::Point2f>>& m,
-        int i, int j) -> const cv::Point2f*
-    {
-        for (const auto& p : m)
-            if (p.first.first == i && p.first.second == j)
-                return &p.second;
-        return nullptr;
-    };
-
-    // Compute Q75 spacing from the full tracked set.
-    float q75_spacing = 0.0f;
-    {
-        auto uv_map = makeUvMap(tracked_corners);
-        std::vector<float> dists;
-        dists.reserve(tracked_corners.size() * 2);
-        for (const auto& c : tracked_corners) {
-            const cv::Point2f* nb;
-            nb = findInMap(uv_map, c.i + 1, c.j);
-            if (nb) dists.push_back(distf(c.uv, *nb));
-            nb = findInMap(uv_map, c.i, c.j + 1);
-            if (nb) dists.push_back(distf(c.uv, *nb));
+    // Spacing consistency filter (geometric — not photometric).
+    if (config_.tracking_spacing_min_rel > 0.0f) {
+        const float q3_spacing = estimateMedianSpacing(previous);
+        if (q3_spacing > 1.0f) {
+            tracked_corners = removeOutlierCorners(
+                tracked_corners, q3_spacing, config_.min_tracking_corners);
+            tracked_corners = filterBySpacingConsistency(
+                tracked_corners, q3_spacing,
+                config_.tracking_spacing_min_rel,
+                config_.tracking_spacing_max_rel,
+                config_.min_tracking_corners);
         }
-        if (dists.size() >= 4) {
-            std::sort(dists.begin(), dists.end());
-            q75_spacing = dists[dists.size() * 3 / 4];
-        } else if (!dists.empty()) {
-            std::sort(dists.begin(), dists.end());
-            q75_spacing = dists[dists.size() / 2];
-        }
-    }
-
-    if (q75_spacing > 1.0f) {
-        // Strict thresholds relative to Q75 (best-visible corners):
-        // pred: max deviation from interpolated grid position.
-        // nb_lo/hi: allowed distance to a single axis-aligned neighbour.
-        const float pred   = q75_spacing * 0.22f;
-        const float nb_lo  = q75_spacing * 0.48f;
-        const float nb_hi  = q75_spacing * 1.28f;
-
-        std::vector<GridCorner> accepted;
-        accepted.reserve(tracked_corners.size());
-
-        auto uv_map = makeUvMap(tracked_corners);
-
-        for (const auto& c : tracked_corners) {
-            const cv::Point2f* p_im1 = findInMap(uv_map, c.i - 1, c.j);
-            const cv::Point2f* p_ip1 = findInMap(uv_map, c.i + 1, c.j);
-            const cv::Point2f* p_jm1 = findInMap(uv_map, c.i, c.j - 1);
-            const cv::Point2f* p_jp1 = findInMap(uv_map, c.i, c.j + 1);
-
-            // --- Interpolation check (both neighbours on same axis) ---
-            cv::Point2f predicted(0.0f, 0.0f);
-            int n_pred = 0;
-            if (p_im1 && p_ip1) { predicted += 0.5f * (*p_im1 + *p_ip1); ++n_pred; }
-            if (p_jm1 && p_jp1) { predicted += 0.5f * (*p_jm1 + *p_jp1); ++n_pred; }
-
-            if (n_pred > 0) {
-                predicted *= 1.0f / static_cast<float>(n_pred);
-                if (distf(c.uv, predicted) <= pred) {
-                    accepted.push_back(c);
-                }
-                // If interpolation possible but fails → reject (no fallback).
-                continue;
-            }
-
-            // --- Single-neighbour distance check (boundary corners) ---
-            // All available neighbours must be within [nb_lo, nb_hi].
-            const cv::Point2f* neighbours[4] = {p_im1, p_ip1, p_jm1, p_jp1};
-            float min_d = std::numeric_limits<float>::max();
-            int   n_nb  = 0;
-            bool  nb_fail = false;
-
-            for (const auto* nb : neighbours) {
-                if (!nb) continue;
-                const float d = distf(c.uv, *nb);
-                min_d = std::min(min_d, d);
-                ++n_nb;
-                if (d < nb_lo || d > nb_hi) { nb_fail = true; }
-            }
-
-            if (n_nb == 0) {
-                // Truly isolated — keep only if Q75 not yet established
-                // (early frames). Otherwise reject: no evidence it belongs
-                // to the grid.
-                continue;
-            }
-
-            if (!nb_fail) {
-                accepted.push_back(c);
-            }
-        }
-
-        if (static_cast<int>(accepted.size()) >= config_.min_tracking_corners) {
-            tracked_corners = std::move(accepted);
-        }
-        // If filter leaves too few, keep original set (safety fallback).
     }
 
     if (static_cast<int>(tracked_corners.size()) < config_.min_tracking_corners)
@@ -1070,65 +974,76 @@ void CheckerboardDetector::updateTrackingState(
         }
     }
 
-    // Sub-pixel refinement for all active corners.
-    // LK optical flow gives integer-accurate positions; cornerSubPix
-    // refines to sub-pixel accuracy every frame.  This prevents gradual
-    // position drift and ensures corners snap to the correct saddle point
-    // rather than sticking to a slightly wrong position.
-    if (!gray.empty()) {
-        // Collect active corner positions.
-        std::vector<cv::Point2f> pts;
-        std::vector<int>         active_idx;
-        pts.reserve(persistent_corners_.size());
-        active_idx.reserve(persistent_corners_.size());
+    // Fast eviction for geometrically inconsistent corners.
+    //
+    // Problem: when a neighbour corner is correctly evicted, the corner next
+    // to it loses its interpolation check and falls into the single-neighbour
+    // spacing band [0.50, 1.30] * Q75.  Under strong perspective rotation this
+    // band is too loose and the stale corner survives for max_missed_frames
+    // more frames before finally being evicted.
+    //
+    // Fix: any persistent corner with missed_frames > 0 (LK lost it or spacing
+    // filter rejected it this frame) that also has NO grid-adjacent neighbour
+    // currently tracked (missed_frames == 0) gets immediately bumped to
+    // max_missed_frames so it is evicted in the erase step below.
+    //
+    // "Grid-adjacent" means |Δi| + |Δj| == 1 (the four axis-aligned
+    // neighbours), matching the connectivity used by the lattice model.
+    if (config_.tracking_spacing_min_rel > 0.0f) {
+        for (auto& pc : persistent_corners_) {
+            if (pc.missed_frames == 0) continue;  // actively tracked — fine
 
-        for (int k = 0; k < static_cast<int>(persistent_corners_.size()); ++k) {
-            if (persistent_corners_[k].missed_frames != 0) continue;
-            pts.push_back(persistent_corners_[k].corner.uv);
-            active_idx.push_back(k);
+            bool has_tracked_neighbour = false;
+            for (const auto& nb : persistent_corners_) {
+                if (nb.missed_frames != 0) continue;
+                const int di = std::abs(nb.corner.i - pc.corner.i);
+                const int dj = std::abs(nb.corner.j - pc.corner.j);
+                if (di + dj == 1) {
+                    has_tracked_neighbour = true;
+                    break;
+                }
+            }
+
+            if (!has_tracked_neighbour) {
+                pc.missed_frames = config_.max_missed_frames + 1;
+            }
         }
+    }
 
-        if (!pts.empty()) {
-            // Window size: ~1/4 of expected spacing but at least 3px.
-            // We don't know spacing yet at this point so use a fixed
-            // reasonable default; tryCompleteMissingCorners uses spacing-
-            // adaptive sizing.
-            const cv::Size win(5, 5);
-            const cv::TermCriteria crit(
-                cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 15, 0.05);
+    // Photometric visibility eviction.
+    //
+    // For every corner that LK is still actively tracking (missed_frames==0),
+    // compute a checkerboard-contrast score along the local grid axes derived
+    // from active neighbours.  If the score falls below the threshold the
+    // corner has rotated to the back of the cylinder and is no longer
+    // photometrically a checkerboard crossing — evict immediately.
+    //
+    // This runs AFTER the geometric fast-eviction above so that isolated
+    // corners (no neighbours) are already handled and the axis estimation
+    // here can rely on a clean neighbour set.
+    if (config_.visibility_evict_threshold > 0.0f) {
+        const float spacing = estimateMedianSpacing(measured_detection);
+        if (spacing >= config_.visibility_min_spacing) {
+            const float alpha = config_.visibility_smoothing_alpha;
+            for (auto& pc : persistent_corners_) {
+                if (pc.missed_frames != 0) continue;
 
-            std::vector<cv::Point2f> refined = pts;
-            cv::cornerSubPix(gray, refined, win, cv::Size(-1,-1), crit);
+                pc.visibility_score = computeCornerVisibilityScore(gray, pc, spacing);
 
-            // Accept refined position only if it didn't move more than
-            // a small amount (prevents convergence to wrong feature).
-            // 4px is generous enough for LK drift but tight enough to
-            // reject jumps to neighbouring corners or dot centres.
-            constexpr float kMaxMove = 4.0f;
-            for (int m = 0; m < static_cast<int>(active_idx.size()); ++m) {
-                if (distf(refined[m], pts[m]) < kMaxMove) {
-                    persistent_corners_[active_idx[m]].corner.uv = refined[m];
+                // EMA smoothing: damps single-frame dips from triggering
+                // eviction while still reacting to genuine fade-out.
+                pc.smoothed_visibility_score =
+                    alpha * pc.visibility_score +
+                    (1.0f - alpha) * pc.smoothed_visibility_score;
+
+                if (pc.smoothed_visibility_score < config_.visibility_evict_threshold) {
+                    pc.missed_frames = config_.max_missed_frames + 1;
                 }
             }
         }
     }
 
-    // Eviction: remove corners that are out-of-image.
-    // Grid-consistency filtering is now done in buildVisibleTrackedDetection
-    // before corners reach the persistent state, so only a simple boundary
-    // check is needed here.
-    if (!gray.empty()) {
-        const float max_x = static_cast<float>(gray.cols) - 1.0f;
-        const float max_y = static_cast<float>(gray.rows) - 1.0f;
-        for (auto& pc : persistent_corners_) {
-            if (pc.missed_frames != 0) continue;
-            const cv::Point2f& uv = pc.corner.uv;
-            if (uv.x < 0.0f || uv.y < 0.0f || uv.x > max_x || uv.y > max_y)
-                pc.missed_frames = config_.max_missed_frames + 1;
-        }
-    }
-
-        // Evict corners that have been missed too long.
+    // Evict corners that have been missed too long.
     persistent_corners_.erase(
         std::remove_if(
             persistent_corners_.begin(),
@@ -1150,16 +1065,6 @@ void CheckerboardDetector::updateTrackingState(
         if (spacing > 1.0f) {
             injectRecoveryCorners(*recovery_detection, spacing);
         }
-    }
-
-    // Lattice-guided corner completion from the current gray frame.
-    // After LK tracking + recovery injection, some grid slots may still be
-    // empty (corners that just became visible or were missed by both LK and
-    // recovery).  We search for them by interpolating their expected position
-    // from known neighbours and looking for a gradient-junction candidate
-    // nearby in the current frame.
-    if (!gray.empty()) {
-        tryCompleteMissingCorners(gray, measured_detection.tracking);
     }
 
     last_detection_ = buildDetectionFromPersistent(
@@ -1186,26 +1091,61 @@ void CheckerboardDetector::updateTrackingState(
 // land on the same physical corner.
 // ============================================================
 
+// ============================================================
+// injectRecoveryCorners
+//
+// Two behaviours depending on whether the recovery corner matches
+// an existing persistent corner:
+//
+// A) Grid-ID match with active corner (missed_frames==0):
+//    Blend the LK position toward the recovery position using
+//    recovery_correction_weight.  Recovery ran cornerSubPix on the
+//    current frame and is more accurate than accumulated LK drift.
+//    Only applied when the distance is within
+//    recovery_correction_max_dist_rel * spacing (sanity guard).
+//
+// B) Grid-ID match with stale corner (missed_frames>0):
+//    Skip — the stale proximity guard already blocks re-injection;
+//    the eviction path will handle it.
+//
+// C) No match by grid ID and not too close to any active corner:
+//    Inject as a new persistent corner (original behaviour).
+// ============================================================
+
 void CheckerboardDetector::injectRecoveryCorners(
     const CheckerboardDetection& recovery_detection,
     float spacing
 ) {
-    // Proximity threshold: only reject if a persistent corner is very close.
-    // 0.35 * spacing (not 0.6) so that corners adjacent on the grid are not
-    // falsely suppressed — adjacent corners are ~1.0 * spacing apart, so
-    // 0.35 leaves a safe margin while still blocking true duplicates.
-    const float min_dist = spacing * 0.35f;
+    const float min_dist     = spacing * 0.6f;
+    const float max_corr_d   = spacing * config_.recovery_correction_max_dist_rel;
+    const float w            = config_.recovery_correction_weight;
 
     for (const auto& rc : recovery_detection.corners) {
-        // Skip if already tracked by grid ID.
-        if (findPersistentCornerByGrid(persistent_corners_, rc.i, rc.j) >= 0)
-            continue;
 
-        // Skip if a persistent corner occupies the same grid slot (different
-        // UV but same logical position — can happen after a partial reset).
-        // Also skip if physically too close to any persistent corner.
+        // --- Fix B: position correction for actively tracked corners ---
+        const int existing_idx =
+            findPersistentCornerByGrid(persistent_corners_, rc.i, rc.j);
+
+        if (existing_idx >= 0) {
+            auto& pc = persistent_corners_[existing_idx];
+
+            // Only correct active corners — stale ones are handled by eviction.
+            if (pc.missed_frames == 0 && w > 0.0f) {
+                const float d = distf(pc.corner.uv, rc.uv);
+                if (d < max_corr_d) {
+                    // Blend LK position toward recovery position.
+                    pc.corner.uv = (1.0f - w) * pc.corner.uv + w * rc.uv;
+                }
+            }
+            continue;
+        }
+
+        // --- Fix C: inject new corners not yet in persistent set ---
+        // Only check against active persistent corners to avoid stale
+        // corners blocking newly visible ones.
         bool too_close = false;
         for (const auto& pc : persistent_corners_) {
+            if (pc.missed_frames > 0) continue;  // ignore stale
             if (distf(pc.corner.uv, rc.uv) < min_dist) {
                 too_close = true;
                 break;
@@ -1222,215 +1162,6 @@ void CheckerboardDetector::injectRecoveryCorners(
 }
 
 
-// ============================================================
-// tryCompleteMissingCorners
-//
-// Finds missing grid corners every frame directly from the image,
-// without relying on a full Recovery detection.
-//
-// For each empty grid slot within (and just outside) the bounding box
-// of currently visible corners:
-//   1. Interpolate the expected UV from grid neighbours.
-//      Interpolation (two neighbours on same axis) is preferred;
-//      extrapolation (one-sided, needs two points on same side) is
-//      used at the marker boundary.
-//   2. Run cornerSubPix at the expected position — this is a local
-//      sub-pixel refinement that works independently of the global
-//      saddle-response threshold and finds a corner immediately if
-//      one exists near the predicted location.
-//   3. Validate the result: refined position must be within
-//      search_r of the expected position and not duplicate an
-//      existing persistent corner.
-//   4. Inject into persistent_corners_ with missed_frames=0.
-//
-// Using cornerSubPix instead of searching raw.points means the corner
-// is found in frame N+0 (not after waiting for the saddle detector to
-// fire) and is insensitive to global threshold tuning.
-// ============================================================
-
-void CheckerboardDetector::tryCompleteMissingCorners(
-    const cv::Mat& gray,
-    bool /*tracking*/
-) {
-    // Build lookup of currently visible corners.
-    std::vector<std::pair<std::pair<int,int>, cv::Point2f>> by_ij;
-    by_ij.reserve(persistent_corners_.size());
-
-    for (const auto& pc : persistent_corners_) {
-        if (pc.missed_frames != 0) continue;
-        by_ij.push_back({{pc.corner.i, pc.corner.j}, pc.corner.uv});
-    }
-
-    if (static_cast<int>(by_ij.size()) < config_.min_corners) return;
-
-    auto findUv = [&](int i, int j) -> const cv::Point2f* {
-        for (const auto& p : by_ij)
-            if (p.first.first == i && p.first.second == j)
-                return &p.second;
-        return nullptr;
-    };
-
-    // Estimate median spacing from visible corners.
-    float spacing = 0.0f;
-    {
-        std::vector<float> dists;
-        dists.reserve(by_ij.size() * 2);
-        for (const auto& p : by_ij) {
-            const cv::Point2f* nb = findUv(p.first.first + 1, p.first.second);
-            if (nb) dists.push_back(distf(p.second, *nb));
-            nb = findUv(p.first.first, p.first.second + 1);
-            if (nb) dists.push_back(distf(p.second, *nb));
-        }
-        if (dists.empty()) return;
-        std::sort(dists.begin(), dists.end());
-        spacing = dists[dists.size() / 2];
-    }
-
-    if (spacing < 4.0f) return;
-
-    // Bounding box of known grid indices — NO expansion.
-    // Only search within the range already established by tracked corners.
-    // Boundary corners (just outside current bbox) are picked up by
-    // injectRecoveryCorners which has a full lattice fit for context.
-    // Expanding here caused unbounded growth every frame.
-    int min_i = std::numeric_limits<int>::max();
-    int max_i = std::numeric_limits<int>::min();
-    int min_j = std::numeric_limits<int>::max();
-    int max_j = std::numeric_limits<int>::min();
-
-    for (const auto& p : by_ij) {
-        min_i = std::min(min_i, p.first.first);
-        max_i = std::max(max_i, p.first.first);
-        min_j = std::min(min_j, p.first.second);
-        max_j = std::max(max_j, p.first.second);
-    }
-
-    // cornerSubPix parameters: search window ~ spacing/4, tight criterion.
-    const int subpix_half = std::max(3, static_cast<int>(spacing * 0.25f));
-    const cv::Size subpix_win(subpix_half, subpix_half);
-    const cv::Size subpix_dead(-1, -1);
-    const cv::TermCriteria subpix_crit(
-        cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 20, 0.05);
-
-    // Max allowed displacement of refined position from expected.
-    const float search_r  = spacing * 0.45f;
-    // Min distance from existing persistent corners (duplicate guard).
-    const float min_dist  = spacing * 0.35f;
-
-    for (int gi = min_i; gi <= max_i; ++gi) {
-        for (int gj = min_j; gj <= max_j; ++gj) {
-            if (findUv(gi, gj)) continue;
-            if (findPersistentCornerByGrid(persistent_corners_, gi, gj) >= 0) continue;
-
-            // --- Compute expected position ---
-            const cv::Point2f* p_im1 = findUv(gi - 1, gj);
-            const cv::Point2f* p_ip1 = findUv(gi + 1, gj);
-            const cv::Point2f* p_jm1 = findUv(gi, gj - 1);
-            const cv::Point2f* p_jp1 = findUv(gi, gj + 1);
-
-            cv::Point2f expected(0.0f, 0.0f);
-            int count = 0;
-
-            // Interpolation (preferred — both neighbours on same axis).
-            if (p_im1 && p_ip1) { expected += 0.5f * (*p_im1 + *p_ip1); ++count; }
-            if (p_jm1 && p_jp1) { expected += 0.5f * (*p_jm1 + *p_jp1); ++count; }
-
-            // Extrapolation (boundary — one side only, needs 2 points).
-            if (count == 0) {
-                if (!p_ip1 && p_im1) {
-                    const cv::Point2f* p_im2 = findUv(gi - 2, gj);
-                    if (p_im2) { expected = *p_im1 + (*p_im1 - *p_im2); ++count; }
-                }
-                if (!p_im1 && p_ip1) {
-                    const cv::Point2f* p_ip2 = findUv(gi + 2, gj);
-                    if (p_ip2) { expected = *p_ip1 + (*p_ip1 - *p_ip2); ++count; }
-                }
-                if (count == 0 && !p_jp1 && p_jm1) {
-                    const cv::Point2f* p_jm2 = findUv(gi, gj - 2);
-                    if (p_jm2) { expected = *p_jm1 + (*p_jm1 - *p_jm2); ++count; }
-                }
-                if (count == 0 && !p_jm1 && p_jp1) {
-                    const cv::Point2f* p_jp2 = findUv(gi, gj + 2);
-                    if (p_jp2) { expected = *p_jp1 + (*p_jp1 - *p_jp2); ++count; }
-                }
-            }
-
-            if (count == 0) continue;
-            if (count > 1) expected *= 1.0f / static_cast<float>(count);
-
-            // Boundary check.
-            const float margin = static_cast<float>(subpix_half + 2);
-            if (expected.x < margin || expected.y < margin) continue;
-            if (expected.x >= static_cast<float>(gray.cols) - margin) continue;
-            if (expected.y >= static_cast<float>(gray.rows) - margin) continue;
-
-            // Duplicate guard on expected position.
-            bool too_close = false;
-            for (const auto& pc : persistent_corners_) {
-                if (distf(pc.corner.uv, expected) < min_dist) {
-                    too_close = true; break;
-                }
-            }
-            if (too_close) continue;
-
-            // --- cornerSubPix refinement at expected position ---
-            // cornerSubPix refines locally without any global threshold —
-            // it finds the corner immediately if the image structure exists.
-            std::vector<cv::Point2f> pts = { expected };
-            cv::cornerSubPix(gray, pts, subpix_win, subpix_dead, subpix_crit);
-            const cv::Point2f refined = pts[0];
-
-            // Reject if refinement moved too far (converged to wrong feature).
-            if (distf(refined, expected) > search_r) continue;
-
-            // Boundary check on refined position.
-            if (refined.x < 2.0f || refined.y < 2.0f) continue;
-            if (refined.x >= static_cast<float>(gray.cols) - 2.0f) continue;
-            if (refined.y >= static_cast<float>(gray.rows) - 2.0f) continue;
-
-            // Final duplicate guard on refined position.
-            bool pt_too_close = false;
-            for (const auto& pc : persistent_corners_) {
-                if (distf(pc.corner.uv, refined) < min_dist) {
-                    pt_too_close = true; break;
-                }
-            }
-            if (pt_too_close) continue;
-
-            // Quadrant symmetry check: verify the refined position actually
-            // has a checkerboard corner pattern (alternating bright/dark).
-            // This rejects cornerSubPix results that converged to table edges,
-            // bottle edges, or other non-checkerboard features.
-            if (config_.quadrant_half_r > 0) {
-                cv::Mat gray_f;
-                gray.convertTo(gray_f, CV_32F);
-                // Use a half_r scaled to spacing for reliable sampling.
-                const int half_r = std::max(
-                    config_.quadrant_half_r,
-                    static_cast<int>(spacing * 0.15f));
-                if (!passesQuadrantTest(gray_f, refined, half_r,
-                                        config_.quadrant_min_contrast,
-                                        config_.quadrant_max_diagonal_diff))
-                    continue;
-            }
-
-            // Inject.
-            GridCorner gc;
-            gc.i  = gi;
-            gc.j  = gj;
-            gc.uv = refined;
-
-            PersistentTrackedCorner pc;
-            pc.corner        = gc;
-            pc.missed_frames = 0;
-            pc.tracked       = true;
-            persistent_corners_.push_back(pc);
-
-            // Make available to subsequent slots in this iteration.
-            by_ij.push_back({{gi, gj}, refined});
-        }
-    }
-}
 
 
 // ============================================================
@@ -1449,7 +1180,9 @@ CheckerboardDetection CheckerboardDetector::buildDetectionFromPersistent(
 
     for (const auto& pc : persistent_corners_) {
         if (pc.missed_frames != 0) continue;
-        visible_corners.push_back(pc.corner);
+        GridCorner gc = pc.corner;
+        gc.visibility_score = pc.smoothed_visibility_score;
+        visible_corners.push_back(gc);
     }
 
     auto rebuilt = grid_builder_.buildFromCorners(
@@ -1575,4 +1308,161 @@ bool CheckerboardDetector::hasNearbyPoint(
     return false;
 }
 
+
+// ============================================================
+// computeCornerVisibilityScore
+//
+// Computes a photometric checkerboard-contrast score in [0,1].
+//
+// Approach (Option B — neighbour-derived axes):
+//   1. Find up to two active grid neighbours of pc in persistent_corners_:
+//      the (i+1,j) neighbour gives axis_u, the (i,j+1) neighbour gives axis_v.
+//      If only one axis is available we use the perpendicular as the other.
+//      If no neighbour is available we return 0 (isolated corner — handled
+//      by the existing fast-eviction rule).
+//   2. Sample four quadrant mean intensities displaced by
+//      ±visibility_sample_rel * spacing along axis_u and axis_v.
+//   3. Score = max adjacent-pair contrast / local_range, normalised to [0,1].
+//      A perfect checkerboard corner scores ~1.0; a featureless or
+//      back-side corner scores near 0.
+// ============================================================
+
+float CheckerboardDetector::computeCornerVisibilityScore(
+    const cv::Mat& gray,
+    const PersistentTrackedCorner& pc,
+    float spacing
+) const {
+    // Minimum spacing guard — avoids noisy scores on tiny markers.
+    if (spacing < config_.visibility_min_spacing) return 1.0f;
+
+    const cv::Point2f& uv = pc.corner.uv;
+
+    // ---- Step 1: derive grid axes from active neighbours ----
+    cv::Point2f axis_u(0.0f, 0.0f);
+    cv::Point2f axis_v(0.0f, 0.0f);
+    bool has_u = false;
+    bool has_v = false;
+
+    for (const auto& nb : persistent_corners_) {
+        if (nb.missed_frames != 0) continue;  // only active neighbours
+
+        const int di = nb.corner.i - pc.corner.i;
+        const int dj = nb.corner.j - pc.corner.j;
+
+        if (!has_u && std::abs(di) == 1 && dj == 0) {
+            cv::Point2f v = nb.corner.uv - uv;
+            const float n = std::sqrt(v.x * v.x + v.y * v.y);
+            if (n > 1.0f) {
+                axis_u = v * (1.0f / n);
+                // Normalise direction: always point toward increasing i.
+                if (di < 0) axis_u = -axis_u;
+                has_u = true;
+            }
+        }
+
+        if (!has_v && di == 0 && std::abs(dj) == 1) {
+            cv::Point2f v = nb.corner.uv - uv;
+            const float n = std::sqrt(v.x * v.x + v.y * v.y);
+            if (n > 1.0f) {
+                axis_v = v * (1.0f / n);
+                if (dj < 0) axis_v = -axis_v;
+                has_v = true;
+            }
+        }
+
+        if (has_u && has_v) break;
+    }
+
+    // If we have one axis, derive the other as its perpendicular.
+    if (has_u && !has_v) {
+        axis_v = cv::Point2f(-axis_u.y, axis_u.x);
+        has_v  = true;
+    } else if (has_v && !has_u) {
+        axis_u = cv::Point2f(axis_v.y, -axis_v.x);
+        has_u  = true;
+    }
+
+    // No neighbours at all — isolated corner, fast-eviction handles it.
+    if (!has_u || !has_v) return 0.0f;
+
+    // ---- Step 2: sample four quadrant means ----
+    const float offset  = spacing * config_.visibility_sample_rel;
+    const float box_r   = spacing * config_.visibility_box_rel;
+    const int   box_r_i = std::max(1, static_cast<int>(std::round(box_r)));
+
+    // Quadrant centres (in image coordinates):
+    //   Q0: +axis_u  +axis_v  (top-right in grid space)
+    //   Q1: -axis_u  +axis_v  (top-left)
+    //   Q2: +axis_u  -axis_v  (bottom-right)
+    //   Q3: -axis_u  -axis_v  (bottom-left)
+    // Opposite pairs (Q0,Q3) and (Q1,Q2) should have similar intensity;
+    // adjacent pairs should differ — the classic checkerboard pattern.
+    const cv::Point2f centres[4] = {
+        uv + offset * axis_u + offset * axis_v,
+        uv - offset * axis_u + offset * axis_v,
+        uv + offset * axis_u - offset * axis_v,
+        uv - offset * axis_u - offset * axis_v
+    };
+
+    // Box-mean sampler on CV_8U gray image.
+    auto boxMean = [&](const cv::Point2f& c) -> float {
+        const int cx = static_cast<int>(std::lround(c.x));
+        const int cy = static_cast<int>(std::lround(c.y));
+        const int x0 = std::max(0, cx - box_r_i);
+        const int y0 = std::max(0, cy - box_r_i);
+        const int x1 = std::min(gray.cols - 1, cx + box_r_i);
+        const int y1 = std::min(gray.rows - 1, cy + box_r_i);
+        if (x1 < x0 || y1 < y0) return -1.0f;  // out of image
+        float sum = 0.0f; int cnt = 0;
+        for (int y = y0; y <= y1; ++y) {
+            const uchar* row = gray.ptr<uchar>(y);
+            for (int x = x0; x <= x1; ++x) { sum += row[x]; ++cnt; }
+        }
+        return cnt > 0 ? sum / static_cast<float>(cnt) : -1.0f;
+    };
+
+    float q[4];
+    for (int k = 0; k < 4; ++k) {
+        q[k] = boxMean(centres[k]);
+        if (q[k] < 0.0f) return 1.0f;  // sample out of image — keep corner
+    }
+
+    // ---- Step 3: compute score ----
+    const float local_min = std::min({q[0], q[1], q[2], q[3]});
+    const float local_max = std::max({q[0], q[1], q[2], q[3]});
+    const float local_range = local_max - local_min;
+
+    // Completely flat region — no checkerboard structure.
+    if (local_range < 2.0f) return 0.0f;
+
+    // Normalise to [0,1].
+    const float inv = 1.0f / local_range;
+    const float n0 = (q[0] - local_min) * inv;
+    const float n1 = (q[1] - local_min) * inv;
+    const float n2 = (q[2] - local_min) * inv;
+    const float n3 = (q[3] - local_min) * inv;
+
+    // Adjacent contrast: max over all four axis-crossing pairs.
+    // For a perfect checkerboard this equals 1.0 (one pair is 0 vs 1).
+    // For a back-side corner with uniform dark/light it approaches 0.
+    const float adj_score = std::max({
+        std::abs(n0 - n1),   // same v, different u
+        std::abs(n2 - n3),
+        std::abs(n0 - n2),   // same u, different v
+        std::abs(n1 - n3)
+    });
+
+    // Diagonal consistency penalty: opposite quadrants should be similar.
+    // If they differ strongly, the corner is not a clean checkerboard crossing.
+    const float diag_penalty = std::max(
+        std::abs(n0 - n3),   // Q0 vs Q3 (opposite)
+        std::abs(n1 - n2)    // Q1 vs Q2 (opposite)
+    );
+
+    // Final score: high adjacent contrast AND low diagonal difference → 1.0.
+    // Back-side corner: adj_score small → score near 0.
+    // Dot centre (all dark): local_range small → already caught above.
+    const float score = std::max(0.0f, adj_score - diag_penalty);
+    return std::min(1.0f, score);
+}
 } // namespace hydramarker

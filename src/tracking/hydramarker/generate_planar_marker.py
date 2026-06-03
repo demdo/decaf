@@ -94,35 +94,66 @@ def sanitize_marker_name(name: str) -> str:
     return "".join(safe)
 
 
-def render_marker_image(field: np.ndarray, cell_px: int, dot_radius_rel: float) -> np.ndarray:
-    field = np.asarray(field, dtype=np.uint8)
-    rows, cols = field.shape
+def render_marker_image(
+    field: np.ndarray,
+    cell_px: int,
+    dot_radius_rel: float,
+    padding_rel: float = 0.0,
+) -> np.ndarray:
+    """Render the marker field as a BGR image.
 
-    img_h = rows * cell_px
-    img_w = cols * cell_px
+    padding_rel controls the checkerboard border rendered around the core field.
+    A value of 0.0 means no border; 1.0 means a full cell-width border.
+    The border continues the checkerboard pattern but contains no dots, giving
+    the saddle detector full contrast on all four sides of every border corner.
+    The physical border width is ``padding_rel * cell_px`` pixels.
+    """
+    field = np.asarray(field, dtype=np.uint8)
+    core_rows, core_cols = field.shape
+
+    pad_px = int(round(padding_rel * cell_px))
+
+    # Total grid including one full padding cell on each side (needed to
+    # generate the correct checker colour at the border).  We render a grid
+    # that is (core + 2) cells wide/tall and then crop to pad_px pixels of
+    # the outer ring.
+    if pad_px > 0:
+        total_rows = core_rows + 2
+        total_cols = core_cols + 2
+        row_offset = 1  # core starts at row index 1 in the extended grid
+        col_offset = 1
+    else:
+        total_rows = core_rows
+        total_cols = core_cols
+        row_offset = 0
+        col_offset = 0
+
+    img_h = total_rows * cell_px
+    img_w = total_cols * cell_px
     img = np.full((img_h, img_w, 3), 255, dtype=np.uint8)
 
-    for row in range(rows):
-        for col in range(cols):
+    for row in range(total_rows):
+        for col in range(total_cols):
             y0 = row * cell_px
             x0 = col * cell_px
             y1 = y0 + cell_px
             x1 = x0 + cell_px
-
             black_cell = ((row + col) % 2 == 0)
             img[y0:y1, x0:x1] = (0, 0, 0) if black_cell else (255, 255, 255)
 
     dot_radius_px = max(1, int(round(dot_radius_rel * cell_px)))
 
-    for row in range(rows):
-        for col in range(cols):
+    for row in range(core_rows):
+        for col in range(core_cols):
             if int(field[row, col]) != 1:
                 continue
 
-            cx = col * cell_px + cell_px // 2
-            cy = row * cell_px + cell_px // 2
+            grid_row = row + row_offset
+            grid_col = col + col_offset
+            cx = grid_col * cell_px + cell_px // 2
+            cy = grid_row * cell_px + cell_px // 2
 
-            black_cell = ((row + col) % 2 == 0)
+            black_cell = ((grid_row + grid_col) % 2 == 0)
             dot_color = (255, 255, 255) if black_cell else (0, 0, 0)
 
             cv2.circle(
@@ -133,6 +164,14 @@ def render_marker_image(field: np.ndarray, cell_px: int, dot_radius_rel: float) 
                 thickness=-1,
                 lineType=cv2.LINE_AA,
             )
+
+    # Crop: keep pad_px pixels of the outer ring on each side.
+    if pad_px > 0:
+        crop_top    = cell_px - pad_px
+        crop_left   = cell_px - pad_px
+        crop_bottom = img_h - (cell_px - pad_px)
+        crop_right  = img_w - (cell_px - pad_px)
+        img = img[crop_top:crop_bottom, crop_left:crop_right]
 
     return img
 
@@ -175,10 +214,25 @@ def build_meta(
     cell_px: int,
     dot_radius_rel: float,
     marker_name: str,
+    padding_rel: float = 0.0,
 ) -> dict:
     square_size_cm = square_size_mm / 10.0
-    detectable_corner_rows = rows - 1
-    detectable_corner_cols = cols - 1
+    pad_mm = padding_rel * square_size_mm
+    # With padding the outermost corner ring is fully visible and reliably
+    # detected, so all (rows+1)×(cols+1) corners are detectable and the
+    # id_encoding origin sits at (0,0).  Without padding the outer ring is
+    # unreliable, so only the inner (rows-1)×(cols-1) corners are used and
+    # the origin is offset by (1,1).
+    if padding_rel > 0.0:
+        detectable_corner_rows = rows + 1
+        detectable_corner_cols = cols + 1
+        id_origin_row = 0
+        id_origin_col = 0
+    else:
+        detectable_corner_rows = rows - 1
+        detectable_corner_cols = cols - 1
+        id_origin_row = 1
+        id_origin_col = 1
 
     if detectable_corner_rows < 2 or detectable_corner_cols < 2:
         raise ValueError(
@@ -194,7 +248,9 @@ def build_meta(
         "patch_size": patch_size,
         "square_size_cm": square_size_cm,
         "square_size_mm": square_size_mm,
-        "has_border": False,
+        "padding_rel": padding_rel,
+        "padding_mm": round(pad_mm, 6),
+        "has_border": pad_mm > 0.0,
         "origin": "top_left",
         "x_axis": "col_positive",
         "y_axis": "row_positive",
@@ -207,8 +263,8 @@ def build_meta(
             "type": "row_major",
             "id_base": 0,
             "num_cols": detectable_corner_cols,
-            "origin_row": 1,
-            "origin_col": 1,
+            "origin_row": id_origin_row,
+            "origin_col": id_origin_col,
             "formula": (
                 "marker_id = "
                 "(origin_row + local_row) * num_cols + "
@@ -251,39 +307,64 @@ def write_pdf_file(
     field: np.ndarray,
     square_size_mm: float,
     dot_radius_rel: float,
+    padding_rel: float = 0.0,
 ) -> None:
+    """Write the marker as a PDF.
+
+    The PDF page is sized to the visible marker including the padding border.
+    padding_rel is the border width as a fraction of square_size_mm (0–1).
+    """
     field = np.asarray(field, dtype=np.uint8)
 
     if field.ndim != 2:
         raise ValueError("field must be a 2D array")
 
-    rows, cols = field.shape
-    width_pt = cols * square_size_mm * mm
-    height_pt = rows * square_size_mm * mm
-    cell_pt = square_size_mm * mm
+    core_rows, core_cols = field.shape
+    pad_mm = padding_rel * square_size_mm
+
+    # Page size = core + 2 * partial padding strip.
+    page_width_mm  = core_cols * square_size_mm + 2.0 * pad_mm
+    page_height_mm = core_rows * square_size_mm + 2.0 * pad_mm
+
+    cell_pt    = square_size_mm * mm
+    pad_pt     = pad_mm * mm
+    page_w_pt  = page_width_mm  * mm
+    page_h_pt  = page_height_mm * mm
     dot_radius_pt = dot_radius_rel * cell_pt
 
-    c = canvas.Canvas(str(path), pagesize=(width_pt, height_pt), pageCompression=0)
+    # Extended grid dimensions (core + 2 padding cells on each side).
+    # We render the full extended grid but only the strip of pad_pt is visible
+    # because the page is cropped to page_w_pt x page_h_pt.
+    # In reportlab the origin is bottom-left; we offset by pad_pt so that
+    # cell (0,0) of the core starts at (pad_pt, page_h_pt - pad_pt - cell_pt).
+    total_rows = core_rows + 2
+    total_cols = core_cols + 2
+
+    c = canvas.Canvas(str(path), pagesize=(page_w_pt, page_h_pt), pageCompression=0)
     c.setTitle(path.stem)
 
-    for row in range(rows):
-        for col in range(cols):
-            x0 = col * cell_pt
-            y0 = height_pt - (row + 1) * cell_pt
-
+    for row in range(total_rows):
+        for col in range(total_cols):
+            # Position relative to page: shift by (pad_pt - cell_pt) so that
+            # the extended grid is centred and only pad_pt of the outer ring
+            # is visible within the page bounds.
+            x0 = (col - 1) * cell_pt + pad_pt
+            y0 = page_h_pt - ((row - 1) * cell_pt + pad_pt) - cell_pt
             black_cell = ((row + col) % 2 == 0)
             c.setFillColor(black if black_cell else white)
             c.rect(x0, y0, cell_pt, cell_pt, stroke=0, fill=1)
 
-    for row in range(rows):
-        for col in range(cols):
+    for row in range(core_rows):
+        for col in range(core_cols):
             if int(field[row, col]) != 1:
                 continue
 
-            cx = (col + 0.5) * cell_pt
-            cy = height_pt - (row + 0.5) * cell_pt
+            grid_row = row + 1
+            grid_col = col + 1
+            cx = (grid_col - 1) * cell_pt + pad_pt + 0.5 * cell_pt
+            cy = page_h_pt - ((grid_row - 1) * cell_pt + pad_pt) - 0.5 * cell_pt
 
-            black_cell = ((row + col) % 2 == 0)
+            black_cell = ((grid_row + grid_col) % 2 == 0)
             c.setFillColor(white if black_cell else black)
             c.circle(cx, cy, dot_radius_pt, stroke=0, fill=1)
 
@@ -360,6 +441,17 @@ class GeneratePlanarMarkerUI(QWidget):
         self.square_size_mm_spin.setValue(5.0)
         self.square_size_mm_spin.setSuffix(" mm")
 
+        self.padding_rel_spin = QDoubleSpinBox()
+        self.padding_rel_spin.setRange(0.0, 1.0)
+        self.padding_rel_spin.setDecimals(2)
+        self.padding_rel_spin.setSingleStep(0.05)
+        self.padding_rel_spin.setValue(0.3)
+        self.padding_rel_spin.setToolTip(
+            "Border width as a fraction of the cell size (0 = no border, 1 = full cell).\n"
+            "The border continues the checkerboard pattern without dots so that\n"
+            "edge corners have full saddle contrast on all four sides."
+        )
+
         self.marker_name_edit = QLineEdit()
         self.marker_name_edit.setPlaceholderText("Leave empty for automatic name")
 
@@ -392,6 +484,7 @@ class GeneratePlanarMarkerUI(QWidget):
         form.addRow("Cols / Cells X", self.cols_spin)
         form.addRow("Patch size k", self.patch_size_spin)
         form.addRow("Square size [mm]", self.square_size_mm_spin)
+        form.addRow("Border padding [0–1]", self.padding_rel_spin)
         form.addRow("Marker name", self.marker_name_edit)
 
         output_row = QHBoxLayout()
@@ -427,6 +520,7 @@ class GeneratePlanarMarkerUI(QWidget):
         self.cols_spin.valueChanged.connect(self.on_params_changed)
         self.patch_size_spin.valueChanged.connect(self.on_params_changed)
         self.square_size_mm_spin.valueChanged.connect(self.on_params_changed)
+        self.padding_rel_spin.valueChanged.connect(self.on_params_changed)
         self.marker_name_edit.textChanged.connect(self._update_auto_name_placeholder)
 
     def _update_auto_name_placeholder(self) -> None:
@@ -465,15 +559,18 @@ class GeneratePlanarMarkerUI(QWidget):
         if not marker_name:
             marker_name = auto_marker_name(rows, cols, patch_size, square_size_mm)
 
+        padding_rel = float(self.padding_rel_spin.value())
+        pad_mm = padding_rel * square_size_mm
         cell_px = mm_to_px(square_size_mm, DEFAULT_PREVIEW_DPI)
-        width_mm = cols * square_size_mm
-        height_mm = rows * square_size_mm
+        width_mm  = cols * square_size_mm + 2.0 * pad_mm
+        height_mm = rows * square_size_mm + 2.0 * pad_mm
 
         return {
             "rows": rows,
             "cols": cols,
             "patch_size": patch_size,
             "square_size_mm": square_size_mm,
+            "padding_rel": padding_rel,
             "cell_px": cell_px,
             "dot_radius_rel": DEFAULT_DOT_RADIUS_REL,
             "preview_dpi": DEFAULT_PREVIEW_DPI,
@@ -542,6 +639,7 @@ class GeneratePlanarMarkerUI(QWidget):
                 field=field,
                 cell_px=params["cell_px"],
                 dot_radius_rel=params["dot_radius_rel"],
+                padding_rel=params["padding_rel"],
             )
 
             self.current_field = field
@@ -555,7 +653,9 @@ class GeneratePlanarMarkerUI(QWidget):
                 f"Field: {params['rows']} x {params['cols']} cells\n"
                 f"Patch size: {params['patch_size']} x {params['patch_size']}\n"
                 f"Square size: {params['square_size_mm']:.3f} mm\n"
-                f"Physical marker size: {params['width_mm']:.3f} x "
+                f"Border padding: {params['padding_rel']:.2f} × cell = "
+                f"{params['padding_rel'] * params['square_size_mm']:.3f} mm\n"
+                f"Physical marker size (incl. border): {params['width_mm']:.3f} x "
                 f"{params['height_mm']:.3f} mm\n"
                 f"Preview raster: {params['cell_px']} px/cell at "
                 f"{params['preview_dpi']} dpi\n"
@@ -623,6 +723,7 @@ class GeneratePlanarMarkerUI(QWidget):
                 cell_px=params["cell_px"],
                 dot_radius_rel=params["dot_radius_rel"],
                 marker_name=name,
+                padding_rel=params["padding_rel"],
             )
 
             # Write to temporary files first. This prevents partial output if one export fails.
@@ -640,6 +741,7 @@ class GeneratePlanarMarkerUI(QWidget):
                 self.current_field,
                 params["square_size_mm"],
                 params["dot_radius_rel"],
+                params["padding_rel"],
             )
             write_temp_then_replace(write_json_file, json_path, ".json", meta)
 

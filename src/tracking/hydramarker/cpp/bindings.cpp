@@ -168,14 +168,32 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def(py::init<>())
         .def_readwrite("i", &GridCorner::i)
         .def_readwrite("j", &GridCorner::j)
-        .def_readwrite("uv", &GridCorner::uv);
+        .def_readwrite("uv", &GridCorner::uv)
+        .def_readwrite("visibility_score", &GridCorner::visibility_score);
 
     py::class_<GridCell>(m, "GridCell")
         .def(py::init<>())
         .def_readwrite("i", &GridCell::i)
         .def_readwrite("j", &GridCell::j)
         .def_readwrite("corner_indices", &GridCell::corner_indices)
-        .def_readwrite("corner_uv", &GridCell::corner_uv)
+        .def_property(
+            "corner_uv",
+            [](const GridCell& self) -> py::list {
+                py::list lst;
+                for (const auto& pt : self.corner_uv) {
+                    lst.append(pt);
+                }
+                return lst;
+            },
+            [](GridCell& self, py::sequence seq) {
+                if (py::len(seq) != 4) {
+                    throw std::runtime_error("corner_uv requires exactly 4 Point2f elements");
+                }
+                for (size_t k = 0; k < 4; ++k) {
+                    self.corner_uv[k] = seq[k].cast<cv::Point2f>();
+                }
+            }
+        )
         .def_readwrite("center_uv", &GridCell::center_uv);
 
     py::class_<CheckerboardDetection>(m, "CheckerboardDetection")
@@ -230,7 +248,17 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("tracking_spacing_max_rel", &CheckerboardDetectorConfig::tracking_spacing_max_rel)
         .def_readwrite("max_degraded_frames_before_reset", &CheckerboardDetectorConfig::max_degraded_frames_before_reset)
         .def_readwrite("max_missed_frames", &CheckerboardDetectorConfig::max_missed_frames)
-        .def_readwrite("max_low_corner_frames", &CheckerboardDetectorConfig::max_low_corner_frames);
+        .def_readwrite("max_low_corner_frames", &CheckerboardDetectorConfig::max_low_corner_frames)
+        .def_readwrite("visibility_sample_rel", &CheckerboardDetectorConfig::visibility_sample_rel)
+        .def_readwrite("visibility_box_rel", &CheckerboardDetectorConfig::visibility_box_rel)
+        .def_readwrite("visibility_evict_threshold", &CheckerboardDetectorConfig::visibility_evict_threshold)
+        .def_readwrite("visibility_min_spacing", &CheckerboardDetectorConfig::visibility_min_spacing)
+        .def_readwrite("visibility_smoothing_alpha", &CheckerboardDetectorConfig::visibility_smoothing_alpha)
+        .def_readwrite("saddle_subpix_win_size", &CheckerboardDetectorConfig::saddle_subpix_win_size)
+        .def_readwrite("saddle_subpix_max_iters", &CheckerboardDetectorConfig::saddle_subpix_max_iters)
+        .def_readwrite("saddle_subpix_epsilon", &CheckerboardDetectorConfig::saddle_subpix_epsilon)
+        .def_readwrite("recovery_correction_weight", &CheckerboardDetectorConfig::recovery_correction_weight)
+        .def_readwrite("recovery_correction_max_dist_rel", &CheckerboardDetectorConfig::recovery_correction_max_dist_rel);
 
     py::class_<geom::CellGeometryValidationConfig>(m, "CellGeometryValidationConfig")
         .def(py::init<>())
@@ -328,7 +356,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("warmup_frames", &DotDetectorConfig::warmup_frames)
         .def_readwrite("temporal_alpha", &DotDetectorConfig::temporal_alpha)
         .def_readwrite("commit_frames", &DotDetectorConfig::commit_frames)
-        .def_readwrite("revoke_frames", &DotDetectorConfig::revoke_frames);
+        .def_readwrite("revoke_frames", &DotDetectorConfig::revoke_frames)
+        .def_readwrite("use_temporal_smoothing", &DotDetectorConfig::use_temporal_smoothing);
 
     py::class_<RefinedCorner>(m, "RefinedCorner")
         .def(py::init<>())
@@ -406,7 +435,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 return self.detect(mat, checkerboard);
             }
         )
-        .def("reset", &DotDetector::reset);
+        .def("reset", &DotDetector::reset)
+        .def("reset_smoothing", &DotDetector::reset_smoothing);
 
     py::class_<LocalPatch>(m, "LocalPatch")
         .def_readonly("row", &LocalPatch::row)

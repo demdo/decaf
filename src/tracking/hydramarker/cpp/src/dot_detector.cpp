@@ -25,6 +25,32 @@ void DotDetector::reset()
     temporal_states_.clear();
 }
 
+void DotDetector::reset_smoothing()
+{
+    for (auto& kv : temporal_states_) {
+        TemporalCellState& state = kv.second;
+
+        // EMA-Score auf den aktuellen has_dot-Zustand zuruecksetzen:
+        // hat die Zelle einen Dot, setzen wir den Score auf commit_threshold,
+        // sonst auf revoke_threshold. Damit startet der EMA neu ohne
+        // dass der naechste raw_score gegen einen weit entfernten
+        // eingefroren Wert ankämpfen muss.
+        if (state.has_dot) {
+            state.ema_score = config_.commit_threshold;
+        } else {
+            state.ema_score = config_.revoke_threshold;
+        }
+
+        // Commit/Revoke-Counter zuruecksetzen damit sofort
+        // re-committed werden kann.
+        state.commit_count = 0;
+        state.revoke_count = 0;
+
+        // initialized und has_dot bleiben erhalten —
+        // der Warmup-State geht nicht verloren.
+    }
+}
+
 DotDetectionResult DotDetector::detect(
     const cv::Mat& image,
     const CheckerboardDetection& checkerboard
@@ -85,10 +111,19 @@ DotDetectionResult DotDetector::detect(
         const std::pair<int, int> key(obs.row, obs.col);
         visible_keys.insert(key);
 
-        TemporalCellState& state = temporal_states_[key];
+        if (config_.use_temporal_smoothing) {
+            TemporalCellState& state = temporal_states_[key];
 
-        obs.has_dot = updateTemporalState(state, score.score);
-        obs.score = state.ema_score;
+            obs.has_dot = updateTemporalState(state, score.score);
+            obs.score = state.ema_score;
+        }
+        else {
+            // Stateless mode: use the current-frame score directly.
+            // This avoids EMA warmup-lock and prevents temporal state from
+            // leaking across different visible sides of a cylindrical marker.
+            obs.score = score.score;
+            obs.has_dot = score.score >= config_.commit_threshold;
+        }
 
         obs.ambiguous =
             obs.score >= config_.uncertainty_low &&
@@ -100,20 +135,22 @@ DotDetectionResult DotDetector::detect(
         max_col = std::max(max_col, obs.col);
     }
 
-    for (auto it = temporal_states_.begin(); it != temporal_states_.end();) {
-        if (visible_keys.find(it->first) == visible_keys.end()) {
-            it->second.missed_frames += 1;
+    if (config_.use_temporal_smoothing) {
+        for (auto it = temporal_states_.begin(); it != temporal_states_.end();) {
+            if (visible_keys.find(it->first) == visible_keys.end()) {
+                it->second.missed_frames += 1;
 
-            if (it->second.missed_frames > 15) {
-                it = temporal_states_.erase(it);
-                continue;
+                if (it->second.missed_frames > 15) {
+                    it = temporal_states_.erase(it);
+                    continue;
+                }
             }
-        }
-        else {
-            it->second.missed_frames = 0;
-        }
+            else {
+                it->second.missed_frames = 0;
+            }
 
-        ++it;
+            ++it;
+        }
     }
 
     result.rows = max_row + 1;

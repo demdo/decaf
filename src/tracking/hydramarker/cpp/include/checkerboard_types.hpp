@@ -11,6 +11,12 @@ struct GridCorner {
     int i = -1;
     int j = -1;
     cv::Point2f uv;
+
+    // Photometric visibility score in [0,1], updated each tracking frame.
+    // 1.0 = strong checkerboard contrast visible (front-facing corner).
+    // 0.0 = no checkerboard structure (back-side / occluded corner).
+    // Only meaningful during tracking; set to 1.0 during recovery detection.
+    float visibility_score = 1.0f;
 };
 
 struct GridCell {
@@ -48,7 +54,7 @@ struct CheckerboardDetectorConfig {
     int min_tracking_cells = 2;
 
     float min_tracking_corner_ratio = 0.45f;
-    float max_tracking_homography_error_px = 8.0f;
+    float max_tracking_homography_error_px = 12.0f;
 
     // How often (in frames) a background recovery is run to pick up new
     // corners that appeared since the last full detection.
@@ -67,23 +73,41 @@ struct CheckerboardDetectorConfig {
     // more corners than the current tracker.
     int refresh_gain_threshold = 5;
 
+    // Recovery position correction weight (Fix B+C).
+    //
+    // When a recovery corner matches an actively tracked persistent corner by
+    // grid ID, the tracked position is blended toward the recovery position:
+    //   new_pos = (1 - w) * lk_pos + w * recovery_pos
+    //
+    // Recovery runs a full saddle-point detection + cornerSubPix on the
+    // current frame and is therefore more accurate than accumulated LK drift.
+    // A weight of 0.5 corrects drift quickly without causing instability.
+    // Set to 0.0 to disable position correction (inject-only behaviour).
+    float recovery_correction_weight = 0.5f;
+
+    // Maximum distance (as fraction of spacing) between a tracked corner and
+    // a recovery corner for position correction to be applied.
+    // Beyond this distance the recovery corner is likely a different physical
+    // corner and correction is skipped.
+    float recovery_correction_max_dist_rel = 0.4f;
+
     // How many consecutive frames a corner may be missed by LK before it is
     // removed from the persistent set.
     // Kept small (2-3) so that genuinely lost corners are evicted quickly.
-    int max_missed_frames = 2;
+    int max_missed_frames = 3;
 
     // Consecutive frames with fewer than (min_corners * 2) corners before a
     // forced reset.  Lower = faster escape from stuck states.
     int max_low_corner_frames = 6;
 
-    int lk_win_size = 21;
-    int lk_max_level = 3;
+    int lk_win_size = 31;
+    int lk_max_level = 4;
     int lk_max_iters = 30;
     double lk_epsilon = 0.01;
     float max_lk_error = 35.0f;
 
     // Forward-backward LK consistency threshold.
-    float max_lk_forward_backward_error_px = 2.0f;
+    float max_lk_forward_backward_error_px = 3.5f;
 
     float stable_motion_threshold_px = 2.0f;
 
@@ -112,6 +136,13 @@ struct CheckerboardDetectorConfig {
     float saddle_max_angle_bias_deg = 20.0f;
     float saddle_correlation_drop = 0.2f;
 
+    // Sub-pixel refinement via cv::cornerSubPix, applied after the
+    // gradient-intersection step and before saddle scoring.
+    // -1 = auto (max(3, saddle_radius-1)), 0 = disabled, >0 = explicit px.
+    int    saddle_subpix_win_size  = -1;
+    int    saddle_subpix_max_iters = 20;
+    double saddle_subpix_epsilon   = 0.05;
+
     // Quadrant intensity symmetry filter — used ONLY during recovery
     // (detectRecovery) to distinguish true checkerboard corners from
     // dot centres and cell interiors in the initial detection.
@@ -128,6 +159,39 @@ struct CheckerboardDetectorConfig {
     // LK spacing consistency filter.
     float tracking_spacing_min_rel = 0.50f;
     float tracking_spacing_max_rel = 1.55f;
+
+    // Photometric visibility eviction.
+    //
+    // After each LK update, every actively tracked corner (missed_frames==0)
+    // is scored by sampling the local checkerboard contrast along the grid
+    // axes derived from its persistent neighbours (Option B: neighbour-derived
+    // axes, not axis-aligned).  This makes the test rotation- and
+    // perspective-robust for any marker size.
+    //
+    // If the score drops below visibility_evict_threshold the corner is
+    // immediately evicted regardless of missed_frames, so back-side corners
+    // disappear in 1-2 frames instead of waiting for max_missed_frames.
+    //
+    // visibility_sample_rel  — half-offset of each quadrant centre as a
+    //                          fraction of the local grid spacing.  0.35 means
+    //                          the sample sits 35% of one cell width from the
+    //                          corner along each grid axis.
+    // visibility_box_rel     — half-side of the averaging box as a fraction
+    //                          of spacing.  0.15 ≈ 15% of cell width.
+    // visibility_evict_threshold — corners with score below this are evicted.
+    //                          0.10 = "essentially no checkerboard contrast".
+    // visibility_min_spacing — skip the test when spacing < this (px) to
+    //                          avoid false evictions on very small markers.
+    float visibility_sample_rel      = 0.35f;
+    float visibility_box_rel         = 0.15f;
+    float visibility_evict_threshold = 0.05f;
+    float visibility_min_spacing     = 8.0f;
+
+    // EMA smoothing factor for visibility score.
+    // smoothed = alpha * raw + (1 - alpha) * prev_smoothed
+    // 0.4 = ~3-frame effective window; prevents single-frame dips from
+    // triggering eviction while still reacting to genuine fade-out.
+    float visibility_smoothing_alpha = 0.4f;
 };
 
 } // namespace hydramarker

@@ -57,6 +57,14 @@ class MapPoseTrackerConfig:
     max_translation_jump_mm: float = 120.0
     max_rotation_jump_deg: float = 45.0
 
+    # Adaptiver Motion Gate:
+    # Threshold wächst um diesen Wert pro verlorenem Frame.
+    # Beispiel: 8.0 -> nach 5 Frames: 45 + 40 = 85 deg
+    rotation_gate_scale_per_lost_frame: float = 8.0
+
+    # Absolutes Maximum, unabhaengig von lost_frames.
+    rotation_gate_max_deg: float = 120.0
+
     use_pose_prior: bool = True
 
 
@@ -100,6 +108,7 @@ class MapPoseTracker:
     def estimate_pose(
         self,
         points: List[PoseTrackPoint],
+        lost_frames: int = 0,
     ) -> MapPoseResult:
 
         if len(points) < self.config.min_points:
@@ -214,6 +223,12 @@ class MapPoseTracker:
             mean_err > self.config.max_mean_reproj_px
             or max_err > self.config.max_max_reproj_px
         ):
+            # Bei sehr hohem Fehler (>3x) ist die Pose strukturell falsch.
+            # Prior löschen damit PnP im nächsten Frame neu startet.
+            if mean_err > self.config.max_mean_reproj_px * 3.0:
+                self.rvec = None
+                self.tvec = None
+                self.T_marker_camera = None
             return MapPoseResult(
                 success=False,
                 message=(
@@ -243,6 +258,7 @@ class MapPoseTracker:
             accepted, reason = self._check_motion_gate(
                 rvec,
                 tvec,
+                lost_frames=lost_frames,
             )
 
             if not accepted:
@@ -315,7 +331,18 @@ class MapPoseTracker:
         self,
         candidate_rvec: np.ndarray,
         candidate_tvec: np.ndarray,
+        lost_frames: int = 0,
     ) -> Tuple[bool, str]:
+
+        # Rotations-Threshold skaliert mit Outage-Laenge.
+        # Nach 0 verlorenen Frames: max_rotation_jump_deg (z.B. 45 deg)
+        # Nach 5 verlorenen Frames: 45 + 5*8 = 85 deg
+        # Gedeckelt bei rotation_gate_max_deg (z.B. 120 deg)
+        effective_rotation_limit = min(
+            self.config.max_rotation_jump_deg
+            + lost_frames * self.config.rotation_gate_scale_per_lost_frame,
+            self.config.rotation_gate_max_deg,
+        )
 
         prev_R, _ = cv2.Rodrigues(self.rvec)
         cand_R, _ = cv2.Rodrigues(candidate_rvec)
@@ -340,23 +367,18 @@ class MapPoseTracker:
             )
         )
 
-        if (
-            angle_deg
-            > self.config.max_rotation_jump_deg
-        ):
+        if angle_deg > effective_rotation_limit:
             return (
                 False,
                 (
                     f"Rotation jump too large: "
                     f"{angle_deg:.2f} deg > "
-                    f"{self.config.max_rotation_jump_deg:.2f} deg"
+                    f"{effective_rotation_limit:.2f} deg"
+                    f" (lost_frames={lost_frames})"
                 ),
             )
 
-        if (
-            translation_mm
-            > self.config.max_translation_jump_mm
-        ):
+        if translation_mm > self.config.max_translation_jump_mm:
             return (
                 False,
                 (

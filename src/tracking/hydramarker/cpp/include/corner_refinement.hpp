@@ -32,6 +32,27 @@ struct CornerRefinementConfig {
     int   quadrant_half_r = 3;
     float quadrant_min_contrast = 12.0f;       // in [0,255]; internally scaled relative to local range
     float quadrant_max_diagonal_diff = 60.0f;  // in [0,255]; relaxed — relative scaling makes it robust
+
+    // cv::cornerSubPix window half-size applied after gradient-intersection
+    // refinement and before saddle-feature computation.
+    //
+    // This extra subpixel step is particularly beneficial under motion blur
+    // and defocus: the gradient-intersection solver converges to a rough
+    // position, then cornerSubPix iterates to the nearest local gradient
+    // minimum with sub-pixel accuracy.
+    //
+    // -1 (default): automatically set to max(3, radius - 1), which gives a
+    //   window large enough to see the gradient transition but small enough
+    //   not to cross into adjacent cells on small markers.
+    //  0: disabled.
+    // >0: explicit half-size in pixels.
+    int subpix_win_size = -1;
+
+    // Maximum number of cornerSubPix iterations.
+    int subpix_max_iters = 20;
+
+    // cornerSubPix convergence epsilon (pixels).
+    double subpix_epsilon = 0.05;
 };
 
 class CornerRefiner {

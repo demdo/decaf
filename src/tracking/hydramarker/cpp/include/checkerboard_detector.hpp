@@ -43,6 +43,17 @@ struct PersistentTrackedCorner {
 
     // True if this corner was successfully LK-tracked in the current frame.
     bool tracked = false;
+
+    // Photometric visibility score in [0, 1].
+    // Computed from local checkerboard contrast along the grid axes
+    // (axis_u = direction to i+1 neighbour, axis_v = direction to j+1
+    // neighbour) sampled from the current frame.
+    // A real front-facing corner has score close to 1.0; a corner that has
+    // rotated to the back of the cylinder has score near 0.0 because the
+    // four quadrants lose their alternating bright/dark structure.
+    // Evicted immediately when smoothed_visibility < config_.visibility_evict_threshold.
+    float visibility_score          = 1.0f;
+    float smoothed_visibility_score = 1.0f;  // EMA over visibility_smoothing_alpha frames
 };
 
 class CheckerboardDetector {
@@ -149,6 +160,18 @@ private:
         const cv::Point2f& uv,
         float radius_px
     );
+
+    // Computes a photometric checkerboard-contrast score in [0,1] for a
+    // tracked corner.  Quadrant sampling axes are derived from the corner's
+    // grid neighbours in persistent_corners_ (Option B), so the test is
+    // rotation- and perspective-robust for any marker size.
+    // Returns 0 if axes cannot be estimated (isolated corner — handled by
+    // the existing fast-eviction rule instead).
+    float computeCornerVisibilityScore(
+        const cv::Mat& gray,          // current frame, CV_8U
+        const PersistentTrackedCorner& pc,
+        float spacing                 // estimated grid spacing in pixels
+    ) const;
 };
 
 } // namespace hydramarker
