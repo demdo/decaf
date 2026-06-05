@@ -1,9 +1,11 @@
 #include "checkerboard_detector.hpp"
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
 namespace hydramarker {
@@ -23,6 +25,92 @@ static float distf(const cv::Point2f& a, const cv::Point2f& b) {
     return std::sqrt(dist2(a, b));
 }
 
+static float cross2(const cv::Point2f& a, const cv::Point2f& b) {
+    return a.x * b.y - a.y * b.x;
+}
+
+static float pointSegmentDistance(
+    const cv::Point2f& p,
+    const cv::Point2f& a,
+    const cv::Point2f& b
+) {
+    const cv::Point2f ab = b - a;
+    const float denom = ab.x * ab.x + ab.y * ab.y;
+    if (denom <= 1e-6f) return distf(p, a);
+
+    const cv::Point2f ap = p - a;
+    const float t =
+        std::max(0.0f,
+                 std::min(1.0f,
+                          (ap.x * ab.x + ap.y * ab.y) / denom));
+    return distf(p, a + t * ab);
+}
+
+static float quadArea(const std::array<cv::Point2f, 4>& q) {
+    float twice_area = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+        const auto& a = q[k];
+        const auto& b = q[(k + 1) % 4];
+        twice_area += a.x * b.y - b.x * a.y;
+    }
+    return 0.5f * std::abs(twice_area);
+}
+
+static float pointInsideQuadDistance(
+    const std::array<cv::Point2f, 4>& q,
+    const cv::Point2f& p
+) {
+    bool has_pos = false;
+    bool has_neg = false;
+    for (int k = 0; k < 4; ++k) {
+        const cv::Point2f edge = q[(k + 1) % 4] - q[k];
+        const cv::Point2f rel = p - q[k];
+        const float c = cross2(edge, rel);
+        if (c > 1e-3f) has_pos = true;
+        if (c < -1e-3f) has_neg = true;
+        if (has_pos && has_neg) return -1.0f;
+    }
+
+    float min_dist = std::numeric_limits<float>::max();
+    for (int k = 0; k < 4; ++k) {
+        min_dist = std::min(
+            min_dist,
+            pointSegmentDistance(p, q[k], q[(k + 1) % 4]));
+    }
+    return min_dist;
+}
+
+static float pointToQuadDistance(
+    const std::array<cv::Point2f, 4>& q,
+    const cv::Point2f& p
+) {
+    if (pointInsideQuadDistance(q, p) >= 0.0f) {
+        return 0.0f;
+    }
+
+    float min_dist = std::numeric_limits<float>::max();
+    for (int k = 0; k < 4; ++k) {
+        min_dist = std::min(
+            min_dist,
+            pointSegmentDistance(p, q[k], q[(k + 1) % 4]));
+    }
+    return min_dist;
+}
+
+static bool projectHomographyPoint(
+    const cv::Mat& H,
+    const cv::Point2f& src,
+    cv::Point2f& dst
+) {
+    const double x = src.x;
+    const double y = src.y;
+    const double w = H.at<double>(2, 0) * x + H.at<double>(2, 1) * y + H.at<double>(2, 2);
+    if (std::abs(w) < 1e-6) return false;
+    dst.x = static_cast<float>((H.at<double>(0, 0) * x + H.at<double>(0, 1) * y + H.at<double>(0, 2)) / w);
+    dst.y = static_cast<float>((H.at<double>(1, 0) * x + H.at<double>(1, 1) * y + H.at<double>(1, 2)) / w);
+    return std::isfinite(dst.x) && std::isfinite(dst.y);
+}
+
 static void updateCellGeometryFromCorners(CheckerboardDetection& det) {
     for (auto& cell : det.cells) {
         bool ok = true;
@@ -39,6 +127,32 @@ static void updateCellGeometryFromCorners(CheckerboardDetection& det) {
             0.25f * (cell.corner_uv[0] + cell.corner_uv[1] +
                      cell.corner_uv[2] + cell.corner_uv[3]);
     }
+}
+
+static bool hasDecodeableCellSpan(
+    const CheckerboardDetection& det,
+    int min_span
+) {
+    if (min_span <= 1) return true;
+    if (det.cells.empty()) return false;
+
+    int min_i = std::numeric_limits<int>::max();
+    int max_i = std::numeric_limits<int>::min();
+    int min_j = std::numeric_limits<int>::max();
+    int max_j = std::numeric_limits<int>::min();
+
+    for (const auto& cell : det.cells) {
+        min_i = std::min(min_i, cell.i);
+        max_i = std::max(max_i, cell.i);
+        min_j = std::min(min_j, cell.j);
+        max_j = std::max(max_j, cell.j);
+    }
+
+    if (min_i > max_i || min_j > max_j) return false;
+
+    const int span_i = max_i - min_i + 1;
+    const int span_j = max_j - min_j + 1;
+    return span_i >= min_span && span_j >= min_span;
 }
 
 
@@ -145,15 +259,30 @@ static std::vector<GridCorner> filterBySpacingConsistency(
         for (int i = 0; i < n; ++i) {
             bool is_duplicate          = false;
             bool has_spacing_neighbour = false;
+            bool has_grid_neighbour    = false;
 
             for (int j = 0; j < n; ++j) {
                 if (i == j) continue;
                 const float d = distf(current[i].uv, current[j].uv);
                 if (d < duplicate_d) { is_duplicate = true; break; }
                 if (d >= min_d && d <= max_d) has_spacing_neighbour = true;
+
+                const int di = std::abs(current[i].i - current[j].i);
+                const int dj = std::abs(current[i].j - current[j].j);
+                if (di + dj == 1 &&
+                    d >= median_spacing * 0.25f &&
+                    d <= median_spacing * 1.85f) {
+                    has_grid_neighbour = true;
+                }
             }
 
-            if (is_duplicate || !has_spacing_neighbour) keep[i] = false;
+            const bool established_grid_corner =
+                current[i].observed_frames >= 8 && has_grid_neighbour;
+
+            if (is_duplicate ||
+                (!has_spacing_neighbour && !established_grid_corner)) {
+                keep[i] = false;
+            }
         }
 
         int survive = 0;
@@ -346,6 +475,8 @@ void CheckerboardDetector::resetTracking() {
     frame_index_           = 0;
     degraded_frames_count_ = 0;
     low_corner_frames_     = 0;
+    undecodeable_tracking_frames_ = 0;
+    held_output_frames_ = 0;
 }
 
 bool CheckerboardDetector::isTracking() const {
@@ -364,6 +495,9 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
     if (gray.empty()) { resetTracking(); return std::nullopt; }
 
     ++frame_index_;
+
+    const int max_held_output_frames =
+        std::max(1, config_.max_low_corner_frames);
 
     if (tracking_active_ &&
         !last_gray_.empty() &&
@@ -393,6 +527,15 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 auto recovered = detectRecovery(gray);
 
                 if (recovered && recovered->valid()) {
+                    auto aligned = alignDetectionGridToReference(*recovered, *tracked);
+                    if (!aligned) {
+                        recovered = std::nullopt;
+                    } else {
+                        recovered = std::move(aligned);
+                    }
+                }
+
+                if (recovered && recovered->valid()) {
                     recovered->tracking = false;
                     recovered->stable   = false;
 
@@ -405,12 +548,30 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     if (gain_trigger || isBetterThanTracked(*recovered, *tracked)) {
                         // Recovery is clearly better — full reset to fresh detection.
                         updateTrackingState(gray, *recovered);
+                        undecodeable_tracking_frames_ = 0;
                         return last_detection_;
                     }
 
                     // Inject new corners from recovery directly into persistent
                     // state — no lattice refit, no Grid-ID loss.
                     updateTrackingState(gray, *tracked, &(*recovered));
+                    if (!last_detection_.valid()) {
+                        updateTrackingState(gray, *recovered);
+                        undecodeable_tracking_frames_ = 0;
+                        return last_detection_;
+                    }
+                    if (hasDecodeableCellSpan(
+                            last_detection_,
+                            config_.min_tracking_decode_cell_span)) {
+                        undecodeable_tracking_frames_ = 0;
+                    } else {
+                        ++undecodeable_tracking_frames_;
+                        if (undecodeable_tracking_frames_ >
+                            config_.max_undecodeable_tracking_frames) {
+                            resetTracking();
+                            return std::nullopt;
+                        }
+                    }
                     return last_detection_;
                 }
 
@@ -420,6 +581,14 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     if (degraded_frames_count_ >=
                         config_.max_degraded_frames_before_reset) {
                         degraded_frames_count_ = 0;
+                        if (last_detection_.valid() &&
+                            held_output_frames_ < max_held_output_frames) {
+                            ++held_output_frames_;
+                            CheckerboardDetection held = last_detection_;
+                            held.tracking = true;
+                            held.stable = false;
+                            return held;
+                        }
                         resetTracking();
                         return std::nullopt;
                     }
@@ -429,6 +598,45 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
             }
 
             updateTrackingState(gray, *tracked);
+            if (!last_detection_.valid()) {
+                auto recovered = detectRecovery(gray);
+                if (recovered && recovered->valid()) {
+                    auto aligned = alignDetectionGridToReference(*recovered, *tracked);
+                    if (aligned) {
+                        recovered = std::move(aligned);
+                    } else {
+                        recovered = std::nullopt;
+                    }
+                }
+                if (recovered && recovered->valid()) {
+                    recovered->tracking = false;
+                    recovered->stable   = false;
+                    updateTrackingState(gray, *recovered);
+                    undecodeable_tracking_frames_ = 0;
+                    return last_detection_;
+                }
+            }
+
+            if (!hasDecodeableCellSpan(
+                    last_detection_,
+                    config_.min_tracking_decode_cell_span)) {
+                ++undecodeable_tracking_frames_;
+                if (undecodeable_tracking_frames_ >
+                    config_.max_undecodeable_tracking_frames) {
+                    if (last_detection_.valid() &&
+                        held_output_frames_ < max_held_output_frames) {
+                        ++held_output_frames_;
+                        CheckerboardDetection held = last_detection_;
+                        held.tracking = true;
+                        held.stable = false;
+                        return held;
+                    }
+                    resetTracking();
+                    return std::nullopt;
+                }
+            } else {
+                undecodeable_tracking_frames_ = 0;
+            }
 
             // Stuck-state detection: corners stuck below minimum for too long → reset.
             // Threshold is min_tracking_corners (not 2x) so partial visibility
@@ -443,10 +651,19 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
 
             if (low_corner_frames_ > config_.max_low_corner_frames) {
                 low_corner_frames_ = 0;
+                if (last_detection_.valid() &&
+                    held_output_frames_ < max_held_output_frames) {
+                    ++held_output_frames_;
+                    CheckerboardDetection held = last_detection_;
+                    held.tracking = true;
+                    held.stable = false;
+                    return held;
+                }
                 resetTracking();
                 return std::nullopt;
             }
 
+            held_output_frames_ = 0;
             return last_detection_;
         }
 
@@ -460,11 +677,22 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
         recovered->tracking = false;
         recovered->stable   = false;
         updateTrackingState(gray, *recovered);
+        undecodeable_tracking_frames_ = 0;
+        held_output_frames_ = 0;
 
         if (config_.refresh_interval_frames > 0)
             frame_index_ = config_.refresh_interval_frames - 1;
 
         return last_detection_;
+    }
+
+    if (last_detection_.valid() &&
+        held_output_frames_ < max_held_output_frames) {
+        ++held_output_frames_;
+        CheckerboardDetection held = last_detection_;
+        held.tracking = true;
+        held.stable = false;
+        return held;
     }
 
     resetTracking();
@@ -536,7 +764,14 @@ CheckerboardRecoveryDebug CheckerboardDetector::debugRecoveryStages(
         return dbg;
 
     auto lattice = lattice_model_.fit(dbg.valid_refined_points);
-    if (!lattice || !lattice->valid) return dbg;
+    if (!lattice || !lattice->valid) {
+        auto clustered = buildBestDetectionFromCornerClusters(dbg.valid_refined_points);
+        if (clustered && clustered->valid()) {
+            dbg.detection     = *clustered;
+            dbg.has_detection = true;
+        }
+        return dbg;
+    }
 
     dbg.lattice     = *lattice;
     dbg.has_lattice = true;
@@ -545,7 +780,14 @@ CheckerboardRecoveryDebug CheckerboardDetector::debugRecoveryStages(
         *lattice, config_.duplicate_corner_dist_px,
         config_.min_corners, config_.min_cells);
 
-    if (!detection || !detection->valid()) return dbg;
+    if (!detection || !detection->valid()) {
+        auto clustered = buildBestDetectionFromCornerClusters(dbg.valid_refined_points);
+        if (clustered && clustered->valid()) {
+            dbg.detection     = *clustered;
+            dbg.has_detection = true;
+        }
+        return dbg;
+    }
 
     dbg.detection     = *detection;
     dbg.has_detection = true;
@@ -637,11 +879,17 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detectRecovery(
     work.convertTo(work_f, CV_32F);
 
     const float inv_scale = 1.0f / scale;
-    std::vector<cv::Point2f> corners;
-    corners.reserve(refined.size());
+    std::vector<cv::Point2f> refined_corners;
+    refined_corners.reserve(refined.size());
+
+    std::vector<cv::Point2f> quadrant_corners;
+    quadrant_corners.reserve(refined.size());
 
     for (const auto& c : refined) {
         if (!c.valid) continue;
+
+        const cv::Point2f full_uv(c.uv.x * inv_scale, c.uv.y * inv_scale);
+        refined_corners.push_back(full_uv);
 
         // Quadrant test in work-image coordinates.
         if (config_.quadrant_half_r > 0 &&
@@ -651,13 +899,24 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detectRecovery(
                                 config_.quadrant_max_diagonal_diff))
             continue;
 
-        corners.emplace_back(c.uv.x * inv_scale, c.uv.y * inv_scale);
+        quadrant_corners.push_back(full_uv);
     }
 
-    if (static_cast<int>(corners.size()) < config_.min_corners)
+    if (static_cast<int>(refined_corners.size()) < config_.min_corners)
         return std::nullopt;
 
-    auto detection = buildDetectionFromCorners(corners);
+    // CornerRefiner already applies a quadrant symmetry check with a safe
+    // fallback.  This second recovery-only check is useful for suppressing dot
+    // centres in crisp front-facing frames, but under motion blur or steep
+    // viewing angles it can reject too much and leave the tracker with no
+    // green corners at all.  Use it only when enough corners survive; otherwise
+    // let the lattice/grid geometry reject outliers.
+    const std::vector<cv::Point2f>& corners =
+        static_cast<int>(quadrant_corners.size()) >= config_.min_corners
+            ? quadrant_corners
+            : refined_corners;
+
+    auto detection = buildBestDetectionFromCornerClusters(corners);
     if (!detection || !detection->valid()) return std::nullopt;
 
     // Lattice-guided completion: fill weak corners inside AND on the boundary
@@ -787,6 +1046,110 @@ CheckerboardDetector::buildDetectionFromCorners(
     return detection;
 }
 
+std::optional<CheckerboardDetection>
+CheckerboardDetector::buildBestDetectionFromCornerClusters(
+    const std::vector<cv::Point2f>& corners
+) const {
+    if (static_cast<int>(corners.size()) < config_.min_corners)
+        return std::nullopt;
+
+    auto best = buildDetectionFromCorners(corners);
+
+    auto better = [](const CheckerboardDetection& a,
+                     const CheckerboardDetection& b) {
+        const int score_a =
+            static_cast<int>(a.cells.size()) * 4 +
+            static_cast<int>(a.corners.size());
+        const int score_b =
+            static_cast<int>(b.cells.size()) * 4 +
+            static_cast<int>(b.corners.size());
+        if (score_a != score_b) return score_a > score_b;
+        if (a.cells.size() != b.cells.size())
+            return a.cells.size() > b.cells.size();
+        return a.corners.size() > b.corners.size();
+    };
+
+    const int n = static_cast<int>(corners.size());
+    const int min_subset = std::max(config_.min_corners, 8);
+    const int max_subset = std::min(n, 44);
+
+    if (n <= min_subset) {
+        return best;
+    }
+
+    std::vector<int> seed_indices;
+    seed_indices.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        seed_indices.push_back(i);
+    }
+
+    // Keep this recovery path fast: evaluate all seeds for ordinary point
+    // counts, and a cheap spatially spread subset for dense noisy frames.
+    if (n > 60) {
+        std::sort(
+            seed_indices.begin(),
+            seed_indices.end(),
+            [&](int a, int b) {
+                if (corners[a].y != corners[b].y)
+                    return corners[a].y < corners[b].y;
+                return corners[a].x < corners[b].x;
+            });
+        std::vector<int> reduced;
+        reduced.reserve(60);
+        const int stride = std::max(1, n / 60);
+        for (int k = 0; k < n; k += stride) {
+            reduced.push_back(seed_indices[k]);
+        }
+        seed_indices = std::move(reduced);
+    }
+
+    std::vector<std::pair<float, int>> by_dist;
+    by_dist.reserve(n);
+
+    for (int seed : seed_indices) {
+        by_dist.clear();
+        for (int k = 0; k < n; ++k) {
+            const float d2 = dist2(corners[seed], corners[k]);
+            by_dist.push_back({d2, k});
+        }
+
+        const int take = max_subset;
+        std::nth_element(
+            by_dist.begin(),
+            by_dist.begin() + static_cast<std::ptrdiff_t>(take - 1),
+            by_dist.end(),
+            [](const auto& a, const auto& b) {
+                return a.first < b.first;
+            });
+        by_dist.resize(take);
+        std::sort(
+            by_dist.begin(),
+            by_dist.end(),
+            [](const auto& a, const auto& b) {
+                return a.first < b.first;
+            });
+
+        for (int subset_size : {12, 18, 28, 44}) {
+            if (subset_size < min_subset || subset_size > take) continue;
+
+            std::vector<cv::Point2f> subset;
+            subset.reserve(subset_size);
+            for (int m = 0; m < subset_size; ++m) {
+                subset.push_back(corners[by_dist[m].second]);
+            }
+
+            auto candidate = buildDetectionFromCorners(subset);
+            if (!candidate || !candidate->valid()) continue;
+
+            if (!best || better(*candidate, *best)) {
+                best = std::move(candidate);
+            }
+        }
+    }
+
+    return best;
+}
+
 
 // ============================================================
 // buildVisibleTrackedDetection
@@ -799,6 +1162,8 @@ CheckerboardDetector::buildVisibleTrackedDetection(
     const TrackingValidationResult& validation
 ) const {
     if (validation.visible_indices.size() != validation.visible_points.size())
+        return std::nullopt;
+    if (validation.visible_predicted.size() != validation.visible_points.size())
         return std::nullopt;
 
     if (static_cast<int>(validation.visible_points.size()) <
@@ -819,23 +1184,32 @@ CheckerboardDetector::buildVisibleTrackedDetection(
 
         GridCorner c = previous.corners[old_idx];
         c.uv = uv;
+        c.predicted = validation.visible_predicted[m];
         tracked_corners.push_back(c);
     }
 
     if (static_cast<int>(tracked_corners.size()) < config_.min_tracking_corners)
         return std::nullopt;
 
-    // Spacing consistency filter (geometric — not photometric).
+    // Spacing cleanup (geometric — not photometric).
+    //
+    // During axial rotation the projected spacing near the cylindrical edges
+    // changes locally. LK plus TrackingValidator already checks frame-to-frame
+    // grid-neighbour consistency, so the old global spacing pass is only safe
+    // as a hard gate when the frame is stable. In moving frames it was dropping
+    // long-lived real edge corners and causing visible block flicker.
     if (config_.tracking_spacing_min_rel > 0.0f) {
         const float q3_spacing = estimateMedianSpacing(previous);
         if (q3_spacing > 1.0f) {
             tracked_corners = removeOutlierCorners(
                 tracked_corners, q3_spacing, config_.min_tracking_corners);
-            tracked_corners = filterBySpacingConsistency(
-                tracked_corners, q3_spacing,
-                config_.tracking_spacing_min_rel,
-                config_.tracking_spacing_max_rel,
-                config_.min_tracking_corners);
+            if (validation.stable) {
+                tracked_corners = filterBySpacingConsistency(
+                    tracked_corners, q3_spacing,
+                    config_.tracking_spacing_min_rel,
+                    config_.tracking_spacing_max_rel,
+                    config_.min_tracking_corners);
+            }
         }
     }
 
@@ -893,18 +1267,25 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
 
         std::vector<int>         culled_indices;
         std::vector<cv::Point2f> culled_points;
+        std::vector<bool>        culled_predicted;
         culled_indices.reserve(validation.visible_indices.size());
         culled_points .reserve(validation.visible_points.size());
+        culled_predicted.reserve(validation.visible_predicted.size());
 
         for (size_t k = 0; k < validation.visible_points.size(); ++k) {
             const cv::Point2f& uv = validation.visible_points[k];
             if (uv.x >= max_x || uv.y >= max_y) continue;
             culled_indices.push_back(validation.visible_indices[k]);
             culled_points .push_back(uv);
+            culled_predicted.push_back(
+                k < validation.visible_predicted.size()
+                    ? validation.visible_predicted[k]
+                    : false);
         }
 
-        validation.visible_indices = std::move(culled_indices);
-        validation.visible_points  = std::move(culled_points);
+        validation.visible_indices   = std::move(culled_indices);
+        validation.visible_points    = std::move(culled_points);
+        validation.visible_predicted = std::move(culled_predicted);
     }
 
     auto detection = buildVisibleTrackedDetection(last_detection_, validation);
@@ -944,6 +1325,9 @@ void CheckerboardDetector::updateTrackingState(
             pc.corner        = c;
             pc.missed_frames = 0;
             pc.tracked       = true;
+            pc.observed_frames = 1;
+            pc.predicted_frames = c.predicted ? 1 : 0;
+            pc.low_visibility_frames = 0;
             persistent_corners_.push_back(pc);
         }
 
@@ -951,6 +1335,11 @@ void CheckerboardDetector::updateTrackingState(
         tracking_active_ = last_detection_.valid();
         return;
     }
+
+    std::vector<cv::Point2f> old_persistent_uvs;
+    old_persistent_uvs.reserve(persistent_corners_.size());
+    for (const auto& pc : persistent_corners_)
+        old_persistent_uvs.push_back(pc.corner.uv);
 
     // Tracking update: mark all as missed, then update matched ones.
     for (auto& pc : persistent_corners_) {
@@ -964,13 +1353,209 @@ void CheckerboardDetector::updateTrackingState(
             persistent_corners_[idx].corner        = c;
             persistent_corners_[idx].missed_frames = 0;
             persistent_corners_[idx].tracked       = true;
+            if (!c.predicted) {
+                persistent_corners_[idx].observed_frames += 1;
+                persistent_corners_[idx].predicted_frames = 0;
+            } else {
+                persistent_corners_[idx].predicted_frames += 1;
+            }
         } else {
             // New corner appeared (e.g. after rotation reveals hidden area).
             PersistentTrackedCorner pc;
             pc.corner        = c;
             pc.missed_frames = 0;
             pc.tracked       = true;
+            pc.observed_frames = c.predicted ? 0 : 1;
+            pc.predicted_frames = c.predicted ? 1 : 0;
+            pc.low_visibility_frames = 0;
             persistent_corners_.push_back(pc);
+        }
+    }
+
+    // Local grid-neighbour prediction for established corners that vanished
+    // from LK/validation as a block. A single global homography is a poor
+    // model for axial rotation of the cylindrical marker; adjacent grid
+    // neighbours give a much better short-term motion estimate at the rim.
+    {
+        const int old_count = std::min(
+            static_cast<int>(old_persistent_uvs.size()),
+            static_cast<int>(persistent_corners_.size()));
+        const float margin = 4.0f;
+        const float min_sep =
+            std::max(4.0f, config_.duplicate_corner_dist_px);
+        const float min_sep2 = min_sep * min_sep;
+
+        for (int pass = 0; pass < 4; ++pass) {
+            bool changed = false;
+
+            for (int k = 0; k < old_count; ++k) {
+                auto& pc = persistent_corners_[k];
+                if (pc.missed_frames == 0) continue;
+                const bool long_established = pc.observed_frames >= 8;
+                const bool locally_confirmed = pc.observed_frames >= 3;
+                if (!locally_confirmed) continue;
+                if (pc.predicted_frames >=
+                    (long_established
+                         ? std::max(config_.max_missed_frames, 8)
+                         : std::max(config_.max_missed_frames, 4)))
+                    continue;
+
+                cv::Point2f displacement(0.0f, 0.0f);
+                float weight_sum = 0.0f;
+                int support = 0;
+
+                for (int n = 0; n < old_count; ++n) {
+                    if (n == k) continue;
+                    const auto& nb = persistent_corners_[n];
+                    if (nb.missed_frames != 0) continue;
+
+                    const int di = std::abs(nb.corner.i - pc.corner.i);
+                    const int dj = std::abs(nb.corner.j - pc.corner.j);
+                    if (di + dj != 1) continue;
+
+                    const float old_d = distf(old_persistent_uvs[k],
+                                              old_persistent_uvs[n]);
+                    const float new_d = distf(old_persistent_uvs[k],
+                                              nb.corner.uv);
+                    if (old_d < 2.0f || new_d < 2.0f) continue;
+
+                    const float w = nb.corner.predicted ? 0.55f : 1.0f;
+                    displacement += w * (nb.corner.uv - old_persistent_uvs[n]);
+                    weight_sum += w;
+                    ++support;
+                }
+
+                const int min_support = long_established ? 1 : 2;
+                if (support < min_support || weight_sum <= 0.0f) continue;
+
+                const cv::Point2f projected =
+                    old_persistent_uvs[k] + displacement * (1.0f / weight_sum);
+                if (projected.x < margin || projected.y < margin ||
+                    projected.x > static_cast<float>(gray.cols) - margin ||
+                    projected.y > static_cast<float>(gray.rows) - margin)
+                    continue;
+
+                bool too_close = false;
+                bool plausible_spacing = false;
+                for (int n = 0; n < old_count; ++n) {
+                    if (n == k) continue;
+                    const auto& nb = persistent_corners_[n];
+                    if (nb.missed_frames != 0) continue;
+
+                    const float d2 = dist2(projected, nb.corner.uv);
+                    if (d2 < min_sep2) {
+                        too_close = true;
+                        break;
+                    }
+
+                    const int di = std::abs(nb.corner.i - pc.corner.i);
+                    const int dj = std::abs(nb.corner.j - pc.corner.j);
+                    if (di + dj != 1) continue;
+
+                    const float old_d = distf(old_persistent_uvs[k],
+                                              old_persistent_uvs[n]);
+                    const float new_d = distf(projected, nb.corner.uv);
+                    if (old_d >= 2.0f) {
+                        const float ratio = new_d / old_d;
+                        if (ratio >= 0.25f && ratio <= 1.90f) {
+                            plausible_spacing = true;
+                        }
+                    }
+                }
+
+                if (too_close || !plausible_spacing) continue;
+
+                pc.corner.uv = projected;
+                pc.corner.predicted = true;
+                pc.missed_frames = 0;
+                pc.tracked = true;
+                pc.predicted_frames += 1;
+                changed = true;
+            }
+
+            if (!changed) break;
+        }
+    }
+
+    // Short-term motion-model fill for stable corners that vanished for a
+    // single frame.  The previous validator can only project corners that were
+    // still present in last_detection_; block losses have already disappeared
+    // there.  This uses the persistent grid memory instead, so real corners can
+    // survive brief LK/validation dropouts during rotation.
+    if (old_persistent_uvs.size() >= 4 && persistent_corners_.size() >= 4) {
+        std::vector<cv::Point2f> h_src;
+        std::vector<cv::Point2f> h_dst;
+        h_src.reserve(persistent_corners_.size());
+        h_dst.reserve(persistent_corners_.size());
+
+        const int old_count = static_cast<int>(old_persistent_uvs.size());
+        for (int k = 0; k < old_count &&
+                        k < static_cast<int>(persistent_corners_.size()); ++k) {
+            const auto& pc = persistent_corners_[k];
+            if (pc.missed_frames != 0) continue;
+            if (pc.corner.predicted) continue;
+            h_src.push_back(old_persistent_uvs[k]);
+            h_dst.push_back(pc.corner.uv);
+        }
+
+        if (h_src.size() >= 4) {
+            cv::Mat inlier_mask;
+            cv::Mat H = cv::findHomography(
+                h_src, h_dst, cv::RANSAC,
+                config_.max_tracking_homography_error_px,
+                inlier_mask);
+            if (!H.empty()) {
+                if (H.depth() != CV_64F) {
+                    cv::Mat H64;
+                    H.convertTo(H64, CV_64F);
+                    H = H64;
+                }
+
+                const float margin = 4.0f;
+                const float min_sep2 =
+                    std::max(4.0f, config_.duplicate_corner_dist_px) *
+                    std::max(4.0f, config_.duplicate_corner_dist_px);
+
+                for (int k = 0; k < old_count &&
+                                k < static_cast<int>(persistent_corners_.size()); ++k) {
+                    auto& pc = persistent_corners_[k];
+                    if (pc.missed_frames == 0) continue;
+                    if (pc.observed_frames < 3) continue;
+                    if (pc.predicted_frames >= config_.max_missed_frames) continue;
+
+                    cv::Point2f projected;
+                    if (!projectHomographyPoint(H, old_persistent_uvs[k], projected))
+                        continue;
+                    if (projected.x < margin || projected.y < margin ||
+                        projected.x > static_cast<float>(gray.cols) - margin ||
+                        projected.y > static_cast<float>(gray.rows) - margin)
+                        continue;
+
+                    bool too_close = false;
+                    bool has_grid_support = false;
+                    for (const auto& nb : persistent_corners_) {
+                        if (nb.missed_frames != 0) continue;
+                        if (&nb == &pc) continue;
+
+                        if (dist2(projected, nb.corner.uv) < min_sep2) {
+                            too_close = true;
+                            break;
+                        }
+
+                        const int di = std::abs(nb.corner.i - pc.corner.i);
+                        const int dj = std::abs(nb.corner.j - pc.corner.j);
+                        if (di + dj == 1)
+                            has_grid_support = true;
+                    }
+                    if (too_close || !has_grid_support) continue;
+
+                    pc.corner.uv = projected;
+                    pc.corner.predicted = true;
+                    pc.missed_frames = 0;
+                    pc.tracked = true;
+                    pc.predicted_frames += 1;
+                }
+            }
         }
     }
 
@@ -992,6 +1577,9 @@ void CheckerboardDetector::updateTrackingState(
     if (config_.tracking_spacing_min_rel > 0.0f) {
         for (auto& pc : persistent_corners_) {
             if (pc.missed_frames == 0) continue;  // actively tracked — fine
+            if (pc.observed_frames >= 3) {
+                continue;
+            }
 
             bool has_tracked_neighbour = false;
             for (const auto& nb : persistent_corners_) {
@@ -1027,6 +1615,7 @@ void CheckerboardDetector::updateTrackingState(
             const float alpha = config_.visibility_smoothing_alpha;
             for (auto& pc : persistent_corners_) {
                 if (pc.missed_frames != 0) continue;
+                if (pc.corner.predicted) continue;
 
                 pc.visibility_score = computeCornerVisibilityScore(gray, pc, spacing);
 
@@ -1036,7 +1625,50 @@ void CheckerboardDetector::updateTrackingState(
                     alpha * pc.visibility_score +
                     (1.0f - alpha) * pc.smoothed_visibility_score;
 
-                if (pc.smoothed_visibility_score < config_.visibility_evict_threshold) {
+                const bool raw_invisible =
+                    pc.visibility_score <
+                    std::max(0.04f, config_.visibility_evict_threshold * 0.45f);
+
+                const float low_visibility_threshold =
+                    std::max(0.06f, config_.visibility_evict_threshold * 0.75f);
+                if (pc.visibility_score < low_visibility_threshold) {
+                    pc.low_visibility_frames += 1;
+                } else if (pc.visibility_score >
+                           config_.visibility_evict_threshold * 1.25f) {
+                    pc.low_visibility_frames = 0;
+                }
+
+                const bool sustained_raw_invisible =
+                    raw_invisible && pc.low_visibility_frames >= 3;
+                const bool sustained_low_visibility =
+                    pc.smoothed_visibility_score <
+                        config_.visibility_evict_threshold * 0.60f &&
+                    pc.low_visibility_frames >= 4;
+
+                bool has_active_grid_neighbour = false;
+                for (const auto& nb : persistent_corners_) {
+                    if (&nb == &pc) continue;
+                    if (nb.missed_frames != 0) continue;
+                    const int di = std::abs(nb.corner.i - pc.corner.i);
+                    const int dj = std::abs(nb.corner.j - pc.corner.j);
+                    if (di + dj == 1) {
+                        has_active_grid_neighbour = true;
+                        break;
+                    }
+                }
+
+                const bool confirmed_with_geometry =
+                    pc.observed_frames >= 3 && has_active_grid_neighbour;
+                const bool sustained_severe_invisible =
+                    raw_invisible &&
+                    pc.smoothed_visibility_score < 0.05f &&
+                    pc.low_visibility_frames >= 8;
+
+                if (!measured_detection.stable &&
+                    (confirmed_with_geometry
+                         ? sustained_severe_invisible
+                         : (sustained_raw_invisible ||
+                            sustained_low_visibility))) {
                     pc.missed_frames = config_.max_missed_frames + 1;
                 }
             }
@@ -1048,8 +1680,25 @@ void CheckerboardDetector::updateTrackingState(
         std::remove_if(
             persistent_corners_.begin(),
             persistent_corners_.end(),
-            [this](const PersistentTrackedCorner& pc) {
-                return pc.missed_frames > config_.max_missed_frames;
+            [this, &measured_detection](const PersistentTrackedCorner& pc) {
+                const bool established = pc.observed_frames >= 8;
+                const bool confirmed = pc.observed_frames >= 3;
+                const int missed_limit =
+                    established
+                        ? std::max(config_.max_missed_frames,
+                                   measured_detection.stable ? 30 : 20)
+                        : (confirmed
+                               ? std::max(config_.max_missed_frames, 12)
+                               : config_.max_missed_frames);
+                const int predicted_limit =
+                    established
+                        ? std::max(config_.max_missed_frames,
+                                   measured_detection.stable ? 12 : 8)
+                        : (confirmed
+                               ? std::max(config_.max_missed_frames, 5)
+                               : config_.max_missed_frames);
+                return pc.missed_frames > missed_limit ||
+                       pc.predicted_frames > predicted_limit;
             }
         ),
         persistent_corners_.end()
@@ -1064,6 +1713,199 @@ void CheckerboardDetector::updateTrackingState(
         const float spacing = estimateMedianSpacing(measured_detection);
         if (spacing > 1.0f) {
             injectRecoveryCorners(*recovery_detection, spacing);
+        }
+    }
+
+    // Recovery-authoritative collision pruning.
+    //
+    // LK can keep tracking an old textured location even after that grid
+    // corner rotated out of view.  If a newly visible recovery corner lands
+    // close to it, the old long-established track used to block the new one
+    // and then stayed visible through output hysteresis.  Resolve only true
+    // conflicts here: pixel-near duplicates or strongly compressed adjacent
+    // grid edges where recovery sees one side but not the other.
+    if (recovery_detection && recovery_detection->valid()) {
+        const float spacing = estimateMedianSpacing(measured_detection);
+        if (spacing > 1.0f && !persistent_corners_.empty()) {
+            auto recoveryHasGrid = [&](int i, int j) {
+                for (const auto& c : recovery_detection->corners) {
+                    if (c.i == i && c.j == j) return true;
+                }
+                return false;
+            };
+
+            auto activeSupport = [&](int idx) {
+                int support = 0;
+                const auto& c = persistent_corners_[idx].corner;
+                for (int k = 0;
+                     k < static_cast<int>(persistent_corners_.size());
+                     ++k) {
+                    if (k == idx) continue;
+                    const auto& nb = persistent_corners_[k];
+                    if (nb.missed_frames != 0) continue;
+                    const int di = std::abs(nb.corner.i - c.i);
+                    const int dj = std::abs(nb.corner.j - c.j);
+                    if (di + dj == 1) ++support;
+                }
+                return support;
+            };
+
+            auto removalScore = [&](int idx) {
+                const auto& pc = persistent_corners_[idx];
+                float score = 0.0f;
+                if (!recoveryHasGrid(pc.corner.i, pc.corner.j)) score += 6.0f;
+                if (pc.corner.predicted) score += 4.0f;
+                if (pc.smoothed_visibility_score < 0.18f) {
+                    score += 3.0f;
+                } else if (pc.smoothed_visibility_score < 0.35f) {
+                    score += 1.0f;
+                }
+                if (pc.observed_frames < 3) score += 1.0f;
+                score -= 0.75f * static_cast<float>(
+                    std::min(activeSupport(idx), 4));
+                return score;
+            };
+
+            auto evictIndex = [&](int idx) {
+                auto& pc = persistent_corners_[idx];
+                pc.missed_frames =
+                    std::max(pc.missed_frames,
+                             std::max(config_.max_missed_frames + 1, 16));
+                pc.predicted_frames =
+                    std::max(pc.predicted_frames,
+                             std::max(config_.max_missed_frames + 1, 16));
+                pc.tracked = false;
+                pc.corner.predicted = true;
+            };
+
+            auto cellUsesGrid = [](const GridCell& cell, int i, int j) {
+                return (i == cell.i && j == cell.j) ||
+                       (i == cell.i + 1 && j == cell.j) ||
+                       (i == cell.i + 1 && j == cell.j + 1) ||
+                       (i == cell.i && j == cell.j + 1);
+            };
+
+            const float duplicate_d =
+                std::max(config_.duplicate_corner_dist_px * 1.6f,
+                         spacing * 0.42f);
+            const float compressed_d = spacing * 0.58f;
+
+            std::vector<char> evict(persistent_corners_.size(), 0);
+            for (int a = 0;
+                 a < static_cast<int>(persistent_corners_.size());
+                 ++a) {
+                if (persistent_corners_[a].missed_frames != 0 || evict[a])
+                    continue;
+                for (int b = a + 1;
+                     b < static_cast<int>(persistent_corners_.size());
+                     ++b) {
+                    if (persistent_corners_[b].missed_frames != 0 ||
+                        evict[b]) {
+                        continue;
+                    }
+
+                    const auto& ca = persistent_corners_[a].corner;
+                    const auto& cb = persistent_corners_[b].corner;
+                    const int di = std::abs(ca.i - cb.i);
+                    const int dj = std::abs(ca.j - cb.j);
+                    if (di == 0 && dj == 0) continue;
+
+                    const float d = distf(ca.uv, cb.uv);
+                    const bool duplicate_collision = d < duplicate_d;
+                    const bool compressed_adjacent =
+                        (di + dj == 1) && d < compressed_d;
+                    if (!duplicate_collision && !compressed_adjacent)
+                        continue;
+
+                    const bool a_recovered = recoveryHasGrid(ca.i, ca.j);
+                    const bool b_recovered = recoveryHasGrid(cb.i, cb.j);
+
+                    int remove_idx = -1;
+                    if (a_recovered != b_recovered) {
+                        remove_idx = a_recovered ? b : a;
+                    } else if (duplicate_collision) {
+                        remove_idx =
+                            removalScore(a) >= removalScore(b) ? a : b;
+                    } else {
+                        // Adjacent compression can be a real perspective
+                        // effect.  Only resolve it without recovery evidence
+                        // when one side is already weakly supported.
+                        const int a_support = activeSupport(a);
+                        const int b_support = activeSupport(b);
+                        if (a_support <= 1 || b_support <= 1) {
+                            remove_idx =
+                                removalScore(a) >= removalScore(b) ? a : b;
+                        }
+                    }
+
+                    if (remove_idx >= 0) {
+                        evict[remove_idx] = 1;
+                    }
+                }
+            }
+
+            const float min_cell_area = spacing * spacing * 0.20f;
+            const float interior_margin =
+                std::max(1.0f, spacing * 0.04f);
+            const float outside_cell_margin =
+                std::max(2.0f, spacing * 0.50f);
+            for (int k = 0;
+                 k < static_cast<int>(persistent_corners_.size());
+                 ++k) {
+                if (evict[k]) continue;
+                auto& pc = persistent_corners_[k];
+                if (pc.missed_frames != 0) continue;
+                if (recoveryHasGrid(pc.corner.i, pc.corner.j)) continue;
+
+                for (const auto& cell : recovery_detection->cells) {
+                    if (cellUsesGrid(cell, pc.corner.i, pc.corner.j))
+                        continue;
+                    if (quadArea(cell.corner_uv) < min_cell_area)
+                        continue;
+
+                    const float inside_d =
+                        pointInsideQuadDistance(cell.corner_uv,
+                                                pc.corner.uv);
+                    if (inside_d > interior_margin) {
+                        evict[k] = 1;
+                        break;
+                    }
+                }
+            }
+
+            for (int k = 0;
+                 k < static_cast<int>(persistent_corners_.size());
+                 ++k) {
+                if (evict[k]) continue;
+                auto& pc = persistent_corners_[k];
+                if (pc.missed_frames != 0) continue;
+
+                bool used_by_cell = false;
+                float min_cell_dist = std::numeric_limits<float>::max();
+                for (const auto& cell : recovery_detection->cells) {
+                    if (quadArea(cell.corner_uv) < min_cell_area)
+                        continue;
+                    if (cellUsesGrid(cell, pc.corner.i, pc.corner.j)) {
+                        used_by_cell = true;
+                        break;
+                    }
+                    min_cell_dist = std::min(
+                        min_cell_dist,
+                        pointToQuadDistance(cell.corner_uv,
+                                            pc.corner.uv));
+                }
+                if (used_by_cell) continue;
+                if (min_cell_dist <= outside_cell_margin) continue;
+                if (activeSupport(k) >= 2) continue;
+
+                evict[k] = 1;
+            }
+
+            for (int k = 0;
+                 k < static_cast<int>(persistent_corners_.size());
+                 ++k) {
+                if (evict[k]) evictIndex(k);
+            }
         }
     }
 
@@ -1120,7 +1962,40 @@ void CheckerboardDetector::injectRecoveryCorners(
     const float max_corr_d   = spacing * config_.recovery_correction_max_dist_rel;
     const float w            = config_.recovery_correction_weight;
 
+    auto recoveryNeighbourCount = [&](const GridCorner& c) {
+        int count = 0;
+        for (const auto& nb : recovery_detection.corners) {
+            if (nb.i == c.i && nb.j == c.j) continue;
+            const int di = std::abs(nb.i - c.i);
+            const int dj = std::abs(nb.j - c.j);
+            if (di + dj == 1) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    auto recoveryHasGrid = [&](int i, int j) {
+        for (const auto& c : recovery_detection.corners) {
+            if (c.i == i && c.j == j) return true;
+        }
+        return false;
+    };
+
+    auto evictActiveBlocker = [&](PersistentTrackedCorner& pc) {
+        pc.missed_frames =
+            std::max(pc.missed_frames,
+                     std::max(config_.max_missed_frames + 1, 16));
+        pc.predicted_frames =
+            std::max(pc.predicted_frames,
+                     std::max(config_.max_missed_frames + 1, 16));
+        pc.tracked = false;
+        pc.corner.predicted = true;
+    };
+
     for (const auto& rc : recovery_detection.corners) {
+        const int recovery_neighbours = recoveryNeighbourCount(rc);
+        const bool strongly_supported_recovery = recovery_neighbours >= 2;
 
         // --- Fix B: position correction for actively tracked corners ---
         const int existing_idx =
@@ -1130,11 +2005,84 @@ void CheckerboardDetector::injectRecoveryCorners(
             auto& pc = persistent_corners_[existing_idx];
 
             // Only correct active corners — stale ones are handled by eviction.
-            if (pc.missed_frames == 0 && w > 0.0f) {
-                const float d = distf(pc.corner.uv, rc.uv);
-                if (d < max_corr_d) {
+            const float d = distf(pc.corner.uv, rc.uv);
+            if (pc.missed_frames == 0) {
+                const float max_confirm_d =
+                    spacing * (pc.observed_frames >= 8 ? 1.5f : 0.9f);
+                if (pc.corner.predicted && d < max_confirm_d) {
+                    pc.corner = rc;
+                    pc.missed_frames = 0;
+                    pc.tracked = true;
+                    pc.observed_frames += 1;
+                    pc.predicted_frames = 0;
+                    pc.low_visibility_frames = 0;
+                    pc.visibility_score = 1.0f;
+                    pc.smoothed_visibility_score =
+                        std::max(pc.smoothed_visibility_score, 0.75f);
+                } else if (!pc.corner.predicted && w > 0.0f) {
                     // Blend LK position toward recovery position.
-                    pc.corner.uv = (1.0f - w) * pc.corner.uv + w * rc.uv;
+                    const float supported_corr_d =
+                        strongly_supported_recovery
+                            ? spacing * 1.15f
+                            : max_corr_d;
+                    if (d < supported_corr_d) {
+                        const float corr_w =
+                            strongly_supported_recovery
+                                ? std::max(w, d > max_corr_d ? 0.85f : 0.65f)
+                                : w;
+                        pc.corner.uv =
+                            (1.0f - corr_w) * pc.corner.uv +
+                            corr_w * rc.uv;
+                        pc.corner.predicted = false;
+                        if (strongly_supported_recovery) {
+                            pc.low_visibility_frames = 0;
+                            pc.visibility_score =
+                                std::max(pc.visibility_score, 0.75f);
+                            pc.smoothed_visibility_score =
+                                std::max(pc.smoothed_visibility_score, 0.60f);
+                        }
+                    }
+                }
+            } else if (pc.missed_frames > 0) {
+                const float max_reactivate_d =
+                    spacing * (pc.observed_frames >= 8 ? 1.5f : 0.9f);
+                const bool trusted_grid_reactivation =
+                    pc.observed_frames >= 3 &&
+                    recovery_neighbours >= 1 &&
+                    d < spacing * 6.0f;
+                if (d < max_reactivate_d || trusted_grid_reactivation) {
+                    bool too_close_to_active = false;
+                    for (int k = 0; k < static_cast<int>(persistent_corners_.size()); ++k) {
+                        if (k == existing_idx) continue;
+                        auto& other = persistent_corners_[k];
+                        if (other.missed_frames > 0) continue;
+                        if (distf(other.corner.uv, rc.uv) < min_dist) {
+                            const bool weak_active_blocker =
+                                recovery_neighbours >= 1 &&
+                                (other.corner.predicted ||
+                                 other.smoothed_visibility_score < 0.18f ||
+                                 (strongly_supported_recovery &&
+                                  !recoveryHasGrid(other.corner.i,
+                                                   other.corner.j)));
+                            if (weak_active_blocker) {
+                                evictActiveBlocker(other);
+                                continue;
+                            }
+                            too_close_to_active = true;
+                            break;
+                        }
+                    }
+                    if (!too_close_to_active) {
+                        pc.corner = rc;
+                        pc.missed_frames = 0;
+                        pc.tracked = true;
+                        pc.observed_frames += 1;
+                        pc.predicted_frames = 0;
+                        pc.low_visibility_frames = 0;
+                        pc.visibility_score = 1.0f;
+                        pc.smoothed_visibility_score =
+                            std::max(pc.smoothed_visibility_score, 0.75f);
+                    }
                 }
             }
             continue;
@@ -1144,9 +2092,19 @@ void CheckerboardDetector::injectRecoveryCorners(
         // Only check against active persistent corners to avoid stale
         // corners blocking newly visible ones.
         bool too_close = false;
-        for (const auto& pc : persistent_corners_) {
+        for (auto& pc : persistent_corners_) {
             if (pc.missed_frames > 0) continue;  // ignore stale
             if (distf(pc.corner.uv, rc.uv) < min_dist) {
+                const bool weak_active_blocker =
+                    recovery_neighbours >= 1 &&
+                    (pc.corner.predicted ||
+                     pc.smoothed_visibility_score < 0.18f ||
+                     (strongly_supported_recovery &&
+                      !recoveryHasGrid(pc.corner.i, pc.corner.j)));
+                if (weak_active_blocker) {
+                    evictActiveBlocker(pc);
+                    continue;
+                }
                 too_close = true;
                 break;
             }
@@ -1157,6 +2115,9 @@ void CheckerboardDetector::injectRecoveryCorners(
         pc.corner        = rc;
         pc.missed_frames = 0;
         pc.tracked       = true;
+        pc.observed_frames = 1;
+        pc.predicted_frames = 0;
+        pc.low_visibility_frames = 0;
         persistent_corners_.push_back(pc);
     }
 }
@@ -1178,11 +2139,273 @@ CheckerboardDetection CheckerboardDetector::buildDetectionFromPersistent(
     std::vector<GridCorner> visible_corners;
     visible_corners.reserve(persistent_corners_.size());
 
+    auto trackedNeighbourCount = [&](const PersistentTrackedCorner& pc) {
+        int count = 0;
+        for (const auto& nb : persistent_corners_) {
+            if (nb.missed_frames != 0) continue;
+            const int di = std::abs(nb.corner.i - pc.corner.i);
+            const int dj = std::abs(nb.corner.j - pc.corner.j);
+            if (di + dj == 1) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
     for (const auto& pc : persistent_corners_) {
-        if (pc.missed_frames != 0) continue;
+        const bool measured_this_frame = pc.missed_frames == 0;
+        const int tracked_neighbours = trackedNeighbourCount(pc);
+
+        const bool established_corner = pc.observed_frames >= 3;
+        const bool long_established_corner = pc.observed_frames >= 8;
+        if (measured_this_frame && pc.corner.predicted) {
+            const int min_predicted_neighbours =
+                long_established_corner ? 1 : 2;
+            if (tracked_neighbours < min_predicted_neighbours)
+                continue;
+
+            const bool severely_low_visibility =
+                pc.smoothed_visibility_score < 0.05f;
+            const int max_predicted_output_frames =
+                severely_low_visibility
+                    ? 2
+                    : (long_established_corner ? 6 : 2);
+            if (pc.predicted_frames > max_predicted_output_frames)
+                continue;
+        }
+
+        const int max_hold_frames =
+            long_established_corner
+                ? (pc.smoothed_visibility_score < 0.05f
+                       ? 2
+                       : std::max(config_.max_missed_frames, 6))
+                : (stable || established_corner ? config_.max_missed_frames : 1);
+        const float min_hold_visibility =
+            long_established_corner
+                ? 0.0f
+                : (stable ? 0.05f : (established_corner ? 0.10f : 0.55f));
+        const int min_hold_neighbours =
+            long_established_corner ? 1 : 2;
+        const bool hold_visible_frame =
+            pc.missed_frames > 0 &&
+            pc.missed_frames <= max_hold_frames &&
+            pc.smoothed_visibility_score >= min_hold_visibility &&
+            tracked_neighbours >= min_hold_neighbours;
+
+        if (!measured_this_frame && !hold_visible_frame) continue;
+
         GridCorner gc = pc.corner;
         gc.visibility_score = pc.smoothed_visibility_score;
+        gc.synthetic = false;
+        gc.observed_frames = pc.observed_frames;
+        gc.predicted = pc.corner.predicted || !measured_this_frame;
         visible_corners.push_back(gc);
+    }
+
+    if (tracking &&
+        static_cast<int>(visible_corners.size()) >
+            config_.min_tracking_corners) {
+        auto compressedOutputFilter = [&]() {
+            std::vector<float> good_edges;
+            good_edges.reserve(visible_corners.size() * 2);
+
+            auto strongVisible = [](const GridCorner& c) {
+                return !c.synthetic &&
+                       !c.predicted &&
+                       c.visibility_score >= 0.30f;
+            };
+
+            for (size_t a = 0; a < visible_corners.size(); ++a) {
+                const auto& ca = visible_corners[a];
+                if (!strongVisible(ca)) continue;
+
+                for (size_t b = a + 1; b < visible_corners.size(); ++b) {
+                    const auto& cb = visible_corners[b];
+                    if (!strongVisible(cb)) continue;
+
+                    const int di = std::abs(ca.i - cb.i);
+                    const int dj = std::abs(ca.j - cb.j);
+                    if (di + dj != 1) continue;
+
+                    const float d = distf(ca.uv, cb.uv);
+                    if (d >= 3.0f) {
+                        good_edges.push_back(d);
+                    }
+                }
+            }
+
+            if (good_edges.size() < 6) {
+                for (size_t a = 0; a < visible_corners.size(); ++a) {
+                    const auto& ca = visible_corners[a];
+                    if (ca.synthetic || ca.predicted ||
+                        ca.visibility_score < 0.18f) {
+                        continue;
+                    }
+
+                    for (size_t b = a + 1; b < visible_corners.size(); ++b) {
+                        const auto& cb = visible_corners[b];
+                        if (cb.synthetic || cb.predicted ||
+                            cb.visibility_score < 0.18f) {
+                            continue;
+                        }
+
+                        const int di = std::abs(ca.i - cb.i);
+                        const int dj = std::abs(ca.j - cb.j);
+                        if (di + dj != 1) continue;
+
+                        const float d = distf(ca.uv, cb.uv);
+                        if (d >= 3.0f) {
+                            good_edges.push_back(d);
+                        }
+                    }
+                }
+            }
+
+            if (good_edges.size() < 6) return;
+
+            std::nth_element(
+                good_edges.begin(),
+                good_edges.begin() +
+                    static_cast<std::ptrdiff_t>(good_edges.size() / 2),
+                good_edges.end());
+            const float spacing = good_edges[good_edges.size() / 2];
+            if (spacing < 6.0f) return;
+
+            const float compressed_d =
+                std::max(config_.duplicate_corner_dist_px * 1.6f,
+                         spacing * 0.65f);
+            const float duplicate_d =
+                std::max(config_.duplicate_corner_dist_px * 1.6f,
+                         spacing * 0.42f);
+
+            std::vector<char> remove(visible_corners.size(), 0);
+
+            auto weakOrPredicted = [](const GridCorner& c) {
+                return c.predicted || c.visibility_score < 0.28f;
+            };
+
+            auto removalScore = [](const GridCorner& c) {
+                float score = 0.0f;
+                if (c.predicted) score += 4.0f;
+                if (c.visibility_score < 0.05f) {
+                    score += 4.0f;
+                } else if (c.visibility_score < 0.12f) {
+                    score += 2.5f;
+                } else if (c.visibility_score < 0.22f) {
+                    score += 1.0f;
+                } else if (c.visibility_score < 0.28f) {
+                    score += 0.5f;
+                }
+                if (c.observed_frames < 3) score += 1.0f;
+                return score;
+            };
+
+            for (size_t a = 0; a < visible_corners.size(); ++a) {
+                if (remove[a]) continue;
+                const auto& ca = visible_corners[a];
+                if (ca.synthetic) continue;
+
+                for (size_t b = a + 1; b < visible_corners.size(); ++b) {
+                    if (remove[b]) continue;
+                    const auto& cb = visible_corners[b];
+                    if (cb.synthetic) continue;
+
+                    const int di = std::abs(ca.i - cb.i);
+                    const int dj = std::abs(ca.j - cb.j);
+                    if (di == 0 && dj == 0) continue;
+
+                    const float d = distf(ca.uv, cb.uv);
+                    const bool duplicate_collision = d < duplicate_d;
+                    const bool compressed_adjacent =
+                        (di + dj == 1) && d < compressed_d;
+                    if (!duplicate_collision && !compressed_adjacent)
+                        continue;
+
+                    if (!duplicate_collision &&
+                        !weakOrPredicted(ca) && !weakOrPredicted(cb)) {
+                        continue;
+                    }
+
+                    const bool a_strong = strongVisible(ca);
+                    const bool b_strong = strongVisible(cb);
+                    if (a_strong && !b_strong) {
+                        remove[b] = 1;
+                    } else if (b_strong && !a_strong) {
+                        remove[a] = 1;
+                        break;
+                    } else if (removalScore(ca) >= removalScore(cb)) {
+                        remove[a] = 1;
+                        break;
+                    } else {
+                        remove[b] = 1;
+                    }
+                }
+            }
+
+            int survivors = 0;
+            for (size_t k = 0; k < visible_corners.size(); ++k) {
+                if (!remove[k]) ++survivors;
+            }
+            if (survivors < config_.min_tracking_corners) return;
+
+            std::vector<GridCorner> filtered;
+            filtered.reserve(static_cast<size_t>(survivors));
+            for (size_t k = 0; k < visible_corners.size(); ++k) {
+                if (!remove[k]) filtered.push_back(visible_corners[k]);
+            }
+            visible_corners = std::move(filtered);
+        };
+
+        compressedOutputFilter();
+    }
+
+    auto hasVisibleGrid = [&](int i, int j) -> bool {
+        for (const auto& c : visible_corners) {
+            if (c.i == i && c.j == j) return true;
+        }
+        return false;
+    };
+
+    auto addIfMissing = [&](int i, int j, const cv::Point2f& uv) {
+        if (hasVisibleGrid(i, j)) return;
+        for (const auto& c : visible_corners) {
+            if (distf(c.uv, uv) < config_.duplicate_corner_dist_px) return;
+        }
+        GridCorner gc;
+        gc.i = i;
+        gc.j = j;
+        gc.uv = uv;
+        gc.visibility_score = 0.0f;
+        gc.synthetic = true;
+        visible_corners.push_back(gc);
+    };
+
+    // Fill single-cell holes between two currently visible opposite
+    // neighbours. This is deliberately conservative: no extrapolation, no
+    // isolated points, just the missing middle between a plausible local row
+    // or column segment.
+    const std::vector<GridCorner> before_gap_fill = visible_corners;
+    for (const auto& left : before_gap_fill) {
+        const int mi = left.i + 1;
+        const int mj = left.j;
+        if (hasVisibleGrid(mi, mj)) continue;
+        for (const auto& right : before_gap_fill) {
+            if (right.i == left.i + 2 && right.j == left.j) {
+                addIfMissing(mi, mj, 0.5f * (left.uv + right.uv));
+                break;
+            }
+        }
+    }
+    for (const auto& top : before_gap_fill) {
+        const int mi = top.i;
+        const int mj = top.j + 1;
+        if (hasVisibleGrid(mi, mj)) continue;
+        for (const auto& bottom : before_gap_fill) {
+            if (bottom.i == top.i && bottom.j == top.j + 2) {
+                addIfMissing(mi, mj, 0.5f * (top.uv + bottom.uv));
+                break;
+            }
+        }
     }
 
     auto rebuilt = grid_builder_.buildFromCorners(
@@ -1202,6 +2425,385 @@ CheckerboardDetection CheckerboardDetector::buildDetectionFromPersistent(
 
     rebuilt->tracking = tracking;
     rebuilt->stable   = stable;
+
+    if (tracking) {
+        const float spacing = std::max(1.0f, estimateMedianSpacing(*rebuilt));
+        const float duplicate_d =
+            std::max(2.0f, config_.duplicate_corner_dist_px);
+
+        auto hasOutputGrid = [&](int i, int j) -> bool {
+            for (const auto& c : rebuilt->corners) {
+                if (c.i == i && c.j == j) return true;
+            }
+            return false;
+        };
+
+        auto outputDuplicate = [&](const cv::Point2f& uv) -> bool {
+            for (const auto& c : rebuilt->corners) {
+                if (distf(c.uv, uv) < duplicate_d) return true;
+            }
+            return false;
+        };
+
+        auto inputNeighbourCount = [&](const GridCorner& candidate) -> int {
+            int count = 0;
+            for (const auto& c : visible_corners) {
+                if (c.synthetic) continue;
+                if (c.i == candidate.i && c.j == candidate.j) continue;
+                const int di = std::abs(c.i - candidate.i);
+                const int dj = std::abs(c.j - candidate.j);
+                if (di + dj == 1) ++count;
+            }
+            return count;
+        };
+
+        auto outputSupportOk = [&](const GridCorner& candidate) -> bool {
+            for (const auto& c : rebuilt->corners) {
+                const int di = std::abs(c.i - candidate.i);
+                const int dj = std::abs(c.j - candidate.j);
+                if (di + dj != 1) continue;
+
+                const float d = distf(c.uv, candidate.uv);
+                if (d >= spacing * 0.25f &&
+                    d <= spacing * 2.10f) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto predictedFramesForGrid = [&](const GridCorner& candidate) -> int {
+            for (const auto& pc : persistent_corners_) {
+                if (pc.corner.i == candidate.i &&
+                    pc.corner.j == candidate.j) {
+                    return pc.predicted_frames;
+                }
+            }
+            return 0;
+        };
+
+        // The cell compaction stage is intentionally strict because it protects
+        // pose/decode quality. For tracking, however, the green landmark output
+        // should be temporally stable: an established rim corner may be valid
+        // even when it does not close a full cell this frame. Re-attach those
+        // locally supported corners after the cell graph has been built.
+        for (int pass = 0; pass < 4; ++pass) {
+            bool changed = false;
+            for (const auto& c : visible_corners) {
+                if (c.synthetic) continue;
+                if (hasOutputGrid(c.i, c.j)) continue;
+                if (outputDuplicate(c.uv)) continue;
+                const int input_neighbours = inputNeighbourCount(c);
+                const bool long_established = c.observed_frames >= 8;
+                const bool locally_confirmed =
+                    c.observed_frames >= 3 && input_neighbours >= 2;
+                const bool strong_new_observation =
+                    !c.predicted &&
+                    c.observed_frames >= 1 &&
+                    c.visibility_score >=
+                        (input_neighbours >= 2 ? 0.30f : 0.45f) &&
+                    input_neighbours >= 1;
+                if (!long_established &&
+                    !locally_confirmed &&
+                    !strong_new_observation) {
+                    continue;
+                }
+                if (c.predicted &&
+                    c.visibility_score < 0.05f &&
+                    predictedFramesForGrid(c) > 2) {
+                    continue;
+                }
+                const float min_output_visibility =
+                    long_established ? 0.0f : (stable ? 0.05f : 0.10f);
+                if (c.visibility_score < min_output_visibility)
+                    continue;
+                if (input_neighbours < 1) continue;
+                if (!outputSupportOk(c)) continue;
+
+                rebuilt->corners.push_back(c);
+                changed = true;
+            }
+            if (!changed) break;
+        }
+
+        auto finalCompressedOutputFilter = [&]() {
+            auto& corners = rebuilt->corners;
+            if (static_cast<int>(corners.size()) <=
+                config_.min_tracking_corners) {
+                return;
+            }
+
+            auto strongVisible = [](const GridCorner& c) {
+                return !c.synthetic &&
+                       !c.predicted &&
+                       c.visibility_score >= 0.30f;
+            };
+            auto weakOrPredicted = [](const GridCorner& c) {
+                return c.predicted || c.visibility_score < 0.28f;
+            };
+            auto removalScore = [](const GridCorner& c) {
+                float score = 0.0f;
+                if (c.predicted) score += 4.0f;
+                if (c.visibility_score < 0.05f) {
+                    score += 4.0f;
+                } else if (c.visibility_score < 0.12f) {
+                    score += 2.5f;
+                } else if (c.visibility_score < 0.22f) {
+                    score += 1.0f;
+                } else if (c.visibility_score < 0.28f) {
+                    score += 0.5f;
+                }
+                if (c.observed_frames < 3) score += 1.0f;
+                return score;
+            };
+
+            std::vector<float> good_edges;
+            good_edges.reserve(corners.size() * 2);
+            for (size_t a = 0; a < corners.size(); ++a) {
+                if (!strongVisible(corners[a])) continue;
+                for (size_t b = a + 1; b < corners.size(); ++b) {
+                    if (!strongVisible(corners[b])) continue;
+                    const int di = std::abs(corners[a].i - corners[b].i);
+                    const int dj = std::abs(corners[a].j - corners[b].j);
+                    if (di + dj != 1) continue;
+                    const float d = distf(corners[a].uv, corners[b].uv);
+                    if (d >= 3.0f) good_edges.push_back(d);
+                }
+            }
+            if (good_edges.size() < 6) return;
+
+            std::nth_element(
+                good_edges.begin(),
+                good_edges.begin() +
+                    static_cast<std::ptrdiff_t>(good_edges.size() / 2),
+                good_edges.end());
+            const float spacing = good_edges[good_edges.size() / 2];
+            if (spacing < 6.0f) return;
+
+            const float compressed_d =
+                std::max(config_.duplicate_corner_dist_px * 1.6f,
+                         spacing * 0.65f);
+            const float duplicate_d =
+                std::max(config_.duplicate_corner_dist_px * 1.6f,
+                         spacing * 0.42f);
+
+            std::vector<char> remove(corners.size(), 0);
+            for (size_t a = 0; a < corners.size(); ++a) {
+                if (remove[a] || corners[a].synthetic) continue;
+                for (size_t b = a + 1; b < corners.size(); ++b) {
+                    if (remove[b] || corners[b].synthetic) continue;
+                    const int di = std::abs(corners[a].i - corners[b].i);
+                    const int dj = std::abs(corners[a].j - corners[b].j);
+                    if (di == 0 && dj == 0) continue;
+
+                    const float d = distf(corners[a].uv, corners[b].uv);
+                    const bool duplicate_collision = d < duplicate_d;
+                    const bool compressed_adjacent =
+                        (di + dj == 1) && d < compressed_d;
+                    if (!duplicate_collision && !compressed_adjacent)
+                        continue;
+                    if (!duplicate_collision &&
+                        !weakOrPredicted(corners[a]) &&
+                        !weakOrPredicted(corners[b])) {
+                        continue;
+                    }
+
+                    const bool a_strong = strongVisible(corners[a]);
+                    const bool b_strong = strongVisible(corners[b]);
+                    if (a_strong && !b_strong) {
+                        remove[b] = 1;
+                    } else if (b_strong && !a_strong) {
+                        remove[a] = 1;
+                        break;
+                    } else if (removalScore(corners[a]) >=
+                               removalScore(corners[b])) {
+                        remove[a] = 1;
+                        break;
+                    } else {
+                        remove[b] = 1;
+                    }
+                }
+            }
+
+            auto cellUsesGrid = [](const GridCell& cell,
+                                   const GridCorner& c) {
+                return (c.i == cell.i && c.j == cell.j) ||
+                       (c.i == cell.i + 1 && c.j == cell.j) ||
+                       (c.i == cell.i + 1 && c.j == cell.j + 1) ||
+                       (c.i == cell.i && c.j == cell.j + 1);
+            };
+
+            const float min_cell_area = spacing * spacing * 0.20f;
+            const float interior_margin =
+                std::max(1.0f, spacing * 0.04f);
+            const float outside_cell_margin =
+                std::max(2.0f, spacing * 0.50f);
+            for (int pass = 0; pass < 3; ++pass) {
+                bool changed = false;
+
+                for (size_t k = 0; k < corners.size(); ++k) {
+                    if (remove[k] || corners[k].synthetic) continue;
+
+                    for (const auto& cell : rebuilt->cells) {
+                        if (cellUsesGrid(cell, corners[k])) continue;
+                        if (quadArea(cell.corner_uv) < min_cell_area)
+                            continue;
+
+                        bool cell_already_removed = false;
+                        for (int idx : cell.corner_indices) {
+                            if (idx < 0 ||
+                                idx >= static_cast<int>(remove.size()) ||
+                                remove[static_cast<size_t>(idx)]) {
+                                cell_already_removed = true;
+                                break;
+                            }
+                        }
+                        if (cell_already_removed) continue;
+
+                        const float inside_d =
+                            pointInsideQuadDistance(cell.corner_uv,
+                                                    corners[k].uv);
+                        if (inside_d <= interior_margin) continue;
+
+                        int weakest_cell_idx = -1;
+                        float weakest_cell_score =
+                            std::numeric_limits<float>::lowest();
+                        for (int idx : cell.corner_indices) {
+                            if (idx < 0 ||
+                                idx >= static_cast<int>(corners.size())) {
+                                continue;
+                            }
+                            const float score =
+                                removalScore(corners[
+                                    static_cast<size_t>(idx)]);
+                            if (score > weakest_cell_score) {
+                                weakest_cell_score = score;
+                                weakest_cell_idx = idx;
+                            }
+                        }
+                        if (weakest_cell_idx < 0) continue;
+
+                        const float candidate_score =
+                            removalScore(corners[k]);
+                        if (candidate_score >=
+                            weakest_cell_score - 0.25f) {
+                            remove[k] = 1;
+                        } else {
+                            remove[static_cast<size_t>(
+                                weakest_cell_idx)] = 1;
+                        }
+                        changed = true;
+                        break;
+                    }
+                }
+
+                if (!changed) break;
+            }
+
+            auto outputGridSupport = [&](size_t idx) {
+                int support = 0;
+                const auto& c = corners[idx];
+                for (size_t k = 0; k < corners.size(); ++k) {
+                    if (k == idx || remove[k]) continue;
+                    const int di = std::abs(corners[k].i - c.i);
+                    const int dj = std::abs(corners[k].j - c.j);
+                    if (di + dj == 1) ++support;
+                }
+                return support;
+            };
+
+            for (size_t k = 0; k < corners.size(); ++k) {
+                if (remove[k] || corners[k].synthetic) continue;
+
+                bool used_by_cell = false;
+                float min_cell_dist = std::numeric_limits<float>::max();
+                for (const auto& cell : rebuilt->cells) {
+                    if (quadArea(cell.corner_uv) < min_cell_area)
+                        continue;
+                    if (cellUsesGrid(cell, corners[k])) {
+                        used_by_cell = true;
+                        break;
+                    }
+                    min_cell_dist = std::min(
+                        min_cell_dist,
+                        pointToQuadDistance(cell.corner_uv,
+                                            corners[k].uv));
+                }
+                if (used_by_cell) continue;
+                if (min_cell_dist <= outside_cell_margin) continue;
+                if (outputGridSupport(k) >= 2) continue;
+
+                remove[k] = 1;
+            }
+
+            int survivors = 0;
+            for (char r : remove) {
+                if (!r) ++survivors;
+            }
+            if (survivors < config_.min_tracking_corners) return;
+
+            std::vector<int> old_to_new(corners.size(), -1);
+            std::vector<GridCorner> filtered_corners;
+            filtered_corners.reserve(static_cast<size_t>(survivors));
+            for (size_t k = 0; k < corners.size(); ++k) {
+                if (remove[k]) continue;
+                old_to_new[k] = static_cast<int>(filtered_corners.size());
+                filtered_corners.push_back(corners[k]);
+            }
+
+            std::vector<GridCell> filtered_cells;
+            filtered_cells.reserve(rebuilt->cells.size());
+            for (auto cell : rebuilt->cells) {
+                bool ok = true;
+                for (int k = 0; k < 4; ++k) {
+                    const int old_idx = cell.corner_indices[k];
+                    if (old_idx < 0 ||
+                        old_idx >= static_cast<int>(old_to_new.size()) ||
+                        old_to_new[old_idx] < 0) {
+                        ok = false;
+                        break;
+                    }
+                    cell.corner_indices[k] = old_to_new[old_idx];
+                    cell.corner_uv[k] =
+                        filtered_corners[cell.corner_indices[k]].uv;
+                }
+                if (!ok) continue;
+                cell.center_uv =
+                    0.25f * (
+                        cell.corner_uv[0] +
+                        cell.corner_uv[1] +
+                        cell.corner_uv[2] +
+                        cell.corner_uv[3]);
+                filtered_cells.push_back(cell);
+            }
+
+            if (static_cast<int>(filtered_cells.size()) <
+                config_.min_tracking_cells) {
+                return;
+            }
+
+            rebuilt->corners = std::move(filtered_corners);
+            rebuilt->cells = std::move(filtered_cells);
+        };
+
+        finalCompressedOutputFilter();
+
+        if (!rebuilt->corners.empty()) {
+            int min_i = std::numeric_limits<int>::max();
+            int max_i = std::numeric_limits<int>::min();
+            int min_j = std::numeric_limits<int>::max();
+            int max_j = std::numeric_limits<int>::min();
+            for (const auto& c : rebuilt->corners) {
+                min_i = std::min(min_i, c.i);
+                max_i = std::max(max_i, c.i);
+                min_j = std::min(min_j, c.j);
+                max_j = std::max(max_j, c.j);
+            }
+            rebuilt->cols = max_i - min_i + 1;
+            rebuilt->rows = max_j - min_j + 1;
+        }
+    }
+
     return *rebuilt;
 }
 
@@ -1264,6 +2866,128 @@ std::optional<CheckerboardDetection> CheckerboardDetector::mergeMeasuredDetectio
 
     rebuilt->tracking = primary.tracking;
     rebuilt->stable   = primary.stable;
+    return rebuilt;
+}
+
+std::optional<CheckerboardDetection>
+CheckerboardDetector::alignDetectionGridToReference(
+    const CheckerboardDetection& detection,
+    const CheckerboardDetection& reference
+) const {
+    if (!detection.valid() || !reference.valid())
+        return std::nullopt;
+
+    struct GridTransform {
+        int a, b, c, d;
+    };
+
+    constexpr std::array<GridTransform, 8> transforms = {{
+        { 1,  0,  0,  1},
+        {-1,  0,  0,  1},
+        { 1,  0,  0, -1},
+        {-1,  0,  0, -1},
+        { 0,  1,  1,  0},
+        { 0, -1,  1,  0},
+        { 0,  1, -1,  0},
+        { 0, -1, -1,  0}
+    }};
+
+    const float ref_spacing = estimateMedianSpacing(reference);
+    const float det_spacing = estimateMedianSpacing(detection);
+    const float spacing =
+        std::max(1.0f, ref_spacing > 1.0f ? ref_spacing : det_spacing);
+    const float seed_match_px = std::max(8.0f, spacing * 0.75f);
+    const float accept_px = std::max(6.0f, spacing * 0.45f);
+
+    auto findReferenceByGrid = [&](int i, int j) -> const GridCorner* {
+        for (const auto& rc : reference.corners) {
+            if (rc.i == i && rc.j == j) return &rc;
+        }
+        return nullptr;
+    };
+
+    struct Candidate {
+        GridTransform tr;
+        int ti = 0;
+        int tj = 0;
+        int matches = 0;
+        float mean_error = std::numeric_limits<float>::max();
+    };
+
+    std::optional<Candidate> best;
+
+    for (const auto& dc : detection.corners) {
+        for (const auto& rc : reference.corners) {
+            if (distf(dc.uv, rc.uv) > seed_match_px) continue;
+
+            for (const auto& tr : transforms) {
+                const int mi = tr.a * dc.i + tr.b * dc.j;
+                const int mj = tr.c * dc.i + tr.d * dc.j;
+                const int ti = rc.i - mi;
+                const int tj = rc.j - mj;
+
+                int matches = 0;
+                float err_sum = 0.0f;
+
+                for (const auto& c : detection.corners) {
+                    const int ai = tr.a * c.i + tr.b * c.j + ti;
+                    const int aj = tr.c * c.i + tr.d * c.j + tj;
+                    const GridCorner* ref = findReferenceByGrid(ai, aj);
+                    if (!ref) continue;
+
+                    const float e = distf(c.uv, ref->uv);
+                    if (e > accept_px) continue;
+
+                    ++matches;
+                    err_sum += e;
+                }
+
+                if (matches < config_.min_tracking_corners)
+                    continue;
+
+                const float mean_error =
+                    err_sum / static_cast<float>(matches);
+
+                if (mean_error > accept_px * 0.75f)
+                    continue;
+
+                if (!best ||
+                    matches > best->matches ||
+                    (matches == best->matches &&
+                     mean_error < best->mean_error)) {
+                    best = Candidate{tr, ti, tj, matches, mean_error};
+                }
+            }
+        }
+    }
+
+    if (!best)
+        return std::nullopt;
+
+    std::vector<GridCorner> aligned_corners;
+    aligned_corners.reserve(detection.corners.size());
+
+    for (auto c : detection.corners) {
+        const int ai = best->tr.a * c.i + best->tr.b * c.j + best->ti;
+        const int aj = best->tr.c * c.i + best->tr.d * c.j + best->tj;
+        c.i = ai;
+        c.j = aj;
+        aligned_corners.push_back(c);
+    }
+
+    auto rebuilt = grid_builder_.buildFromCorners(
+        aligned_corners,
+        config_.duplicate_corner_dist_px,
+        config_.min_corners,
+        config_.min_cells,
+        detection.tracking,
+        detection.stable);
+
+    if (!rebuilt || !rebuilt->valid())
+        return std::nullopt;
+
+    rebuilt->tracking = detection.tracking;
+    rebuilt->stable   = detection.stable;
     return rebuilt;
 }
 

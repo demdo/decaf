@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <opencv2/calib3d.hpp>
 
@@ -105,94 +106,127 @@ TrackingValidationResult TrackingValidator::validate(
         return result;
     }
 
-    cv::Mat H;
-    std::vector<uchar> inlier_mask;
+    result.visible_indices.reserve(good_indices.size());
+    result.visible_points.reserve(good_indices.size());
+    result.visible_predicted.reserve(good_indices.size());
 
-    if (prev_good.size() >= 4) {
-        H = cv::findHomography(
-            prev_good,
-            curr_good,
-            cv::RANSAC,
-            config.max_tracking_homography_error_px,
-            inlier_mask
-        );
-    }
+    std::vector<char> exported(n, 0);
 
-    if (H.empty() || inlier_mask.size() != prev_good.size()) {
-        return result;
-    }
+    const float min_edge_ratio =
+        std::max(0.30f, config.tracking_spacing_min_rel * 0.75f);
+    const float max_edge_ratio =
+        std::max(1.20f, config.tracking_spacing_max_rel * 1.35f);
 
-    int inliers = 0;
-    for (uchar v : inlier_mask) {
-        if (v) {
-            ++inliers;
+    std::vector<int> local_support(good_indices.size(), 0);
+    std::vector<float> local_error(
+        good_indices.size(),
+        std::numeric_limits<float>::max());
+
+    for (size_t a = 0; a < good_indices.size(); ++a) {
+        const int ka = good_indices[a];
+        const auto& ca = previous.corners[ka];
+
+        for (size_t b = a + 1; b < good_indices.size(); ++b) {
+            const int kb = good_indices[b];
+            const auto& cb = previous.corners[kb];
+
+            const int di = std::abs(ca.i - cb.i);
+            const int dj = std::abs(ca.j - cb.j);
+            if (di + dj != 1) {
+                continue;
+            }
+
+            const float old_d = pointDistance(ca.uv, cb.uv);
+            const float new_d = pointDistance(curr_good[a], curr_good[b]);
+            if (old_d < 2.0f || new_d < 2.0f) {
+                continue;
+            }
+
+            const float ratio = new_d / old_d;
+            if (ratio < min_edge_ratio || ratio > max_edge_ratio) {
+                continue;
+            }
+
+            ++local_support[a];
+            ++local_support[b];
+
+            const float e = std::abs(std::log(ratio));
+            local_error[a] = std::min(local_error[a], e);
+            local_error[b] = std::min(local_error[b], e);
         }
     }
 
-    result.homography_inliers = inliers;
-    result.inlier_ratio =
-        prev_good.empty()
-            ? 0.0f
-            : static_cast<float>(inliers) /
-              static_cast<float>(prev_good.size());
-
-    if (result.inlier_ratio < kMinHomographyInlierRatio) {
-        return result;
-    }
-
-    const float max_h_residual =
-        std::max(2.0f, config.max_tracking_homography_error_px);
-
-    result.visible_indices.reserve(good_indices.size());
-    result.visible_points.reserve(good_indices.size());
-
-    float residual_sum = 0.0f;
-    int residual_count = 0;
+    int supported_tracks = 0;
+    float local_error_sum = 0.0f;
+    float local_error_max = 0.0f;
 
     float motion_sum = 0.0f;
     int motion_count = 0;
 
     for (size_t m = 0; m < good_indices.size(); ++m) {
-        if (!inlier_mask[m]) {
-            continue;
-        }
-
         const int k = good_indices[m];
         const cv::Point2f old_uv = previous.corners[k].uv;
         const cv::Point2f measured = lk.curr_points[k];
-        const cv::Point2f projected = projectPoint(H, old_uv);
 
-        if (!isInsideImageSafe(projected, image_size, kBorderMarginPx)) {
+        if (local_support[m] <= 0) {
             continue;
         }
 
-        const float residual = pointDistance(measured, projected);
-
-        residual_sum += residual;
-        ++residual_count;
-
-        result.max_lk_to_h_px =
-            std::max(result.max_lk_to_h_px, residual);
-
-        if (residual > max_h_residual) {
-            continue;
+        ++supported_tracks;
+        if (std::isfinite(local_error[m])) {
+            local_error_sum += local_error[m];
+            local_error_max = std::max(local_error_max, local_error[m]);
         }
 
-        // Key rule:
-        // Only directly measured LK points are exported.
-        // Homography projection is used only as a plausibility test.
         result.visible_indices.push_back(k);
         result.visible_points.push_back(measured);
+        result.visible_predicted.push_back(false);
+        exported[k] = 1;
         ++result.directly_tracked;
 
         motion_sum += pointDistance(old_uv, measured);
         ++motion_count;
     }
 
-    result.mean_lk_to_h_px =
-        residual_count > 0
-            ? residual_sum / static_cast<float>(residual_count)
+    if (result.directly_tracked < config.min_tracking_corners) {
+        // Fallback for very sparse but LK-consistent frames: keep the basic
+        // forward-backward-checked points instead of dropping the pose. The
+        // downstream grid builder still removes points that do not form a
+        // plausible checkerboard patch.
+        result.visible_indices.clear();
+        result.visible_points.clear();
+        result.visible_predicted.clear();
+        std::fill(exported.begin(), exported.end(), 0);
+
+        motion_sum = 0.0f;
+        motion_count = 0;
+        result.directly_tracked = 0;
+
+        for (size_t m = 0; m < good_indices.size(); ++m) {
+            const int k = good_indices[m];
+            result.visible_indices.push_back(k);
+            result.visible_points.push_back(curr_good[m]);
+            result.visible_predicted.push_back(false);
+            exported[k] = 1;
+            ++result.directly_tracked;
+
+            motion_sum += pointDistance(previous.corners[k].uv, curr_good[m]);
+            ++motion_count;
+        }
+    }
+
+    result.homography_inliers = supported_tracks;
+    result.inlier_ratio =
+        result.lk_basic_good > 0
+            ? static_cast<float>(supported_tracks) /
+              static_cast<float>(result.lk_basic_good)
             : 0.0f;
+
+    result.mean_lk_to_h_px =
+        supported_tracks > 0
+            ? local_error_sum / static_cast<float>(supported_tracks)
+            : 0.0f;
+    result.max_lk_to_h_px = local_error_max;
 
     result.mean_motion_px =
         motion_count > 0
@@ -213,12 +247,8 @@ TrackingValidationResult TrackingValidator::validate(
         return result;
     }
 
-    // Degrade rule:
-    // If too many previously visible corners are no longer directly confirmed,
-    // tracking must stop and recovery must re-anchor the detector.
-    if (result.direct_ratio < config.min_tracking_corner_ratio) {
-        return result;
-    }
+    result.homography_projected = 0;
+    result.projected_ratio = 0.0f;
 
     result.valid = true;
 

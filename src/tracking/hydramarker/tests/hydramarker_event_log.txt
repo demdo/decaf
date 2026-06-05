@@ -1,71 +1,185 @@
 HydraTracker event log
 ======================
 
-OUTAGE_START frame=263 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=264 len=2 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_END frame=265 duration=2 pose_available_pct=99.25
-OUTAGE_START frame=301 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
-OUTAGE_CONT frame=302 len=2 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=34 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
-OUTAGE_END frame=303 duration=2 pose_available_pct=98.68
-OUTAGE_START frame=490 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=40 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=491 len=2 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=39 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=492 len=3 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=42 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=493 len=4 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=41 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=494 len=5 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=41 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=495 len=6 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=49 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=496 len=7 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
-OUTAGE_CONT frame=497 len=8 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
-OUTAGE_CONT frame=498 len=9 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
-OUTAGE_CONT frame=499 len=10 stage=CORRESPONDENCE reason=CORRESPONDENCE_REJECTED det=52 pose=0 pts=4 inl=0 msg=Too few correspondences: 4.
-OUTAGE_CONT frame=500 len=11 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=501 len=12 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=502 len=13 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=503 len=14 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=504 len=15 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=52 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=505 len=16 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=50 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=506 len=17 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=507 len=18 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=508 len=19 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=509 len=20 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=510 len=21 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=51 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=511 len=22 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=512 len=23 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=513 len=24 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=514 len=25 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=515 len=26 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=516 len=27 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=517 len=28 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=518 len=29 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=53 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=519 len=30 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=520 len=31 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=521 len=32 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=522 len=33 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=523 len=34 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=524 len=35 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=525 len=36 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=526 len=37 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=527 len=38 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=528 len=39 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=529 len=40 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=530 len=41 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=531 len=42 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=532 len=43 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=533 len=44 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=534 len=45 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=54 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=535 len=46 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=536 len=47 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=537 len=48 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=538 len=49 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=539 len=50 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=540 len=51 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=541 len=52 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=542 len=53 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=543 len=54 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=544 len=55 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=545 len=56 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=546 len=57 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=547 len=58 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=548 len=59 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=549 len=60 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=550 len=61 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
-OUTAGE_CONT frame=551 len=62 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=55 pose=0 pts=0 inl=0 msg=No valid decoded patches.
+OUTAGE_START frame=1 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=2 len=2 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=3 len=3 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=4 len=4 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=5 len=5 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=6 len=6 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=7 len=7 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=8 len=8 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=9 len=9 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=10 len=10 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=11 len=11 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=12 len=12 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=13 len=13 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=14 len=14 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=15 len=15 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=16 len=16 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=17 len=17 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=18 len=18 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=19 len=19 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=20 len=20 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=21 len=21 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=22 len=22 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=23 len=23 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=24 len=24 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=25 len=25 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=26 len=26 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=27 len=27 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=28 len=28 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=29 len=29 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=30 len=30 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=31 len=31 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=32 len=32 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=33 len=33 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=34 len=34 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=35 len=35 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=36 len=36 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=37 len=37 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=38 len=38 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=39 len=39 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=40 len=40 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=41 len=41 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=42 len=42 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=43 len=43 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=44 len=44 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=45 len=45 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=46 len=46 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=47 len=47 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=48 len=48 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=49 len=49 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=50 len=50 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=51 len=51 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=52 len=52 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=53 len=53 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=54 len=54 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=55 len=55 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=56 len=56 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=57 len=57 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=58 len=58 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=59 len=59 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=60 len=60 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=61 len=61 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=62 len=62 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=63 len=63 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=64 len=64 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=65 len=65 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=66 len=66 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=67 len=67 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=68 len=68 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=69 len=69 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=70 len=70 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=71 len=71 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=72 len=72 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=73 len=73 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=74 len=74 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=75 len=75 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=76 len=76 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=77 len=77 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=78 len=78 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=79 len=79 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=80 len=80 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=81 len=81 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=82 len=82 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=83 len=83 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=84 len=84 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=85 len=85 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=86 len=86 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=87 len=87 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=88 len=88 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=89 len=89 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=90 len=90 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=91 len=91 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=92 len=92 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=93 len=93 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=94 len=94 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=95 len=95 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=96 len=96 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=97 len=97 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=98 len=98 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=99 len=99 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=100 len=100 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=101 len=101 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=102 len=102 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=103 len=103 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=104 len=104 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=105 len=105 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=106 len=106 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=107 len=107 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=108 len=108 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=109 len=109 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=110 len=110 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=111 len=111 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=112 len=112 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=113 len=113 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=114 len=114 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=115 len=115 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=116 len=116 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=117 len=117 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=118 len=118 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=119 len=119 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=120 len=120 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=121 len=121 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=122 len=122 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=11 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=4, valid_cells=4, ambig_cells=0, cached_cells=0, grid=1x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=123 len=123 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=11 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=4, valid_cells=4, ambig_cells=0, cached_cells=0, grid=1x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=124 len=124 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=10 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=3, valid_cells=3, ambig_cells=0, cached_cells=0, grid=0x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=125 len=125 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=126 len=126 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=127 len=127 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=128 len=128 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=129 len=129 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=130 len=130 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=131 len=131 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=132 len=132 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=133 len=133 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=134 len=134 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=135 len=135 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=136 len=136 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=137 len=137 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=138 len=138 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=139 len=139 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=140 len=140 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=141 len=141 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=142 len=142 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=143 len=143 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=144 len=144 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=145 len=145 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=8 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=2, valid_cells=2, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=146 len=146 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=8 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=2, valid_cells=2, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=147 len=147 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=8 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=2, valid_cells=2, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=148 len=148 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=149 len=149 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=150 len=150 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=151 len=151 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=152 len=152 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=153 len=153 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=154 len=154 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=155 len=155 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=156 len=156 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=157 len=157 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=158 len=158 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=159 len=159 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=160 len=160 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=161 len=161 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=162 len=162 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=163 len=163 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=164 len=164 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=165 len=165 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=166 len=166 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=167 len=167 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=168 len=168 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=169 len=169 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=12 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=5, valid_cells=5, ambig_cells=0, cached_cells=0, grid=1x4, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=170 len=170 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=12 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=5, valid_cells=5, ambig_cells=0, cached_cells=0, grid=1x4, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=171 len=171 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=12 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=5, valid_cells=5, ambig_cells=0, cached_cells=0, grid=1x4, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=172 len=172 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=173 len=173 stage=OTHER reason=OTHER det=0 pose=0 pts=0 inl=0 msg=No valid checkerboard detection.
+OUTAGE_CONT frame=174 len=174 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=175 len=175 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=176 len=176 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=177 len=177 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=178 len=178 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=179 len=179 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=180 len=180 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_CONT frame=181 len=181 stage=PATCH_DECODER reason=NO_VALID_DECODED_PATCHES det=16 pose=0 pts=0 inl=0 msg=No valid decoded patches (cells=8, valid_cells=8, ambig_cells=0, cached_cells=0, grid=2x1, patches=0, decoded=0, bad_geom=0, ambiguous=0, matched_rejected=0).
+OUTAGE_END frame=182 duration=181 pose_available_pct=0.55

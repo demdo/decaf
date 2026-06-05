@@ -17,6 +17,19 @@ struct GridCorner {
     // 0.0 = no checkerboard structure (back-side / occluded corner).
     // Only meaningful during tracking; set to 1.0 during recovery detection.
     float visibility_score = 1.0f;
+
+    // Internal helper corners may be used while testing local cell geometry,
+    // but must not leak out as final visible checkerboard corners.
+    bool synthetic = false;
+
+    // Number of successful observations in the persistent tracker.  Recovery
+    // detections leave this at 0; tracked output uses it for stable edge
+    // hysteresis.
+    int observed_frames = 0;
+
+    // True when the point was carried by the motion model for this frame
+    // instead of directly confirmed by LK/recovery.
+    bool predicted = false;
 };
 
 struct GridCell {
@@ -52,6 +65,12 @@ struct CheckerboardDetectorConfig {
 
     int min_tracking_corners = 6;
     int min_tracking_cells = 2;
+
+    // A k x k HydraMarker code patch needs at least k contiguous cell rows and
+    // k contiguous cell columns.  LK tracking can otherwise get stuck in a
+    // visually plausible but undecodable narrow strip (for example 4x2 cells).
+    int min_tracking_decode_cell_span = 3;
+    int max_undecodeable_tracking_frames = 2;
 
     float min_tracking_corner_ratio = 0.45f;
     float max_tracking_homography_error_px = 12.0f;
@@ -184,14 +203,14 @@ struct CheckerboardDetectorConfig {
     //                          avoid false evictions on very small markers.
     float visibility_sample_rel      = 0.35f;
     float visibility_box_rel         = 0.15f;
-    float visibility_evict_threshold = 0.05f;
+    float visibility_evict_threshold = 0.18f;
     float visibility_min_spacing     = 8.0f;
 
     // EMA smoothing factor for visibility score.
     // smoothed = alpha * raw + (1 - alpha) * prev_smoothed
     // 0.4 = ~3-frame effective window; prevents single-frame dips from
     // triggering eviction while still reacting to genuine fade-out.
-    float visibility_smoothing_alpha = 0.4f;
+    float visibility_smoothing_alpha = 0.40f;
 };
 
 } // namespace hydramarker

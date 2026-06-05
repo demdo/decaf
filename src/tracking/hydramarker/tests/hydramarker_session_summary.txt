@@ -2,16 +2,16 @@
 HydraTracker Session Summary
 ========================================
 
-Total frames:                 638
-Frames with pose:             596
-Frames without pose:          42
-Pose availability [%]:        93.42
+Total frames:                 657
+Frames with pose:             476
+Frames without pose:          181
+Pose availability [%]:        72.45
 
-Blue-only frames:             42
-Blue-only ratio [%]:          6.58
-Zero-green frames:            42
-Zero-green ratio [%]:         6.58
-Few-green frames (<5):       42
-Few-green ratio [%]:          6.58
+Blue-only frames:             173
+Blue-only ratio [%]:          26.33
+Zero-green frames:            417
+Zero-green ratio [%]:         63.47
+Few-green frames (<5):       417
+Few-green ratio [%]:          63.47
 
-Number of pose outages:       5
+Number of pose outages:       1

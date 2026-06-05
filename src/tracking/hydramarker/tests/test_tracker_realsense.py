@@ -571,7 +571,8 @@ def draw_status(vis: np.ndarray, result, frame_idx: int, tracker: HydraTracker) 
 
     line1 = (
         f"frame={frame_idx} | {result.mode.value} | ok={result.success} | "
-        f"det={len(detection_corners)} | pose={len(result.corners)} | "
+        f"det={len(detection_corners)} | pose={'Y' if result.rvec is not None and result.tvec is not None else 'N'} | "
+        f"vis={len(result.corners)} | "
         f"pts={result.num_points} | inl={result.num_inliers} | "
         f"pers={len(tracker._persistent_corners)}"
     )
@@ -612,7 +613,8 @@ def log_console(frame_idx: int, result, tracker, *, force: bool = False) -> None
         f"reason={failure_reason}",
         f"msg={result.message}",
         f"det={len(getattr(result, 'detection_corners', []))}",
-        f"pose={len(result.corners)}",
+        f"pose={'Y' if result.rvec is not None and result.tvec is not None else 'N'}",
+        f"vis={len(result.corners)}",
         f"pts={result.num_points}",
         f"inl={result.num_inliers}",
         f"mean={result.mean_reprojection_error_px:.3f}",
@@ -657,10 +659,13 @@ def make_tracker(field_path, marker_json_path, K, dist) -> HydraTracker:
             # corners may be on the occluded side.
             enable_pose_propagation=False,
 
-            # Disable persistence for diagnosis and for fast rotations: old
-            # global 3D IDs cannot safely be matched to new corners by UV
-            # proximity after the visible cylinder side changes.
-            enable_temporal_correspondence_persistence=False,
+            # Safe decode-outage bridge: cached global IDs are matched by
+            # last-pose reprojection, not stale UV proximity. This can bridge
+            # short decoder dropouts without accepting newly ambiguous IDs.
+            enable_temporal_correspondence_persistence=True,
+            persistence_use_pose_projection=True,
+            persistence_projection_max_reproj_px=12.0,
+            persistence_projection_max_pose_error_px=2.5,
 
             # Current-frame dot decisions: no EMA warmup-lock.
             dot_use_temporal_smoothing=False,
@@ -670,7 +675,7 @@ def make_tracker(field_path, marker_json_path, K, dist) -> HydraTracker:
             log_to_console=False,
             dot_commit_frames=1,
             dot_revoke_frames=5,
-            persistence_max_frames=20,
+            persistence_max_frames=8,
         ),
     )
 

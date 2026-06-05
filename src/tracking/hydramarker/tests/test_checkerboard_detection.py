@@ -59,6 +59,8 @@ _log_file      = None
 _log_writer    = None
 _log_start_ms  = 0.0
 _log_frame_idx = 0
+_log_debug_recovery = False
+_log_corner_payload = True
 
 
 def log_start() -> None:
@@ -71,7 +73,9 @@ def log_start() -> None:
         "frame", "timestamp_ms",
         "n_corners", "n_cells", "tracking", "stable",
         "spacing_median", "spacing_min",
-        "i", "j", "u", "v", "visibility", "present",
+        "debug_raw", "debug_refined", "debug_lattice",
+        "debug_det_corners", "debug_det_cells",
+        "corner_keys", "corner_uvs", "corner_vis", "corner_pred",
     ])
     _log_start_ms  = datetime.now().timestamp() * 1000.0
     _log_frame_idx = 0
@@ -83,12 +87,45 @@ def log_stop() -> None:
     global _log_active, _log_file
     _log_active = False
     if _log_file:
+        _log_file.flush()
         _log_file.close()
         _log_file = None
     print(f"[LOG] Stopped - {_log_frame_idx} frames logged")
 
 
-def log_frame(det, global_frame: int) -> None:
+def toggle_log_debug_recovery() -> None:
+    global _log_debug_recovery
+    _log_debug_recovery = not _log_debug_recovery
+    print(f"[LOG] Recovery-stage logging {'ON' if _log_debug_recovery else 'OFF'}")
+
+
+def toggle_log_corner_payload() -> None:
+    global _log_corner_payload
+    _log_corner_payload = not _log_corner_payload
+    print(f"[LOG] Corner payload {'ON' if _log_corner_payload else 'OFF'}")
+
+
+def recovery_counts(dbg):
+    if not dbg:
+        return 0, 0, 0, 0, 0
+
+    raw_n = len(getattr(dbg, "raw_candidates", []) or [])
+    refined_n = sum(
+        1 for c in (getattr(dbg, "refined_corners", []) or [])
+        if bool(getattr(c, "valid", False))
+    )
+    lattice = int(bool(getattr(dbg, "has_lattice", False)))
+    rec_det = (
+        getattr(dbg, "detection", None)
+        if getattr(dbg, "has_detection", False)
+        else None
+    )
+    rec_c = len(rec_det.corners) if rec_det else 0
+    rec_cells = len(rec_det.cells) if rec_det else 0
+    return raw_n, refined_n, lattice, rec_c, rec_cells
+
+
+def log_frame(det, global_frame: int, debug_recovery=None) -> None:
     global _log_frame_idx
 
     if not _log_active or _log_writer is None:
@@ -104,33 +141,44 @@ def log_frame(det, global_frame: int) -> None:
     stats          = estimate_square_stats(det)
     spacing_median = f"{stats['median']:.2f}" if stats else "-1"
     spacing_min    = f"{stats['min']:.2f}"    if stats else "-1"
+    raw_n, refined_n, lattice, rec_c, rec_cells = recovery_counts(debug_recovery)
 
+    corner_keys = ""
+    corner_uvs = ""
+    corner_vis = ""
+    corner_pred = ""
     if det and det.corners:
-        for c in det.corners:
-            u, v   = get_xy(c.uv)
-            vscore = float(getattr(c, "visibility_score", 1.0))
-            _log_writer.writerow([
-                global_frame,
-                f"{now_ms:.1f}",
-                n_corners, n_cells, tracking, stable,
-                spacing_median, spacing_min,
-                int(c.i), int(c.j),
-                f"{u:.2f}", f"{v:.2f}",
-                f"{vscore:.4f}",
-                1,
-            ])
-    else:
-        # No detection — one summary row so the frame is represented.
-        _log_writer.writerow([
-            global_frame, f"{now_ms:.1f}",
-            0, 0, 0, 0,
-            spacing_median, spacing_min,
-            "", "", "", "", "", 0,
-        ])
+        if _log_corner_payload:
+            key_parts = []
+            uv_parts = []
+            vis_parts = []
+            pred_parts = []
+            for c in det.corners:
+                u, v = get_xy(c.uv)
+                vscore = float(getattr(c, "visibility_score", 1.0))
+                key_parts.append(f"{int(c.i)}:{int(c.j)}")
+                uv_parts.append(f"{int(c.i)}:{int(c.j)}:{u:.1f}:{v:.1f}")
+                vis_parts.append(f"{int(c.i)}:{int(c.j)}:{vscore:.3f}")
+                predicted = 1 if bool(getattr(c, "predicted", False)) else 0
+                observed = int(getattr(c, "observed_frames", 0))
+                pred_parts.append(f"{int(c.i)}:{int(c.j)}:{predicted}:{observed}")
+            corner_keys = ";".join(key_parts)
+            corner_uvs = ";".join(uv_parts)
+            corner_vis = ";".join(vis_parts)
+            corner_pred = ";".join(pred_parts)
 
-    _log_file.flush()
+    _log_writer.writerow([
+        global_frame,
+        f"{now_ms:.1f}",
+        n_corners, n_cells, tracking, stable,
+        spacing_median, spacing_min,
+        raw_n, refined_n, lattice, rec_c, rec_cells,
+        corner_keys, corner_uvs, corner_vis, corner_pred,
+    ])
+
     _log_frame_idx += 1
-
+    if _log_frame_idx % 30 == 0:
+        _log_file.flush()
 
 # ============================================================
 # Helpers
@@ -140,6 +188,13 @@ def get_xy(p):
     if hasattr(p, "x") and hasattr(p, "y"):
         return float(p.x), float(p.y)
     return float(p[0]), float(p[1])
+
+
+def draw_points(vis, points, color, radius=3, thickness=-1) -> None:
+    for p in points:
+        u, v = get_xy(p)
+        cv2.circle(vis, (int(round(u)), int(round(v))),
+                   radius, color, thickness, lineType=cv2.LINE_AA)
 
 
 def estimate_square_stats(det):
@@ -206,6 +261,39 @@ def draw_cells(vis, det, draw_indices=True) -> None:
                         (255, 0, 255), 1, cv2.LINE_AA)
 
 
+def final_uvs(det):
+    if not det:
+        return []
+    return [get_xy(c.uv) for c in det.corners]
+
+
+def draw_recovery_debug(vis, dbg, det) -> None:
+    if not dbg:
+        return
+
+    raw = list(getattr(dbg, "raw_candidates", []) or [])
+    refined = [
+        c.uv for c in (getattr(dbg, "refined_corners", []) or [])
+        if bool(getattr(c, "valid", False))
+    ]
+
+    draw_points(vis, raw, color=(255, 255, 0), radius=2, thickness=1)
+    draw_points(vis, refined, color=(0, 165, 255), radius=3, thickness=1)
+
+    if getattr(dbg, "has_detection", False):
+        draw_corners(vis, dbg.detection, color=(255, 100, 0),
+                     radius=3, draw_indices=False)
+
+        finals = final_uvs(det)
+        for c in dbg.detection.corners:
+            u, v = get_xy(c.uv)
+            found = any(abs(u - fu) < 10 and abs(v - fv) < 10
+                        for fu, fv in finals)
+            if not found:
+                cv2.circle(vis, (int(round(u)), int(round(v))),
+                           5, (0, 255, 255), 2, lineType=cv2.LINE_AA)
+
+
 def count_lost_debug_corners(det, debug_det, max_dist_px=10.0):
     if not debug_det or not det:
         return 0
@@ -230,8 +318,12 @@ def draw_status(vis, mode_name, det, debug_det, debug_on) -> None:
     debug_stats = estimate_square_stats(debug_det)
 
     log_indicator = " | [LOG]" if _log_active else ""
+    if _log_active and _log_debug_recovery:
+        log_indicator += "[DBG]"
+    if _log_active and not _log_corner_payload:
+        log_indicator += "[NO-CORNERS]"
     line1 = (f"mode: {mode_name} | t=toggle d=debug "
-             f"l=log SPACE=save ESC=quit{log_indicator}")
+             f"g=logdbg c=corners l=log SPACE=save ESC=quit{log_indicator}")
     line2 = f"final corners: {normal_n} | final cells: {normal_c}"
     line3 = (f"recovery/debug corners: {debug_n} | cells: {debug_c} "
              f"| debug {'ON' if debug_on else 'OFF'}")
@@ -256,6 +348,40 @@ def draw_status(vis, mode_name, det, debug_det, debug_on) -> None:
                     (0, 255, 255), 2, cv2.LINE_AA)
 
 
+def draw_recovery_status(vis, dbg) -> None:
+    if not dbg:
+        return
+
+    raw_n = len(getattr(dbg, "raw_candidates", []) or [])
+    refined_n = sum(
+        1 for c in (getattr(dbg, "refined_corners", []) or [])
+        if bool(getattr(c, "valid", False))
+    )
+    lattice = "Y" if getattr(dbg, "has_lattice", False) else "N"
+    rec_det = (
+        getattr(dbg, "detection", None)
+        if getattr(dbg, "has_detection", False)
+        else None
+    )
+    rec_c = len(rec_det.corners) if rec_det else 0
+    rec_cells = len(rec_det.cells) if rec_det else 0
+
+    line = (
+        f"recovery stages: raw={raw_n} refined={refined_n} "
+        f"lattice={lattice} det={rec_c}/{rec_cells}"
+    )
+    cv2.putText(vis, line, (20, 125),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 255, 255), 2, cv2.LINE_AA)
+
+
+def make_checkerboard_config():
+    cfg = hydramarker_cpp.CheckerboardDetectorConfig()
+    cfg.recovery_correction_weight = 0.5
+    cfg.recovery_correction_max_dist_rel = 0.6
+    return cfg
+
+
 def save_current_frame(img, vis, det, debug_det, mode_name, debug_on):
     stamp    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     raw_path = OUT_DIR / f"{stamp}_raw.png"
@@ -272,8 +398,9 @@ def save_current_frame(img, vis, det, debug_det, mode_name, debug_on):
 def main() -> None:
     global _log_frame_idx
 
-    detector       = hydramarker_cpp.CheckerboardDetector()
-    debug_detector = hydramarker_cpp.CheckerboardDetector()
+    checker_cfg    = make_checkerboard_config()
+    detector       = hydramarker_cpp.CheckerboardDetector(checker_cfg)
+    debug_detector = hydramarker_cpp.CheckerboardDetector(checker_cfg)
 
     frame_idx = 0
 
@@ -303,29 +430,19 @@ def main() -> None:
 
             det = detector.detect(img)
 
-            # Flicker log
-            log_frame(det, frame_idx)
-
             # Debug overlay
             debug_det = None
-            if debug_on:
+            debug_recovery = None
+            if debug_on or (_log_active and _log_debug_recovery):
                 debug_detector.reset_tracking()
                 debug_det = debug_detector.detect(img)
+                debug_recovery = debug_detector.debug_recovery_stages(img)
 
-            if debug_on and debug_det:
-                draw_corners(vis, debug_det, color=(255, 100, 0),
-                             radius=3, draw_indices=False)
-                if det:
-                    final_uvs = [get_xy(c.uv) for c in det.corners]
-                    for c in debug_det.corners:
-                        u, v  = get_xy(c.uv)
-                        found = any(abs(u - fu) < 10 and abs(v - fv) < 10
-                                    for fu, fv in final_uvs)
-                        if not found:
-                            cv2.circle(vis,
-                                       (int(round(u)), int(round(v))),
-                                       5, (0, 255, 255), 2,
-                                       lineType=cv2.LINE_AA)
+            # Flicker/recovery-stage log
+            log_frame(det, frame_idx, debug_recovery)
+
+            if debug_on:
+                draw_recovery_debug(vis, debug_recovery, det)
 
             if det:
                 if mode == 0:
@@ -339,6 +456,8 @@ def main() -> None:
                                  radius=4, draw_indices=True)
 
             draw_status(vis, mode_names[mode], det, debug_det, debug_on)
+            if debug_on:
+                draw_recovery_status(vis, debug_recovery)
 
             # Logging indicator
             if _log_active:
@@ -359,6 +478,13 @@ def main() -> None:
                 mode = (mode + 1) % 3
             elif key == ord("d"):
                 debug_on = not debug_on
+                debug_detector.reset_tracking()
+            elif key == ord("g"):
+                toggle_log_debug_recovery()
+            elif key == ord("c"):
+                toggle_log_corner_payload()
+            elif key == ord("r"):
+                detector.reset_tracking()
                 debug_detector.reset_tracking()
             elif key == ord("l"):
                 if not _log_active:

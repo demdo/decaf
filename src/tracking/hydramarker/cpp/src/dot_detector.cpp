@@ -23,6 +23,8 @@ DotDetector::DotDetector(DotDetectorConfig config)
 void DotDetector::reset()
 {
     temporal_states_.clear();
+    cell_value_cache_.clear();
+    frame_index_ = 0;
 }
 
 void DotDetector::reset_smoothing()
@@ -57,6 +59,7 @@ DotDetectionResult DotDetector::detect(
 )
 {
     DotDetectionResult result;
+    frame_index_ += 1;
 
     if (image.empty()) {
         return result;
@@ -129,6 +132,28 @@ DotDetectionResult DotDetector::detect(
             obs.score >= config_.uncertainty_low &&
             obs.score < config_.uncertainty_high;
 
+        if (config_.use_cell_value_cache && obs.ambiguous) {
+            const auto cached_it = cell_value_cache_.find(key);
+            if (
+                cached_it != cell_value_cache_.end() &&
+                isCellCacheMatch(cached_it->second, obs)
+            ) {
+                obs.has_dot = cached_it->second.has_dot;
+                obs.score = cached_it->second.score;
+                obs.ambiguous = false;
+                obs.cache_reused = true;
+            }
+        }
+
+        if (config_.use_cell_value_cache && !obs.ambiguous) {
+            CachedCellValue cached;
+            cached.has_dot = obs.has_dot;
+            cached.score = obs.score;
+            cached.corners_uv = obs.corners_uv;
+            cached.last_seen_frame = frame_index_;
+            cell_value_cache_[key] = cached;
+        }
+
         result.cells.push_back(obs);
 
         max_row = std::max(max_row, obs.row);
@@ -157,6 +182,27 @@ DotDetectionResult DotDetector::detect(
     result.cols = max_col + 1;
 
     return result;
+}
+
+bool DotDetector::isCellCacheMatch(
+    const CachedCellValue& cached,
+    const DotCellObservation& obs
+) const
+{
+    const int max_age = std::max(config_.cell_cache_max_age_frames, 0);
+    if (cached.last_seen_frame < 0 || frame_index_ - cached.last_seen_frame > max_age) {
+        return false;
+    }
+
+    const float max_motion = std::max(config_.cell_cache_max_corner_motion_px, 0.0f);
+    for (int i = 0; i < 4; ++i) {
+        const cv::Point2f d = obs.corners_uv[i] - cached.corners_uv[i];
+        if (std::sqrt(d.x * d.x + d.y * d.y) > max_motion) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool DotDetector::updateTemporalState(

@@ -14,6 +14,7 @@ struct TrackingValidationResult {
     // No homography-only projections and no old_uv fallback points are exported.
     std::vector<int> visible_indices;
     std::vector<cv::Point2f> visible_points;
+    std::vector<bool> visible_predicted;
 
     int total = 0;
     int lk_basic_good = 0;

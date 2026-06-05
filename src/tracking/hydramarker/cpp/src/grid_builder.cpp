@@ -338,6 +338,223 @@ void computeGridExtent(
     }
 }
 
+void compactCornersToCells(
+    std::vector<GridCorner>& corners,
+    std::vector<GridCell>& cells,
+    bool tracking,
+    bool stable
+) {
+    if (corners.empty() || cells.empty()) {
+        corners.clear();
+        cells.clear();
+        return;
+    }
+
+    std::vector<int> old_to_new(corners.size(), -1);
+    std::vector<GridCorner> compact;
+    compact.reserve(corners.size());
+
+    for (const auto& cell : cells) {
+        for (const int old_idx : cell.corner_indices) {
+            if (old_idx < 0 || old_idx >= static_cast<int>(corners.size())) {
+                continue;
+            }
+            if (corners[old_idx].synthetic) {
+                continue;
+            }
+            if (old_to_new[old_idx] >= 0) {
+                continue;
+            }
+            old_to_new[old_idx] = static_cast<int>(compact.size());
+            compact.push_back(corners[old_idx]);
+        }
+    }
+
+    std::vector<float> cell_edges;
+    cell_edges.reserve(cells.size() * 4);
+    for (const auto& cell : cells) {
+        cell_edges.push_back(geom::dist(cell.corner_uv[0], cell.corner_uv[1]));
+        cell_edges.push_back(geom::dist(cell.corner_uv[1], cell.corner_uv[2]));
+        cell_edges.push_back(geom::dist(cell.corner_uv[2], cell.corner_uv[3]));
+        cell_edges.push_back(geom::dist(cell.corner_uv[3], cell.corner_uv[0]));
+    }
+    std::sort(cell_edges.begin(), cell_edges.end());
+    const float spacing =
+        cell_edges.empty()
+            ? 0.0f
+            : cell_edges[cell_edges.size() / 2];
+
+    auto findCompactGrid = [&](int i, int j) -> const GridCorner* {
+        for (const auto& c : compact) {
+            if (c.i == i && c.j == j) {
+                return &c;
+            }
+        }
+        return nullptr;
+    };
+
+    auto hasCompactGrid = [&](int i, int j) -> bool {
+        return findCompactGrid(i, j) != nullptr;
+    };
+
+    auto findInputGrid = [&](int i, int j) -> const GridCorner* {
+        for (const auto& c : corners) {
+            if (c.synthetic) continue;
+            if (c.i == i && c.j == j) {
+                return &c;
+            }
+        }
+        return nullptr;
+    };
+
+    auto hasInputGrid = [&](int i, int j) -> bool {
+        return findInputGrid(i, j) != nullptr;
+    };
+
+    for (int old_idx = 0; old_idx < static_cast<int>(corners.size()); ++old_idx) {
+        if (old_to_new[old_idx] >= 0) continue;
+
+        const GridCorner& c = corners[old_idx];
+        if (c.synthetic) continue;
+
+        const bool bridges_compact_gap =
+            (hasCompactGrid(c.i - 1, c.j) &&
+             hasCompactGrid(c.i + 1, c.j)) ||
+            (hasCompactGrid(c.i, c.j - 1) &&
+             hasCompactGrid(c.i, c.j + 1));
+
+        const int neighbours =
+            (hasCompactGrid(c.i - 1, c.j) ? 1 : 0) +
+            (hasCompactGrid(c.i + 1, c.j) ? 1 : 0) +
+            (hasCompactGrid(c.i, c.j - 1) ? 1 : 0) +
+            (hasCompactGrid(c.i, c.j + 1) ? 1 : 0);
+
+        const int input_neighbours =
+            (hasInputGrid(c.i - 1, c.j) ? 1 : 0) +
+            (hasInputGrid(c.i + 1, c.j) ? 1 : 0) +
+            (hasInputGrid(c.i, c.j - 1) ? 1 : 0) +
+            (hasInputGrid(c.i, c.j + 1) ? 1 : 0);
+
+        bool extends_compact_line = false;
+        if (!c.predicted && c.observed_frames >= 3 && spacing > 1.0f && neighbours == 1) {
+            for (const auto& offset : {
+                     std::pair<int, int>{-1, 0},
+                     std::pair<int, int>{ 1, 0},
+                     std::pair<int, int>{ 0,-1},
+                     std::pair<int, int>{ 0, 1}}) {
+                const GridCorner* nb =
+                    findCompactGrid(c.i + offset.first, c.j + offset.second);
+                const GridCorner* next =
+                    findCompactGrid(c.i + 2 * offset.first,
+                                    c.j + 2 * offset.second);
+                if (!nb || !next) continue;
+
+                const float d0 = geom::dist(c.uv, nb->uv);
+                const float d1 = geom::dist(nb->uv, next->uv);
+                if (d0 >= spacing * 0.35f &&
+                    d0 <= spacing * 1.85f &&
+                    d1 >= spacing * 0.35f &&
+                    d1 <= spacing * 1.85f) {
+                    extends_compact_line = true;
+                    break;
+                }
+            }
+        }
+
+        bool tracking_edge_anchor = false;
+        const bool can_anchor_tracking_edge =
+            !c.predicted ||
+            stable ||
+            (c.observed_frames >= 8 &&
+             c.visibility_score >= 0.25f &&
+             input_neighbours >= 3);
+        if (tracking &&
+            can_anchor_tracking_edge &&
+            c.observed_frames >= 3 &&
+            c.visibility_score >= (stable ? 0.10f : 0.20f) &&
+            spacing > 1.0f &&
+            neighbours >= 1 &&
+            input_neighbours >= (c.predicted && !stable ? 3 : 2)) {
+            for (const auto& offset : {
+                     std::pair<int, int>{-1, 0},
+                     std::pair<int, int>{ 1, 0},
+                     std::pair<int, int>{ 0,-1},
+                     std::pair<int, int>{ 0, 1}}) {
+                const GridCorner* nb =
+                    findCompactGrid(c.i + offset.first, c.j + offset.second);
+                if (!nb) continue;
+
+                const float d = geom::dist(c.uv, nb->uv);
+                if (d >= spacing * 0.30f &&
+                    d <= spacing * 2.10f) {
+                    tracking_edge_anchor = true;
+                    break;
+                }
+            }
+        }
+
+        bool local_geometry_ok = spacing <= 1.0f;
+        if (spacing > 1.0f && neighbours >= 2) {
+            local_geometry_ok = true;
+            for (const auto& offset : {
+                     std::pair<int, int>{-1, 0},
+                     std::pair<int, int>{ 1, 0},
+                     std::pair<int, int>{ 0,-1},
+                     std::pair<int, int>{ 0, 1}}) {
+                const GridCorner* nb =
+                    findCompactGrid(c.i + offset.first, c.j + offset.second);
+                if (!nb) continue;
+
+                const float d = geom::dist(c.uv, nb->uv);
+                if (d < spacing * 0.35f || d > spacing * 1.85f) {
+                    local_geometry_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (!bridges_compact_gap &&
+            !extends_compact_line &&
+            !tracking_edge_anchor &&
+            (neighbours < 2 || !local_geometry_ok)) {
+            continue;
+        }
+
+        old_to_new[old_idx] = static_cast<int>(compact.size());
+        compact.push_back(c);
+    }
+
+    std::vector<GridCell> remapped_cells;
+    remapped_cells.reserve(cells.size());
+
+    for (auto cell : cells) {
+        bool ok = true;
+        for (int k = 0; k < 4; ++k) {
+            const int old_idx = cell.corner_indices[k];
+            if (old_idx < 0 ||
+                old_idx >= static_cast<int>(old_to_new.size()) ||
+                old_to_new[old_idx] < 0) {
+                ok = false;
+                break;
+            }
+            cell.corner_indices[k] = old_to_new[old_idx];
+            cell.corner_uv[k] = compact[cell.corner_indices[k]].uv;
+        }
+        if (!ok) continue;
+        cell.center_uv =
+            0.25f * (
+                cell.corner_uv[0] +
+                cell.corner_uv[1] +
+                cell.corner_uv[2] +
+                cell.corner_uv[3]
+            );
+        remapped_cells.push_back(cell);
+    }
+
+    corners = std::move(compact);
+    cells = std::move(remapped_cells);
+}
+
 } // namespace
 
 GridBuilder::GridBuilder() = default;
@@ -387,6 +604,13 @@ std::optional<CheckerboardDetection> GridBuilder::buildFromCorners(
     std::vector<GridCell> cells = makeGridCells(corners);
 
     if (static_cast<int>(cells.size()) < min_cells) {
+        return std::nullopt;
+    }
+
+    compactCornersToCells(corners, cells, tracking, stable);
+
+    if (static_cast<int>(corners.size()) < min_corners ||
+        static_cast<int>(cells.size()) < min_cells) {
         return std::nullopt;
     }
 

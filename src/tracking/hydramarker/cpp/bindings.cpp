@@ -169,7 +169,9 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("i", &GridCorner::i)
         .def_readwrite("j", &GridCorner::j)
         .def_readwrite("uv", &GridCorner::uv)
-        .def_readwrite("visibility_score", &GridCorner::visibility_score);
+        .def_readwrite("visibility_score", &GridCorner::visibility_score)
+        .def_readwrite("observed_frames", &GridCorner::observed_frames)
+        .def_readwrite("predicted", &GridCorner::predicted);
 
     py::class_<GridCell>(m, "GridCell")
         .def(py::init<>())
@@ -212,6 +214,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("min_cells", &CheckerboardDetectorConfig::min_cells)
         .def_readwrite("min_tracking_corners", &CheckerboardDetectorConfig::min_tracking_corners)
         .def_readwrite("min_tracking_cells", &CheckerboardDetectorConfig::min_tracking_cells)
+        .def_readwrite("min_tracking_decode_cell_span", &CheckerboardDetectorConfig::min_tracking_decode_cell_span)
+        .def_readwrite("max_undecodeable_tracking_frames", &CheckerboardDetectorConfig::max_undecodeable_tracking_frames)
         .def_readwrite("min_tracking_corner_ratio", &CheckerboardDetectorConfig::min_tracking_corner_ratio)
         .def_readwrite("max_tracking_homography_error_px", &CheckerboardDetectorConfig::max_tracking_homography_error_px)
         .def_readwrite("refresh_interval_frames", &CheckerboardDetectorConfig::refresh_interval_frames)
@@ -334,6 +338,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("local_mean", &DotCellObservation::local_mean)
         .def_readwrite("local_std", &DotCellObservation::local_std)
         .def_readwrite("polarity", &DotCellObservation::polarity)
+        .def_readwrite("cache_reused", &DotCellObservation::cache_reused)
         .def_readwrite("center_uv", &DotCellObservation::center_uv)
         .def_readwrite("corners_uv", &DotCellObservation::corners_uv);
 
@@ -357,7 +362,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("temporal_alpha", &DotDetectorConfig::temporal_alpha)
         .def_readwrite("commit_frames", &DotDetectorConfig::commit_frames)
         .def_readwrite("revoke_frames", &DotDetectorConfig::revoke_frames)
-        .def_readwrite("use_temporal_smoothing", &DotDetectorConfig::use_temporal_smoothing);
+        .def_readwrite("use_temporal_smoothing", &DotDetectorConfig::use_temporal_smoothing)
+        .def_readwrite("use_cell_value_cache", &DotDetectorConfig::use_cell_value_cache)
+        .def_readwrite("cell_cache_max_age_frames", &DotDetectorConfig::cell_cache_max_age_frames)
+        .def_readwrite("cell_cache_max_corner_motion_px", &DotDetectorConfig::cell_cache_max_corner_motion_px);
 
     py::class_<RefinedCorner>(m, "RefinedCorner")
         .def(py::init<>())

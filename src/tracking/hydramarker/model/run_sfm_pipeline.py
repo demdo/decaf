@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 from pathlib import Path
 import io
+import json
 import sys
 
 import numpy as np
@@ -23,6 +24,7 @@ from tracking.hydramarker.model.bundle_adjustment import (
 )
 from tracking.hydramarker.model.incremental import (
     register_remaining_frames,
+    triangulate_missing_markers,
 )
 from tracking.hydramarker.model.observations import (
     FrameObservation,
@@ -38,9 +40,13 @@ from tracking.hydramarker.model.visualization import (
 )
 from tracking.hydramarker.model.alignment import (
     align_state_to_marker_frame_inplace,
+    regularize_marker_columns_z_inplace,
 )
 from tracking.hydramarker.model.export_marker_map import (
     export_marker_geometry_json,
+)
+from tracking.hydramarker.model.diagnostics import (
+    write_sfm_geometry_diagnostics,
 )
 
 
@@ -55,8 +61,15 @@ OUTLIER_MAD_SIGMA = 3.5
 OUTLIER_MAX_FRACTION = 0.03
 OUTLIER_MIN_ERROR_PX = 1.0
 
+TRIANGULATE_MISSING_MIN_OBSERVATIONS = 8
+TRIANGULATE_MISSING_MIN_INLIERS = 6
+TRIANGULATE_MISSING_MAX_REPROJ_PX = 2.5
+TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER = 48
+TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER = 220
+
 SHOW_PLOTS = True
 EXPORT_FILENAME = "marker_geometry_sfm.json"
+DIAGNOSTICS_FILENAME = "marker_geometry_sfm_diagnostics.txt"
 
 
 def choose_file_qt(title: str, file_filter: str) -> Path:
@@ -128,6 +141,29 @@ def load_pipeline_inputs() -> tuple[list[FrameObservation], CameraCalibration, P
 
 def final_json_path() -> Path:
     return Path(__file__).resolve().parent / EXPORT_FILENAME
+
+
+def final_diagnostics_path() -> Path:
+    return Path(__file__).resolve().parent / DIAGNOSTICS_FILENAME
+
+
+def should_regularize_column_z(marker_json_path: Path) -> bool:
+    marker_json_path = Path(marker_json_path)
+
+    with marker_json_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    surface_model = meta.get("surface_model", {})
+
+    if not isinstance(surface_model, dict):
+        return False
+
+    model_type = str(surface_model.get("type", "")).lower()
+
+    if model_type != "cylinder":
+        return False
+
+    return bool(surface_model.get("regularize_columns_z", True))
 
 
 def call_silent(func, *args, **kwargs):
@@ -247,6 +283,28 @@ def run_sfm_pipeline(
         max_mean_reprojection_error_px=None,
     )
 
+    triangulation_results = triangulate_missing_markers(
+        state,
+        min_observations=TRIANGULATE_MISSING_MIN_OBSERVATIONS,
+        min_inliers=TRIANGULATE_MISSING_MIN_INLIERS,
+        max_reprojection_error_px=TRIANGULATE_MISSING_MAX_REPROJ_PX,
+        max_observations_per_marker=(
+            TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER
+        ),
+        max_pair_candidates_per_marker=(
+            TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER
+        ),
+    )
+
+    triangulated_count = sum(1 for r in triangulation_results if r.success)
+    failed_count = len(triangulation_results) - triangulated_count
+
+    print(
+        "[SfM] missing-marker triangulation: "
+        f"added={triangulated_count}, failed={failed_count}, "
+        f"total_markers={len(state.marker_positions)}"
+    )
+
     if SHOW_PLOTS:
         plot_sfm_state(
             state,
@@ -304,6 +362,11 @@ def run_sfm_pipeline(
         adaptive_observation_weights=adaptive_observation_weights,
     )
 
+    final_observation_errors = compute_observation_reprojection_errors(
+        state,
+        frame_ids=ba_frame_ids,
+    )
+
     if SHOW_PLOTS:
         plot_sfm_state(
             state,
@@ -322,6 +385,19 @@ def run_sfm_pipeline(
         alignment_mode="topology",
     )
 
+    column_regularization_stats = {}
+
+    if should_regularize_column_z(marker_json_path):
+        column_regularization_stats = regularize_marker_columns_z_inplace(
+            state,
+            marker_json_path=marker_json_path,
+        )
+
+        print(
+            "[SfM] column Z regularization: "
+            f"columns={len(column_regularization_stats)}"
+        )
+
     if SHOW_PLOTS:
         call_silent(
             visualize_aligned_state,
@@ -336,6 +412,17 @@ def run_sfm_pipeline(
         state=state,
         marker_json_path=marker_json_path,
     )
+
+    diagnostics_path = write_sfm_geometry_diagnostics(
+        output_path=final_diagnostics_path(),
+        state=state,
+        marker_json_path=marker_json_path,
+        observation_errors=final_observation_errors,
+        triangulation_results=triangulation_results,
+        column_regularization_stats=column_regularization_stats,
+    )
+
+    print(f"[SfM] geometry diagnostics written: {diagnostics_path}")
 
     return state
 

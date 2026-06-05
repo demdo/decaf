@@ -35,6 +35,14 @@ struct DotDetectorConfig {
     // because local cell indices and visible surface regions can change
     // abruptly between frames.
     bool use_temporal_smoothing = false;
+
+    // Reuse the last confident bit for a cell when the current-frame score is
+    // ambiguous and the same local cell is still geometrically close. This is
+    // intentionally separate from EMA smoothing: it does not slowly blend
+    // scores, it only fills short blur/motion gaps for already-known cells.
+    bool use_cell_value_cache = true;
+    int cell_cache_max_age_frames = 12;
+    float cell_cache_max_corner_motion_px = 35.0f;
 };
 
 struct DotCellObservation {
@@ -55,6 +63,7 @@ struct DotCellObservation {
     double local_std = 0.0;
 
     int polarity = 0;
+    bool cache_reused = false;
 
     cv::Point2f center_uv;
 
@@ -117,6 +126,13 @@ private:
         int missed_frames = 0;
     };
 
+    struct CachedCellValue {
+        bool has_dot = false;
+        double score = 0.0;
+        std::array<cv::Point2f, 4> corners_uv;
+        int last_seen_frame = -1;
+    };
+
     static cv::Mat toGray8(const cv::Mat& image);
 
     static double sampleBilinearClamp(
@@ -136,9 +152,16 @@ private:
         double raw_score
     ) const;
 
+    bool isCellCacheMatch(
+        const CachedCellValue& cached,
+        const DotCellObservation& obs
+    ) const;
+
 private:
     DotDetectorConfig config_;
     std::map<std::pair<int, int>, TemporalCellState> temporal_states_;
+    std::map<std::pair<int, int>, CachedCellValue> cell_value_cache_;
+    int frame_index_ = 0;
 };
 
 } // namespace hydramarker

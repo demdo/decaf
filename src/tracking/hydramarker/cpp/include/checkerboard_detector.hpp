@@ -44,6 +44,9 @@ struct PersistentTrackedCorner {
     // True if this corner was successfully LK-tracked in the current frame.
     bool tracked = false;
 
+    int observed_frames = 0;
+    int predicted_frames = 0;
+
     // Photometric visibility score in [0, 1].
     // Computed from local checkerboard contrast along the grid axes
     // (axis_u = direction to i+1 neighbour, axis_v = direction to j+1
@@ -54,6 +57,7 @@ struct PersistentTrackedCorner {
     // Evicted immediately when smoothed_visibility < config_.visibility_evict_threshold.
     float visibility_score          = 1.0f;
     float smoothed_visibility_score = 1.0f;  // EMA over visibility_smoothing_alpha frames
+    int low_visibility_frames = 0;
 };
 
 class CheckerboardDetector {
@@ -74,6 +78,8 @@ private:
     int frame_index_ = 0;
     int degraded_frames_count_ = 0;
     int low_corner_frames_ = 0;
+    int undecodeable_tracking_frames_ = 0;
+    int held_output_frames_ = 0;
 
     cv::Mat last_gray_;
     CheckerboardDetection last_detection_;
@@ -96,6 +102,11 @@ private:
 
     std::optional<CheckerboardDetection>
     buildDetectionFromCorners(
+        const std::vector<cv::Point2f>& corners
+    ) const;
+
+    std::optional<CheckerboardDetection>
+    buildBestDetectionFromCornerClusters(
         const std::vector<cv::Point2f>& corners
     ) const;
 
@@ -141,6 +152,11 @@ private:
         const CheckerboardDetection& primary,
         const CheckerboardDetection& secondary,
         float duplicate_dist_px
+    ) const;
+
+    std::optional<CheckerboardDetection> alignDetectionGridToReference(
+        const CheckerboardDetection& detection,
+        const CheckerboardDetection& reference
     ) const;
 
     static int findPersistentCornerByGrid(

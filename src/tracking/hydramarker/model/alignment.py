@@ -296,6 +296,15 @@ def resolve_row_col_mapping_from_ids(
                 valid = False
                 break
 
+            if (
+                row < geometry.detectable_origin_row
+                or row >= geometry.detectable_origin_row + geometry.corner_rows
+                or col < geometry.detectable_origin_col
+                or col >= geometry.detectable_origin_col + geometry.corner_cols
+            ):
+                valid = False
+                break
+
             key = (row, col)
 
             if key in row_col_to_id:
@@ -725,6 +734,156 @@ def apply_alignment_to_state_inplace(
     state.poses.update(new_poses)
 
 
+def apply_metric_scale_to_state_inplace(
+    state: SfMState,
+    scale: float,
+) -> None:
+    scale = float(scale)
+
+    for marker_id, point in list(state.marker_positions.items()):
+        state.marker_positions[int(marker_id)] = (
+            scale * np.asarray(point, dtype=np.float64).reshape(3)
+        )
+
+    for frame_id, pose in list(state.poses.items()):
+        state.poses[int(frame_id)] = CameraPose(
+            R=pose.R,
+            t=scale * np.asarray(pose.t, dtype=np.float64).reshape(3),
+        )
+
+
+def regularize_marker_columns_xz_inplace(
+    state: SfMState,
+    marker_json_path: Path,
+) -> dict[int, dict[str, float]]:
+    geometry = load_marker_geometry(marker_json_path)
+    id_to_row_col, _, _ = resolve_row_col_mapping_from_ids(
+        marker_ids=sorted(int(mid) for mid in state.marker_positions.keys()),
+        geometry=geometry,
+    )
+
+    ids_by_col: dict[int, list[int]] = {}
+
+    for marker_id, (_, col) in id_to_row_col.items():
+        ids_by_col.setdefault(int(col), []).append(int(marker_id))
+
+    stats: dict[int, dict[str, float]] = {}
+
+    for col, marker_ids in sorted(ids_by_col.items()):
+        if len(marker_ids) < 2:
+            continue
+
+        xs = np.asarray(
+            [
+                np.asarray(state.marker_positions[mid], dtype=np.float64).reshape(3)[0]
+                for mid in marker_ids
+            ],
+            dtype=np.float64,
+        )
+        zs = np.asarray(
+            [
+                np.asarray(state.marker_positions[mid], dtype=np.float64).reshape(3)[2]
+                for mid in marker_ids
+            ],
+            dtype=np.float64,
+        )
+
+        x_target = float(np.median(xs))
+        z_target = float(np.median(zs))
+
+        x_range_before = float(np.max(xs) - np.min(xs))
+        z_range_before = float(np.max(zs) - np.min(zs))
+        x_std_before = float(np.std(xs))
+        z_std_before = float(np.std(zs))
+
+        for marker_id in marker_ids:
+            p = np.asarray(
+                state.marker_positions[int(marker_id)],
+                dtype=np.float64,
+            ).reshape(3).copy()
+            p[0] = x_target
+            p[2] = z_target
+            state.marker_positions[int(marker_id)] = p
+
+        stats[int(col)] = {
+            "count": float(len(marker_ids)),
+            "x_target": x_target,
+            "z_target": z_target,
+            "x_range_before": x_range_before,
+            "z_range_before": z_range_before,
+            "x_std_before": x_std_before,
+            "z_std_before": z_std_before,
+        }
+
+    return stats
+
+
+def regularize_marker_columns_z_inplace(
+    state: SfMState,
+    marker_json_path: Path,
+) -> dict[int, dict[str, float]]:
+    geometry = load_marker_geometry(marker_json_path)
+    id_to_row_col, _, _ = resolve_row_col_mapping_from_ids(
+        marker_ids=sorted(int(mid) for mid in state.marker_positions.keys()),
+        geometry=geometry,
+    )
+
+    ids_by_col: dict[int, list[int]] = {}
+
+    for marker_id, (_, col) in id_to_row_col.items():
+        ids_by_col.setdefault(int(col), []).append(int(marker_id))
+
+    stats: dict[int, dict[str, float]] = {}
+
+    for col, marker_ids in sorted(ids_by_col.items()):
+        if len(marker_ids) < 2:
+            continue
+
+        xs = np.asarray(
+            [
+                np.asarray(state.marker_positions[mid], dtype=np.float64).reshape(3)[0]
+                for mid in marker_ids
+            ],
+            dtype=np.float64,
+        )
+        zs = np.asarray(
+            [
+                np.asarray(state.marker_positions[mid], dtype=np.float64).reshape(3)[2]
+                for mid in marker_ids
+            ],
+            dtype=np.float64,
+        )
+
+        x_target = float(np.median(xs))
+        z_target = float(np.median(zs))
+
+        x_range_before = float(np.max(xs) - np.min(xs))
+        z_range_before = float(np.max(zs) - np.min(zs))
+        x_std_before = float(np.std(xs))
+        z_std_before = float(np.std(zs))
+
+        for marker_id in marker_ids:
+            p = np.asarray(
+                state.marker_positions[int(marker_id)],
+                dtype=np.float64,
+            ).reshape(3).copy()
+            p[2] = z_target
+            state.marker_positions[int(marker_id)] = p
+
+        stats[int(col)] = {
+            "mode": "z_only",
+            "count": float(len(marker_ids)),
+            "x_target": x_target,
+            "z_target": z_target,
+            "x_range_before": x_range_before,
+            "z_range_before": z_range_before,
+            "x_std_before": x_std_before,
+            "z_std_before": z_std_before,
+        }
+
+    return stats
+
+
 def align_state_to_marker_frame_inplace(
     state: SfMState,
     marker_json_path: Path,
@@ -792,6 +951,18 @@ def align_state_to_marker_frame_inplace(
         origin_sfm=origin_sfm,
         scale=scale,
     )
+
+    if scale_metric and scale_mode == "topology":
+        correction, corrected_median_spacing = estimate_metric_scale_from_topology_edges(
+            state.marker_positions,
+            geometry,
+            expected_spacing_mm=geometry.square_size_mm,
+        )
+
+        if np.isfinite(correction) and correction > 1e-12:
+            apply_metric_scale_to_state_inplace(state, correction)
+            scale *= correction
+            median_spacing = corrected_median_spacing
 
     message = (
         "SfM state aligned to marker frame using automatically resolved "

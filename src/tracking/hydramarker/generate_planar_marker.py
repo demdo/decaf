@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QCheckBox,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -215,6 +216,7 @@ def build_meta(
     dot_radius_rel: float,
     marker_name: str,
     padding_rel: float = 0.0,
+    surface_model: dict | None = None,
 ) -> dict:
     square_size_cm = square_size_mm / 10.0
     pad_mm = padding_rel * square_size_mm
@@ -240,7 +242,7 @@ def build_meta(
             "contains at least 2x2 corners."
         )
 
-    return {
+    meta = {
         "name": marker_name,
         "marker_type": "planar",
         "rows": rows,
@@ -295,6 +297,11 @@ def build_meta(
             }
         },
     }
+
+    if surface_model:
+        meta["surface_model"] = surface_model
+
+    return meta
 
 
 def write_json_file(path: Path, meta: dict) -> None:
@@ -452,6 +459,12 @@ class GeneratePlanarMarkerUI(QWidget):
             "edge corners have full saddle contrast on all four sides."
         )
 
+        self.surface_cylinder_checkbox = QCheckBox("Cylinder surface")
+        self.surface_cylinder_checkbox.setChecked(False)
+        self.surface_cylinder_checkbox.setToolTip(
+            "Store cylinder surface metadata for markers mounted on a cylinder."
+        )
+
         self.marker_name_edit = QLineEdit()
         self.marker_name_edit.setPlaceholderText("Leave empty for automatic name")
 
@@ -495,12 +508,19 @@ class GeneratePlanarMarkerUI(QWidget):
         params_group = QGroupBox("Marker Parameters")
         params_group.setLayout(form)
 
+        surface_layout = QVBoxLayout()
+        surface_layout.addWidget(self.surface_cylinder_checkbox)
+
+        surface_group = QGroupBox("Surface Model")
+        surface_group.setLayout(surface_layout)
+
         button_row = QHBoxLayout()
         button_row.addWidget(self.generate_button)
         button_row.addWidget(self.save_button)
 
         left_layout = QVBoxLayout()
         left_layout.addWidget(params_group)
+        left_layout.addWidget(surface_group)
         left_layout.addLayout(button_row)
         left_layout.addWidget(self.status_label)
         left_layout.addStretch(1)
@@ -521,6 +541,7 @@ class GeneratePlanarMarkerUI(QWidget):
         self.patch_size_spin.valueChanged.connect(self.on_params_changed)
         self.square_size_mm_spin.valueChanged.connect(self.on_params_changed)
         self.padding_rel_spin.valueChanged.connect(self.on_params_changed)
+        self.surface_cylinder_checkbox.stateChanged.connect(self.on_params_changed)
         self.marker_name_edit.textChanged.connect(self._update_auto_name_placeholder)
 
     def _update_auto_name_placeholder(self) -> None:
@@ -560,6 +581,16 @@ class GeneratePlanarMarkerUI(QWidget):
             marker_name = auto_marker_name(rows, cols, patch_size, square_size_mm)
 
         padding_rel = float(self.padding_rel_spin.value())
+        surface_model = None
+
+        if self.surface_cylinder_checkbox.isChecked():
+            surface_model = {
+                "type": "cylinder",
+                "axis": "row",
+                "regularize_columns_z": True,
+                "note": "Marker is mounted on a cylinder; SfM regularizes Z per column only.",
+            }
+
         pad_mm = padding_rel * square_size_mm
         cell_px = mm_to_px(square_size_mm, DEFAULT_PREVIEW_DPI)
         width_mm  = cols * square_size_mm + 2.0 * pad_mm
@@ -577,6 +608,7 @@ class GeneratePlanarMarkerUI(QWidget):
             "width_mm": width_mm,
             "height_mm": height_mm,
             "marker_name": marker_name,
+            "surface_model": surface_model,
             "output_dir": Path(self.output_dir_edit.text()).resolve(),
             "max_ms": DEFAULT_MAX_MS,
             "max_trial": DEFAULT_MAX_TRIAL,
@@ -724,6 +756,7 @@ class GeneratePlanarMarkerUI(QWidget):
                 dot_radius_rel=params["dot_radius_rel"],
                 marker_name=name,
                 padding_rel=params["padding_rel"],
+                surface_model=params["surface_model"],
             )
 
             # Write to temporary files first. This prevents partial output if one export fails.

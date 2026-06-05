@@ -225,6 +225,52 @@ def _round_xyz(
     ]
 
 
+def _metric_normalization_from_topology(
+    marker_positions: dict[int, np.ndarray],
+    resolved_mapping: dict[int, tuple[int, int]],
+    *,
+    expected_spacing_mm: float,
+) -> tuple[float, float, int]:
+    id_by_row_col = {
+        (int(row), int(col)): int(marker_id)
+        for marker_id, (row, col) in resolved_mapping.items()
+        if int(marker_id) in marker_positions
+    }
+
+    distances: list[float] = []
+
+    for (row, col), marker_id in id_by_row_col.items():
+        p = np.asarray(
+            marker_positions[int(marker_id)],
+            dtype=np.float64,
+        ).reshape(3)
+
+        for neighbor_key in ((row, col + 1), (row + 1, col)):
+            neighbor_id = id_by_row_col.get(neighbor_key)
+            if neighbor_id is None:
+                continue
+
+            q = np.asarray(
+                marker_positions[int(neighbor_id)],
+                dtype=np.float64,
+            ).reshape(3)
+
+            d = float(np.linalg.norm(q - p))
+            if np.isfinite(d) and d > 1e-12:
+                distances.append(d)
+
+    values = np.asarray(distances, dtype=np.float64)
+    values = values[np.isfinite(values) & (values > 1e-12)]
+
+    if values.size == 0:
+        return 1.0, float("nan"), 0
+
+    median_spacing = float(np.median(values))
+    scale = float(expected_spacing_mm / median_spacing)
+
+    return scale, median_spacing, int(values.size)
+
+
 def export_marker_geometry_json(
     state: SfMState,
     source_marker_json_path: str | Path,
@@ -269,13 +315,26 @@ def export_marker_geometry_json(
     resolved_num_cols = resolved["id_num_cols"]
     resolved_mapping = resolved["mapping"]
 
+    marker_positions = {
+        int(marker_id): np.asarray(point, dtype=np.float64).reshape(3)
+        for marker_id, point in state.marker_positions.items()
+    }
+
+    metric_scale, median_spacing_before_metric_scale, metric_edge_count = (
+        _metric_normalization_from_topology(
+            marker_positions,
+            resolved_mapping,
+            expected_spacing_mm=float(meta_out["square_size_mm"]),
+        )
+    )
+
     corners = []
 
     for marker_id in marker_ids:
         row, col = resolved_mapping[int(marker_id)]
 
         xyz_mm = _round_xyz(
-            state.marker_positions[int(marker_id)],
+            metric_scale * marker_positions[int(marker_id)],
             xyz_decimals,
         )
 
@@ -300,6 +359,13 @@ def export_marker_geometry_json(
         "num_exported_corners": int(len(corners)),
 
         "resolved_id_num_cols": int(resolved_num_cols),
+
+        "metric_normalization_scale": float(metric_scale),
+        "median_topology_spacing_before_metric_normalization": float(
+            median_spacing_before_metric_scale
+        ),
+        "metric_normalization_edge_count": int(metric_edge_count),
+        "expected_topology_spacing_mm": float(meta_out["square_size_mm"]),
 
         "id_base": int(meta["id_base"]),
         "detectable_origin_row": int(meta["origin_row"]),
