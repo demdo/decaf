@@ -34,7 +34,9 @@ public:
         int max_level,
         int max_iters,
         double epsilon,
-        float max_error
+        float max_error,
+        const std::vector<cv::Mat>* prev_pyramid_cache = nullptr,
+        std::vector<cv::Mat>* curr_pyramid_out = nullptr
     ) const;
 };
 

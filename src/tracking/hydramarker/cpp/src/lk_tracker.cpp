@@ -28,7 +28,9 @@ LKTrackingResult LKTracker::track(
     int max_level,
     int max_iters,
     double epsilon,
-    float /*max_error*/
+    float /*max_error*/,
+    const std::vector<cv::Mat>* prev_pyramid_cache,
+    std::vector<cv::Mat>* curr_pyramid_out
 ) const {
     LKTrackingResult result;
 
@@ -45,16 +47,38 @@ LKTrackingResult LKTracker::track(
     std::vector<cv::Point2f> curr_points;
     std::vector<uchar> status;
     std::vector<float> error;
+    std::vector<cv::Mat> prev_pyramid;
+    std::vector<cv::Mat> curr_pyramid;
+    const cv::Size lk_window(win_size, win_size);
+
+    if (prev_pyramid_cache != nullptr && !prev_pyramid_cache->empty()) {
+        prev_pyramid = *prev_pyramid_cache;
+    } else {
+        cv::buildOpticalFlowPyramid(
+            prev_gray,
+            prev_pyramid,
+            lk_window,
+            max_level,
+            true
+        );
+    }
+    cv::buildOpticalFlowPyramid(
+        curr_gray,
+        curr_pyramid,
+        lk_window,
+        max_level,
+        true
+    );
 
     // Forward LK: previous frame -> current frame.
     cv::calcOpticalFlowPyrLK(
-        prev_gray,
-        curr_gray,
+        prev_pyramid,
+        curr_pyramid,
         prev_points,
         curr_points,
         status,
         error,
-        cv::Size(win_size, win_size),
+        lk_window,
         max_level,
         criteria
     );
@@ -67,6 +91,10 @@ LKTrackingResult LKTracker::track(
         return result;
     }
 
+    if (curr_pyramid_out != nullptr) {
+        *curr_pyramid_out = curr_pyramid;
+    }
+
     std::vector<cv::Point2f> back_points;
     std::vector<uchar> back_status;
     std::vector<float> back_error;
@@ -75,13 +103,13 @@ LKTrackingResult LKTracker::track(
     // This catches tracks that look locally plausible in forward direction,
     // but do not return to the original corner.
     cv::calcOpticalFlowPyrLK(
-        curr_gray,
-        prev_gray,
+        curr_pyramid,
+        prev_pyramid,
         curr_points,
         back_points,
         back_status,
         back_error,
-        cv::Size(win_size, win_size),
+        lk_window,
         max_level,
         criteria
     );

@@ -33,6 +33,8 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import csv
+import json
+import time
 
 import cv2
 import numpy as np
@@ -62,6 +64,139 @@ _log_frame_idx = 0
 _log_debug_recovery = False
 _log_corner_payload = True
 
+TIMING_KEYS = [
+    "detect_wall_ms",
+    "to_gray_ms",
+    "track_total_ms",
+    "lk_ms",
+    "lk_prev_pyramid_reused_count",
+    "tracking_validate_ms",
+    "tracking_cull_ms",
+    "build_visible_tracked_ms",
+    "build_visible_tracked_total_ms",
+    "build_visible_spacing_cleanup_ms",
+    "grid_build_tracking_ms",
+    "update_tracking_state_ms",
+    "tracking_local_completion_attempt_ms",
+    "tracking_local_completion_reused_recovery_count",
+    "tracking_local_completion_corner_detect_ms",
+    "tracking_local_completion_refine_ms",
+    "tracking_local_completion_detected_candidate_count",
+    "tracking_local_completion_guided_seed_count",
+    "tracking_local_completion_guided_refine_ms",
+    "tracking_local_completion_guided_candidate_count",
+    "tracking_local_completion_candidate_count",
+    "tracking_local_completion_proposal_count",
+    "tracking_local_completion_cell_proposal_count",
+    "tracking_local_completion_line_proposal_count",
+    "tracking_local_completion_match_count",
+    "tracking_local_completion_guided_match_count",
+    "tracking_local_completion_measured_match_count",
+    "tracking_local_completion_pending_count",
+    "tracking_local_completion_deferred_count",
+    "tracking_local_completion_geometry_reject_count",
+    "tracking_local_completion_fast_accept_count",
+    "tracking_local_completion_added_count",
+    "tracking_local_correction_count",
+    "tracking_local_correction_error_px",
+    "recovery_position_correction_count",
+    "recovery_position_correction_error_px",
+    "tracking_output_geometry_reject_count",
+    "tracking_output_temporal_reject_count",
+    "tracking_output_single_neighbour_hold_count",
+    "tracking_output_support_reject_count",
+    "tracking_persistent_count",
+    "tracking_persistent_missed_count",
+    "tracking_persistent_predicted_count",
+    "refresh_recovery_call_ms",
+    "recovery_total_ms",
+    "full_recovery_call_ms",
+    "fallback_recovery_call_ms",
+    "recovery_crop_ms",
+    "recovery_roi_select_ms",
+    "recovery_roi_attempt_ms",
+    "recovery_roi_area_ratio",
+    "recovery_roi_width_px",
+    "recovery_roi_height_px",
+    "recovery_roi_success_count",
+    "recovery_roi_fallback_count",
+    "recovery_roi_skipped_count",
+    "recovery_roi_retry_select_ms",
+    "recovery_roi_retry_attempt_ms",
+    "recovery_roi_retry_area_ratio",
+    "recovery_roi_retry_width_px",
+    "recovery_roi_retry_height_px",
+    "recovery_roi_retry_success_count",
+    "recovery_roi_retry_fallback_count",
+    "recovery_roi_retry_skipped_count",
+    "recovery_roi_retry_corner_detect_ms",
+    "recovery_roi_retry_refine_ms",
+    "recovery_roi_retry_build_best_ms",
+    "recovery_full_frame_fallback_ms",
+    "recovery_full_frame_fallback_deferred_count",
+    "refresh_roi_recovery_fail_count",
+    "refresh_roi_align_fail_count",
+    "refresh_roi_fail_full_retry_count",
+    "refresh_roi_unaligned_reset_count",
+    "refresh_full_recovery_unaligned_reset_count",
+    "refresh_full_recovery_after_roi_align_fail_deferred_count",
+    "refresh_expanded_roi_after_align_fail_ms",
+    "refresh_expanded_roi_align_success_count",
+    "refresh_expanded_roi_align_fail_count",
+    "recovery_expanded_roi_corner_detect_ms",
+    "recovery_expanded_roi_refine_ms",
+    "recovery_expanded_roi_build_best_ms",
+    "refresh_full_recovery_align_success_count",
+    "refresh_full_recovery_after_roi_align_fail_ms",
+    "fallback_full_recovery_after_roi_align_fail_ms",
+    "fallback_full_recovery_after_roi_align_fail_deferred_count",
+    "recovery_resize_ms",
+    "recovery_raw_count",
+    "recovery_refined_count",
+    "recovery_quadrant_count",
+    "recovery_corner_detect_ms",
+    "recovery_roi_corner_detect_ms",
+    "recovery_roi_raw_count",
+    "recovery_roi_refined_count",
+    "recovery_roi_quadrant_count",
+    "recovery_roi_refine_ms",
+    "recovery_roi_build_best_ms",
+    "recovery_full_fallback_corner_detect_ms",
+    "recovery_full_fallback_raw_count",
+    "recovery_full_fallback_refined_count",
+    "recovery_full_fallback_quadrant_count",
+    "build_best_total_ms",
+    "build_best_subset_pruned_count",
+    "corner_detect_total_ms",
+    "corner_detect_make_fast_image_ms",
+    "corner_detect_fast_gradient_total_ms",
+    "corner_detect_fast_gradient_sobel_ms",
+    "corner_detect_fast_gradient_blur_ms",
+    "corner_detect_fast_gradient_nms_ms",
+    "corner_detect_fast_gradient_scan_points_ms",
+    "corner_detect_fast_gradient_partial_sort_ms",
+    "corner_detect_fast_gftt_good_features_ms",
+    "corner_detect_fast_merge_ms",
+    "corner_detect_build_variants_ms",
+    "corner_detect_variants_clahe_ms",
+    "corner_detect_variant_gradient_total_ms",
+    "corner_detect_variant_gradient_sobel_ms",
+    "corner_detect_variant_gradient_blur_ms",
+    "corner_detect_variant_gradient_nms_ms",
+    "corner_detect_variant_gradient_scan_points_ms",
+    "corner_detect_variant_gradient_partial_sort_ms",
+    "corner_detect_variant_gftt_good_features_ms",
+    "corner_detect_variant_merge_gradient_ms",
+    "corner_detect_variant_merge_gftt_ms",
+    "corner_detect_final_gradient_total_ms",
+    "recovery_refine_ms",
+    "recovery_quadrant_filter_ms",
+    "recovery_build_best_ms",
+    "recovery_completion_ms",
+    "lattice_fit_ms",
+    "grid_build_lattice_ms",
+]
+
 
 def log_start() -> None:
     global _log_active, _log_file, _log_writer, _log_start_ms, _log_frame_idx
@@ -75,6 +210,8 @@ def log_start() -> None:
         "spacing_median", "spacing_min",
         "debug_raw", "debug_refined", "debug_lattice",
         "debug_det_corners", "debug_det_cells",
+        *TIMING_KEYS,
+        "timing_detail_json",
         "corner_keys", "corner_uvs", "corner_vis", "corner_pred",
     ])
     _log_start_ms  = datetime.now().timestamp() * 1000.0
@@ -125,7 +262,42 @@ def recovery_counts(dbg):
     return raw_n, refined_n, lattice, rec_c, rec_cells
 
 
-def log_frame(det, global_frame: int, debug_recovery=None) -> None:
+def format_timing(timings: dict, key: str) -> str:
+    value = timings.get(key)
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):.3f}"
+    except Exception:
+        return ""
+
+
+def timing_value(timings: dict, *keys: str) -> float:
+    for key in keys:
+        value = timings.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return 0.0
+
+
+def get_checkerboard_timings(detector, detect_wall_ms: float) -> dict:
+    timings = {"detect_wall_ms": float(detect_wall_ms)}
+    if hasattr(detector, "last_timings_ms"):
+        try:
+            timings.update({
+                str(k): float(v)
+                for k, v in detector.last_timings_ms().items()
+            })
+        except Exception:
+            pass
+    return timings
+
+
+def log_frame(det, global_frame: int, timings: dict, debug_recovery=None) -> None:
     global _log_frame_idx
 
     if not _log_active or _log_writer is None:
@@ -173,6 +345,11 @@ def log_frame(det, global_frame: int, debug_recovery=None) -> None:
         n_corners, n_cells, tracking, stable,
         spacing_median, spacing_min,
         raw_n, refined_n, lattice, rec_c, rec_cells,
+        *[format_timing(timings, key) for key in TIMING_KEYS],
+        json.dumps(
+            {k: round(float(v), 3) for k, v in sorted(timings.items())},
+            ensure_ascii=False,
+        ),
         corner_keys, corner_uvs, corner_vis, corner_pred,
     ])
 
@@ -308,7 +485,7 @@ def count_lost_debug_corners(det, debug_det, max_dist_px=10.0):
     return lost
 
 
-def draw_status(vis, mode_name, det, debug_det, debug_on) -> None:
+def draw_status(vis, mode_name, det, debug_det, debug_on, timings=None) -> None:
     normal_n = len(det.corners) if det else 0
     normal_c = len(det.cells)   if det else 0
     debug_n  = len(debug_det.corners) if debug_det else 0
@@ -342,7 +519,28 @@ def draw_status(vis, mode_name, det, debug_det, debug_on) -> None:
         lost = count_lost_debug_corners(det, debug_det)
         line3 += f" | lost in final: {lost}"
 
-    for i, line in enumerate([line1, line2, line3]):
+    lines = [line1, line2, line3]
+    if timings:
+        lines.append(
+            "ms: "
+            f"det={float(timings.get('detect_wall_ms', 0.0)):.1f} "
+            f"track={float(timings.get('track_total_ms', 0.0)):.1f} "
+            f"lk={float(timings.get('lk_ms', 0.0)):.1f} "
+            f"val={float(timings.get('tracking_validate_ms', 0.0)):.1f} "
+            f"grid={float(timings.get('grid_build_tracking_ms', 0.0)):.1f} "
+            f"rec={float(timings.get('recovery_total_ms', 0.0)):.1f}"
+        )
+        lines.append(
+            "corner ms: "
+            f"all={timing_value(timings, 'corner_detect_total_ms'):.1f} "
+            f"sob={timing_value(timings, 'corner_detect_fast_gradient_sobel_ms', 'corner_detect_variant_gradient_sobel_ms'):.1f} "
+            f"blur={timing_value(timings, 'corner_detect_fast_gradient_blur_ms', 'corner_detect_variant_gradient_blur_ms'):.1f} "
+            f"nms={timing_value(timings, 'corner_detect_fast_gradient_nms_ms', 'corner_detect_variant_gradient_nms_ms'):.1f} "
+            f"scan={timing_value(timings, 'corner_detect_fast_gradient_scan_points_ms', 'corner_detect_variant_gradient_scan_points_ms'):.1f} "
+            f"sort={timing_value(timings, 'corner_detect_fast_gradient_partial_sort_ms', 'corner_detect_variant_gradient_partial_sort_ms'):.1f}"
+        )
+
+    for i, line in enumerate(lines):
         cv2.putText(vis, line, (20, 35 + i * 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 255, 255), 2, cv2.LINE_AA)
@@ -377,6 +575,23 @@ def draw_recovery_status(vis, dbg) -> None:
 
 def make_checkerboard_config():
     cfg = hydramarker_cpp.CheckerboardDetectorConfig()
+    cfg.refresh_interval_frames = 1
+    cfg.det_width = 0
+    if hasattr(cfg, "max_undecodeable_tracking_frames"):
+        cfg.max_undecodeable_tracking_frames = 12
+    if hasattr(cfg, "max_low_corner_frames"):
+        cfg.max_low_corner_frames = 12
+    if hasattr(cfg, "use_tracking_roi_recovery"):
+        cfg.use_tracking_roi_recovery = True
+        cfg.tracking_recovery_roi_margin_cells = 3.0
+        cfg.tracking_recovery_roi_min_margin_px = 80
+        cfg.tracking_recovery_roi_max_area_ratio = 0.85
+        if hasattr(cfg, "tracking_recovery_align_fail_full_retry_frames"):
+            cfg.tracking_recovery_align_fail_full_retry_frames = 0
+            cfg.tracking_recovery_align_fail_roi_margin_multiplier = 2.0
+            if hasattr(cfg, "tracking_recovery_roi_fail_retry_margin_multiplier"):
+                cfg.tracking_recovery_roi_fail_retry_margin_multiplier = 1.0
+            cfg.tracking_recovery_roi_fail_full_retry_frames = 0
     cfg.recovery_correction_weight = 0.5
     cfg.recovery_correction_max_dist_rel = 0.6
     return cfg
@@ -428,7 +643,10 @@ def main() -> None:
             vis = img.copy()
             frame_idx += 1
 
+            detect_t0 = time.perf_counter()
             det = detector.detect(img)
+            detect_wall_ms = (time.perf_counter() - detect_t0) * 1000.0
+            checker_timings = get_checkerboard_timings(detector, detect_wall_ms)
 
             # Debug overlay
             debug_det = None
@@ -439,7 +657,7 @@ def main() -> None:
                 debug_recovery = debug_detector.debug_recovery_stages(img)
 
             # Flicker/recovery-stage log
-            log_frame(det, frame_idx, debug_recovery)
+            log_frame(det, frame_idx, checker_timings, debug_recovery)
 
             if debug_on:
                 draw_recovery_debug(vis, debug_recovery, det)
@@ -455,7 +673,7 @@ def main() -> None:
                     draw_corners(vis, det, color=(0, 255, 0),
                                  radius=4, draw_indices=True)
 
-            draw_status(vis, mode_names[mode], det, debug_det, debug_on)
+            draw_status(vis, mode_names[mode], det, debug_det, debug_on, checker_timings)
             if debug_on:
                 draw_recovery_status(vis, debug_recovery)
 

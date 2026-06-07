@@ -1,6 +1,10 @@
 #pragma once
 
+#include <cstdint>
+#include <limits>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -60,6 +64,17 @@ struct PersistentTrackedCorner {
     int low_visibility_frames = 0;
 };
 
+struct PendingCompletionCorner {
+    int i = 0;
+    int j = 0;
+    cv::Point2f uv;
+    int hits = 0;
+    int measured_hits = 0;
+    int missed = 0;
+    int support = 0;
+    float error = std::numeric_limits<float>::max();
+};
+
 class CheckerboardDetector {
 public:
     CheckerboardDetector();
@@ -71,6 +86,9 @@ public:
 
     void resetTracking();
     bool isTracking() const;
+    std::unordered_map<std::string, double> lastTimingsMs() const;
+    void addTimingMs(const std::string& name, double elapsed_ms) const;
+    static double elapsedMs(std::int64_t start_tick);
 
 private:
     CheckerboardDetectorConfig config_;
@@ -80,12 +98,15 @@ private:
     int low_corner_frames_ = 0;
     int undecodeable_tracking_frames_ = 0;
     int held_output_frames_ = 0;
+    int roi_align_fail_frames_ = 0;
+    int roi_recovery_fail_frames_ = 0;
 
     cv::Mat last_gray_;
     CheckerboardDetection last_detection_;
     bool tracking_active_ = false;
 
     std::vector<PersistentTrackedCorner> persistent_corners_;
+    std::vector<PendingCompletionCorner> pending_completion_corners_;
 
     CornerDetector corner_detector_;
     CornerRefiner corner_refiner_;
@@ -94,11 +115,36 @@ private:
     LKTracker lk_tracker_;
     TrackingValidator tracking_validator_;
 
+    struct RecoveryRegionCache {
+        int frame_index = -1;
+        cv::Rect roi;
+        CornerDetectionResult raw;
+        std::vector<RefinedCorner> refined;
+    };
+
+    mutable std::optional<RecoveryRegionCache> recovery_region_cache_;
+
+    std::vector<cv::Mat> last_gray_pyramid_;
+    std::vector<cv::Mat> pending_current_gray_pyramid_;
+    int last_gray_pyramid_frame_index_ = -1;
+    int pending_current_gray_pyramid_frame_index_ = -1;
+
 private:
     static cv::Mat toGray8(const cv::Mat& image);
 
     std::optional<CheckerboardDetection>
-    detectRecovery(const cv::Mat& gray) const;
+    detectRecovery(
+        const cv::Mat& gray,
+        const CheckerboardDetection* roi_hint = nullptr,
+        bool allow_full_frame_fallback = true
+    ) const;
+
+    std::optional<CheckerboardDetection>
+    detectRecoveryInRegion(
+        const cv::Mat& gray,
+        const cv::Rect& roi,
+        const char* timing_prefix = nullptr
+    ) const;
 
     std::optional<CheckerboardDetection>
     buildDetectionFromCorners(
@@ -138,7 +184,7 @@ private:
 
     // Searches for missing grid corners by interpolating expected positions
     // from known neighbours and looking for raw candidates nearby.
-    void tryCompleteMissingCorners(
+    int tryCompleteMissingCorners(
         const cv::Mat& gray,
         bool tracking
     );
@@ -188,6 +234,10 @@ private:
         const PersistentTrackedCorner& pc,
         float spacing                 // estimated grid spacing in pixels
     ) const;
+
+    mutable std::unordered_map<std::string, double> last_timings_ms_;
+
+    void clearTimings() const;
 };
 
 } // namespace hydramarker
