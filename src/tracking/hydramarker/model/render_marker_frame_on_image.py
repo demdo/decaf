@@ -444,9 +444,6 @@ def create_tracker(
     dist: np.ndarray,
 ) -> HydraTracker:
     config = TrackerConfig(
-        enable_debug_prints=True,
-        log_to_console=True,
-        log_path="hydramarker_frame_renderer.log",
         min_points=8,
         min_inliers=6,
         max_mean_reprojection_error_px=4.0,

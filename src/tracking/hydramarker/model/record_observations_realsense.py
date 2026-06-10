@@ -352,15 +352,7 @@ def make_sfm_tracker(
     marker_json_path: Path,
     K,
     dist,
-    *,
-    log_path: Path | None = None,
 ) -> HydraTracker:
-    tracker_log_path = (
-        Path("hydramarker_sfm_recorder_tracker.log")
-        if log_path is None
-        else Path(log_path)
-    )
-
     return HydraTracker(
         field_path=str(field_path),
         marker_json_path=str(marker_json_path),
@@ -405,9 +397,6 @@ def make_sfm_tracker(
             persistence_max_frames=8,
             pose_hold_max_frames=0,
             emergency_pose_hold_enabled=False,
-            enable_debug_prints=True,
-            log_path=str(tracker_log_path),
-            log_to_console=False,
         ),
     )
 
@@ -434,19 +423,14 @@ def main() -> None:
     K, dist = load_tracker_camera_calibration(profile)
     save_camera_intrinsics(camera_path, K, dist)
 
-    tracker_log_path = observations_path.with_name(
-        "hydramarker_sfm_recorder_tracker.log"
-    )
     tracker = make_sfm_tracker(
         field_path,
         marker_json_path,
         K,
         dist,
-        log_path=tracker_log_path,
     )
     assert_sfm_recorder_config(tracker)
     print("[recorder] SfM mode: Fast Path disabled, Decode-only save enabled")
-    print(f"[recorder] tracker_log = {tracker_log_path}")
 
     window_name = "HydraMarker SfM Observation Recorder"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)

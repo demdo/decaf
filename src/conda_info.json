@@ -1,0 +1,99 @@
+{
+  "active_prefix": "C:\\Users\\domin\\anaconda3",
+  "active_prefix_name": "base",
+  "av_data_dir": "C:\\Users\\domin\\anaconda3\\etc\\conda",
+  "av_metadata_url_base": null,
+  "channels": [
+    "https://repo.anaconda.com/pkgs/main/win-64",
+    "https://repo.anaconda.com/pkgs/main/noarch",
+    "https://repo.anaconda.com/pkgs/r/win-64",
+    "https://repo.anaconda.com/pkgs/r/noarch",
+    "https://repo.anaconda.com/pkgs/msys2/win-64",
+    "https://repo.anaconda.com/pkgs/msys2/noarch"
+  ],
+  "conda_build_version": "25.5.0",
+  "conda_env_version": "25.5.1",
+  "conda_location": "C:\\Users\\domin\\anaconda3\\Lib\\site-packages\\conda",
+  "conda_prefix": "C:\\Users\\domin\\anaconda3",
+  "conda_shlvl": 3,
+  "conda_version": "25.5.1",
+  "config_files": [
+    "C:\\Users\\domin\\anaconda3\\.condarc",
+    "C:\\Users\\domin\\anaconda3\\condarc.d\\anaconda-auth.yml",
+    "C:\\Users\\domin\\.condarc"
+  ],
+  "default_prefix": "C:\\Users\\domin\\anaconda3",
+  "env_vars": {
+    "CIO_TEST": "<not set>",
+    "CONDA_ALLOW_SOFTLINKS": "false",
+    "CONDA_DEFAULT_ENV": "base",
+    "CONDA_EXE": "C:\\Users\\domin\\anaconda3\\Scripts\\conda.exe",
+    "CONDA_EXES": "\"C:\\Users\\domin\\anaconda3\\Scripts\\conda.exe\"  ",
+    "CONDA_PREFIX": "C:\\Users\\domin\\anaconda3",
+    "CONDA_PREFIX_1": "C:\\Users\\domin\\anaconda3",
+    "CONDA_PREFIX_2": "C:\\Users\\domin\\anaconda3\\envs\\decaf",
+    "CONDA_PROMPT_MODIFIER": "(base) ",
+    "CONDA_PYTHON_EXE": "C:\\Users\\domin\\anaconda3\\python.exe",
+    "CONDA_ROOT": "C:\\Users\\domin\\anaconda3",
+    "CONDA_SHLVL": "3",
+    "CURL_CA_BUNDLE": "<not set>",
+    "HOMEPATH": "\\Users\\domin",
+    "LD_PRELOAD": "<not set>",
+    "PATH": "C:\\Users\\domin\\anaconda3;C:\\Users\\domin\\anaconda3\\Library\\mingw-w64\\bin;C:\\Users\\domin\\anaconda3\\Library\\usr\\bin;C:\\Users\\domin\\anaconda3\\Library\\bin;C:\\Users\\domin\\anaconda3\\Scripts;C:\\Users\\domin\\anaconda3\\bin;C:\\Users\\domin\\anaconda3\\condabin;C:\\Program Files (x86)\\NVIDIA Corporation\\PhysX\\Common;C:\\Program Files (x86)\\Common Files\\Oracle\\Java\\java8path;C:\\Program Files (x86)\\Common Files\\Oracle\\Java\\javapath;C:\\windows\\system32;C:\\windows;C:\\windows\\System32\\Wbem;C:\\windows\\System32\\WindowsPowerShell\\v1.0;C:\\windows\\System32\\OpenSSH;C:\\Program Files\\dotnet;C:\\Program Files\\MATLAB\\R2025b\\runtime\\win64;C:\\Program Files\\MATLAB\\R2025b\\bin;C:\\Program Files (x86)\\Windows Kits\\8.1\\Windows Performance Toolkit;C:\\Program Files\\CMake\\bin;C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit;C:\\Users\\domin\\.local\\bin;C:\\Users\\domin\\AppData\\Local\\Microsoft\\WindowsApps;C:\\Users\\domin\\AppData\\Local\\Programs\\Microsoft VS Code\\bin;C:\\Users\\domin\\AppData\\Roaming\\Programs\\Zero Install;C:\\Users\\domin\\AppData\\Local\\Programs\\MiKTeX\\miktex\\bin\\x64;C:\\Users\\domin\\AppData\\Local\\Programs\\Git\\cmd",
+    "PSMODULEPATH": "C:\\Program Files\\WindowsPowerShell\\Modules;C:\\windows\\system32\\WindowsPowerShell\\v1.0\\Modules",
+    "REQUESTS_CA_BUNDLE": "<not set>",
+    "SSL_CERT_FILE": "C:\\Users\\domin\\anaconda3\\Library\\ssl\\cacert.pem"
+  },
+  "envs": [
+    "C:\\Users\\domin\\anaconda3",
+    "C:\\Users\\domin\\anaconda3\\envs\\decaf"
+  ],
+  "envs_dirs": [
+    "C:\\Users\\domin\\anaconda3\\envs",
+    "C:\\Users\\domin\\.conda\\envs",
+    "C:\\Users\\domin\\AppData\\Local\\conda\\conda\\envs"
+  ],
+  "is_windows_admin": false,
+  "netrc_file": null,
+  "offline": false,
+  "pkgs_dirs": [
+    "C:\\Users\\domin\\anaconda3\\pkgs",
+    "C:\\Users\\domin\\.conda\\pkgs",
+    "C:\\Users\\domin\\AppData\\Local\\conda\\conda\\pkgs"
+  ],
+  "platform": "win-64",
+  "python_version": "3.13.9.final.0",
+  "rc_path": "C:\\Users\\domin\\.condarc",
+  "requests_version": "2.32.3",
+  "root_prefix": "C:\\Users\\domin\\anaconda3",
+  "root_writable": true,
+  "site_dirs": [],
+  "solver": {
+    "default": true,
+    "name": "libmamba",
+    "user_agent": "solver/libmamba conda-libmamba-solver/25.4.0 libmambapy/2.0.5"
+  },
+  "sys.executable": "C:\\Users\\domin\\anaconda3\\python.exe",
+  "sys.prefix": "C:\\Users\\domin\\anaconda3",
+  "sys.version": "3.13.9 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 19:09:58) [MSC v.1929 64 bit (AMD64)]",
+  "sys_rc_path": "C:\\Users\\domin\\anaconda3\\.condarc",
+  "user_agent": "conda/25.5.1 requests/2.32.3 CPython/3.13.9 Windows/11 Windows/10.0.26200 solver/libmamba conda-libmamba-solver/25.4.0 libmambapy/2.0.5 aau/0.7.5 c/dI5ZnmGpf3unVTh5huaD9N s/LiLv_TvP7GJf1fKXiuH1fG e/np6BDcgd2jNHGyukTydC-I a/sRcMZwZLToiCeEnYdRzZ3w",
+  "user_rc_path": "C:\\Users\\domin\\.condarc",
+  "virtual_pkgs": [
+    [
+      "__archspec",
+      "1",
+      "skylake"
+    ],
+    [
+      "__conda",
+      "25.5.1",
+      "0"
+    ],
+    [
+      "__win",
+      "10.0.26200",
+      "0"
+    ]
+  ]
+}

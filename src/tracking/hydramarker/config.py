@@ -30,12 +30,12 @@ class TrackerConfig:
     pnp_direct_max_mean_reprojection_error_px: float = 1.5
     pnp_direct_max_max_reprojection_error_px: float = 3.0
 
-    # Frühzeitiger Smoothing-Reset: wenn pts unter diesen Anteil des
-    # letzten guten Wertes fällt, reset_smoothing() präventiv aufrufen.
-    # Verhindert den Totalausfall durch graduellen LK-Drift.
-    # 0.0 = deaktiviert, 0.4 = Reset wenn pts auf 40% des Maximalwerts fällt.
+    # Early smoothing reset when the current point count falls below this
+    # fraction of the best recent count. This catches gradual LK drift before
+    # a complete decode failure.
+    # 0.0 = disabled, 0.4 = reset at 40 percent of the maximum count.
     dot_early_reset_pts_ratio: float = 0.4
-    # Minimale pts-Anzahl ab der die Ratio überhaupt geprüft wird.
+    # Minimum point count before the ratio gate is evaluated.
     dot_early_reset_min_pts: int = 6
 
     dot_canonical_size: int = 80
@@ -132,13 +132,12 @@ class TrackerConfig:
     # without moving the physical corners in the image.
     persistence_uv_match_dist_px: float = 25.0
 
-    # Pose-Propagation: projiziert bekannte Marker-Corners mit der letzten
-    # guten Pose in den nächsten Frame. Ersetzt LK-Drift-anfällige
-    # CheckerboardDetection wenn die Pose gut genug ist.
-    # Nur aktiv wenn mean_reprojection_error < threshold.
+    # Pose propagation projects known marker corners from the last good pose
+    # into the next frame. It replaces the LK-driven checkerboard detection
+    # only while the last accepted reprojection error is below the threshold.
     enable_pose_propagation: bool = True
     pose_propagation_max_reproj_px: float = 2.0
-    # Minimaler Bildrand-Abstand für projizierte Corners (px).
+    # Minimum image-border distance for projected corners in pixels.
     pose_propagation_border_px: float = 8.0
     pose_hold_max_frames: int = 45
     pose_hold_min_detection_corners: int = 8
@@ -158,10 +157,6 @@ class TrackerConfig:
     uncoded_bootstrap_max_mean_reprojection_error_px: float = 1.2
     uncoded_bootstrap_max_max_reprojection_error_px: float = 3.0
     uncoded_bootstrap_min_second_best_margin_px: float = 1.0
-
-    enable_debug_prints: bool = True
-    log_path: str = "hydramarker_tracker.log"
-    log_to_console: bool = False
 
 
 __all__ = ["TrackerConfig"]

@@ -2340,9 +2340,6 @@ def make_tracker(field_path, marker_json_path, K, dist) -> HydraTracker:
             # Current-frame dot decisions: no EMA warmup-lock.
             dot_use_temporal_smoothing=False,
 
-            enable_debug_prints=False,
-            log_path="hydramarker_tracker.log",
-            log_to_console=False,
             dot_commit_frames=1,
             dot_revoke_frames=5,
             persistence_max_frames=8,
