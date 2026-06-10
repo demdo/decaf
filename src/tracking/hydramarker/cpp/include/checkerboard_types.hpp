@@ -70,7 +70,7 @@ struct CheckerboardDetectorConfig {
     // k contiguous cell columns.  LK tracking can otherwise get stuck in a
     // visually plausible but undecodable narrow strip (for example 4x2 cells).
     int min_tracking_decode_cell_span = 3;
-    int max_undecodeable_tracking_frames = 2;
+    int max_undecodeable_tracking_frames = 12;
 
     float min_tracking_corner_ratio = 0.45f;
     float max_tracking_homography_error_px = 12.0f;
@@ -117,7 +117,7 @@ struct CheckerboardDetectorConfig {
 
     // Consecutive frames with fewer than (min_corners * 2) corners before a
     // forced reset.  Lower = faster escape from stuck states.
-    int max_low_corner_frames = 6;
+    int max_low_corner_frames = 12;
 
     int lk_win_size = 31;
     int lk_max_level = 4;
@@ -132,6 +132,31 @@ struct CheckerboardDetectorConfig {
 
     int det_width = 0;
     int max_recovery_corners = 150;
+
+    // During active tracking, recovery can search only a generous full-res ROI
+    // around the currently tracked board. This keeps per-frame correction fast
+    // without losing precision through image downscaling. Full-frame recovery is
+    // still used for startup, tracking loss, and as fallback when ROI recovery
+    // cannot produce a valid board.
+    bool use_tracking_roi_recovery = true;
+    float tracking_recovery_roi_margin_cells = 3.0f;
+    int tracking_recovery_roi_min_margin_px = 80;
+    float tracking_recovery_roi_max_area_ratio = 0.85f;
+    // 0 disables periodic full-frame retry while active tracking is still
+    // usable. Full-frame recovery still runs at startup or after tracking loss.
+    int tracking_recovery_align_fail_full_retry_frames = 0;
+    float tracking_recovery_align_fail_roi_margin_multiplier = 2.0f;
+    // >1 enables a larger second ROI attempt after a normal ROI failure.
+    float tracking_recovery_roi_fail_retry_margin_multiplier = 1.0f;
+    // 0 disables periodic full-frame fallback while active tracking is still
+    // usable. Full-frame recovery is too expensive for the normal partial-board
+    // path and is mainly useful as an explicit diagnostic escape hatch.
+    int tracking_recovery_roi_fail_full_retry_frames = 0;
+    // During stable active tracking, keep detecting/refining ROI candidates
+    // every refresh, but only rebuild the full ROI lattice/grid every N frames.
+    // Candidate-only refreshes are enough for same-frame saddle snapping and
+    // local completion; a value of 1 keeps the old every-frame full build.
+    int tracking_recovery_full_build_interval_frames = 4;
 
     float merge_radius_px = 5.0f;
     float duplicate_corner_dist_px = 4.0f;

@@ -23,10 +23,6 @@ static float dist2(const cv::Point2f& a, const cv::Point2f& b) {
     return sqr(a.x - b.x) + sqr(a.y - b.y);
 }
 
-static float dist(const cv::Point2f& a, const cv::Point2f& b) {
-    return std::sqrt(dist2(a, b));
-}
-
 static float norm(const cv::Point2f& v) {
     return std::sqrt(v.x * v.x + v.y * v.y);
 }
@@ -95,18 +91,18 @@ static float estimateNearestSpacing(
     nn.reserve(pts.size());
 
     for (size_t i = 0; i < pts.size(); ++i) {
-        float best = std::numeric_limits<float>::max();
+        float best_d2 = std::numeric_limits<float>::max();
 
         for (size_t j = 0; j < pts.size(); ++j) {
             if (i == j) {
                 continue;
             }
 
-            best = std::min(best, dist(pts[i], pts[j]));
+            best_d2 = std::min(best_d2, dist2(pts[i], pts[j]));
         }
 
-        if (std::isfinite(best)) {
-            nn.push_back(best);
+        if (std::isfinite(best_d2)) {
+            nn.push_back(std::sqrt(best_d2));
         }
     }
 
@@ -283,12 +279,12 @@ static bool validateLatticeStructure(
         return false;
     }
 
-    std::vector<float> u_edges;
-    std::vector<float> v_edges;
+    std::vector<float> u_edge_d2;
+    std::vector<float> v_edge_d2;
     std::vector<float> cell_crosses;
 
-    u_edges.reserve(points.size());
-    v_edges.reserve(points.size());
+    u_edge_d2.reserve(points.size());
+    v_edge_d2.reserve(points.size());
     cell_crosses.reserve(points.size());
 
     for (const auto& p : points) {
@@ -297,12 +293,12 @@ static bool validateLatticeStructure(
 
         const auto it_u = by_grid.find(gridKey(i + 1, j));
         if (it_u != by_grid.end()) {
-            u_edges.push_back(dist(p.uv, points[it_u->second].uv));
+            u_edge_d2.push_back(dist2(p.uv, points[it_u->second].uv));
         }
 
         const auto it_v = by_grid.find(gridKey(i, j + 1));
         if (it_v != by_grid.end()) {
-            v_edges.push_back(dist(p.uv, points[it_v->second].uv));
+            v_edge_d2.push_back(dist2(p.uv, points[it_v->second].uv));
         }
 
         const auto it_10 = by_grid.find(gridKey(i + 1, j));
@@ -321,38 +317,46 @@ static bool validateLatticeStructure(
     }
 
     const int edge_count =
-        static_cast<int>(u_edges.size() + v_edges.size());
+        static_cast<int>(u_edge_d2.size() + v_edge_d2.size());
 
     if (edge_count < 4) {
         return false;
     }
 
     const float med_u =
-        u_edges.empty() ? spacing_u : medianValue(u_edges);
+        u_edge_d2.empty()
+            ? spacing_u
+            : std::sqrt(medianValue(u_edge_d2));
 
     const float med_v =
-        v_edges.empty() ? spacing_v : medianValue(v_edges);
+        v_edge_d2.empty()
+            ? spacing_v
+            : std::sqrt(medianValue(v_edge_d2));
 
     if (med_u < kEps || med_v < kEps) {
         return false;
     }
 
     int good_u = 0;
-    for (const float e : u_edges) {
-        if (e >= 0.60f * med_u && e <= 1.40f * med_u) {
+    const float min_u_d2 = sqr(0.60f * med_u);
+    const float max_u_d2 = sqr(1.40f * med_u);
+    for (const float e_d2 : u_edge_d2) {
+        if (e_d2 >= min_u_d2 && e_d2 <= max_u_d2) {
             good_u++;
         }
     }
 
     int good_v = 0;
-    for (const float e : v_edges) {
-        if (e >= 0.60f * med_v && e <= 1.40f * med_v) {
+    const float min_v_d2 = sqr(0.60f * med_v);
+    const float max_v_d2 = sqr(1.40f * med_v);
+    for (const float e_d2 : v_edge_d2) {
+        if (e_d2 >= min_v_d2 && e_d2 <= max_v_d2) {
             good_v++;
         }
     }
 
-    const int total_u = static_cast<int>(u_edges.size());
-    const int total_v = static_cast<int>(v_edges.size());
+    const int total_u = static_cast<int>(u_edge_d2.size());
+    const int total_v = static_cast<int>(v_edge_d2.size());
 
     if (total_u > 0 &&
         static_cast<float>(good_u) / static_cast<float>(total_u) < 0.75f) {
@@ -495,6 +499,8 @@ bool LatticeModel::estimateAxes(
     // on genuine axis-aligned neighbours.
     const float d_min = 0.55f * spacing;
     const float d_max = 1.25f * spacing;
+    const float d_min2 = d_min * d_min;
+    const float d_max2 = d_max * d_max;
 
     std::vector<cv::Point2f> dirs;
     std::vector<cv::Point2f> diffs;
@@ -505,13 +511,14 @@ bool LatticeModel::estimateAxes(
     for (size_t a = 0; a < pts.size(); ++a) {
         for (size_t b = a + 1; b < pts.size(); ++b) {
             const cv::Point2f v = pts[b] - pts[a];
-            const float d = norm(v);
+            const float d2 = v.x * v.x + v.y * v.y;
 
-            if (d < d_min || d > d_max) {
+            if (d2 < d_min2 || d2 > d_max2) {
                 continue;
             }
 
-            dirs.push_back(normalizeSafe(v));
+            const float inv_d = 1.0f / std::sqrt(d2);
+            dirs.emplace_back(v.x * inv_d, v.y * inv_d);
             diffs.push_back(v);
         }
     }

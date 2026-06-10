@@ -126,6 +126,53 @@ def select_bootstrap_pair(
     return best
 
 
+def select_bootstrap_pair_candidates(
+    frames: list[FrameObservation],
+    *,
+    min_shared_ids: int = 20,
+    max_pairs: int = 2000,
+    min_frame_gap: int = 5,
+) -> list[BootstrapPair]:
+    if len(frames) < 2:
+        raise ValueError("Need at least two frames for SfM bootstrap.")
+
+    candidates: list[BootstrapPair] = []
+    tested = 0
+
+    for i, frame_a in enumerate(frames):
+        for j in range(i + 1, len(frames)):
+            frame_b = frames[j]
+
+            gap = abs(frame_b.frame_id - frame_a.frame_id)
+            if gap < min_frame_gap:
+                continue
+
+            shared = frame_a.shared_ids(frame_b)
+            n_shared = len(shared)
+
+            if n_shared < min_shared_ids:
+                continue
+
+            candidates.append(
+                BootstrapPair(
+                    frame_a=frame_a,
+                    frame_b=frame_b,
+                    shared_ids=shared,
+                    score=float(n_shared) + 0.01 * float(gap),
+                )
+            )
+
+            tested += 1
+            if tested >= max_pairs:
+                break
+
+        if tested >= max_pairs:
+            break
+
+    candidates.sort(key=lambda pair: pair.score, reverse=True)
+    return candidates
+
+
 def estimate_relative_pose(
     frame_a: FrameObservation,
     frame_b: FrameObservation,
@@ -248,37 +295,105 @@ def run_bootstrap(
     *,
     min_shared_ids: int = 20,
     min_frame_gap: int = 5,
+    max_pairs: int = 2000,
+    max_candidate_pairs_to_try: int = 50,
     ransac_threshold_norm: float = 1e-3,
     max_reprojection_error_norm: float = 2e-3,
 ) -> BootstrapResult:
     try:
-        pair = select_bootstrap_pair(
+        candidates = select_bootstrap_pair_candidates(
             frames,
             min_shared_ids=min_shared_ids,
             min_frame_gap=min_frame_gap,
+            max_pairs=max_pairs,
         )
 
-        R_ba, t_ba, marker_ids, pts_a_norm, pts_b_norm = estimate_relative_pose(
-            pair.frame_a,
-            pair.frame_b,
-            pair.shared_ids,
-            calib,
-            ransac_threshold_norm=ransac_threshold_norm,
-        )
+        if not candidates:
+            raise RuntimeError(
+                f"Could not find bootstrap pair with at least {min_shared_ids} shared IDs."
+            )
 
-        ids_valid, points_valid, depths_a, depths_b, reproj = triangulate_two_view(
+        best = None
+        failures = []
+
+        for pair in candidates[: max(1, int(max_candidate_pairs_to_try))]:
+            try:
+                R_ba, t_ba, marker_ids, pts_a_norm, pts_b_norm = estimate_relative_pose(
+                    pair.frame_a,
+                    pair.frame_b,
+                    pair.shared_ids,
+                    calib,
+                    ransac_threshold_norm=ransac_threshold_norm,
+                )
+
+                ids_valid, points_valid, depths_a, depths_b, reproj = triangulate_two_view(
+                    marker_ids,
+                    pts_a_norm,
+                    pts_b_norm,
+                    R_ba,
+                    t_ba,
+                    max_reprojection_error_norm=max_reprojection_error_norm,
+                )
+            except Exception as exc:
+                failures.append(
+                    f"{pair.frame_a.frame_id}-{pair.frame_b.frame_id}: {exc}"
+                )
+                continue
+
+            median_reproj = (
+                float(np.median(reproj))
+                if len(reproj) > 0
+                else float("inf")
+            )
+            candidate_score = (
+                int(len(ids_valid)),
+                -median_reproj,
+                int(len(pair.shared_ids)),
+                float(pair.score),
+            )
+
+            if best is None or candidate_score > best[0]:
+                best = (
+                    candidate_score,
+                    pair,
+                    R_ba,
+                    t_ba,
+                    marker_ids,
+                    pts_a_norm,
+                    pts_b_norm,
+                    ids_valid,
+                    points_valid,
+                    depths_a,
+                    depths_b,
+                    reproj,
+                )
+
+        if best is None:
+            detail = "; ".join(failures[:5])
+            return BootstrapResult(
+                success=False,
+                message=f"Bootstrap failed for all candidate pairs. {detail}",
+            )
+
+        (
+            _,
+            pair,
+            R_ba,
+            t_ba,
             marker_ids,
             pts_a_norm,
             pts_b_norm,
-            R_ba,
-            t_ba,
-            max_reprojection_error_norm=max_reprojection_error_norm,
-        )
+            ids_valid,
+            points_valid,
+            depths_a,
+            depths_b,
+            reproj,
+        ) = best
 
         if len(ids_valid) < 8:
             return BootstrapResult(
                 success=False,
-                message=f"Bootstrap triangulated too few valid points: {len(ids_valid)}.",
+                message=f"Best bootstrap triangulated too few valid points: {len(ids_valid)}.",
                 frame_a_id=pair.frame_a.frame_id,
                 frame_b_id=pair.frame_b.frame_id,
             )

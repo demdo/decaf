@@ -8,6 +8,7 @@ Bildkoordinatensystem:
 
 - u: nach rechts
 - v: nach unten
+- Rasterlinien parallel zu u/v als Tisch-Markierungshilfe
 
 ESC beendet das Skript.
 """
@@ -22,17 +23,119 @@ import numpy as np
 import pyrealsense2 as rs
 
 
+GRID_SPACING_PX = 100
+GRID_MAJOR_EVERY = 5
+
+
+def draw_uv_grid(
+    image_bgr: np.ndarray,
+    spacing_px: int = GRID_SPACING_PX,
+    major_every: int = GRID_MAJOR_EVERY,
+    principal_point: tuple[float, float] | None = None,
+    alpha: float = 0.34,
+) -> np.ndarray:
+    """
+    Zeichnet ein Bildraster:
+      horizontale Linien: parallel zu u
+      vertikale Linien: parallel zu v
+    """
+    vis = image_bgr.copy()
+    overlay = vis.copy()
+    h, w = vis.shape[:2]
+
+    spacing_px = max(10, int(spacing_px))
+    major_every = max(1, int(major_every))
+
+    minor_color = (95, 95, 95)
+    major_color = (185, 185, 185)
+    u_axis_color = (0, 0, 255)
+    v_axis_color = (0, 255, 0)
+    principal_color = (255, 255, 0)
+
+    for x in range(0, w, spacing_px):
+        major = (x // spacing_px) % major_every == 0
+        color = major_color if major else minor_color
+        thickness = 2 if major else 1
+        cv2.line(overlay, (x, 0), (x, h - 1), color, thickness, cv2.LINE_AA)
+
+    for y in range(0, h, spacing_px):
+        major = (y // spacing_px) % major_every == 0
+        color = major_color if major else minor_color
+        thickness = 2 if major else 1
+        cv2.line(overlay, (0, y), (w - 1, y), color, thickness, cv2.LINE_AA)
+
+    cv2.addWeighted(overlay, alpha, vis, 1.0 - alpha, 0.0, vis)
+
+    # Direction labels for the two line families.
+    cv2.putText(
+        vis,
+        f"grid: {spacing_px}px",
+        (30, h - 95),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (235, 235, 235),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.line(vis, (30, h - 130), (210, h - 130), u_axis_color, 3, cv2.LINE_AA)
+    cv2.putText(
+        vis,
+        "lines parallel to u",
+        (225, h - 123),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        u_axis_color,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.line(vis, (30, h - 120), (30, h - 40), v_axis_color, 3, cv2.LINE_AA)
+    cv2.putText(
+        vis,
+        "lines parallel to v",
+        (45, h - 42),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        v_axis_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    if principal_point is not None:
+        ppx, ppy = principal_point
+        if np.isfinite(ppx) and np.isfinite(ppy):
+            cx = int(round(float(ppx)))
+            cy = int(round(float(ppy)))
+            if 0 <= cx < w and 0 <= cy < h:
+                cv2.line(vis, (cx, 0), (cx, h - 1), principal_color, 2, cv2.LINE_AA)
+                cv2.line(vis, (0, cy), (w - 1, cy), principal_color, 2, cv2.LINE_AA)
+                cv2.circle(vis, (cx, cy), 7, principal_color, -1, cv2.LINE_AA)
+                cv2.circle(vis, (cx, cy), 10, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(
+                    vis,
+                    "principal point",
+                    (cx + 14, max(25, cy - 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    principal_color,
+                    2,
+                    cv2.LINE_AA,
+                )
+
+    return vis
+
+
 def draw_image_axes(
     image_bgr: np.ndarray,
     origin: tuple[int, int] = (80, 80),
     axis_len_px: int = 140,
+    principal_point: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """
     Zeichnet das 2D-Bildkoordinatensystem in das Bild:
       u -> rechts
       v -> unten
     """
-    vis = image_bgr.copy()
+    vis = draw_uv_grid(image_bgr, principal_point=principal_point)
 
     ox, oy = origin
 
@@ -97,7 +200,7 @@ def draw_image_axes(
     )
     cv2.putText(
         vis,
-        "u -> right, v -> down",
+        "u -> right, v -> down; grid lines are image-parallel",
         (30, vis.shape[0] - 25),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -154,7 +257,10 @@ def main() -> None:
 
             color_bgr = np.asanyarray(color_frame.get_data())
 
-            vis = draw_image_axes(color_bgr)
+            vis = draw_image_axes(
+                color_bgr,
+                principal_point=(float(intr.ppx), float(intr.ppy)),
+            )
 
             cv2.putText(
                 vis,

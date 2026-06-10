@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -13,6 +15,7 @@ struct CornerDetectionResult {
     cv::Mat response;
     cv::Mat grad_x;
     cv::Mat grad_y;
+    std::unordered_map<std::string, double> timings_ms;
 };
 
 class CornerDetector {
@@ -32,12 +35,16 @@ private:
         const cv::Mat& gray,
         int max_corners,
         float sigma,
-        float response_threshold
+        float response_threshold,
+        std::unordered_map<std::string, double>* timings = nullptr,
+        const char* timing_prefix = nullptr
     ) const;
 
     // --- dein schneller Ansatz (optional) ---
     std::vector<cv::Point2f> detectFastCandidates(
-        const cv::Mat& gray
+        const cv::Mat& gray,
+        std::unordered_map<std::string, double>* timings = nullptr,
+        const char* timing_prefix = nullptr
     ) const;
 
     // --- merging ---
@@ -45,7 +52,9 @@ private:
         const std::vector<cv::Point2f>& a,
         const std::vector<cv::Point2f>& b,
         float merge_radius,
-        int max_points
+        int max_points,
+        std::unordered_map<std::string, double>* timings = nullptr,
+        const char* timing_name = nullptr
     ) const;
 };
 

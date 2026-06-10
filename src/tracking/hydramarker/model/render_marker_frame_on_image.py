@@ -9,11 +9,9 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from tracking.hydramarker.tracker import (
-    HydraTracker,
-    TrackerConfig,
-    TrackerResult,
-)
+from tracking.hydramarker.config import TrackerConfig
+from tracking.hydramarker.tracker import HydraTracker
+from tracking.hydramarker.tracker_types import TrackerResult
 
 
 INPUT_MODE = "realsense"  # "realsense" or "image"

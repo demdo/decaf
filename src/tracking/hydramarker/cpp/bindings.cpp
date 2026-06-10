@@ -228,6 +228,15 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("stable_motion_threshold_px", &CheckerboardDetectorConfig::stable_motion_threshold_px)
         .def_readwrite("det_width", &CheckerboardDetectorConfig::det_width)
         .def_readwrite("max_recovery_corners", &CheckerboardDetectorConfig::max_recovery_corners)
+        .def_readwrite("use_tracking_roi_recovery", &CheckerboardDetectorConfig::use_tracking_roi_recovery)
+        .def_readwrite("tracking_recovery_roi_margin_cells", &CheckerboardDetectorConfig::tracking_recovery_roi_margin_cells)
+        .def_readwrite("tracking_recovery_roi_min_margin_px", &CheckerboardDetectorConfig::tracking_recovery_roi_min_margin_px)
+        .def_readwrite("tracking_recovery_roi_max_area_ratio", &CheckerboardDetectorConfig::tracking_recovery_roi_max_area_ratio)
+        .def_readwrite("tracking_recovery_align_fail_full_retry_frames", &CheckerboardDetectorConfig::tracking_recovery_align_fail_full_retry_frames)
+        .def_readwrite("tracking_recovery_align_fail_roi_margin_multiplier", &CheckerboardDetectorConfig::tracking_recovery_align_fail_roi_margin_multiplier)
+        .def_readwrite("tracking_recovery_roi_fail_retry_margin_multiplier", &CheckerboardDetectorConfig::tracking_recovery_roi_fail_retry_margin_multiplier)
+        .def_readwrite("tracking_recovery_roi_fail_full_retry_frames", &CheckerboardDetectorConfig::tracking_recovery_roi_fail_full_retry_frames)
+        .def_readwrite("tracking_recovery_full_build_interval_frames", &CheckerboardDetectorConfig::tracking_recovery_full_build_interval_frames)
         .def_readwrite("merge_radius_px", &CheckerboardDetectorConfig::merge_radius_px)
         .def_readwrite("duplicate_corner_dist_px", &CheckerboardDetectorConfig::duplicate_corner_dist_px)
         .def_readwrite("min_neighbor_dist_rel", &CheckerboardDetectorConfig::min_neighbor_dist_rel)
@@ -426,6 +435,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 return self.debugRecoveryStages(mat);
             }
         )
+        .def("last_timings_ms", &CheckerboardDetector::lastTimingsMs)
         .def("reset_tracking", &CheckerboardDetector::resetTracking)
         .def("is_tracking", &CheckerboardDetector::isTracking);
 

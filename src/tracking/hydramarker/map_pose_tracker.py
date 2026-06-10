@@ -40,6 +40,7 @@ class MapPoseResult:
     num_inliers: int = 0
 
     points: Optional[List[PoseTrackPoint]] = None
+    method: str = ""
 
 
 @dataclass
@@ -66,6 +67,11 @@ class MapPoseTrackerConfig:
     rotation_gate_max_deg: float = 120.0
 
     use_pose_prior: bool = True
+    refine_with_iterative: bool = True
+    use_direct_prior_solver: bool = True
+    direct_refine_method: str = "lm"
+    direct_max_mean_reproj_px: float = 1.5
+    direct_max_max_reproj_px: float = 3.0
 
 
 class MapPoseTracker:
@@ -138,6 +144,16 @@ class MapPoseTracker:
             and self.tvec is not None
         )
 
+        if use_guess and self.config.use_direct_prior_solver:
+            direct = self._estimate_pose_direct_prior(
+                points=points,
+                object_points=object_points,
+                image_points=image_points,
+                lost_frames=lost_frames,
+            )
+            if direct is not None and direct.success:
+                return direct
+
         try:
             success, rvec, tvec, inliers = cv2.solvePnPRansac(
                 object_points,
@@ -173,6 +189,7 @@ class MapPoseTracker:
                 message=f"solvePnPRansac failed: {e}",
                 num_points=len(points),
                 points=[],
+                method="ransac_iterative",
             )
 
         if (
@@ -191,6 +208,7 @@ class MapPoseTracker:
                     0 if inliers is None else len(inliers)
                 ),
                 points=[],
+                method="ransac_iterative",
             )
 
         inlier_idx = (
@@ -200,6 +218,24 @@ class MapPoseTracker:
 
         object_inliers = object_points[inlier_idx]
         image_inliers = image_points[inlier_idx]
+
+        if self.config.refine_with_iterative:
+            try:
+                refine_success, rvec_ref, tvec_ref = cv2.solvePnP(
+                    object_inliers,
+                    image_inliers,
+                    self.K,
+                    self.dist_coeffs,
+                    rvec=np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+                    tvec=np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if refine_success:
+                    rvec = np.asarray(rvec_ref, dtype=np.float64).reshape(3, 1)
+                    tvec = np.asarray(tvec_ref, dtype=np.float64).reshape(3, 1)
+            except Exception:
+                pass
 
         projected, _ = cv2.projectPoints(
             object_inliers,
@@ -249,6 +285,7 @@ class MapPoseTracker:
                 num_points=len(points),
                 num_inliers=len(inlier_idx),
                 points=[],
+                method="ransac_iterative",
             )
 
         if (
@@ -281,6 +318,7 @@ class MapPoseTracker:
                     num_points=len(points),
                     num_inliers=len(inlier_idx),
                     points=[],
+                    method="ransac_iterative",
                 )
 
         selected_points = [
@@ -325,7 +363,161 @@ class MapPoseTracker:
             num_inliers=len(inlier_idx),
 
             points=selected_points,
+            method="ransac_iterative",
         )
+
+    def _estimate_pose_direct_prior(
+        self,
+        *,
+        points: List[PoseTrackPoint],
+        object_points: np.ndarray,
+        image_points: np.ndarray,
+        lost_frames: int,
+    ) -> Optional[MapPoseResult]:
+        if self.rvec is None or self.tvec is None:
+            return None
+
+        if len(points) < self.config.min_inliers:
+            return None
+
+        try:
+            success, rvec, tvec = cv2.solvePnP(
+                object_points,
+                image_points,
+                self.K,
+                self.dist_coeffs,
+                rvec=np.asarray(self.rvec, dtype=np.float64).reshape(3, 1).copy(),
+                tvec=np.asarray(self.tvec, dtype=np.float64).reshape(3, 1).copy(),
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except Exception:
+            return None
+
+        if not success:
+            return None
+
+        rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+
+        rvec, tvec, method = self._refine_direct_prior_pose(
+            object_points,
+            image_points,
+            rvec,
+            tvec,
+        )
+
+        try:
+            projected, _ = cv2.projectPoints(
+                object_points,
+                rvec,
+                tvec,
+                self.K,
+                self.dist_coeffs,
+            )
+        except Exception:
+            return None
+
+        projected = projected.reshape(-1, 2)
+        reproj_errors = np.linalg.norm(projected - image_points, axis=1)
+        mean_err = float(np.mean(reproj_errors))
+        max_err = float(np.max(reproj_errors))
+
+        if (
+            mean_err > self.config.direct_max_mean_reproj_px
+            or max_err > self.config.direct_max_max_reproj_px
+        ):
+            return None
+
+        accepted, _ = self._check_motion_gate(
+            rvec,
+            tvec,
+            lost_frames=lost_frames,
+        )
+        if not accepted:
+            return None
+
+        T = make_transform_from_rvec_tvec(rvec, tvec)
+        self.rvec = rvec.copy()
+        self.tvec = tvec.copy()
+        self.T_marker_camera = np.asarray(T, dtype=np.float64).reshape(4, 4)
+        inlier_idx = np.arange(len(points), dtype=np.int64)
+
+        return MapPoseResult(
+            success=True,
+            message="Direct prior pose estimation successful.",
+            rvec=self.rvec.copy(),
+            tvec=self.tvec.copy(),
+            T_marker_camera=self.T_marker_camera.copy(),
+            inlier_indices=inlier_idx.copy(),
+            reprojection_mean_px=mean_err,
+            reprojection_max_px=max_err,
+            num_points=len(points),
+            num_inliers=len(points),
+            points=list(points),
+            method=method,
+        )
+
+    def _refine_direct_prior_pose(
+        self,
+        object_points: np.ndarray,
+        image_points: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, str]:
+        configured = str(self.config.direct_refine_method or "none").lower()
+        if configured in ("", "none", "off", "false"):
+            return rvec, tvec, "direct_prior_unrefined"
+
+        if configured == "auto":
+            methods = ("lm", "vvs")
+        elif configured in ("lm", "vvs"):
+            methods = (configured,)
+        else:
+            methods = ("lm",)
+
+        for method in methods:
+            if method == "lm" and hasattr(cv2, "solvePnPRefineLM"):
+                try:
+                    refined = cv2.solvePnPRefineLM(
+                        object_points,
+                        image_points,
+                        self.K,
+                        self.dist_coeffs,
+                        rvec.copy(),
+                        tvec.copy(),
+                    )
+                    if refined is not None:
+                        rvec_ref, tvec_ref = refined[:2]
+                        return (
+                            np.asarray(rvec_ref, dtype=np.float64).reshape(3, 1),
+                            np.asarray(tvec_ref, dtype=np.float64).reshape(3, 1),
+                            "direct_prior_lm",
+                        )
+                except Exception:
+                    pass
+
+            if method == "vvs" and hasattr(cv2, "solvePnPRefineVVS"):
+                try:
+                    refined = cv2.solvePnPRefineVVS(
+                        object_points,
+                        image_points,
+                        self.K,
+                        self.dist_coeffs,
+                        rvec.copy(),
+                        tvec.copy(),
+                    )
+                    if refined is not None:
+                        rvec_ref, tvec_ref = refined[:2]
+                        return (
+                            np.asarray(rvec_ref, dtype=np.float64).reshape(3, 1),
+                            np.asarray(tvec_ref, dtype=np.float64).reshape(3, 1),
+                            "direct_prior_vvs",
+                        )
+                except Exception:
+                    pass
+
+        return rvec, tvec, "direct_prior_iterative"
 
     def _check_motion_gate(
         self,

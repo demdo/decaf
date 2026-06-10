@@ -273,9 +273,20 @@ def run_sfm_pipeline(
         bootstrap=bootstrap,
     )
 
+    registration_min_points = min(
+        12,
+        max(6, len(state.marker_positions)),
+    )
+
+    print(
+        "[SfM] frame registration: "
+        f"min_points={registration_min_points}, "
+        f"bootstrap_markers={len(state.marker_positions)}"
+    )
+
     register_remaining_frames(
         state,
-        min_points=12,
+        min_points=registration_min_points,
         ransac_reprojection_error_px=1.5,
         confidence=0.999,
         iterations_count=200,

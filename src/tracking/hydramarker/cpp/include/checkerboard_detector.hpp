@@ -136,14 +136,16 @@ private:
     detectRecovery(
         const cv::Mat& gray,
         const CheckerboardDetection* roi_hint = nullptr,
-        bool allow_full_frame_fallback = true
+        bool allow_full_frame_fallback = true,
+        bool roi_candidates_only = false
     ) const;
 
     std::optional<CheckerboardDetection>
     detectRecoveryInRegion(
         const cv::Mat& gray,
         const cv::Rect& roi,
-        const char* timing_prefix = nullptr
+        const char* timing_prefix = nullptr,
+        bool candidates_only = false
     ) const;
 
     std::optional<CheckerboardDetection>

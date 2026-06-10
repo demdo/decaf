@@ -88,8 +88,10 @@ TIMING_KEYS = [
     "tracking_local_completion_candidate_count",
     "tracking_local_completion_proposal_count",
     "tracking_local_completion_cell_proposal_count",
+    "tracking_local_completion_edge_proposal_count",
     "tracking_local_completion_line_proposal_count",
     "tracking_local_completion_match_count",
+    "tracking_local_completion_edge_pair_match_count",
     "tracking_local_completion_guided_match_count",
     "tracking_local_completion_measured_match_count",
     "tracking_local_completion_pending_count",
@@ -97,11 +99,15 @@ TIMING_KEYS = [
     "tracking_local_completion_geometry_reject_count",
     "tracking_local_completion_fast_accept_count",
     "tracking_local_completion_added_count",
+    "tracking_saddle_snap_count",
+    "tracking_saddle_snap_predicted_count",
+    "tracking_saddle_snap_error_px",
     "tracking_local_correction_count",
     "tracking_local_correction_error_px",
     "recovery_position_correction_count",
     "recovery_position_correction_error_px",
     "tracking_output_geometry_reject_count",
+    "tracking_output_decode_span_guard_count",
     "tracking_output_temporal_reject_count",
     "tracking_output_single_neighbour_hold_count",
     "tracking_output_support_reject_count",
@@ -118,6 +124,7 @@ TIMING_KEYS = [
     "recovery_roi_area_ratio",
     "recovery_roi_width_px",
     "recovery_roi_height_px",
+    "recovery_roi_candidate_only_count",
     "recovery_roi_success_count",
     "recovery_roi_fallback_count",
     "recovery_roi_skipped_count",
@@ -134,6 +141,8 @@ TIMING_KEYS = [
     "recovery_roi_retry_build_best_ms",
     "recovery_full_frame_fallback_ms",
     "recovery_full_frame_fallback_deferred_count",
+    "refresh_roi_candidate_only_requested_count",
+    "refresh_roi_candidate_only_count",
     "refresh_roi_recovery_fail_count",
     "refresh_roi_align_fail_count",
     "refresh_roi_fail_full_retry_count",
@@ -208,6 +217,13 @@ def log_start() -> None:
         "frame", "timestamp_ms",
         "n_corners", "n_cells", "tracking", "stable",
         "spacing_median", "spacing_min",
+        "seed_span_i", "seed_span_j",
+        "seed_cell_span_i", "seed_cell_span_j",
+        "seed_max_cell_square",
+        "seed_bbox_x", "seed_bbox_y",
+        "seed_bbox_w", "seed_bbox_h", "seed_bbox_area_px",
+        "seed_corner_density", "seed_cell_density",
+        "seed_decodeable_3x3", "seed_score",
         "debug_raw", "debug_refined", "debug_lattice",
         "debug_det_corners", "debug_det_cells",
         *TIMING_KEYS,
@@ -313,6 +329,7 @@ def log_frame(det, global_frame: int, timings: dict, debug_recovery=None) -> Non
     stats          = estimate_square_stats(det)
     spacing_median = f"{stats['median']:.2f}" if stats else "-1"
     spacing_min    = f"{stats['min']:.2f}"    if stats else "-1"
+    seed = estimate_seed_geometry(det)
     raw_n, refined_n, lattice, rec_c, rec_cells = recovery_counts(debug_recovery)
 
     corner_keys = ""
@@ -344,6 +361,16 @@ def log_frame(det, global_frame: int, timings: dict, debug_recovery=None) -> Non
         f"{now_ms:.1f}",
         n_corners, n_cells, tracking, stable,
         spacing_median, spacing_min,
+        seed["span_i"], seed["span_j"],
+        seed["cell_span_i"], seed["cell_span_j"],
+        seed["max_cell_square"],
+        f"{seed['bbox_x']:.1f}", f"{seed['bbox_y']:.1f}",
+        f"{seed['bbox_w']:.1f}", f"{seed['bbox_h']:.1f}",
+        f"{seed['bbox_area_px']:.1f}",
+        f"{seed['corner_density']:.3f}",
+        f"{seed['cell_density']:.3f}",
+        seed["decodeable_3x3"],
+        f"{seed['score']:.1f}",
         raw_n, refined_n, lattice, rec_c, rec_cells,
         *[format_timing(timings, key) for key in TIMING_KEYS],
         json.dumps(
@@ -402,6 +429,118 @@ def estimate_square_stats(det):
         "min":    float(np.min(dists)),
         "max":    float(np.max(dists)),
         "n":      int(len(dists)),
+    }
+
+
+def max_contiguous_cell_square(cells) -> int:
+    if not cells:
+        return 0
+
+    cell_keys = {(int(c.i), int(c.j)) for c in cells}
+    best = 0
+
+    for origin_i, origin_j in cell_keys:
+        size = 1
+        while True:
+            ok = True
+            for di in range(size):
+                for dj in range(size):
+                    if (origin_i + di, origin_j + dj) not in cell_keys:
+                        ok = False
+                        break
+                if not ok:
+                    break
+
+            if not ok:
+                break
+
+            best = max(best, size)
+            size += 1
+
+    return best
+
+
+def estimate_seed_geometry(det) -> dict:
+    empty = {
+        "span_i": 0,
+        "span_j": 0,
+        "cell_span_i": 0,
+        "cell_span_j": 0,
+        "max_cell_square": 0,
+        "bbox_x": -1.0,
+        "bbox_y": -1.0,
+        "bbox_w": 0.0,
+        "bbox_h": 0.0,
+        "bbox_area_px": 0.0,
+        "corner_density": 0.0,
+        "cell_density": 0.0,
+        "decodeable_3x3": 0,
+        "score": 0.0,
+    }
+    if not det or not det.corners:
+        return empty
+
+    corner_is = [int(c.i) for c in det.corners]
+    corner_js = [int(c.j) for c in det.corners]
+    span_i = max(corner_is) - min(corner_is) + 1
+    span_j = max(corner_js) - min(corner_js) + 1
+
+    uvs = np.asarray([get_xy(c.uv) for c in det.corners], dtype=np.float32)
+    x0 = float(np.min(uvs[:, 0]))
+    y0 = float(np.min(uvs[:, 1]))
+    x1 = float(np.max(uvs[:, 0]))
+    y1 = float(np.max(uvs[:, 1]))
+    bbox_w = max(0.0, x1 - x0)
+    bbox_h = max(0.0, y1 - y0)
+
+    if det.cells:
+        cell_is = [int(c.i) for c in det.cells]
+        cell_js = [int(c.j) for c in det.cells]
+        cell_span_i = max(cell_is) - min(cell_is) + 1
+        cell_span_j = max(cell_js) - min(cell_js) + 1
+    else:
+        cell_span_i = 0
+        cell_span_j = 0
+
+    max_square = max_contiguous_cell_square(det.cells)
+    corner_slots = max(1, span_i * span_j)
+    cell_slots = max(1, cell_span_i * cell_span_j)
+    corner_density = len(det.corners) / corner_slots
+    cell_density = len(det.cells) / cell_slots if det.cells else 0.0
+    decodeable = int(max_square >= 3)
+
+    # Diagnostic only: rough 0..100 quality score for comparing cold-start
+    # seeds. It intentionally mirrors what we care about for initialization:
+    # enough corners, enough cells, a 3x3-decodeable cell patch, and real image
+    # extent instead of a tiny local cluster.
+    corner_score = min(1.0, len(det.corners) / 60.0)
+    cell_score = min(1.0, len(det.cells) / 45.0)
+    span_score = min(1.0, min(span_i, span_j) / 6.0)
+    square_score = min(1.0, max_square / 4.0)
+    extent_score = min(1.0, (bbox_w * bbox_h) / 120000.0)
+    score = 100.0 * (
+        0.25 * corner_score +
+        0.20 * cell_score +
+        0.20 * span_score +
+        0.25 * square_score +
+        0.10 * extent_score
+    )
+
+    return {
+        "span_i": span_i,
+        "span_j": span_j,
+        "cell_span_i": cell_span_i,
+        "cell_span_j": cell_span_j,
+        "max_cell_square": max_square,
+        "bbox_x": x0,
+        "bbox_y": y0,
+        "bbox_w": bbox_w,
+        "bbox_h": bbox_h,
+        "bbox_area_px": bbox_w * bbox_h,
+        "corner_density": corner_density,
+        "cell_density": cell_density,
+        "decodeable_3x3": decodeable,
+        "score": score,
     }
 
 
@@ -592,6 +731,8 @@ def make_checkerboard_config():
             if hasattr(cfg, "tracking_recovery_roi_fail_retry_margin_multiplier"):
                 cfg.tracking_recovery_roi_fail_retry_margin_multiplier = 1.0
             cfg.tracking_recovery_roi_fail_full_retry_frames = 0
+            if hasattr(cfg, "tracking_recovery_full_build_interval_frames"):
+                cfg.tracking_recovery_full_build_interval_frames = 4
     cfg.recovery_correction_weight = 0.5
     cfg.recovery_correction_max_dist_rel = 0.6
     return cfg

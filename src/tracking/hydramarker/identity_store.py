@@ -9,9 +9,6 @@ GridKey = Tuple[int, int]
 
 @dataclass
 class GlobalCornerIdentity:
-    local_row: int
-    local_col: int
-
     global_row: int
     global_col: int
 

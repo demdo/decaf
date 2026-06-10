@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <unordered_set>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -131,30 +132,47 @@ static void updateCellGeometryFromCorners(CheckerboardDetection& det) {
     }
 }
 
+static std::int64_t gridKey64(int i, int j) {
+    return (static_cast<std::int64_t>(static_cast<std::uint32_t>(i)) << 32) |
+           static_cast<std::uint32_t>(j);
+}
+
+static int maxContiguousCellSquare(const CheckerboardDetection& det) {
+    if (det.cells.empty()) return 0;
+
+    std::unordered_set<std::int64_t> cells;
+    cells.reserve(det.cells.size() * 2);
+    for (const auto& cell : det.cells) {
+        cells.insert(gridKey64(cell.i, cell.j));
+    }
+
+    int best = 0;
+    for (const auto& origin : det.cells) {
+        for (int size = 1;; ++size) {
+            bool ok = true;
+            for (int di = 0; di < size && ok; ++di) {
+                for (int dj = 0; dj < size; ++dj) {
+                    if (cells.find(gridKey64(origin.i + di,
+                                             origin.j + dj)) ==
+                        cells.end()) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (!ok) break;
+            best = std::max(best, size);
+        }
+    }
+    return best;
+}
+
 static bool hasDecodeableCellSpan(
     const CheckerboardDetection& det,
     int min_span
 ) {
     if (min_span <= 1) return true;
-    if (det.cells.empty()) return false;
-
-    int min_i = std::numeric_limits<int>::max();
-    int max_i = std::numeric_limits<int>::min();
-    int min_j = std::numeric_limits<int>::max();
-    int max_j = std::numeric_limits<int>::min();
-
-    for (const auto& cell : det.cells) {
-        min_i = std::min(min_i, cell.i);
-        max_i = std::max(max_i, cell.i);
-        min_j = std::min(min_j, cell.j);
-        max_j = std::max(max_j, cell.j);
-    }
-
-    if (min_i > max_i || min_j > max_j) return false;
-
-    const int span_i = max_i - min_i + 1;
-    const int span_j = max_j - min_j + 1;
-    return span_i >= min_span && span_j >= min_span;
+    return maxContiguousCellSquare(det) >= min_span;
 }
 
 
@@ -637,11 +655,63 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 const bool allow_roi_fail_full_retry =
                     allow_roi_fail_count_retry;
 
+                int persistent_missed_count = 0;
+                int persistent_predicted_count = 0;
+                for (const auto& pc : persistent_corners_) {
+                    if (pc.missed_frames > 0) {
+                        ++persistent_missed_count;
+                    }
+                    if (pc.corner.predicted || pc.predicted_frames > 0) {
+                        ++persistent_predicted_count;
+                    }
+                }
+
+                const int full_build_interval =
+                    config_.tracking_recovery_full_build_interval_frames;
+                const bool periodic_full_build_due =
+                    full_build_interval <= 1 ||
+                    (frame_index_ % full_build_interval == 0);
+                const bool tracked_decodeable =
+                    hasDecodeableCellSpan(
+                        *tracked,
+                        config_.min_tracking_decode_cell_span);
+                const int tracked_corner_count =
+                    static_cast<int>(tracked->corners.size());
+                const int tracked_cell_count =
+                    static_cast<int>(tracked->cells.size());
+                const bool tracked_dense_enough =
+                    tracked_cell_count >=
+                    std::max(12, config_.min_tracking_cells * 6);
+                const bool persistent_state_not_critical =
+                    persistent_missed_count <
+                        std::max(24, tracked_corner_count / 2) &&
+                    persistent_predicted_count <
+                        std::max(24, tracked_corner_count / 2);
+                const bool roi_candidates_only =
+                    config_.use_tracking_roi_recovery &&
+                    full_build_interval > 1 &&
+                    !periodic_full_build_due &&
+                    !allow_roi_fail_full_retry &&
+                    roi_align_fail_frames_ == 0 &&
+                    roi_recovery_fail_frames_ == 0 &&
+                    tracked->stable &&
+                    tracked_decodeable &&
+                    tracked_dense_enough &&
+                    persistent_state_not_critical &&
+                    !corner_loss &&
+                    !geometry_degraded;
+                if (roi_candidates_only) {
+                    addTimingMs(
+                        "refresh_roi_candidate_only_requested_count",
+                        1.0);
+                }
+
                 const auto recovery_t0 = cv::getTickCount();
                 auto recovered = detectRecovery(
                     gray,
                     &(*tracked),
-                    allow_roi_fail_full_retry);
+                    allow_roi_fail_full_retry,
+                    roi_candidates_only);
                 addTimingMs("refresh_recovery_call_ms", elapsedMs(recovery_t0));
                 const auto full_fallback_it =
                     last_timings_ms_.find("recovery_full_frame_fallback_ms");
@@ -860,12 +930,16 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     }
                 } else {
                     roi_align_fail_frames_ = 0;
-                    if (full_frame_fallback_used) {
-                        roi_recovery_fail_frames_ = 0;
+                    if (roi_candidates_only) {
+                        addTimingMs("refresh_roi_candidate_only_count", 1.0);
                     } else {
-                        ++roi_recovery_fail_frames_;
+                        if (full_frame_fallback_used) {
+                            roi_recovery_fail_frames_ = 0;
+                        } else {
+                            ++roi_recovery_fail_frames_;
+                        }
+                        addTimingMs("refresh_roi_recovery_fail_count", 1.0);
                     }
-                    addTimingMs("refresh_roi_recovery_fail_count", 1.0);
                 }
 
                 if (recovered && recovered->valid()) {
@@ -1196,7 +1270,8 @@ cv::Mat CheckerboardDetector::toGray8(const cv::Mat& image) {
 std::optional<CheckerboardDetection> CheckerboardDetector::detectRecovery(
     const cv::Mat& gray,
     const CheckerboardDetection* roi_hint,
-    bool allow_full_frame_fallback
+    bool allow_full_frame_fallback,
+    bool roi_candidates_only
 ) const {
     struct ScopedRecoveryTimer {
         const CheckerboardDetector* self;
@@ -1237,10 +1312,18 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detectRecovery(
 
             const auto roi_attempt_t0 = cv::getTickCount();
             auto recovered =
-                detectRecoveryInRegion(gray, roi, "recovery_roi_");
+                detectRecoveryInRegion(
+                    gray,
+                    roi,
+                    "recovery_roi_",
+                    roi_candidates_only);
             addTimingMs(
                 "recovery_roi_attempt_ms",
                 elapsedMs(roi_attempt_t0));
+
+            if (roi_candidates_only) {
+                return std::nullopt;
+            }
 
             if (recovered && recovered->valid()) {
                 addTimingMs("recovery_roi_success_count", 1.0);
@@ -1335,7 +1418,8 @@ std::optional<CheckerboardDetection>
 CheckerboardDetector::detectRecoveryInRegion(
     const cv::Mat& gray,
     const cv::Rect& roi,
-    const char* timing_prefix
+    const char* timing_prefix,
+    bool candidates_only
 ) const {
     if (gray.empty()) return std::nullopt;
 
@@ -1431,6 +1515,11 @@ CheckerboardDetector::detectRecoveryInRegion(
         work, raw.points, raw.grad_x, raw.grad_y, refine_config);
     addRecoveryTiming("refine_ms", elapsedMs(refine_t0));
     rememberRecoveryRegion(raw, refined);
+
+    if (candidates_only) {
+        addRecoveryTiming("candidate_only_count", 1.0);
+        return std::nullopt;
+    }
 
     if (static_cast<int>(refined.size()) < config_.min_corners)
         return std::nullopt;
@@ -3200,9 +3289,200 @@ int CheckerboardDetector::tryCompleteMissingCorners(
         }
     };
 
+    auto upsertActiveCopy = [&](
+        int i,
+        int j,
+        const cv::Point2f& uv,
+        int persistent_idx
+    ) {
+        for (auto& c : active) {
+            if (c.i == i && c.j == j) {
+                c.uv = uv;
+                c.persistent_idx = persistent_idx;
+                return;
+            }
+        }
+        active.push_back({i, j, uv, persistent_idx});
+    };
+
+    struct LocalExpectation {
+        int count = 0;
+        cv::Point2f expected{0.0f, 0.0f};
+        float spread = 0.0f;
+    };
+
+    auto localExpectation = [&](int i, int j) {
+        LocalExpectation result;
+        std::vector<cv::Point2f> expected_positions;
+        expected_positions.reserve(8);
+
+        const ActiveCorner* im1 = findActive(i - 1, j);
+        const ActiveCorner* ip1 = findActive(i + 1, j);
+        const ActiveCorner* jm1 = findActive(i, j - 1);
+        const ActiveCorner* jp1 = findActive(i, j + 1);
+        const ActiveCorner* im2 = findActive(i - 2, j);
+        const ActiveCorner* ip2 = findActive(i + 2, j);
+        const ActiveCorner* jm2 = findActive(i, j - 2);
+        const ActiveCorner* jp2 = findActive(i, j + 2);
+
+        if (im1 && ip1) {
+            expected_positions.push_back(0.5f * (im1->uv + ip1->uv));
+        }
+        if (jm1 && jp1) {
+            expected_positions.push_back(0.5f * (jm1->uv + jp1->uv));
+        }
+        if (im1 && im2) {
+            expected_positions.push_back(im1->uv + (im1->uv - im2->uv));
+        }
+        if (ip1 && ip2) {
+            expected_positions.push_back(ip1->uv + (ip1->uv - ip2->uv));
+        }
+        if (jm1 && jm2) {
+            expected_positions.push_back(jm1->uv + (jm1->uv - jm2->uv));
+        }
+        if (jp1 && jp2) {
+            expected_positions.push_back(jp1->uv + (jp1->uv - jp2->uv));
+        }
+
+        const int dirs[2] = {-1, 1};
+        for (int di : dirs) {
+            for (int dj : dirs) {
+                const ActiveCorner* edge_i = findActive(i - di, j);
+                const ActiveCorner* edge_j = findActive(i, j - dj);
+                const ActiveCorner* diag = findActive(i - di, j - dj);
+                if (!edge_i || !edge_j || !diag) continue;
+                expected_positions.push_back(edge_i->uv + edge_j->uv -
+                                             diag->uv);
+            }
+        }
+
+        if (expected_positions.empty()) return result;
+
+        for (const auto& p : expected_positions) result.expected += p;
+        result.expected *=
+            1.0f / static_cast<float>(expected_positions.size());
+        result.count = static_cast<int>(expected_positions.size());
+
+        for (const auto& p : expected_positions) {
+            result.spread = std::max(result.spread,
+                                     distf(p, result.expected));
+        }
+        return result;
+    };
+
     int corrected = 0;
     double correction_error_sum = 0.0;
     std::vector<char> corrected_candidate_used(candidates.size(), 0);
+
+    int saddle_snap_count = 0;
+    int saddle_snap_predicted_count = 0;
+    double saddle_snap_error_sum = 0.0;
+
+    for (int idx = 0; idx < static_cast<int>(persistent_corners_.size());
+         ++idx) {
+        auto& pc = persistent_corners_[idx];
+        if (pc.missed_frames != 0) continue;
+        if (pc.smoothed_visibility_score < 0.05f) continue;
+
+        const bool predicted_corner =
+            pc.corner.predicted || pc.predicted_frames > 0;
+        const bool weak_track =
+            pc.smoothed_visibility_score < 0.45f ||
+            pc.low_visibility_frames > 0;
+        const LocalExpectation expectation =
+            localExpectation(pc.corner.i, pc.corner.j);
+        const bool use_expectation_anchor =
+            expectation.count >= 2 &&
+            expectation.spread <= spacing * 0.70f &&
+            (predicted_corner || weak_track);
+        const float snap_radius =
+            std::max(
+                4.0f,
+                spacing *
+                    (use_expectation_anchor
+                         ? (predicted_corner ? 0.55f : 0.38f) :
+                     predicted_corner ? 0.55f :
+                     weak_track ? 0.40f : 0.28f));
+        const cv::Point2f snap_anchor =
+            use_expectation_anchor ? expectation.expected : pc.corner.uv;
+
+        const auto [best_idx, candidate_d] =
+            bestCandidateNear(
+                snap_anchor,
+                snap_radius,
+                &corrected_candidate_used);
+        if (best_idx < 0) continue;
+        if (!use_expectation_anchor &&
+            !predicted_corner &&
+            candidate_d < 0.75f) {
+            continue;
+        }
+
+        const cv::Point2f candidate_uv = candidates[best_idx];
+        if (nearOtherActiveCorner(
+                candidate_uv,
+                pc.corner.i,
+                pc.corner.j,
+                spacing * 0.35f)) {
+            continue;
+        }
+
+        bool geometry_ok = true;
+        if (expectation.count >= 2) {
+            const float current_error =
+                distf(pc.corner.uv, expectation.expected);
+            const float candidate_error =
+                distf(candidate_uv, expectation.expected);
+            const float max_abs_error =
+                spacing * (predicted_corner ? 0.90f : 0.70f);
+            const float max_worse_error =
+                current_error +
+                spacing * (predicted_corner ? 0.30f : 0.12f);
+            geometry_ok =
+                expectation.spread <= spacing * 0.70f &&
+                candidate_error <= max_abs_error &&
+                candidate_error <= max_worse_error;
+        } else {
+            geometry_ok =
+                candidate_d <=
+                spacing * (predicted_corner ? 0.45f : 0.22f);
+        }
+        if (!geometry_ok) continue;
+
+        pc.corner.uv = candidate_uv;
+        pc.corner.predicted = false;
+        pc.missed_frames = 0;
+        pc.tracked = true;
+        if (predicted_corner) {
+            pc.observed_frames += 1;
+        }
+        pc.predicted_frames = 0;
+        pc.low_visibility_frames = 0;
+        pc.visibility_score = std::max(pc.visibility_score, 0.80f);
+        pc.smoothed_visibility_score =
+            std::max(pc.smoothed_visibility_score, 0.65f);
+
+        upsertActiveCopy(pc.corner.i, pc.corner.j, pc.corner.uv, idx);
+        corrected_candidate_used[best_idx] = 1;
+        saddle_snap_error_sum += candidate_d;
+        ++saddle_snap_count;
+        if (predicted_corner) ++saddle_snap_predicted_count;
+    }
+
+    if (saddle_snap_count > 0) {
+        addTimingMs(
+            "tracking_saddle_snap_count",
+            static_cast<double>(saddle_snap_count));
+        addTimingMs(
+            "tracking_saddle_snap_error_px",
+            saddle_snap_error_sum /
+                static_cast<double>(saddle_snap_count));
+        if (saddle_snap_predicted_count > 0) {
+            addTimingMs(
+                "tracking_saddle_snap_predicted_count",
+                static_cast<double>(saddle_snap_predicted_count));
+        }
+    }
 
     for (const auto& c : active) {
         if (c.persistent_idx < 0 ||
@@ -3306,6 +3586,7 @@ int CheckerboardDetector::tryCompleteMissingCorners(
     std::vector<Proposal> proposals;
     proposals.reserve(active.size() * 2);
     int cell_proposal_count = 0;
+    int edge_proposal_count = 0;
     int line_proposal_count = 0;
 
     auto addProposal = [&](
@@ -3410,6 +3691,9 @@ int CheckerboardDetector::tryCompleteMissingCorners(
     addTimingMs(
         "tracking_local_completion_cell_proposal_count",
         static_cast<double>(cell_proposal_count));
+    addTimingMs(
+        "tracking_local_completion_edge_proposal_count",
+        static_cast<double>(edge_proposal_count));
     addTimingMs(
         "tracking_local_completion_line_proposal_count",
         static_cast<double>(line_proposal_count));
@@ -3571,6 +3855,7 @@ int CheckerboardDetector::tryCompleteMissingCorners(
     matches.reserve(proposals.size());
     int guided_match_count = 0;
     int measured_match_count = 0;
+    int edge_pair_match_count = 0;
 
     for (const auto& p : proposals) {
         int best_idx = -1;
@@ -3610,6 +3895,148 @@ int CheckerboardDetector::tryCompleteMissingCorners(
             ++measured_match_count;
         }
         matches.push_back({p.i, p.j, uv, p.support, best_d, guided_match});
+    }
+
+    auto addMeasuredEdgePair = [&](
+        const ActiveCorner& a,
+        const ActiveCorner& b,
+        const ActiveCorner& inner_a,
+        const ActiveCorner& inner_b,
+        int target_ai,
+        int target_aj,
+        int target_bi,
+        int target_bj
+    ) {
+        if (hasActiveGrid(target_ai, target_aj) ||
+            hasActiveGrid(target_bi, target_bj)) {
+            return;
+        }
+        for (const auto& m : matches) {
+            if ((m.i == target_ai && m.j == target_aj) ||
+                (m.i == target_bi && m.j == target_bj)) {
+                return;
+            }
+        }
+
+        const int existing_a =
+            findPersistentCornerByGrid(
+                persistent_corners_, target_ai, target_aj);
+        const int existing_b =
+            findPersistentCornerByGrid(
+                persistent_corners_, target_bi, target_bj);
+        if ((existing_a >= 0 &&
+             persistent_corners_[existing_a].missed_frames == 0) ||
+            (existing_b >= 0 &&
+             persistent_corners_[existing_b].missed_frames == 0)) {
+            return;
+        }
+
+        const cv::Point2f edge = b.uv - a.uv;
+        const cv::Point2f inward_a = inner_a.uv - a.uv;
+        const cv::Point2f inward_b = inner_b.uv - b.uv;
+        const float edge_d = distf(a.uv, b.uv);
+        const float inward_a_d = distf(a.uv, inner_a.uv);
+        const float inward_b_d = distf(b.uv, inner_b.uv);
+        if (edge_d < spacing * 0.35f || edge_d > spacing * 2.20f)
+            return;
+        if (inward_a_d < spacing * 0.35f ||
+            inward_b_d < spacing * 0.35f ||
+            inward_a_d > spacing * 2.35f ||
+            inward_b_d > spacing * 2.35f) {
+            return;
+        }
+
+        const float area =
+            std::abs(edge.x * inward_a.y - edge.y * inward_a.x);
+        if (area < edge_d * inward_a_d * 0.15f) return;
+        if (distf(inward_a, inward_b) > spacing * 0.50f) return;
+
+        const cv::Point2f expected_a = a.uv - inward_a;
+        const cv::Point2f expected_b = b.uv - inward_b;
+        const auto [idx_a, err_a] =
+            bestCandidateNear(
+                expected_a,
+                std::max(4.0f, spacing * 0.20f),
+                &used);
+        if (idx_a < 0) return;
+        std::vector<char> used_for_b = used;
+        used_for_b[static_cast<size_t>(idx_a)] = 1;
+        const auto [idx_b, err_b] =
+            bestCandidateNear(
+                expected_b,
+                std::max(4.0f, spacing * 0.20f),
+                &used_for_b);
+        if (idx_b < 0) return;
+
+        const cv::Point2f uv_a = candidates[idx_a];
+        const cv::Point2f uv_b = candidates[idx_b];
+        if (nearActiveCorner(uv_a, spacing * 0.24f) ||
+            nearActiveCorner(uv_b, spacing * 0.24f)) {
+            return;
+        }
+
+        const float candidate_edge_d = distf(uv_a, uv_b);
+        const float edge_ratio = candidate_edge_d / std::max(edge_d, 1.0f);
+        if (edge_ratio < 0.70f || edge_ratio > 1.35f) return;
+        if (distf(uv_b - uv_a, edge) > spacing * 0.38f) return;
+
+        used[idx_a] = 1;
+        used[idx_b] = 1;
+        matches.push_back(
+            {target_ai, target_aj, uv_a, 4, err_a, false});
+        matches.push_back(
+            {target_bi, target_bj, uv_b, 4, err_b, false});
+        measured_match_count += 2;
+        edge_pair_match_count += 2;
+    };
+
+    for (const auto& a : active) {
+        const int inward_dirs[2] = {-1, 1};
+        const ActiveCorner* b_i = findActive(a.i + 1, a.j);
+        if (b_i) {
+            for (int inward_j : inward_dirs) {
+                const ActiveCorner* inner_a =
+                    findActive(a.i, a.j + inward_j);
+                const ActiveCorner* inner_b =
+                    findActive(a.i + 1, a.j + inward_j);
+                if (!inner_a || !inner_b) continue;
+                addMeasuredEdgePair(
+                    a,
+                    *b_i,
+                    *inner_a,
+                    *inner_b,
+                    a.i,
+                    a.j - inward_j,
+                    a.i + 1,
+                    a.j - inward_j);
+            }
+        }
+
+        const ActiveCorner* b_j = findActive(a.i, a.j + 1);
+        if (b_j) {
+            for (int inward_i : inward_dirs) {
+                const ActiveCorner* inner_a =
+                    findActive(a.i + inward_i, a.j);
+                const ActiveCorner* inner_b =
+                    findActive(a.i + inward_i, a.j + 1);
+                if (!inner_a || !inner_b) continue;
+                addMeasuredEdgePair(
+                    a,
+                    *b_j,
+                    *inner_a,
+                    *inner_b,
+                    a.i - inward_i,
+                    a.j,
+                    a.i - inward_i,
+                    a.j + 1);
+            }
+        }
+    }
+
+    if (edge_pair_match_count > 0) {
+        addTimingMs(
+            "tracking_local_completion_edge_pair_match_count",
+            static_cast<double>(edge_pair_match_count));
     }
 
     for (auto& pending : pending_completion_corners_) {
@@ -3711,7 +4138,8 @@ int CheckerboardDetector::tryCompleteMissingCorners(
             it->hits >= 1 &&
             it->error <= spacing * 0.22f;
         const bool strong_measured_single_frame =
-            precise_measured_support3 || very_precise_multi_source;
+            precise_measured_support3 ||
+            very_precise_multi_source;
         const bool confirmed =
             strong_measured_single_frame ||
             (it->support >= 3 &&
@@ -3813,7 +4241,7 @@ int CheckerboardDetector::tryCompleteMissingCorners(
             static_cast<double>(fast_accepted));
     }
 
-    if (added > 0 || corrected > 0) {
+    if (added > 0 || corrected > 0 || saddle_snap_count > 0) {
         auto completed = buildDetectionFromPersistent(tracking, false);
         if (completed.valid()) {
             last_detection_ = std::move(completed);
@@ -4699,14 +5127,15 @@ CheckerboardDetection CheckerboardDetector::buildDetectionFromPersistent(
                     findPreviousOutputCorner(
                         corners[k].i,
                         corners[k].j);
+                const bool previous_measured_output =
+                    previous_output && !previous_output->predicted;
                 const bool plausible_single_edge =
                     support == 1 &&
                     only_neighbour_edge >= spacing * 0.45f &&
                     only_neighbour_edge <= spacing * 1.85f;
                 const bool temporal_single_neighbour_hold =
                     plausible_single_edge &&
-                    previous_output &&
-                    !previous_output->predicted &&
+                    previous_measured_output &&
                     !corners[k].predicted &&
                     corners[k].observed_frames >= 3 &&
                     corners[k].visibility_score >= 0.55f;
@@ -4795,6 +5224,23 @@ CheckerboardDetection CheckerboardDetector::buildDetectionFromPersistent(
 
             if (static_cast<int>(filtered_cells.size()) <
                 config_.min_tracking_cells) {
+                return;
+            }
+
+            CheckerboardDetection filtered_detection;
+            filtered_detection.corners = filtered_corners;
+            filtered_detection.cells = filtered_cells;
+            filtered_detection.cols = rebuilt->cols;
+            filtered_detection.rows = rebuilt->rows;
+            filtered_detection.tracking = rebuilt->tracking;
+            filtered_detection.stable = rebuilt->stable;
+            if (!hasDecodeableCellSpan(
+                    filtered_detection,
+                    config_.min_tracking_decode_cell_span) &&
+                hasDecodeableCellSpan(
+                    *rebuilt,
+                    config_.min_tracking_decode_cell_span)) {
+                addTimingMs("tracking_output_decode_span_guard_count", 1.0);
                 return;
             }
 

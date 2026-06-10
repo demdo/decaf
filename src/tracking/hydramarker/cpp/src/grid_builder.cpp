@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 #include "geometry_utils.hpp"
@@ -18,6 +20,32 @@ constexpr float kMinCellEdgePx = 3.0f;
 constexpr float kMaxCellEdgeRatio = 2.4f;
 constexpr float kMaxCellDiagonalRatio = 2.0f;
 constexpr float kMaxDominantOrientationDiffDeg = 18.0f;
+
+std::int64_t gridKey(int i, int j) {
+    return (static_cast<std::int64_t>(i) << 32) ^
+           static_cast<std::uint32_t>(j);
+}
+
+std::unordered_map<std::int64_t, int> buildGridIndex(
+    const std::vector<GridCorner>& corners,
+    bool include_synthetic = true
+) {
+    std::unordered_map<std::int64_t, int> index_by_grid;
+    index_by_grid.reserve(corners.size());
+
+    for (int idx = 0; idx < static_cast<int>(corners.size()); ++idx) {
+        if (!include_synthetic && corners[idx].synthetic) {
+            continue;
+        }
+
+        const auto key = gridKey(corners[idx].i, corners[idx].j);
+        if (index_by_grid.find(key) == index_by_grid.end()) {
+            index_by_grid[key] = idx;
+        }
+    }
+
+    return index_by_grid;
+}
 
 bool basicCellPlausible(const GridCell& cell) {
     const auto& q = cell.corner_uv;
@@ -384,13 +412,15 @@ void compactCornersToCells(
             ? 0.0f
             : cell_edges[cell_edges.size() / 2];
 
+    auto compact_index = buildGridIndex(compact);
+    const auto input_index = buildGridIndex(corners, false);
+
     auto findCompactGrid = [&](int i, int j) -> const GridCorner* {
-        for (const auto& c : compact) {
-            if (c.i == i && c.j == j) {
-                return &c;
-            }
+        const auto it = compact_index.find(gridKey(i, j));
+        if (it == compact_index.end()) {
+            return nullptr;
         }
-        return nullptr;
+        return &compact[static_cast<size_t>(it->second)];
     };
 
     auto hasCompactGrid = [&](int i, int j) -> bool {
@@ -398,13 +428,11 @@ void compactCornersToCells(
     };
 
     auto findInputGrid = [&](int i, int j) -> const GridCorner* {
-        for (const auto& c : corners) {
-            if (c.synthetic) continue;
-            if (c.i == i && c.j == j) {
-                return &c;
-            }
+        const auto it = input_index.find(gridKey(i, j));
+        if (it == input_index.end()) {
+            return nullptr;
         }
-        return nullptr;
+        return &corners[static_cast<size_t>(it->second)];
     };
 
     auto hasInputGrid = [&](int i, int j) -> bool {
@@ -521,6 +549,10 @@ void compactCornersToCells(
         }
 
         old_to_new[old_idx] = static_cast<int>(compact.size());
+        const auto key = gridKey(c.i, c.j);
+        if (compact_index.find(key) == compact_index.end()) {
+            compact_index[key] = static_cast<int>(compact.size());
+        }
         compact.push_back(c);
     }
 
@@ -679,6 +711,8 @@ std::vector<GridCorner> GridBuilder::sanitizeGridCorners(
 ) const {
     std::vector<GridCorner> corners;
     corners.reserve(input_corners.size());
+    std::unordered_map<std::int64_t, int> index_by_grid;
+    index_by_grid.reserve(input_corners.size());
 
     for (const auto& c : input_corners) {
         if (!geom::isFinite(c.uv)) {
@@ -694,10 +728,12 @@ std::vector<GridCorner> GridBuilder::sanitizeGridCorners(
             continue;
         }
 
-        const int existing_idx = findCornerIndex(corners, c.i, c.j);
+        const auto key = gridKey(c.i, c.j);
+        const auto existing = index_by_grid.find(key);
 
-        if (existing_idx >= 0) {
-            const cv::Point2f d = corners[existing_idx].uv - c.uv;
+        if (existing != index_by_grid.end()) {
+            const cv::Point2f d =
+                corners[static_cast<size_t>(existing->second)].uv - c.uv;
             const float d2 = d.dot(d);
 
             if (d2 < 1.0f) {
@@ -707,6 +743,7 @@ std::vector<GridCorner> GridBuilder::sanitizeGridCorners(
             continue;
         }
 
+        index_by_grid[key] = static_cast<int>(corners.size());
         corners.push_back(c);
     }
 
@@ -728,15 +765,21 @@ std::vector<GridCell> GridBuilder::makeGridCells(
     const std::vector<GridCorner>& corners
 ) const {
     std::vector<GridCell> raw_cells;
+    const auto index_by_grid = buildGridIndex(corners);
+
+    auto findIndex = [&](int i, int j) {
+        const auto it = index_by_grid.find(gridKey(i, j));
+        return it == index_by_grid.end() ? -1 : it->second;
+    };
 
     for (const auto& c : corners) {
         const int i = c.i;
         const int j = c.j;
 
-        const int idx00 = findCornerIndex(corners, i,     j);
-        const int idx10 = findCornerIndex(corners, i + 1, j);
-        const int idx11 = findCornerIndex(corners, i + 1, j + 1);
-        const int idx01 = findCornerIndex(corners, i,     j + 1);
+        const int idx00 = findIndex(i,     j);
+        const int idx10 = findIndex(i + 1, j);
+        const int idx11 = findIndex(i + 1, j + 1);
+        const int idx01 = findIndex(i,     j + 1);
 
         if (idx00 < 0 || idx10 < 0 || idx11 < 0 || idx01 < 0) {
             continue;
