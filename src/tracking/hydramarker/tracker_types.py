@@ -1,13 +1,17 @@
+"""Shared data structures for HydraMarker tracking results and state."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
 
 class TrackerMode(str, Enum):
+    """High-level tracker state reported to callers."""
+
     LOST = "LOST"
     DETECTING = "DETECTING"
     TRACKING = "TRACKING"
@@ -15,6 +19,8 @@ class TrackerMode(str, Enum):
 
 
 class PoseSource(str, Enum):
+    """Origin of the pose returned for a processed frame."""
+
     NONE = "none"
     DECODE = "decode"
     PERSISTENT = "persistent"
@@ -25,6 +31,8 @@ class PoseSource(str, Enum):
 
 @dataclass
 class DetectedCorner:
+    """Frame-local checkerboard corner observed by the detector."""
+
     local_row: int
     local_col: int
     uv: Tuple[float, float]
@@ -32,6 +40,8 @@ class DetectedCorner:
 
 @dataclass
 class TrackerCorner:
+    """Matched marker corner with frame-local and global marker identity."""
+
     local_row: int
     local_col: int
     global_row: int
@@ -43,6 +53,8 @@ class TrackerCorner:
 
 @dataclass
 class FastPathDebug:
+    """Diagnostics for persistent fast-path and dense-refine decisions."""
+
     attempted: bool = False
     success: bool = False
     reason: str = ""
@@ -76,6 +88,8 @@ class FastPathDebug:
 
 @dataclass
 class TrackerResult:
+    """Complete public result produced by :class:`HydraTracker` for one frame."""
+
     success: bool
     mode: TrackerMode
     message: str = ""
@@ -106,6 +120,8 @@ class TrackerResult:
 
 @dataclass
 class PersistentMatchStats:
+    """Counters describing how persistent identities matched a current detection."""
+
     age: int = 0
     identities: int = 0
     current_corners: int = 0
@@ -119,6 +135,8 @@ class PersistentMatchStats:
 
 @dataclass
 class GeometryCornerCache:
+    """Vectorized cache of valid marker geometry corners."""
+
     rows: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.int32))
     cols: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.int32))
     xyz_mm: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float64))
@@ -126,6 +144,8 @@ class GeometryCornerCache:
 
 @dataclass
 class DenseProjectionMatchStats:
+    """Quality metrics for dense projected-corner matching."""
+
     detected: int = 0
     projected: int = 0
     rejected_no_projection: int = 0
@@ -142,6 +162,115 @@ class DenseProjectionMatchStats:
     distinct_cols: int = 0
 
 
+GridKey = Tuple[int, int]
+
+
+@dataclass
+class GlobalCornerIdentity:
+    """Persistent identity for one global marker corner."""
+
+    global_row: int
+    global_col: int
+
+    xyz_mm: Tuple[float, float, float]
+    uv: Tuple[float, float]
+
+    votes: int = 0
+
+
+class IdentityStore:
+    """
+    Persistent global identity storage.
+
+    IMPORTANT:
+    Local checkerboard indices are NOT persistent semantic identities.
+    They may change during recovery / lattice refit / tracking updates.
+
+    Therefore:
+        - only global IDs are stored persistently
+        - local IDs are frame-local only
+    """
+
+    def __init__(self) -> None:
+        self._items: List[GlobalCornerIdentity] = []
+
+        # Persistent storage ONLY by global key.
+        self._by_global: Dict[GridKey, GlobalCornerIdentity] = {}
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._by_global.clear()
+
+    def empty(self) -> bool:
+        return len(self._items) == 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def all(self) -> List[GlobalCornerIdentity]:
+        return list(self._items)
+
+    def by_global(self) -> Dict[GridKey, GlobalCornerIdentity]:
+        return dict(self._by_global)
+
+    def get_global(
+        self,
+        global_row: int,
+        global_col: int,
+    ) -> Optional[GlobalCornerIdentity]:
+        return self._by_global.get(
+            (int(global_row), int(global_col))
+        )
+
+    def has_global(
+        self,
+        global_row: int,
+        global_col: int,
+    ) -> bool:
+        return (
+            int(global_row),
+            int(global_col),
+        ) in self._by_global
+
+    def global_keys(self) -> set[GridKey]:
+        return set(self._by_global.keys())
+
+    def replace(
+        self,
+        identities: Iterable[GlobalCornerIdentity],
+    ) -> None:
+        self.clear()
+        self.merge(identities)
+
+    def merge(
+        self,
+        identities: Iterable[GlobalCornerIdentity],
+    ) -> None:
+        """
+        Merge ONLY by global key.
+
+        Never persist local checkerboard indices.
+        """
+
+        for p in identities:
+            global_key = (
+                int(p.global_row),
+                int(p.global_col),
+            )
+
+            existing = self._by_global.get(global_key)
+
+            if existing is None:
+                self._by_global[global_key] = p
+                continue
+
+            # Keep higher-vote observation.
+            if int(p.votes) >= int(existing.votes):
+                self._by_global[global_key] = p
+
+        self._items = list(self._by_global.values())
+
+
 __all__ = [
     "TrackerMode",
     "PoseSource",
@@ -152,4 +281,7 @@ __all__ = [
     "PersistentMatchStats",
     "GeometryCornerCache",
     "DenseProjectionMatchStats",
+    "GridKey",
+    "GlobalCornerIdentity",
+    "IdentityStore",
 ]

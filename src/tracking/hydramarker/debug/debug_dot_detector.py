@@ -5,7 +5,17 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-import hydramarker_cpp
+
+def _ensure_src_on_path() -> None:
+    src_root = Path(__file__).resolve().parents[3]
+    src = str(src_root)
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+
+_ensure_src_on_path()
+
+from tracking.hydramarker.backend import cpp_impl as hydramarker_cpp
 
 
 def select_file(title: str, file_filter: str) -> Path | None:

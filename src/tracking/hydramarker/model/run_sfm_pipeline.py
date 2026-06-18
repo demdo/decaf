@@ -294,28 +294,6 @@ def run_sfm_pipeline(
         max_mean_reprojection_error_px=None,
     )
 
-    triangulation_results = triangulate_missing_markers(
-        state,
-        min_observations=TRIANGULATE_MISSING_MIN_OBSERVATIONS,
-        min_inliers=TRIANGULATE_MISSING_MIN_INLIERS,
-        max_reprojection_error_px=TRIANGULATE_MISSING_MAX_REPROJ_PX,
-        max_observations_per_marker=(
-            TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER
-        ),
-        max_pair_candidates_per_marker=(
-            TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER
-        ),
-    )
-
-    triangulated_count = sum(1 for r in triangulation_results if r.success)
-    failed_count = len(triangulation_results) - triangulated_count
-
-    print(
-        "[SfM] missing-marker triangulation: "
-        f"added={triangulated_count}, failed={failed_count}, "
-        f"total_markers={len(state.marker_positions)}"
-    )
-
     if SHOW_PLOTS:
         plot_sfm_state(
             state,
@@ -337,6 +315,35 @@ def run_sfm_pipeline(
         state=state,
         ba_frame_ids=ba_frame_ids,
         marker_json_path=marker_json_path,
+    )
+
+    triangulation_results = triangulate_missing_markers(
+        state,
+        min_observations=TRIANGULATE_MISSING_MIN_OBSERVATIONS,
+        min_inliers=TRIANGULATE_MISSING_MIN_INLIERS,
+        max_reprojection_error_px=TRIANGULATE_MISSING_MAX_REPROJ_PX,
+        max_observations_per_marker=(
+            TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER
+        ),
+        max_pair_candidates_per_marker=(
+            TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER
+        ),
+    )
+
+    triangulated_count = sum(1 for r in triangulation_results if r.success)
+    failed_count = len(triangulation_results) - triangulated_count
+
+    print(
+        "[SfM] missing-marker triangulation after first BA: "
+        f"added={triangulated_count}, failed={failed_count}, "
+        f"total_markers={len(state.marker_positions)}"
+    )
+
+    ba_frame_ids = call_silent(
+        select_good_frames_for_bundle_adjustment,
+        state,
+        min_observations=BA_MIN_OBSERVATIONS,
+        max_median_error_px=BA_MAX_MEDIAN_ERROR_PX,
     )
 
     observation_errors = compute_observation_reprojection_errors(

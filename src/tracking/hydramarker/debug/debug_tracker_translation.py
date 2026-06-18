@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import json
-import importlib.util
 import os
 import sys
-import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,36 +11,11 @@ import numpy as np
 os.environ.setdefault("QT_API", "pyside6")
 
 
-CHECKERBOARD_PATTERN = (9, 9)  # inner corners: 10x10 printed cells -> 9x9 corners
-CHECKERBOARD_SQUARE_SIZE_MM = 10.0
-BOARD_REFINE_TARGET_FRAMES = 25
-BOARD_REFINE_MIN_FRAMES = 8
-BOARD_REFINE_MAX_ATTEMPTS = 90
-BOARD_AXIS_LENGTH_MM = 30.0
-
 COMPONENTS = (
     ("x", "x", "#1f77b4"),
     ("y", "y", "#2ca02c"),
     ("z", "z", "#d62728"),
 )
-
-
-@dataclass
-class BoardPoseCalibration:
-    rvec_cb: np.ndarray
-    tvec_cb_mm: np.ndarray
-    T_C_B: np.ndarray
-    T_B_C: np.ndarray
-    corners_uv: np.ndarray
-    reproj_mean_px: float
-    reproj_median_px: float
-    reproj_p95_px: float
-    reproj_max_px: float
-    inlier_count: int
-    total_count: int
-    collected_frames: int
-    mean_corner_std_px: float
-    max_corner_std_px: float
 
 
 def _ensure_src_on_path() -> None:
@@ -54,13 +26,23 @@ def _ensure_src_on_path() -> None:
     sys.path.insert(0, src)
 
 
-def _forget_tracking_modules() -> None:
-    for name in (
-        "tracking.hydramarker.tests.test_tracker_realsense",
-        "tracking.hydramarker.tracker",
-        "tracking.hydramarker.map_pose_tracker",
-    ):
-        sys.modules.pop(name, None)
+_ensure_src_on_path()
+
+from tracking.hydramarker.calib import calib_checkerboard
+
+
+BoardPoseCalibration = calib_checkerboard.CheckerboardPose
+CHECKERBOARD_PATTERN = calib_checkerboard.CHECKERBOARD_PATTERN
+CHECKERBOARD_SQUARE_SIZE_MM = calib_checkerboard.CHECKERBOARD_SQUARE_SIZE_MM
+BOARD_REFINE_TARGET_FRAMES = calib_checkerboard.DEFAULT_MAX_FRAMES
+BOARD_REFINE_MIN_FRAMES = calib_checkerboard.DEFAULT_MIN_FRAMES
+BOARD_AXIS_LENGTH_MM = calib_checkerboard.BOARD_AXIS_LENGTH_MM
+
+
+def _tracker_log_module():
+    from tracking.hydramarker import tracker_log
+
+    return tracker_log
 
 
 def _force_dense_refine_config(tracker) -> None:
@@ -159,35 +141,6 @@ def select_jsonl_with_qt() -> Path | None:
     return Path(path)
 
 
-def checkerboard_object_points_mm() -> np.ndarray:
-    cols, rows = CHECKERBOARD_PATTERN
-    grid = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-    obj = np.zeros((rows * cols, 3), dtype=np.float64)
-    obj[:, :2] = grid.astype(np.float64) * CHECKERBOARD_SQUARE_SIZE_MM
-    return obj
-
-
-def _make_transform_from_rvec_tvec(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
-    import cv2
-
-    R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
-    t = np.asarray(tvec, dtype=np.float64).reshape(3)
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3] = t
-    return T
-
-
-def _invert_transform(T: np.ndarray) -> np.ndarray:
-    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
-    out = np.eye(4, dtype=np.float64)
-    R = T[:3, :3]
-    t = T[:3, 3]
-    out[:3, :3] = R.T
-    out[:3, 3] = -R.T @ t
-    return out
-
-
 def _camera_tvec_to_board_mm(tvec_camera_mm: np.ndarray, T_B_C: np.ndarray) -> np.ndarray:
     p_c = np.ones(4, dtype=np.float64)
     p_c[:3] = np.asarray(tvec_camera_mm, dtype=np.float64).reshape(3)
@@ -195,466 +148,11 @@ def _camera_tvec_to_board_mm(tvec_camera_mm: np.ndarray, T_B_C: np.ndarray) -> n
     return p_b[:3]
 
 
-def _reprojection_errors_px(
-    object_points: np.ndarray,
-    image_points: np.ndarray,
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-) -> np.ndarray:
-    import cv2
-
-    projected, _ = cv2.projectPoints(
-        np.asarray(object_points, dtype=np.float64).reshape(-1, 3),
-        np.asarray(rvec, dtype=np.float64).reshape(3, 1),
-        np.asarray(tvec, dtype=np.float64).reshape(3, 1),
-        np.asarray(K, dtype=np.float64).reshape(3, 3),
-        dist,
-    )
-    projected = projected.reshape(-1, 2)
-    measured = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
-    return np.linalg.norm(projected - measured, axis=1)
-
-
-def _pose_stats(
-    object_points: np.ndarray,
-    image_points: np.ndarray,
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-) -> dict[str, Any]:
-    errors = _reprojection_errors_px(object_points, image_points, rvec, tvec, K, dist)
-    return {
-        "errors": errors,
-        "mean": float(np.mean(errors)),
-        "median": float(np.median(errors)),
-        "p95": float(np.percentile(errors, 95)),
-        "max": float(np.max(errors)),
-    }
-
-
-def _refined_pose_candidates(
-    object_points: np.ndarray,
-    image_points: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-) -> list[tuple[np.ndarray, np.ndarray]]:
-    import cv2
-
-    candidates = [
-        (
-            np.asarray(rvec, dtype=np.float64).reshape(3, 1),
-            np.asarray(tvec, dtype=np.float64).reshape(3, 1),
-        )
-    ]
-
-    if hasattr(cv2, "solvePnPRefineLM"):
-        try:
-            lm_rvec, lm_tvec = cv2.solvePnPRefineLM(
-                object_points,
-                image_points,
-                K,
-                dist,
-                candidates[0][0].copy(),
-                candidates[0][1].copy(),
-            )
-            candidates.append((lm_rvec.reshape(3, 1), lm_tvec.reshape(3, 1)))
-        except cv2.error:
-            pass
-
-    if hasattr(cv2, "solvePnPRefineVVS"):
-        try:
-            vvs_rvec, vvs_tvec = cv2.solvePnPRefineVVS(
-                object_points,
-                image_points,
-                K,
-                dist,
-                candidates[0][0].copy(),
-                candidates[0][1].copy(),
-            )
-            candidates.append((vvs_rvec.reshape(3, 1), vvs_tvec.reshape(3, 1)))
-        except cv2.error:
-            pass
-
-    return candidates
-
-
-def _solve_best_board_pose(
-    object_points: np.ndarray,
-    image_points: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    import cv2
-
-    object_points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
-    image_points = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
-    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
-
-    flags: list[int] = []
-    if hasattr(cv2, "SOLVEPNP_SQPNP"):
-        flags.append(int(cv2.SOLVEPNP_SQPNP))
-    if hasattr(cv2, "SOLVEPNP_IPPE"):
-        flags.append(int(cv2.SOLVEPNP_IPPE))
-    flags.append(int(cv2.SOLVEPNP_ITERATIVE))
-
-    best: tuple[float, np.ndarray, np.ndarray, dict[str, Any]] | None = None
-    for flag in flags:
-        try:
-            success, rvec, tvec = cv2.solvePnP(
-                object_points,
-                image_points,
-                K,
-                dist,
-                flags=flag,
-            )
-        except cv2.error:
-            continue
-        if not success:
-            continue
-
-        for cand_rvec, cand_tvec in _refined_pose_candidates(
-            object_points,
-            image_points,
-            K,
-            dist,
-            rvec,
-            tvec,
-        ):
-            stats = _pose_stats(
-                object_points,
-                image_points,
-                cand_rvec,
-                cand_tvec,
-                K,
-                dist,
-            )
-            # Prefer physically plausible camera-facing candidates, but keep a
-            # fallback so diagnostics remain visible if OpenCV returns a flipped
-            # planar solution.
-            penalty = 0.0 if float(cand_tvec.reshape(3)[2]) > 0.0 else 1000.0
-            score = float(stats["mean"]) + penalty
-            if best is None or score < best[0]:
-                stats["pnp_flag"] = int(flag)
-                best = (score, cand_rvec, cand_tvec, stats)
-
-    if best is None:
-        raise RuntimeError("Could not estimate checkerboard pose.")
-
-    _, best_rvec, best_tvec, best_stats = best
-    return best_rvec.reshape(3, 1), best_tvec.reshape(3, 1), best_stats
-
-
-def estimate_board_pose_from_corners(
-    corners_uv: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-    *,
-    collected_frames: int = 1,
-    mean_corner_std_px: float = 0.0,
-    max_corner_std_px: float = 0.0,
-) -> BoardPoseCalibration:
-    object_points = checkerboard_object_points_mm()
-    image_points = np.asarray(corners_uv, dtype=np.float64).reshape(-1, 2)
-
-    rvec, tvec, stats = _solve_best_board_pose(object_points, image_points, K, dist)
-    errors = np.asarray(stats["errors"], dtype=np.float64)
-
-    inlier_count = len(errors)
-    total_count = len(errors)
-    if total_count >= 20:
-        median = float(np.median(errors))
-        mad = float(np.median(np.abs(errors - median)))
-        robust_sigma = 1.4826 * mad
-        trim_threshold = max(0.75, median + 4.0 * robust_sigma)
-        inlier_mask = errors <= trim_threshold
-        if int(np.count_nonzero(inlier_mask)) >= max(12, int(0.75 * total_count)):
-            inlier_count = int(np.count_nonzero(inlier_mask))
-            if inlier_count < total_count:
-                rvec_trim, tvec_trim, _ = _solve_best_board_pose(
-                    object_points[inlier_mask],
-                    image_points[inlier_mask],
-                    K,
-                    dist,
-                )
-                full_stats = _pose_stats(
-                    object_points,
-                    image_points,
-                    rvec_trim,
-                    tvec_trim,
-                    K,
-                    dist,
-                )
-                if float(full_stats["mean"]) <= float(stats["mean"]) * 1.25:
-                    rvec, tvec, stats = rvec_trim, tvec_trim, full_stats
-                    errors = np.asarray(stats["errors"], dtype=np.float64)
-
-    T_C_B = _make_transform_from_rvec_tvec(rvec, tvec)
-    T_B_C = _invert_transform(T_C_B)
-
-    return BoardPoseCalibration(
-        rvec_cb=rvec.reshape(3, 1),
-        tvec_cb_mm=tvec.reshape(3, 1),
-        T_C_B=T_C_B,
-        T_B_C=T_B_C,
-        corners_uv=image_points.reshape(-1, 2),
-        reproj_mean_px=float(np.mean(errors)),
-        reproj_median_px=float(np.median(errors)),
-        reproj_p95_px=float(np.percentile(errors, 95)),
-        reproj_max_px=float(np.max(errors)),
-        inlier_count=int(inlier_count),
-        total_count=int(total_count),
-        collected_frames=int(collected_frames),
-        mean_corner_std_px=float(mean_corner_std_px),
-        max_corner_std_px=float(max_corner_std_px),
-    )
-
-
-def detect_checkerboard_corners(frame: np.ndarray) -> np.ndarray | None:
-    import cv2
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    pattern = CHECKERBOARD_PATTERN
-
-    corners = None
-    ok = False
-    if hasattr(cv2, "findChessboardCornersSB"):
-        flags = (
-            cv2.CALIB_CB_NORMALIZE_IMAGE
-            | cv2.CALIB_CB_EXHAUSTIVE
-            | cv2.CALIB_CB_ACCURACY
-        )
-        try:
-            ok, corners = cv2.findChessboardCornersSB(gray, pattern, flags)
-        except cv2.error:
-            ok, corners = False, None
-
-    if not ok:
-        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-        ok, corners = cv2.findChessboardCorners(gray, pattern, flags)
-        if ok:
-            criteria = (
-                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
-                80,
-                1e-4,
-            )
-            corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-
-    if not ok or corners is None:
-        return None
-
-    return np.asarray(corners, dtype=np.float64).reshape(-1, 2)
-
-
-def put_text_cv(
-    img: np.ndarray,
-    text: str,
-    pos: tuple[int, int],
-    color: tuple[int, int, int] = (0, 255, 255),
-    scale: float = 0.55,
-    thickness: int = 1,
-) -> None:
-    import cv2
-
-    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale,
-                (0, 0, 0), thickness + 2, cv2.LINE_AA)
-    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale,
-                color, thickness, cv2.LINE_AA)
-
-
-def draw_board_axes(
-    vis: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-) -> None:
-    import cv2
-
-    if hasattr(cv2, "drawFrameAxes"):
-        try:
-            cv2.drawFrameAxes(vis, K, dist, rvec, tvec, BOARD_AXIS_LENGTH_MM, 3)
-            return
-        except cv2.error:
-            pass
-
-    axis = np.asarray(
-        [
-            [0.0, 0.0, 0.0],
-            [BOARD_AXIS_LENGTH_MM, 0.0, 0.0],
-            [0.0, BOARD_AXIS_LENGTH_MM, 0.0],
-            [0.0, 0.0, BOARD_AXIS_LENGTH_MM],
-        ],
-        dtype=np.float64,
-    )
-    projected, _ = cv2.projectPoints(axis, rvec, tvec, K, dist)
-    pts = np.round(projected.reshape(-1, 2)).astype(int)
-    origin = tuple(pts[0])
-    cv2.line(vis, origin, tuple(pts[1]), (0, 0, 255), 3, cv2.LINE_AA)
-    cv2.line(vis, origin, tuple(pts[2]), (0, 255, 0), 3, cv2.LINE_AA)
-    cv2.line(vis, origin, tuple(pts[3]), (255, 0, 0), 3, cv2.LINE_AA)
-
-
-def draw_checkerboard_overlay(
-    frame: np.ndarray,
-    corners_uv: np.ndarray | None,
-    pose: BoardPoseCalibration | None,
-    K: np.ndarray,
-    dist: np.ndarray,
-    *,
-    status: str,
-    collecting: str = "",
-) -> np.ndarray:
-    import cv2
-
-    vis = frame.copy()
-    if corners_uv is not None:
-        cv2.drawChessboardCorners(
-            vis,
-            CHECKERBOARD_PATTERN,
-            np.asarray(corners_uv, dtype=np.float32).reshape(-1, 1, 2),
-            True,
-        )
-
-    if pose is not None:
-        draw_board_axes(vis, K, dist, pose.rvec_cb, pose.tvec_cb_mm)
-
-    overlay = vis.copy()
-    cv2.rectangle(overlay, (20, 20), (1080, 170), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.58, vis, 0.42, 0, vis)
-
-    put_text_cv(vis, "Checkerboard pose calibration", (40, 55), scale=0.68)
-    put_text_cv(vis, status, (40, 88), scale=0.50)
-    if pose is None:
-        detail = "SPACE=accept current detection | q/ESC=quit"
-    else:
-        detail = (
-            f"mean={pose.reproj_mean_px:.3f}px p95={pose.reproj_p95_px:.3f}px "
-            f"max={pose.reproj_max_px:.3f}px frames={pose.collected_frames}"
-        )
-    put_text_cv(vis, detail, (40, 120), scale=0.48)
-    if collecting:
-        put_text_cv(vis, collecting, (40, 150), color=(0, 255, 0), scale=0.48)
-    else:
-        put_text_cv(
-            vis,
-            "Board: 10x10 cells, 1 cm cells, OpenCV pattern 9x9 inner corners",
-            (40, 150),
-            color=(180, 220, 255),
-            scale=0.45,
-        )
-    return vis
-
-
-def collect_refined_board_pose(
-    pipe,
-    K: np.ndarray,
-    dist: np.ndarray,
-    window_name: str,
-    first_corners: np.ndarray,
-) -> BoardPoseCalibration | None:
-    import cv2
-
-    collected: list[np.ndarray] = [np.asarray(first_corners, dtype=np.float64).reshape(-1, 2)]
-    reference = collected[0]
-    last_frame = None
-    attempts = 0
-
-    while len(collected) < BOARD_REFINE_TARGET_FRAMES and attempts < BOARD_REFINE_MAX_ATTEMPTS:
-        attempts += 1
-        frames = pipe.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            continue
-
-        frame = np.asanyarray(color_frame.get_data())
-        last_frame = frame
-        corners = detect_checkerboard_corners(frame)
-        if corners is not None:
-            direct_err = float(np.mean(np.linalg.norm(corners - reference, axis=1)))
-            reverse_err = float(np.mean(np.linalg.norm(corners[::-1] - reference, axis=1)))
-            if reverse_err < direct_err:
-                corners = corners[::-1]
-            collected.append(corners)
-
-        progress = (
-            f"collecting stable detections {len(collected)}/{BOARD_REFINE_TARGET_FRAMES} "
-            f"(attempt {attempts}/{BOARD_REFINE_MAX_ATTEMPTS})"
-        )
-        pose = None
-        if corners is not None:
-            try:
-                pose = estimate_board_pose_from_corners(
-                    corners,
-                    K,
-                    dist,
-                    collected_frames=len(collected),
-                )
-            except RuntimeError:
-                pose = None
-
-        vis = draw_checkerboard_overlay(
-            frame,
-            corners,
-            pose,
-            K,
-            dist,
-            status="Keep camera and board still while the pose is refined.",
-            collecting=progress,
-        )
-        cv2.imshow(window_name, vis)
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord("q")):
-            return None
-
-    if len(collected) < BOARD_REFINE_MIN_FRAMES:
-        _qt_app()
-        _, _, QMessageBox = _load_qt_widgets()
-        QMessageBox.warning(
-            None,
-            "Checkerboard pose",
-            (
-                "Not enough stable checkerboard detections were collected.\n\n"
-                f"Needed at least {BOARD_REFINE_MIN_FRAMES}, got {len(collected)}."
-            ),
-        )
-        return None
-
-    stack = np.stack(collected, axis=0)
-    mean_corners = np.mean(stack, axis=0)
-    corner_std = np.linalg.norm(np.std(stack, axis=0), axis=1)
-    pose = estimate_board_pose_from_corners(
-        mean_corners,
-        K,
-        dist,
-        collected_frames=len(collected),
-        mean_corner_std_px=float(np.mean(corner_std)),
-        max_corner_std_px=float(np.max(corner_std)),
-    )
-
-    if last_frame is not None:
-        vis = draw_checkerboard_overlay(
-            last_frame,
-            mean_corners,
-            pose,
-            K,
-            dist,
-            status="Refined checkerboard pose. Confirm the axes in the dialog.",
-        )
-        cv2.imshow(window_name, vis)
-        cv2.waitKey(1)
-
-    return pose
-
-
 def confirm_board_pose(pose: BoardPoseCalibration) -> bool:
     _qt_app()
     _, _, QMessageBox = _load_qt_widgets()
     t = pose.tvec_cb_mm.reshape(3)
+    quality = calib_checkerboard.pose_quality_dict(pose)
     reply = QMessageBox.question(
         None,
         "Checkerboard pose uebernehmen?",
@@ -664,7 +162,12 @@ def confirm_board_pose(pose: BoardPoseCalibration) -> bool:
             f"Reprojection p95:  {pose.reproj_p95_px:.3f} px\n"
             f"Reprojection max:  {pose.reproj_max_px:.3f} px\n"
             f"Collected frames:  {pose.collected_frames}\n"
+            f"Used frames:       {quality['frames_used']}\n"
             f"Corner noise mean: {pose.mean_corner_std_px:.3f} px\n"
+            f"Solver:            {pose.solver_mode} "
+            f"(candidate={pose.selected_candidate_index}, "
+            f"ambiguous={pose.pose_ambiguous})\n"
+            f"IPPE alt gap:      {pose.alternative_error_gap_px:.4f} px\n"
             f"Camera board tvec: x={t[0]:.1f} mm, y={t[1]:.1f} mm, z={t[2]:.1f} mm\n\n"
             "Yes: use this board pose and start the tracker view.\n"
             "No: repeat checkerboard detection."
@@ -680,49 +183,23 @@ def calibrate_checkerboard_pose(
     K: np.ndarray,
     dist: np.ndarray,
 ) -> BoardPoseCalibration | None:
-    import cv2
-
-    window_name = "HydraTracker Translation Debug"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
     while True:
-        frames = pipe.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            continue
-
-        frame = np.asanyarray(color_frame.get_data())
-        corners = detect_checkerboard_corners(frame)
-        pose = None
-        status = "No full checkerboard detected."
-        if corners is not None:
-            try:
-                pose = estimate_board_pose_from_corners(corners, K, dist)
-                status = "Checkerboard detected. Check the axes, then press SPACE."
-            except RuntimeError as exc:
-                status = f"Checkerboard detected, pose failed: {exc}"
-
-        vis = draw_checkerboard_overlay(frame, corners, pose, K, dist, status=status)
-        cv2.imshow(window_name, vis)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord("q")):
+        pose = calib_checkerboard.capture_checkerboard_pose_from_pipeline(
+            pipe,
+            K,
+            dist,
+            min_frames=BOARD_REFINE_MIN_FRAMES,
+            max_frames=BOARD_REFINE_TARGET_FRAMES,
+            window_name="HydraTracker Translation Debug",
+        )
+        if pose is None:
             return None
-        if key == ord(" ") and corners is not None:
-            refined_pose = collect_refined_board_pose(
-                pipe,
-                K,
-                dist,
-                window_name,
-                corners,
-            )
-            if refined_pose is None:
-                continue
-            if confirm_board_pose(refined_pose):
-                return refined_pose
+        if confirm_board_pose(pose):
+            return pose
 
 
 def board_pose_record(board_pose: BoardPoseCalibration, run_id: str) -> dict[str, Any]:
+    quality = calib_checkerboard.pose_quality_dict(board_pose)
     return {
         "type": "board_pose",
         "run_id": run_id,
@@ -739,43 +216,49 @@ def board_pose_record(board_pose: BoardPoseCalibration, run_id: str) -> dict[str
             "median_px": board_pose.reproj_median_px,
             "p95_px": board_pose.reproj_p95_px,
             "max_px": board_pose.reproj_max_px,
-            "inlier_count": board_pose.inlier_count,
-            "total_count": board_pose.total_count,
+            "frames_used": quality["frames_used"],
+            "frames_total": quality["frames_total"],
             "collected_frames": board_pose.collected_frames,
+            "frame_rms_mean_px": quality["frame_rms_mean_px"],
+            "frame_rms_median_px": quality["frame_rms_median_px"],
+            "frame_rms_p95_px": quality["frame_rms_p95_px"],
             "mean_corner_std_px": board_pose.mean_corner_std_px,
             "max_corner_std_px": board_pose.max_corner_std_px,
+            "pnp_flag": quality["pnp_flag"],
+        },
+        "solver": {
+            "mode": board_pose.solver_mode,
+            "candidate_count": board_pose.candidate_count,
+            "selected_candidate_index": board_pose.selected_candidate_index,
+            "alternative_rms_px": board_pose.alternative_rms_px,
+            "alternative_error_gap_px": board_pose.alternative_error_gap_px,
+            "alternative_error_ratio": board_pose.alternative_error_ratio,
+            "alternative_likelihood_ratio": board_pose.alternative_likelihood_ratio,
+            "alternative_translation_delta_mm": board_pose.alternative_translation_delta_mm,
+            "alternative_rotation_delta_deg": board_pose.alternative_rotation_delta_deg,
+            "pose_ambiguous": board_pose.pose_ambiguous,
         },
     }
 
 
-def write_board_pose_to_live_log(live, board_pose: BoardPoseCalibration) -> None:
-    if not getattr(live, "_log_active", False):
-        return
-    live._write_json_record(
-        board_pose_record(board_pose, str(getattr(live, "_log_run_id", "")))
+def write_board_pose_to_live_log(
+    board_pose: BoardPoseCalibration,
+    tracker_log=None,
+) -> None:
+    if tracker_log is None:
+        tracker_log = _tracker_log_module()
+    if not tracker_log.is_active():
+        raise RuntimeError("Cannot write board pose: tracker log is not active.")
+    tracker_log.write_record(
+        board_pose_record(board_pose, tracker_log.current_run_id())
     )
+    print("[debug_tracker_translation] wrote board_pose record to active run log")
 
 
 def load_live_tracker_module():
     _ensure_src_on_path()
-    _forget_tracking_modules()
-
-    module_path = (
-        Path(__file__).resolve().parents[1]
-        / "tests"
-        / "test_tracker_realsense.py"
-    )
     try:
-        spec = importlib.util.spec_from_file_location(
-            "tracking.hydramarker.tests.test_tracker_realsense",
-            module_path,
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Could not create import spec for {module_path}")
-        live = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = live
-        spec.loader.exec_module(live)
-        print(f"[debug_tracker_translation] live module -> {module_path}")
+        from tracking.hydramarker.tests import test_tracker_realsense as live
     except Exception as exc:
         raise RuntimeError(
             "Could not import the RealSense tracker test module. "
@@ -783,264 +266,96 @@ def load_live_tracker_module():
         ) from exc
 
     script_path = Path(__file__).resolve()
-    live.RUN_LOG_DIR = script_path.parents[1] / "tests" / "hydramarker_tracker_runs"
+    live.tracker_log.set_run_log_dir(
+        script_path.parents[1] / "tests" / "hydramarker_tracker_runs"
+    )
+    print(f"[debug_tracker_translation] live module -> {Path(live.__file__).resolve()}")
     return live
 
 
 def run_live_tracker_translation() -> Path | None:
-    import cv2
-
     live = load_live_tracker_module()
+    tracker_log = live.tracker_log
+    board_pose_ref: dict[str, BoardPoseCalibration | None] = {"pose": None}
 
-    field_path = live.choose_file_qt("Select HydraMarker .field file", "HydraMarker field (*.field)")
-    marker_json_path = live.choose_file_qt("Select marker .json file", "Marker JSON (*.json)")
-
-    pipe, profile = live.create_realsense_pipeline()
-    K_rgb, dist_rgb = live.load_tracker_camera_calibration(profile)
-    if hasattr(live, "_camera_intrinsics_info"):
-        live._camera_intrinsics_info.update(
+    def after_camera_ready(pipe, K_rgb: np.ndarray, dist_rgb: np.ndarray) -> bool:
+        camera_info = tracker_log.camera_intrinsics_info()
+        tracker_log.update_camera_intrinsics_info(
             {
                 "debug_rectification_mode": "disabled_raw_realsense",
                 "debug_rectification_enabled": False,
                 "debug_tracker_uses_loaded_camera_calibration": bool(
-                    live._camera_intrinsics_info.get("camera_source") == "opencv_calibration_npz"
+                    camera_info.get("camera_source") == "opencv_calibration_npz"
                 ),
                 "tracker_K": K_rgb.tolist(),
                 "tracker_dist_coeffs": dist_rgb.reshape(-1).tolist(),
             }
         )
 
-    recorded_log_path: Path | None = None
-    window_name = "HydraTracker Translation Debug"
-
-    try:
         board_pose = calibrate_checkerboard_pose(
             pipe,
             K_rgb,
             dist_rgb,
         )
         if board_pose is None:
-            return None
-        if hasattr(live, "set_debug_board_transform"):
-            live.set_debug_board_transform(board_pose.T_B_C)
+            print("[debug_tracker_translation] checkerboard board pose was not confirmed")
+            return False
 
-        tracker = live.make_tracker(field_path, marker_json_path, K_rgb, dist_rgb)
+        board_pose_ref["pose"] = board_pose
+        tracker_log.set_debug_board_transform(board_pose.T_B_C)
+        tracker_log.update_camera_intrinsics_info(
+            {
+                "debug_translation_reference_frame": "checkerboard",
+                "debug_board_pose_available": True,
+                "debug_board_T_B_C": board_pose.T_B_C.tolist(),
+                "debug_board_reprojection_mean_px": board_pose.reproj_mean_px,
+                "debug_board_reprojection_p95_px": board_pose.reproj_p95_px,
+                "debug_board_solver_mode": board_pose.solver_mode,
+                "debug_board_selected_candidate_index": board_pose.selected_candidate_index,
+                "debug_board_pose_ambiguous": board_pose.pose_ambiguous,
+                "debug_board_alternative_error_gap_px": board_pose.alternative_error_gap_px,
+                "debug_board_alternative_likelihood_ratio": board_pose.alternative_likelihood_ratio,
+            }
+        )
+        print(
+            "[debug_tracker_translation] board pose fixed; "
+            "subsequent frame diagnostics use checkerboard coordinates"
+        )
+        return True
+
+    def after_tracker_created(tracker) -> None:
         _force_dense_refine_config(tracker)
-        preview_detector = live.make_idle_preview_detector()
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-        frame_idx = 0
-        last_mode = None
-        last_success = None
-        last_message = None
-        app_state = live.APP_IDLE
-        acquire_start_frame = 0
-        provisional_start_frame = 0
-        last_candidate_frame = 0
-        stale_pose_frames = 0
-        tracking_armed = False
-        auto_acquire_blocked = False
-
-        def enter_idle(
-            reason: str,
-            *,
-            keep_armed: bool = True,
-            block_auto_acquire: bool = False,
-        ) -> None:
-            nonlocal app_state, acquire_start_frame, provisional_start_frame
-            nonlocal last_candidate_frame, stale_pose_frames
-            nonlocal tracking_armed, auto_acquire_blocked
-            nonlocal last_mode, last_success, last_message
-            tracker.reset()
-            preview_detector.reset_tracking()
-            app_state = live.APP_IDLE
-            acquire_start_frame = 0
-            provisional_start_frame = 0
-            last_candidate_frame = 0
-            stale_pose_frames = 0
-            tracking_armed = bool(keep_armed)
-            auto_acquire_blocked = bool(block_auto_acquire)
-            last_mode = None
-            last_success = None
-            last_message = None
-            print(f"[debug_tracker_translation] idle ({reason})")
-
-        def start_acquire(*, manual: bool = False) -> None:
-            nonlocal app_state, acquire_start_frame, provisional_start_frame
-            nonlocal last_candidate_frame, stale_pose_frames
-            nonlocal tracking_armed, auto_acquire_blocked
-            nonlocal last_mode, last_success, last_message
-            tracker.reset()
-            preview_detector.reset_tracking()
-            app_state = live.APP_ACQUIRE
-            acquire_start_frame = frame_idx
-            provisional_start_frame = 0
-            last_candidate_frame = 0
-            stale_pose_frames = 0
-            tracking_armed = True
-            auto_acquire_blocked = False
-            last_mode = None
-            last_success = None
-            last_message = None
-            reason = "manual" if manual else "auto"
-            print(f"[debug_tracker_translation] acquire started ({reason})")
-
-        while True:
-            frames = pipe.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                continue
-
-            frame_idx += 1
-            frame = np.asanyarray(color_frame.get_data())
-
-            t0 = time.perf_counter()
-            result = tracker.process_frame(
-                frame,
-                run_detection=(app_state != live.APP_IDLE),
+    def on_log_open(_field_path, _marker_json_path, _tracker) -> None:
+        board_pose = board_pose_ref["pose"]
+        if board_pose is None:
+            raise RuntimeError(
+                "Translation debug recording started without a checkerboard board pose."
             )
-            wall_ms = (time.perf_counter() - t0) * 1000.0
+        if not tracker_log.is_active():
+            tracker_log.log_open(_field_path, _marker_json_path, _tracker)
+        write_board_pose_to_live_log(board_pose, tracker_log)
 
-            preview_corners: list[tuple[float, float]] = []
-            preview_ms = 0.0
-            if app_state == live.APP_IDLE:
-                preview_t0 = time.perf_counter()
-                preview_detection = preview_detector.detect(frame)
-                preview_ms = (time.perf_counter() - preview_t0) * 1000.0
-                preview_corners = live.preview_corner_uvs(preview_detection)
-                if len(preview_corners) < live.PROVISIONAL_MIN_CORNERS:
-                    auto_acquire_blocked = False
-                if (
-                    tracking_armed
-                    and not auto_acquire_blocked
-                    and len(preview_corners) >= live.IDLE_PREVIEW_AUTO_ACQUIRE_CORNERS
-                ):
-                    start_acquire(manual=False)
+    def draw_extra_overlay(vis: np.ndarray, log_active: bool) -> None:
+        state_line = (
+            "Board pose fixed | camera=selected_opencv_calibration | s=start/stop tracking | "
+            f"SPACE={'STOP recording and analyze' if log_active else 'START recording'} | q=quit"
+        )
+        live.put_text(vis, state_line, (25, 245), color=(0, 255, 255), scale=0.48)
 
-            det_count = len(getattr(result, "detection_corners", []))
-            if app_state in (live.APP_ACQUIRE, live.APP_PROVISIONAL):
-                active_frames = max(0, frame_idx - acquire_start_frame + 1)
-                if live.has_fresh_pose(result):
-                    app_state = live.APP_TRACKING
-                    stale_pose_frames = 0
-                    print("[debug_tracker_translation] tracking locked")
-                elif det_count >= live.PROVISIONAL_MIN_CORNERS:
-                    last_candidate_frame = frame_idx
-                    if app_state != live.APP_PROVISIONAL:
-                        app_state = live.APP_PROVISIONAL
-                        provisional_start_frame = frame_idx
-                        print(f"[debug_tracker_translation] provisional fragment det={det_count}")
-                elif app_state == live.APP_ACQUIRE and active_frames >= live.ACQUIRE_TIMEOUT_FRAMES:
-                    enter_idle("acquire timeout", block_auto_acquire=True)
-                elif app_state == live.APP_PROVISIONAL:
-                    no_candidate_frames = (
-                        frame_idx - last_candidate_frame
-                        if last_candidate_frame > 0
-                        else active_frames
-                    )
-                    provisional_frames = (
-                        frame_idx - provisional_start_frame + 1
-                        if provisional_start_frame > 0
-                        else active_frames
-                    )
-                    if no_candidate_frames >= live.PROVISIONAL_STALE_TIMEOUT_FRAMES:
-                        enter_idle("provisional stale", block_auto_acquire=True)
-                    elif provisional_frames >= live.PROVISIONAL_TOTAL_TIMEOUT_FRAMES:
-                        enter_idle("provisional timeout", block_auto_acquire=True)
-            elif app_state == live.APP_TRACKING:
-                if live.has_fresh_pose(result):
-                    stale_pose_frames = 0
-                else:
-                    stale_pose_frames += 1
-                    if stale_pose_frames >= live.TRACKING_STALE_TO_IDLE_FRAMES:
-                        enter_idle("tracking lost", keep_armed=True)
+    def final_cleanup() -> None:
+        tracker_log.set_debug_board_transform(None)
 
-            mode_changed = last_mode != result.mode.value
-            success_changed = last_success != bool(result.success)
-            message_changed = last_message != result.message
-            force_log = (
-                mode_changed
-                or success_changed
-                or message_changed
-                or (not result.success and app_state != live.APP_IDLE)
-            )
-            live.log_console(frame_idx, result, tracker, force=force_log)
-
-            last_mode = result.mode.value
-            last_success = bool(result.success)
-            last_message = result.message
-
-            draw_t0 = time.perf_counter()
-            vis = live.draw_debug(
-                frame.copy(),
-                result,
-                K_rgb,
-                dist_rgb,
-                frame_idx,
-                tracker,
-            )
-            if app_state == live.APP_IDLE:
-                live.draw_preview_corners(vis, preview_corners)
-            active_frames_for_display = (
-                max(0, frame_idx - acquire_start_frame + 1)
-                if app_state in (live.APP_ACQUIRE, live.APP_PROVISIONAL)
-                and acquire_start_frame > 0
-                else 0
-            )
-            live.draw_app_state(
-                vis,
-                app_state,
-                active_frames_for_display,
-                stale_pose_frames,
-                tracking_armed=tracking_armed,
-                preview_count=len(preview_corners),
-                preview_ms=preview_ms,
-                auto_blocked=auto_acquire_blocked,
-            )
-
-            state_line = (
-                "Board pose fixed | camera=raw_realsense_distortion | s=start/stop tracking | "
-                f"SPACE={'STOP recording and analyze' if live._log_active else 'START recording'} | q=quit"
-            )
-            put_text_cv(vis, state_line, (25, 245), color=(0, 255, 255), scale=0.48)
-            draw_ms = (time.perf_counter() - draw_t0) * 1000.0
-
-            live.log_frame(frame_idx, result, wall_ms, tracker, draw_ms)
-
-            cv2.imshow(window_name, vis)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
-                if live._log_active:
-                    recorded_log_path = Path(live._log_path)
-                    live.log_close()
-                break
-            if key == ord("r"):
-                enter_idle("reset", keep_armed=False)
-            if key == ord("s"):
-                if app_state == live.APP_IDLE:
-                    start_acquire(manual=True)
-                else:
-                    enter_idle("manual stop", keep_armed=False)
-            if key == ord(" "):
-                if live._log_active:
-                    recorded_log_path = Path(live._log_path)
-                    live.log_close()
-                    break
-                live.log_open(field_path, marker_json_path, tracker)
-                write_board_pose_to_live_log(live, board_pose)
-
-    finally:
-        if getattr(live, "_log_active", False):
-            if recorded_log_path is None and getattr(live, "_log_path", None) is not None:
-                recorded_log_path = Path(live._log_path)
-            live.log_close()
-        if hasattr(live, "set_debug_board_transform"):
-            live.set_debug_board_transform(None)
-        pipe.stop()
-        cv2.destroyAllWindows()
-
-    return recorded_log_path
+    return live.run_live_tracker(
+        window_name="HydraTracker Translation Debug",
+        console_prefix="[debug_tracker_translation]",
+        after_camera_ready=after_camera_ready,
+        after_tracker_created=after_tracker_created,
+        on_log_open=on_log_open,
+        draw_extra_overlay=draw_extra_overlay,
+        stop_after_log_close=True,
+        final_cleanup=final_cleanup,
+    )
 
 
 def _parse_board_pose_record(record: dict) -> dict[str, Any] | None:
@@ -1403,7 +718,11 @@ def plot_translation(run: dict) -> Path:
     return out_path
 
 
-def plot_existing_run(path: Path | None = None) -> Path | None:
+def plot_existing_run(
+    path: Path | None = None,
+    *,
+    require_board_pose: bool = True,
+) -> Path | None:
     if path is None:
         path = select_jsonl_with_qt()
 
@@ -1412,6 +731,13 @@ def plot_existing_run(path: Path | None = None) -> Path | None:
         return None
 
     run = load_tracker_run(path)
+    if require_board_pose and run.get("board_pose") is None:
+        raise RuntimeError(
+            "This run has no board_pose record, so it cannot be plotted as the "
+            "translation debug checkerboard-frame run.\n"
+            "Run hydramarker/debug/debug_tracker_translation.py live and confirm "
+            "the checkerboard pose before recording."
+        )
     return plot_translation(run)
 
 
@@ -1420,6 +746,11 @@ def main() -> None:
     if args and args[0] in ("--plot", "plot"):
         path = Path(args[1]) if len(args) > 1 else None
         plot_existing_run(path)
+        return
+
+    if args and args[0] in ("--plot-camera", "plot-camera"):
+        path = Path(args[1]) if len(args) > 1 else None
+        plot_existing_run(path, require_board_pose=False)
         return
 
     if args and args[0] in ("--select", "select"):
@@ -1439,4 +770,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"[debug_tracker_translation] ERROR: {exc}")
+        sys.exit(1)

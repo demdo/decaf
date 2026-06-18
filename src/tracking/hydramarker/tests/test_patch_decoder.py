@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -6,6 +7,16 @@ import numpy as np
 import pyrealsense2 as rs
 
 from PySide6.QtWidgets import QApplication, QFileDialog
+
+
+def _ensure_src_on_path() -> None:
+    src_root = Path(__file__).resolve().parents[3]
+    src = str(src_root)
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+
+_ensure_src_on_path()
 
 from tracking.hydramarker.backend import cpp_impl as hydramarker_cpp
 

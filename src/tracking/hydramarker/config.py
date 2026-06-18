@@ -1,3 +1,5 @@
+"""Central configuration surface for the HydraMarker frame tracker."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +7,8 @@ from dataclasses import dataclass
 
 @dataclass
 class TrackerConfig:
+    """Runtime thresholds and feature toggles shared by all tracker stages."""
+
     min_points: int = 6
     min_inliers: int = 5
 

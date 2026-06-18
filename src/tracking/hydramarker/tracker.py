@@ -1,3 +1,5 @@
+"""Frame-level orchestration for HydraMarker tracking."""
+
 from __future__ import annotations
 
 import time
@@ -6,25 +8,27 @@ from typing import Dict, Optional
 import numpy as np
 
 from tracking.hydramarker.backend import cpp_impl as hm
-from tracking.hydramarker.identity_store import IdentityStore
 from tracking.hydramarker.config import TrackerConfig
+from tracking.hydramarker.tracker_decode import (
+    DecodeHelperMixin,
+    DecodePipelineMixin,
+    PosePropagationMixin,
+    TrackerFactoryMixin,
+)
+from tracking.hydramarker.tracker_geometry import (
+    DenseRefineMixin,
+    GeometryMixin,
+    ProjectionMixin,
+)
+from tracking.hydramarker.tracker_persistence import FastPathMixin, PersistenceMixin
+from tracking.hydramarker.tracker_pose import FallbackPoseMixin, PoseEstimationMixin
 from tracking.hydramarker.tracker_types import (
     FastPathDebug,
+    IdentityStore,
     PersistentMatchStats,
     TrackerMode,
     TrackerResult,
 )
-from tracking.hydramarker.tracker_decode_helpers import DecodeHelperMixin
-from tracking.hydramarker.tracker_decode_pipeline import DecodePipelineMixin
-from tracking.hydramarker.tracker_dense_refine import DenseRefineMixin
-from tracking.hydramarker.tracker_factories import TrackerFactoryMixin
-from tracking.hydramarker.tracker_fallbacks import FallbackPoseMixin
-from tracking.hydramarker.tracker_fast_path import FastPathMixin
-from tracking.hydramarker.tracker_geometry import GeometryMixin
-from tracking.hydramarker.tracker_persistence import PersistenceMixin
-from tracking.hydramarker.tracker_pose_estimation import PoseEstimationMixin
-from tracking.hydramarker.tracker_pose_propagation import PosePropagationMixin
-from tracking.hydramarker.tracker_projection import ProjectionMixin
 
 
 class HydraTracker(
@@ -40,7 +44,7 @@ class HydraTracker(
     PersistenceMixin,
     GeometryMixin,
 ):
-    """Frame-level tracker orchestrator; implementation lives in tracker_* mixins."""
+    """Coordinate detection, decoding, pose estimation, and recovery per frame."""
 
     def __init__(
         self,
@@ -50,6 +54,7 @@ class HydraTracker(
         dist_coeffs: Optional[np.ndarray] = None,
         config: Optional[TrackerConfig] = None,
     ) -> None:
+        """Load marker assets and initialize all detector, decoder, and pose state."""
         self.config = config or TrackerConfig()
 
         self.K = np.asarray(K, dtype=np.float64).reshape(3, 3)
@@ -108,6 +113,7 @@ class HydraTracker(
         return self.pose_tracker.T_marker_camera
 
     def reset(self) -> None:
+        """Reset all runtime state while keeping the loaded marker assets."""
         self.mode = TrackerMode.LOST
         self.frame_index = 0
         self.lost_frames = 0
@@ -140,6 +146,7 @@ class HydraTracker(
         *,
         run_detection: bool = True,
     ) -> TrackerResult:
+        """Process one camera frame and return the best available tracker result."""
         frame_t0 = time.perf_counter()
         timings_ms: Dict[str, float] = {}
 
@@ -257,6 +264,7 @@ class HydraTracker(
         return finish(result)
 
     def _on_tracking_failure(self) -> None:
+        """Advance the loss state and clear stale detector/persistence state as needed."""
         self.lost_frames += 1
 
         if self.lost_frames > self.config.max_lost_frames:
