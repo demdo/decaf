@@ -17,6 +17,7 @@ from tracking.hydramarker.tracker_types import (
     TrackerResult,
 )
 from tracking.pose_filters import PoseDepthFilterResult
+from tracking.pose_prior import PlateauPosePriorResult, solve_plateau_pose_prior
 from tracking.pose_solvers import make_transform_from_rvec_tvec
 
 
@@ -662,7 +663,172 @@ class PoseEstimationMixin:
             "depth_filter_z_mm": float(filtered.filtered_z_mm),
             "depth_filter_reproj_excess_px": float(filtered.reprojection_excess_px),
             "depth_filter_guard_alpha": float(filtered.guard_alpha),
+            "depth_filter_innovation_z_mm": float(filtered.innovation_z_mm),
+            "depth_filter_innovation_mean_z_mm": float(filtered.innovation_mean_z_mm),
+            "depth_filter_innovation_cusum_pos_mm": float(filtered.innovation_cusum_pos_mm),
+            "depth_filter_innovation_cusum_neg_mm": float(filtered.innovation_cusum_neg_mm),
+            "depth_filter_innovation_bias_detected": bool(filtered.innovation_bias_detected),
+            "depth_filter_innovation_bias_direction": int(filtered.innovation_bias_direction),
+            "depth_filter_innovation_bias_limited": bool(filtered.innovation_bias_limited),
+            "depth_filter_object_z_span_mm": float(filtered.object_z_span_mm),
+            "depth_filter_negative_delta_guard_limited": bool(
+                filtered.negative_delta_guard_limited
+            ),
         }
+
+    @staticmethod
+    def _plateau_prior_kwargs(
+        prior: PlateauPosePriorResult | None,
+        *,
+        triggered: bool = False,
+        attempted: bool = False,
+        applied: bool = False,
+    ) -> dict:
+        if prior is None:
+            if not triggered and not attempted and not applied:
+                return {}
+            return {
+                "pose_plateau_prior_triggered": bool(triggered),
+                "pose_plateau_prior_attempted": bool(attempted),
+                "pose_plateau_prior_applied": bool(applied),
+            }
+        return {
+            "pose_plateau_prior_triggered": bool(triggered),
+            "pose_plateau_prior_attempted": bool(attempted),
+            "pose_plateau_prior_applied": bool(applied and prior.success),
+            "pose_plateau_prior_method": str(prior.method),
+            "pose_plateau_prior_reason": str(prior.reason),
+            "pose_plateau_prior_delta_z_mm": float(prior.delta_z_mm),
+            "pose_plateau_prior_reproj_excess_px": float(prior.reprojection_excess_px),
+            "pose_plateau_prior_max_reproj_excess_px": float(
+                prior.max_reprojection_excess_px
+            ),
+            "pose_plateau_prior_iterations": int(prior.iterations),
+        }
+
+    @staticmethod
+    def _clone_map_pose_result(pose: MapPoseResult) -> MapPoseResult:
+        return MapPoseResult(
+            success=bool(pose.success),
+            message=str(pose.message),
+            rvec=None if pose.rvec is None else np.asarray(pose.rvec, dtype=np.float64).reshape(3, 1).copy(),
+            tvec=None if pose.tvec is None else np.asarray(pose.tvec, dtype=np.float64).reshape(3, 1).copy(),
+            T_marker_camera=(
+                None
+                if pose.T_marker_camera is None
+                else np.asarray(pose.T_marker_camera, dtype=np.float64).reshape(4, 4).copy()
+            ),
+            inlier_indices=(
+                None
+                if pose.inlier_indices is None
+                else np.asarray(pose.inlier_indices, dtype=np.int64).reshape(-1).copy()
+            ),
+            reprojection_mean_px=float(pose.reprojection_mean_px),
+            reprojection_max_px=float(pose.reprojection_max_px),
+            num_points=int(pose.num_points),
+            num_inliers=int(pose.num_inliers),
+            points=None if pose.points is None else list(pose.points),
+            method=str(pose.method),
+        )
+
+    def _pose_plateau_prior_triggered(
+        self,
+        filtered: PoseDepthFilterResult | None,
+    ) -> bool:
+        if filtered is None:
+            return False
+        if not bool(getattr(self.config, "pose_plateau_prior_enabled", False)):
+            return False
+        delta_limit = float(
+            getattr(self.config, "pose_plateau_prior_trigger_negative_delta_mm", 0.0)
+        )
+        if float(filtered.delta_z_mm) >= delta_limit:
+            return False
+        min_z_span = float(
+            getattr(self.config, "pose_plateau_prior_min_object_z_span_mm", 14.835)
+        )
+        if not np.isfinite(filtered.object_z_span_mm):
+            return False
+        return float(filtered.object_z_span_mm) >= min_z_span
+
+    def _maybe_apply_plateau_pose_prior(
+        self,
+        raw_pose: MapPoseResult,
+        fallback_points: List[PoseTrackPoint],
+        filtered: PoseDepthFilterResult | None,
+        prev_rvec: Optional[np.ndarray],
+        prev_tvec: Optional[np.ndarray],
+    ) -> tuple[MapPoseResult | None, PlateauPosePriorResult | None, bool, bool]:
+        """Try a second-stage pose when the depth filter sees a Z plateau."""
+        triggered = self._pose_plateau_prior_triggered(filtered)
+        if not triggered:
+            return None, None, False, False
+
+        if prev_rvec is None or prev_tvec is None:
+            prior = PlateauPosePriorResult(False, "none", "missing_previous_pose")
+            return None, prior, True, False
+        if raw_pose.rvec is None or raw_pose.tvec is None:
+            prior = PlateauPosePriorResult(False, "none", "missing_raw_pose")
+            return None, prior, True, False
+
+        points = list(raw_pose.points or fallback_points or [])
+        min_points = max(1, int(getattr(self.config, "pose_plateau_prior_min_points", 6)))
+        if len(points) < min_points:
+            prior = PlateauPosePriorResult(False, "none", "too_few_points")
+            return None, prior, True, False
+
+        object_points = np.asarray([p.xyz_mm for p in points], dtype=np.float64).reshape(-1, 3)
+        image_points = np.asarray([p.uv for p in points], dtype=np.float64).reshape(-1, 2)
+        prior = solve_plateau_pose_prior(
+            object_points=object_points,
+            image_points=image_points,
+            K=self.K,
+            dist_coeffs=self.dist_coeffs,
+            raw_rvec=raw_pose.rvec,
+            raw_tvec=raw_pose.tvec,
+            seed_rvec=prev_rvec,
+            seed_tvec=prev_tvec,
+            static_max_excess_px=float(
+                getattr(self.config, "pose_plateau_prior_static_max_excess_px", 0.18)
+            ),
+            candidate_max_excess_px=float(
+                getattr(self.config, "pose_plateau_prior_candidate_max_excess_px", 0.25)
+            ),
+            candidate_max_max_excess_px=float(
+                getattr(self.config, "pose_plateau_prior_candidate_max_max_excess_px", 1.00)
+            ),
+            min_positive_z_correction_mm=float(
+                getattr(self.config, "pose_plateau_prior_min_positive_z_correction_mm", 0.0)
+            ),
+            max_positive_z_correction_mm=float(
+                getattr(self.config, "pose_plateau_prior_max_positive_z_correction_mm", 0.75)
+            ),
+            robust_c_px=float(getattr(self.config, "pose_plateau_prior_robust_c_px", 0.20)),
+            max_iterations=int(getattr(self.config, "pose_plateau_prior_max_iterations", 6)),
+            max_step_translation_mm=float(
+                getattr(self.config, "pose_plateau_prior_max_step_translation_mm", 5.0)
+            ),
+            max_step_rotation_deg=float(
+                getattr(self.config, "pose_plateau_prior_max_step_rotation_deg", 5.0)
+            ),
+            lm_damping=float(getattr(self.config, "pose_plateau_prior_lm_damping", 1.0e-5)),
+        )
+        if not prior.success or prior.rvec is None or prior.tvec is None:
+            return None, prior, True, False
+
+        pose = self._clone_map_pose_result(raw_pose)
+        pose.rvec = prior.rvec.copy()
+        pose.tvec = prior.tvec.copy()
+        pose.T_marker_camera = (
+            None
+            if prior.T_marker_camera is None
+            else prior.T_marker_camera.copy()
+        )
+        pose.reprojection_mean_px = float(prior.reprojection_mean_px)
+        pose.reprojection_max_px = float(prior.reprojection_max_px)
+        pose.method = f"{raw_pose.method}+plateau_prior_{prior.method}"
+        pose.message = "Pose refined by triggered plateau prior."
+        return pose, prior, True, True
 
     def _decode_update_rejection_reason(
         self,
@@ -717,6 +883,10 @@ class PoseEstimationMixin:
             if self._last_accepted_tvec is None
             else self._last_accepted_tvec.copy()
         )
+        pose_timings: dict[str, float] = {}
+
+        def mark_pose_timing(name: str, start: float) -> None:
+            pose_timings[name] = (time.perf_counter() - start) * 1000.0
 
         pnp_t0 = time.perf_counter()
         pose = self.pose_tracker.estimate_pose(
@@ -724,6 +894,7 @@ class PoseEstimationMixin:
             lost_frames=self.lost_frames,
         )
         pnp_ms = (time.perf_counter() - pnp_t0) * 1000.0
+        pose_timings["pnp_ms"] = pnp_ms
 
         if not pose.success:
             return TrackerResult(
@@ -740,10 +911,12 @@ class PoseEstimationMixin:
                 pnp_method=str(getattr(pose, "method", "")),
                 corners=[],
                 correspondence_corners=tracker_corners,
-                timings_ms={"pnp_ms": pnp_ms},
+                timings_ms=dict(pose_timings),
             )
 
+        stage_t0 = time.perf_counter()
         inlier_corners = self._inlier_corners_from_pose(pose, tracker_corners)
+        mark_pose_timing("pose_inlier_corners_ms", stage_t0)
 
         if (
             not update_persistence
@@ -771,7 +944,7 @@ class PoseEstimationMixin:
                 pnp_method=str(getattr(pose, "method", "")),
                 corners=[],
                 correspondence_corners=tracker_corners,
-                timings_ms={"pnp_ms": pnp_ms},
+                timings_ms=dict(pose_timings),
             )
 
         if not update_persistence:
@@ -800,16 +973,50 @@ class PoseEstimationMixin:
                     pnp_method=str(getattr(pose, "method", "")),
                     corners=[],
                     correspondence_corners=tracker_corners,
-                    timings_ms={"pnp_ms": pnp_ms},
+                    timings_ms=dict(pose_timings),
                 )
 
+        raw_pose = self._clone_map_pose_result(pose)
+        stage_t0 = time.perf_counter()
         filtered_depth = self._apply_depth_filter_to_pose(pose, track_points)
+        mark_pose_timing("pose_depth_filter_pre_ms", stage_t0)
 
+        plateau_prior_t0 = time.perf_counter()
+        prior_pose, plateau_prior, plateau_triggered, plateau_applied = (
+            self._maybe_apply_plateau_pose_prior(
+                raw_pose,
+                track_points,
+                filtered_depth,
+                prev_pose_rvec,
+                prev_pose_tvec,
+            )
+        )
+        plateau_prior_ms = (time.perf_counter() - plateau_prior_t0) * 1000.0
+        pose_timings["pose_plateau_prior_ms"] = plateau_prior_ms
+        if prior_pose is not None:
+            self.pose_depth_filter.restore(prev_depth_filter_state)
+            pose = prior_pose
+            if pose.rvec is not None:
+                self.pose_tracker.rvec = pose.rvec.copy()
+            if pose.tvec is not None:
+                self.pose_tracker.tvec = pose.tvec.copy()
+            self.pose_tracker.T_marker_camera = (
+                None if pose.T_marker_camera is None else pose.T_marker_camera.copy()
+            )
+            stage_t0 = time.perf_counter()
+            filtered_depth = self._apply_depth_filter_to_pose(pose, track_points)
+            mark_pose_timing("pose_depth_filter_prior_ms", stage_t0)
+            stage_t0 = time.perf_counter()
+            inlier_corners = self._inlier_corners_from_pose(pose, tracker_corners)
+            mark_pose_timing("pose_inlier_corners_prior_ms", stage_t0)
+
+        stage_t0 = time.perf_counter()
         visual_corners = self._visual_corners_from_pose(
             inlier_corners,
             pose.rvec,
             pose.tvec,
         )
+        mark_pose_timing("pose_visual_corners_ms", stage_t0)
         visual_note = ""
         if len(visual_corners) != len(inlier_corners):
             visual_note = (
@@ -817,7 +1024,9 @@ class PoseEstimationMixin:
                 f"{len(inlier_corners)}."
             )
         if update_persistence:
+            stage_t0 = time.perf_counter()
             reject_reason = self._decode_update_rejection_reason(visual_corners)
+            mark_pose_timing("pose_decode_update_guard_ms", stage_t0)
             if reject_reason:
                 self.pose_tracker.rvec = prev_pose_rvec
                 self.pose_tracker.tvec = prev_pose_tvec
@@ -838,10 +1047,19 @@ class PoseEstimationMixin:
                     pnp_method=str(getattr(pose, "method", "")),
                     corners=[],
                     correspondence_corners=tracker_corners,
-                    timings_ms={"pnp_ms": pnp_ms},
+                    timings_ms=dict(pose_timings),
+                    **self._depth_filter_kwargs(filtered_depth),
+                    **self._plateau_prior_kwargs(
+                        plateau_prior,
+                        triggered=plateau_triggered,
+                        attempted=plateau_triggered,
+                        applied=plateau_applied,
+                    ),
                 )
 
+            stage_t0 = time.perf_counter()
             self._store_persistent_correspondences(visual_corners)
+            mark_pose_timing("pose_persistent_store_ms", stage_t0)
 
         if not update_persistence and len(visual_corners) < self.config.visual_corner_min_count:
             visual_corners = []
@@ -890,8 +1108,14 @@ class PoseEstimationMixin:
             confidence=confidence,
             pose_source=pose_source,
             pnp_method=str(getattr(pose, "method", "")),
-            timings_ms={"pnp_ms": pnp_ms},
+            timings_ms=dict(pose_timings),
             **self._depth_filter_kwargs(filtered_depth),
+            **self._plateau_prior_kwargs(
+                plateau_prior,
+                triggered=plateau_triggered,
+                attempted=plateau_triggered,
+                applied=plateau_applied,
+            ),
         )
 
     def _reprojection_errors_for_pose(

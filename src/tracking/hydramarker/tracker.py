@@ -82,6 +82,42 @@ class HydraTracker(
             reprojection_guard_px=self.config.pose_depth_filter_reprojection_guard_px,
             K=self.K,
             dist_coeffs=self.dist_coeffs,
+            innovation_guard_enabled=self.config.pose_depth_filter_innovation_guard_enabled,
+            innovation_guard_window=self.config.pose_depth_filter_innovation_window,
+            innovation_guard_bias_threshold_mm=(
+                self.config.pose_depth_filter_innovation_bias_threshold_mm
+            ),
+            innovation_guard_min_same_sign=(
+                self.config.pose_depth_filter_innovation_min_same_sign
+            ),
+            innovation_cusum_slack_mm=self.config.pose_depth_filter_innovation_cusum_slack_mm,
+            innovation_cusum_threshold_mm=(
+                self.config.pose_depth_filter_innovation_cusum_threshold_mm
+            ),
+            negative_delta_guard_enabled=(
+                self.config.pose_depth_filter_negative_delta_guard_enabled
+            ),
+            negative_delta_guard_min_z_span_mm=(
+                self.config.pose_depth_filter_negative_delta_guard_min_z_span_mm
+            ),
+            negative_delta_guard_max_negative_delta_mm=(
+                self.config.pose_depth_filter_negative_delta_guard_max_negative_delta_mm
+            ),
+            negative_delta_guard_hold_previous_z=(
+                self.config.pose_depth_filter_negative_delta_guard_hold_previous_z
+            ),
+            negative_delta_guard_hold_requires_innovation_bias=(
+                self.config.pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias
+            ),
+            negative_delta_guard_hold_min_negative_delta_mm=(
+                self.config.pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm
+            ),
+            negative_delta_guard_max_hold_correction_mm=(
+                self.config.pose_depth_filter_negative_delta_guard_max_hold_correction_mm
+            ),
+            negative_delta_guard_velocity_damping=(
+                self.config.pose_depth_filter_negative_delta_guard_velocity_damping
+            ),
         )
 
         self.mode = TrackerMode.LOST

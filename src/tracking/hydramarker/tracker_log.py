@@ -24,7 +24,7 @@ COLUMNS = [
     # frame / timing
     "frame", "wall_ms",
     "tracker_total_ms", "checkerboard_ms", "fast_persistent_ms",
-    "persistent_match_ms", "pnp_ms", "pnp_method", "pose_propagation_ms",
+    "persistent_match_ms", "pnp_ms", "pnp_method", "pose_plateau_prior_ms", "pose_propagation_ms",
     "decode_pose_ms", "hold_pose_ms", "emergency_hold_ms", "draw_ms",
     "checkerboard_to_gray_ms", "checkerboard_track_total_ms",
     "checkerboard_lk_ms", "checkerboard_tracking_validate_ms",
@@ -38,6 +38,7 @@ COLUMNS = [
     "checkerboard_recovery_build_best_ms",
     "checkerboard_lattice_fit_ms",
     "checkerboard_grid_build_lattice_ms",
+    "timing_profile_ms",
     "checkerboard_detail_timings",
 
     # tracker result
@@ -97,6 +98,24 @@ COLUMNS = [
     "depth_filter_z_mm",
     "depth_filter_reproj_excess_px",
     "depth_filter_guard_alpha",
+    "depth_filter_innovation_z_mm",
+    "depth_filter_innovation_mean_z_mm",
+    "depth_filter_innovation_cusum_pos_mm",
+    "depth_filter_innovation_cusum_neg_mm",
+    "depth_filter_innovation_bias_detected",
+    "depth_filter_innovation_bias_direction",
+    "depth_filter_innovation_bias_limited",
+    "depth_filter_object_z_span_mm",
+    "depth_filter_negative_delta_guard_limited",
+    "pose_plateau_prior_triggered",
+    "pose_plateau_prior_attempted",
+    "pose_plateau_prior_applied",
+    "pose_plateau_prior_method",
+    "pose_plateau_prior_reason",
+    "pose_plateau_prior_delta_z_mm",
+    "pose_plateau_prior_reproj_excess_px",
+    "pose_plateau_prior_max_reproj_excess_px",
+    "pose_plateau_prior_iterations",
 
     # board-relative pose diagnostics, filled by debug_tracker_translation
     "board_pose_available",
@@ -275,6 +294,22 @@ def _fmt_float(x: Optional[float], digits: int = 3) -> str:
     if x is None or not np.isfinite(x):
         return ""
     return f"{float(x):.{digits}f}"
+
+
+def _timing_profile_dict(timings: dict[str, Any], *, wall_ms: float, draw_ms: float) -> dict[str, float]:
+    profile: dict[str, float] = {}
+    source = dict(timings or {})
+    source["wall_ms"] = wall_ms
+    source["draw_ms"] = draw_ms
+    for key, value in sorted(source.items()):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(parsed):
+            continue
+        profile[str(key)] = round(parsed, 3)
+    return profile
 
 
 def set_debug_board_transform(T_B_C: Optional[np.ndarray]) -> None:
@@ -1658,6 +1693,8 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
     if dense_object_span is not None and float(dense_object_span) < 0.0:
         dense_object_span = None
 
+    timing_profile = _timing_profile_dict(timings, wall_ms=wall_ms, draw_ms=draw_ms)
+
     row = {
         "frame": frame_idx,
         "wall_ms": f"{wall_ms:.1f}",
@@ -1667,6 +1704,7 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
         "persistent_match_ms": _fmt_float(timings.get("persistent_match_ms")),
         "pnp_ms": _fmt_float(timings.get("pnp_ms")),
         "pnp_method": getattr(result, "pnp_method", ""),
+        "pose_plateau_prior_ms": _fmt_float(timings.get("pose_plateau_prior_ms")),
         "pose_propagation_ms": _fmt_float(timings.get("pose_propagation_ms")),
         "decode_pose_ms": _fmt_float(timings.get("decode_pose_ms")),
         "hold_pose_ms": _fmt_float(timings.get("hold_pose_ms")),
@@ -1686,6 +1724,7 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
         "checkerboard_recovery_build_best_ms": _fmt_float(timings.get("checkerboard_recovery_build_best_ms")),
         "checkerboard_lattice_fit_ms": _fmt_float(timings.get("checkerboard_lattice_fit_ms")),
         "checkerboard_grid_build_lattice_ms": _fmt_float(timings.get("checkerboard_grid_build_lattice_ms")),
+        "timing_profile_ms": timing_profile,
         "checkerboard_detail_timings": {
             key[len("checkerboard_"):]: round(float(value), 3)
             for key, value in sorted(timings.items())
@@ -1792,6 +1831,56 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
             getattr(result, "depth_filter_reproj_excess_px", None)
         ),
         "depth_filter_guard_alpha": _fmt_float(getattr(result, "depth_filter_guard_alpha", None)),
+        "depth_filter_innovation_z_mm": _fmt_float(
+            getattr(result, "depth_filter_innovation_z_mm", None)
+        ),
+        "depth_filter_innovation_mean_z_mm": _fmt_float(
+            getattr(result, "depth_filter_innovation_mean_z_mm", None)
+        ),
+        "depth_filter_innovation_cusum_pos_mm": _fmt_float(
+            getattr(result, "depth_filter_innovation_cusum_pos_mm", None)
+        ),
+        "depth_filter_innovation_cusum_neg_mm": _fmt_float(
+            getattr(result, "depth_filter_innovation_cusum_neg_mm", None)
+        ),
+        "depth_filter_innovation_bias_detected": int(
+            bool(getattr(result, "depth_filter_innovation_bias_detected", False))
+        ),
+        "depth_filter_innovation_bias_direction": int(
+            getattr(result, "depth_filter_innovation_bias_direction", 0) or 0
+        ),
+        "depth_filter_innovation_bias_limited": int(
+            bool(getattr(result, "depth_filter_innovation_bias_limited", False))
+        ),
+        "depth_filter_object_z_span_mm": _fmt_float(
+            getattr(result, "depth_filter_object_z_span_mm", None)
+        ),
+        "depth_filter_negative_delta_guard_limited": int(
+            bool(getattr(result, "depth_filter_negative_delta_guard_limited", False))
+        ),
+        "pose_plateau_prior_triggered": int(
+            bool(getattr(result, "pose_plateau_prior_triggered", False))
+        ),
+        "pose_plateau_prior_attempted": int(
+            bool(getattr(result, "pose_plateau_prior_attempted", False))
+        ),
+        "pose_plateau_prior_applied": int(
+            bool(getattr(result, "pose_plateau_prior_applied", False))
+        ),
+        "pose_plateau_prior_method": getattr(result, "pose_plateau_prior_method", ""),
+        "pose_plateau_prior_reason": getattr(result, "pose_plateau_prior_reason", ""),
+        "pose_plateau_prior_delta_z_mm": _fmt_float(
+            getattr(result, "pose_plateau_prior_delta_z_mm", None)
+        ),
+        "pose_plateau_prior_reproj_excess_px": _fmt_float(
+            getattr(result, "pose_plateau_prior_reproj_excess_px", None)
+        ),
+        "pose_plateau_prior_max_reproj_excess_px": _fmt_float(
+            getattr(result, "pose_plateau_prior_max_reproj_excess_px", None)
+        ),
+        "pose_plateau_prior_iterations": int(
+            getattr(result, "pose_plateau_prior_iterations", 0) or 0
+        ),
 
         "board_pose_available": int(board_pose["available"]),
         "board_tvec_x_mm": _fmt_float(board_pose["x"]),

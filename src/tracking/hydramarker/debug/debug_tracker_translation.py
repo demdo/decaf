@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import sys
@@ -22,6 +23,15 @@ DEPTH_FILTER_COLUMNS = (
     "depth_filter_z_mm",
     "depth_filter_reproj_excess_px",
     "depth_filter_guard_alpha",
+    "depth_filter_innovation_z_mm",
+    "depth_filter_innovation_mean_z_mm",
+    "depth_filter_innovation_cusum_pos_mm",
+    "depth_filter_innovation_cusum_neg_mm",
+    "depth_filter_innovation_bias_detected",
+    "depth_filter_innovation_bias_direction",
+    "depth_filter_innovation_bias_limited",
+    "depth_filter_object_z_span_mm",
+    "depth_filter_negative_delta_guard_limited",
 )
 
 
@@ -113,6 +123,128 @@ def _to_int(value, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _finite_float(value) -> float | None:
+    parsed = _to_float(value)
+    if not np.isfinite(parsed):
+        return None
+    return float(parsed)
+
+
+def _timing_profile_from_frame_data(data: dict) -> dict[str, float]:
+    timings: dict[str, float] = {}
+
+    profile = data.get("timing_profile_ms")
+    if isinstance(profile, dict):
+        for key, value in profile.items():
+            parsed = _finite_float(value)
+            if parsed is not None:
+                timings[str(key)] = parsed
+
+    for key, value in data.items():
+        if key == "timing_profile_ms":
+            continue
+        if not (str(key).endswith("_ms") or key == "wall_ms"):
+            continue
+        parsed = _finite_float(value)
+        if parsed is not None:
+            timings[str(key)] = parsed
+
+    return timings
+
+
+def _component_spread_stats(values: np.ndarray) -> dict[str, float]:
+    finite = values[np.isfinite(values)]
+    if len(finite) == 0:
+        return {
+            "mean": np.nan,
+            "median": np.nan,
+            "std": np.nan,
+            "var": np.nan,
+            "rms": np.nan,
+            "p95_abs": np.nan,
+            "p95_low": np.nan,
+            "p95_high": np.nan,
+        }
+
+    return {
+        "mean": float(np.mean(finite)),
+        "median": float(np.median(finite)),
+        "std": float(np.std(finite, ddof=1)) if len(finite) > 1 else 0.0,
+        "var": float(np.var(finite, ddof=1)) if len(finite) > 1 else 0.0,
+        "rms": float(np.sqrt(np.mean(np.square(finite)))),
+        "p95_abs": float(np.percentile(np.abs(finite), 95.0)),
+        "p95_low": float(np.percentile(finite, 2.5)),
+        "p95_high": float(np.percentile(finite, 97.5)),
+    }
+
+
+def timing_profile_summary(run: dict) -> list[dict[str, float | int | str]]:
+    series = dict(run.get("timing_series") or {})
+    rows: list[dict[str, float | int | str]] = []
+    for key in sorted(series):
+        values = np.asarray(series[key], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        if len(finite) == 0:
+            continue
+        rows.append(
+            {
+                "timing": key,
+                "count": int(len(finite)),
+                "mean_ms": float(np.mean(finite)),
+                "median_ms": float(np.median(finite)),
+                "p95_ms": float(np.percentile(finite, 95.0)),
+                "max_ms": float(np.max(finite)),
+                "sum_ms": float(np.sum(finite)),
+            }
+        )
+    rows.sort(key=lambda row: float(row["sum_ms"]), reverse=True)
+    return rows
+
+
+def write_timing_profile_summary(run: dict) -> Path | None:
+    rows = timing_profile_summary(run)
+    if not rows:
+        return None
+
+    path: Path = run["path"]
+    out_path = path.with_name(f"{path.stem}_timing_profile_summary.csv")
+    fieldnames = ["timing", "count", "mean_ms", "median_ms", "p95_ms", "max_ms", "sum_ms"]
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "timing": row["timing"],
+                    "count": row["count"],
+                    "mean_ms": f"{float(row['mean_ms']):.4f}",
+                    "median_ms": f"{float(row['median_ms']):.4f}",
+                    "p95_ms": f"{float(row['p95_ms']):.4f}",
+                    "max_ms": f"{float(row['max_ms']):.4f}",
+                    "sum_ms": f"{float(row['sum_ms']):.4f}",
+                }
+            )
+    print(f"[timing_profile] saved -> {out_path.resolve()}")
+    return out_path
+
+
+def print_timing_profile_summary(run: dict, limit: int = 12) -> None:
+    rows = timing_profile_summary(run)
+    if not rows:
+        return
+    print("[timing_profile] slowest accumulated timings:")
+    for row in rows[:limit]:
+        print(
+            "  "
+            f"{row['timing']}: "
+            f"mean={float(row['mean_ms']):.3f} ms, "
+            f"p95={float(row['p95_ms']):.3f} ms, "
+            f"max={float(row['max_ms']):.3f} ms, "
+            f"sum={float(row['sum_ms']):.1f} ms, "
+            f"n={int(row['count'])}"
+        )
 
 
 def _qt_app():
@@ -333,6 +465,38 @@ def replay_depth_filter_on_run(path: Path, output_path: Path | None = None) -> P
         reprojection_guard_px=float(cfg.pose_depth_filter_reprojection_guard_px),
         K=K,
         dist_coeffs=dist,
+        innovation_guard_enabled=bool(cfg.pose_depth_filter_innovation_guard_enabled),
+        innovation_guard_window=int(cfg.pose_depth_filter_innovation_window),
+        innovation_guard_bias_threshold_mm=float(
+            cfg.pose_depth_filter_innovation_bias_threshold_mm
+        ),
+        innovation_guard_min_same_sign=int(cfg.pose_depth_filter_innovation_min_same_sign),
+        innovation_cusum_slack_mm=float(cfg.pose_depth_filter_innovation_cusum_slack_mm),
+        innovation_cusum_threshold_mm=float(cfg.pose_depth_filter_innovation_cusum_threshold_mm),
+        negative_delta_guard_enabled=bool(
+            cfg.pose_depth_filter_negative_delta_guard_enabled
+        ),
+        negative_delta_guard_min_z_span_mm=float(
+            cfg.pose_depth_filter_negative_delta_guard_min_z_span_mm
+        ),
+        negative_delta_guard_max_negative_delta_mm=float(
+            cfg.pose_depth_filter_negative_delta_guard_max_negative_delta_mm
+        ),
+        negative_delta_guard_hold_previous_z=bool(
+            cfg.pose_depth_filter_negative_delta_guard_hold_previous_z
+        ),
+        negative_delta_guard_hold_requires_innovation_bias=bool(
+            cfg.pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias
+        ),
+        negative_delta_guard_hold_min_negative_delta_mm=float(
+            cfg.pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm
+        ),
+        negative_delta_guard_max_hold_correction_mm=float(
+            cfg.pose_depth_filter_negative_delta_guard_max_hold_correction_mm
+        ),
+        negative_delta_guard_velocity_damping=float(
+            cfg.pose_depth_filter_negative_delta_guard_velocity_damping
+        ),
     )
     min_points = max(1, int(cfg.pose_depth_filter_min_points))
 
@@ -365,6 +529,48 @@ def replay_depth_filter_on_run(path: Path, output_path: Path | None = None) -> P
                         cfg.pose_depth_filter_reprojection_guard_px
                     ),
                     "pose_depth_filter_min_points": int(cfg.pose_depth_filter_min_points),
+                    "pose_depth_filter_innovation_guard_enabled": bool(
+                        cfg.pose_depth_filter_innovation_guard_enabled
+                    ),
+                    "pose_depth_filter_innovation_window": int(
+                        cfg.pose_depth_filter_innovation_window
+                    ),
+                    "pose_depth_filter_innovation_bias_threshold_mm": float(
+                        cfg.pose_depth_filter_innovation_bias_threshold_mm
+                    ),
+                    "pose_depth_filter_innovation_min_same_sign": int(
+                        cfg.pose_depth_filter_innovation_min_same_sign
+                    ),
+                    "pose_depth_filter_innovation_cusum_slack_mm": float(
+                        cfg.pose_depth_filter_innovation_cusum_slack_mm
+                    ),
+                    "pose_depth_filter_innovation_cusum_threshold_mm": float(
+                        cfg.pose_depth_filter_innovation_cusum_threshold_mm
+                    ),
+                    "pose_depth_filter_negative_delta_guard_enabled": bool(
+                        cfg.pose_depth_filter_negative_delta_guard_enabled
+                    ),
+                    "pose_depth_filter_negative_delta_guard_min_z_span_mm": float(
+                        cfg.pose_depth_filter_negative_delta_guard_min_z_span_mm
+                    ),
+                    "pose_depth_filter_negative_delta_guard_max_negative_delta_mm": float(
+                        cfg.pose_depth_filter_negative_delta_guard_max_negative_delta_mm
+                    ),
+                    "pose_depth_filter_negative_delta_guard_hold_previous_z": bool(
+                        cfg.pose_depth_filter_negative_delta_guard_hold_previous_z
+                    ),
+                    "pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias": bool(
+                        cfg.pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias
+                    ),
+                    "pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm": float(
+                        cfg.pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm
+                    ),
+                    "pose_depth_filter_negative_delta_guard_max_hold_correction_mm": float(
+                        cfg.pose_depth_filter_negative_delta_guard_max_hold_correction_mm
+                    ),
+                    "pose_depth_filter_negative_delta_guard_velocity_damping": float(
+                        cfg.pose_depth_filter_negative_delta_guard_velocity_damping
+                    ),
                     "offline_depth_filter_replay": True,
                 }
             )
@@ -411,6 +617,31 @@ def replay_depth_filter_on_run(path: Path, output_path: Path | None = None) -> P
             float(filtered.reprojection_excess_px)
         )
         data["depth_filter_guard_alpha"] = _fmt_debug_float(float(filtered.guard_alpha), digits=6)
+        data["depth_filter_innovation_z_mm"] = _fmt_debug_float(float(filtered.innovation_z_mm))
+        data["depth_filter_innovation_mean_z_mm"] = _fmt_debug_float(
+            float(filtered.innovation_mean_z_mm)
+        )
+        data["depth_filter_innovation_cusum_pos_mm"] = _fmt_debug_float(
+            float(filtered.innovation_cusum_pos_mm)
+        )
+        data["depth_filter_innovation_cusum_neg_mm"] = _fmt_debug_float(
+            float(filtered.innovation_cusum_neg_mm)
+        )
+        data["depth_filter_innovation_bias_detected"] = int(
+            bool(filtered.innovation_bias_detected)
+        )
+        data["depth_filter_innovation_bias_direction"] = int(
+            filtered.innovation_bias_direction
+        )
+        data["depth_filter_innovation_bias_limited"] = int(
+            bool(filtered.innovation_bias_limited)
+        )
+        data["depth_filter_object_z_span_mm"] = _fmt_debug_float(
+            float(filtered.object_z_span_mm)
+        )
+        data["depth_filter_negative_delta_guard_limited"] = int(
+            bool(filtered.negative_delta_guard_limited)
+        )
         data.update(
             _reprojection_stats(
                 K=K,
@@ -914,6 +1145,7 @@ def load_tracker_run(path: Path) -> dict:
     pitch_deg: list[float] = []
     yaw_deg: list[float] = []
     best_method: list[str] = []
+    timing_rows: list[dict[str, float]] = []
 
     run_id = path.stem
     run_timestamp = ""
@@ -961,6 +1193,7 @@ def load_tracker_run(path: Path) -> dict:
                 continue
 
             data = record.get("data") or {}
+            timing_rows.append(_timing_profile_from_frame_data(data))
             frames.append(_to_int(data.get("frame"), default=len(frames)))
             success.append(_to_int(data.get("success"), default=0))
             pose_is_fresh.append(_to_int(data.get("pose_is_fresh"), default=0))
@@ -1033,6 +1266,11 @@ def load_tracker_run(path: Path) -> dict:
 
     logged_delta_arr = np.asarray(logged_delta, dtype=np.float64)
     plot_delta = np.where(np.isfinite(computed_delta), computed_delta, logged_delta_arr)
+    timing_keys = sorted({key for row in timing_rows for key in row})
+    timing_series = {
+        key: np.asarray([row.get(key, np.nan) for row in timing_rows], dtype=np.float64)
+        for key in timing_keys
+    }
 
     return {
         "path": path,
@@ -1061,6 +1299,7 @@ def load_tracker_run(path: Path) -> dict:
         "pitch_deg": np.asarray(pitch_deg, dtype=np.float64),
         "yaw_deg": np.asarray(yaw_deg, dtype=np.float64),
         "best_method": np.asarray(best_method, dtype=object),
+        "timing_series": timing_series,
     }
 
 
@@ -1207,11 +1446,26 @@ def plot_translation(run: dict) -> Path:
         )
 
         if np.any(np.isfinite(values)):
-            first_value = float(values[np.where(np.isfinite(values))[0][0]])
-            ax.axhline(first_value, color=color, alpha=0.22, linewidth=1.2, linestyle="--")
-
-            value_range = float(np.nanmax(values) - np.nanmin(values))
-            ax.set_title(f"{label.upper()} relative component   range={value_range:.2f} mm", loc="left")
+            stats = _component_spread_stats(values)
+            if np.isfinite(stats["p95_low"]) and np.isfinite(stats["p95_high"]):
+                ax.axhspan(
+                    stats["p95_low"],
+                    stats["p95_high"],
+                    color=color,
+                    alpha=0.08,
+                    lw=0,
+                    label="95% band",
+                )
+            ax.axhline(0.0, color="#555555", alpha=0.32, linewidth=1.1, linestyle="--")
+            ax.set_title(
+                (
+                    f"{label.upper()} relative component   "
+                    f"p95|0|={stats['p95_abs']:.2f} mm   "
+                    f"95%=[{stats['p95_low']:+.2f},{stats['p95_high']:+.2f}] mm   "
+                    f"std={stats['std']:.2f} mm   var={stats['var']:.3f} mm^2"
+                ),
+                loc="left",
+            )
         else:
             ax.set_title(f"{label.upper()} relative component", loc="left")
 
@@ -1323,6 +1577,8 @@ def plot_existing_run(path: Path | None = None) -> Path | None:
         return None
 
     run = load_tracker_run(path)
+    print_timing_profile_summary(run)
+    write_timing_profile_summary(run)
     return plot_translation(run)
 
 

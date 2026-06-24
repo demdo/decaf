@@ -43,6 +43,38 @@ class TrackerConfig:
     pose_depth_filter_initial_velocity_std_mm: float = 0.1
     pose_depth_filter_reprojection_guard_px: float = 1.0
     pose_depth_filter_min_points: int = 6
+    pose_depth_filter_innovation_guard_enabled: bool = True
+    pose_depth_filter_innovation_window: int = 10
+    pose_depth_filter_innovation_bias_threshold_mm: float = 0.75
+    pose_depth_filter_innovation_min_same_sign: int = 8
+    pose_depth_filter_innovation_cusum_slack_mm: float = 0.2
+    pose_depth_filter_innovation_cusum_threshold_mm: float = 8.0
+    pose_depth_filter_negative_delta_guard_enabled: bool = True
+    pose_depth_filter_negative_delta_guard_min_z_span_mm: float = 14.835
+    pose_depth_filter_negative_delta_guard_max_negative_delta_mm: float = 0.0
+    pose_depth_filter_negative_delta_guard_hold_previous_z: bool = False
+    pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias: bool = True
+    pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm: float = 0.4
+    pose_depth_filter_negative_delta_guard_max_hold_correction_mm: float = 0.75
+    pose_depth_filter_negative_delta_guard_velocity_damping: float = 0.25
+
+    # Triggered second-stage pose prior for reprojection-consistent negative-Z
+    # plateaus. The normal fast PnP result remains the default; this stage only
+    # runs when the depth filter observes a geometry-gated negative-Z pull.
+    pose_plateau_prior_enabled: bool = True
+    pose_plateau_prior_trigger_negative_delta_mm: float = 0.0
+    pose_plateau_prior_min_object_z_span_mm: float = 14.835
+    pose_plateau_prior_min_points: int = 6
+    pose_plateau_prior_static_max_excess_px: float = 0.18
+    pose_plateau_prior_candidate_max_excess_px: float = 0.25
+    pose_plateau_prior_candidate_max_max_excess_px: float = 1.00
+    pose_plateau_prior_min_positive_z_correction_mm: float = 0.0
+    pose_plateau_prior_max_positive_z_correction_mm: float = 0.75
+    pose_plateau_prior_robust_c_px: float = 0.20
+    pose_plateau_prior_max_iterations: int = 6
+    pose_plateau_prior_max_step_translation_mm: float = 5.0
+    pose_plateau_prior_max_step_rotation_deg: float = 5.0
+    pose_plateau_prior_lm_damping: float = 1.0e-5
 
     # Early smoothing reset when the current point count falls below this
     # fraction of the best recent count. This catches gradual LK drift before

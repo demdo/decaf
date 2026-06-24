@@ -120,6 +120,24 @@ class TrackerResult:
     depth_filter_z_mm: float = float("nan")
     depth_filter_reproj_excess_px: float = float("nan")
     depth_filter_guard_alpha: float = 1.0
+    depth_filter_innovation_z_mm: float = 0.0
+    depth_filter_innovation_mean_z_mm: float = 0.0
+    depth_filter_innovation_cusum_pos_mm: float = 0.0
+    depth_filter_innovation_cusum_neg_mm: float = 0.0
+    depth_filter_innovation_bias_detected: bool = False
+    depth_filter_innovation_bias_direction: int = 0
+    depth_filter_innovation_bias_limited: bool = False
+    depth_filter_object_z_span_mm: float = float("nan")
+    depth_filter_negative_delta_guard_limited: bool = False
+    pose_plateau_prior_triggered: bool = False
+    pose_plateau_prior_attempted: bool = False
+    pose_plateau_prior_applied: bool = False
+    pose_plateau_prior_method: str = ""
+    pose_plateau_prior_reason: str = ""
+    pose_plateau_prior_delta_z_mm: float = float("nan")
+    pose_plateau_prior_reproj_excess_px: float = float("nan")
+    pose_plateau_prior_max_reproj_excess_px: float = float("nan")
+    pose_plateau_prior_iterations: int = 0
     fast_path_debug: FastPathDebug = field(default_factory=FastPathDebug)
     timings_ms: Dict[str, float] = field(default_factory=dict)
 

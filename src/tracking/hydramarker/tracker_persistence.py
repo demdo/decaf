@@ -468,18 +468,22 @@ class FastPathMixin:
             matches=len(points),
         )
 
+        dense_t0 = time.perf_counter()
         dense_result = self._try_dense_projection_refine_from_fast_pose(
             detection,
             seed_result=result,
         )
+        dense_total_ms = (time.perf_counter() - dense_t0) * 1000.0
         if dense_result is not None:
             dense_result.timings_ms["persistent_match_ms"] = persistent_match_ms
+            dense_result.timings_ms["fast_dense_total_ms"] = dense_total_ms
             dense_result.timings_ms["fast_seed_pnp_ms"] = result.timings_ms.get(
                 "pnp_ms",
                 0.0,
             )
             result = dense_result
         else:
+            result.timings_ms["fast_dense_total_ms"] = dense_total_ms
             debug = self._last_fast_path_debug
             dense_reason = str(getattr(debug, "dense_refine_reason", ""))
             current_corners = int(getattr(debug, "current_corners", 0))
@@ -505,10 +509,14 @@ class FastPathMixin:
 
         self._attach_fast_path_debug(result)
         result.confidence *= 0.95
+        refresh_t0 = time.perf_counter()
         self._refresh_persistent_correspondences_from_result(
             result,
             max_mean_error_px=self.config.fast_persistent_refresh_mean_error_px,
         )
+        result.timings_ms["fast_refresh_persistence_ms"] = (
+            time.perf_counter() - refresh_t0
+        ) * 1000.0
         return result
 
     def _try_dense_projection_refine_from_fast_pose(
