@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import math
+from typing import Sequence
+
 import numpy as np
 
 
@@ -27,6 +31,192 @@ def _compute_motion_score(
     motion_rot = np.clip(float(rot_step_deg) / float(rot_ref_deg), 0.0, 1.0)
     motion_score = float(w_tip) * motion_tip + float(w_rot) * motion_rot
     return float(np.clip(motion_score, 0.0, 1.0))
+
+
+@dataclass
+class PoseDepthFilterResult:
+    """Result of one camera-Z filter update."""
+
+    rvec: np.ndarray
+    tvec: np.ndarray
+    T_marker_camera: np.ndarray
+
+    raw_z_mm: float
+    filtered_z_mm: float
+    delta_z_mm: float
+
+    raw_reprojection_rms_px: float = math.nan
+    filtered_reprojection_rms_px: float = math.nan
+    reprojection_excess_px: float = math.nan
+    guard_alpha: float = 1.0
+    applied: bool = False
+
+
+class PoseDepthKalmanFilter:
+    """Constant-velocity Kalman filter for the camera-Z translation channel."""
+
+    def __init__(
+        self,
+        *,
+        observation_std_mm: float,
+        process_std_mm: float,
+        initial_velocity_std_mm: float,
+        reprojection_guard_px: float,
+        K: np.ndarray,
+        dist_coeffs: np.ndarray,
+    ) -> None:
+        self.observation_std_mm = max(float(observation_std_mm), 1.0e-12)
+        self.process_std_mm = max(float(process_std_mm), 1.0e-12)
+        self.initial_velocity_std_mm = max(float(initial_velocity_std_mm), 1.0e-12)
+        self.reprojection_guard_px = float(reprojection_guard_px)
+        self.K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        self.dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
+        self._x: np.ndarray | None = None
+        self._P: np.ndarray | None = None
+
+    def reset(self) -> None:
+        """Forget the current depth state."""
+        self._x = None
+        self._P = None
+
+    def snapshot(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return a restorable copy of the filter state."""
+        return (
+            None if self._x is None else self._x.copy(),
+            None if self._P is None else self._P.copy(),
+        )
+
+    def restore(self, state: tuple[np.ndarray | None, np.ndarray | None]) -> None:
+        """Restore a state previously returned by snapshot()."""
+        x, P = state
+        self._x = None if x is None else np.asarray(x, dtype=np.float64).reshape(2).copy()
+        self._P = None if P is None else np.asarray(P, dtype=np.float64).reshape(2, 2).copy()
+
+    def update(
+        self,
+        *,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        object_points: Sequence[Sequence[float]] | np.ndarray,
+        image_points: Sequence[Sequence[float]] | np.ndarray,
+    ) -> PoseDepthFilterResult:
+        """Filter one accepted pose and enforce the reprojection guard."""
+        from tracking.pose_solvers import make_transform_from_rvec_tvec
+
+        rvec_arr = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+        raw_tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+        raw_z = float(raw_tvec[2, 0])
+        filtered_z = self._update_state(raw_z)
+
+        out_tvec = raw_tvec.copy()
+        out_tvec[2, 0] = filtered_z
+
+        object_arr = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
+        image_arr = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+        raw_rms = self._reprojection_rms(object_arr, image_arr, rvec_arr, raw_tvec)
+        filtered_rms = self._reprojection_rms(object_arr, image_arr, rvec_arr, out_tvec)
+        guard_alpha = 1.0
+
+        if (
+            self.reprojection_guard_px > 0.0
+            and np.isfinite(raw_rms)
+            and np.isfinite(filtered_rms)
+            and filtered_rms - raw_rms > self.reprojection_guard_px
+        ):
+            accepted_z = raw_z
+            accepted_rms = raw_rms
+            lo = 0.0
+            hi = 1.0
+            for _ in range(20):
+                alpha = 0.5 * (lo + hi)
+                candidate_z = raw_z + alpha * (filtered_z - raw_z)
+                candidate_tvec = raw_tvec.copy()
+                candidate_tvec[2, 0] = candidate_z
+                candidate_rms = self._reprojection_rms(
+                    object_arr,
+                    image_arr,
+                    rvec_arr,
+                    candidate_tvec,
+                )
+                if (
+                    np.isfinite(candidate_rms)
+                    and candidate_rms - raw_rms <= self.reprojection_guard_px
+                ):
+                    accepted_z = float(candidate_z)
+                    accepted_rms = float(candidate_rms)
+                    guard_alpha = float(alpha)
+                    lo = alpha
+                else:
+                    hi = alpha
+
+            filtered_z = accepted_z
+            filtered_rms = accepted_rms
+            out_tvec = raw_tvec.copy()
+            out_tvec[2, 0] = filtered_z
+            if self._x is not None:
+                self._x[0] = filtered_z
+
+        T = make_transform_from_rvec_tvec(rvec_arr, out_tvec)
+        return PoseDepthFilterResult(
+            rvec=rvec_arr.copy(),
+            tvec=out_tvec.copy(),
+            T_marker_camera=np.asarray(T, dtype=np.float64).reshape(4, 4),
+            raw_z_mm=raw_z,
+            filtered_z_mm=float(filtered_z),
+            delta_z_mm=float(filtered_z - raw_z),
+            raw_reprojection_rms_px=float(raw_rms),
+            filtered_reprojection_rms_px=float(filtered_rms),
+            reprojection_excess_px=float(filtered_rms - raw_rms),
+            guard_alpha=float(guard_alpha),
+            applied=bool(abs(filtered_z - raw_z) > 1.0e-12),
+        )
+
+    def _update_state(self, measurement_z_mm: float) -> float:
+        F = np.asarray([[1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+        H = np.asarray([[1.0, 0.0]], dtype=np.float64)
+        G = np.asarray([[0.5], [1.0]], dtype=np.float64)
+        q = self.process_std_mm
+        r = self.observation_std_mm
+        Q = G @ G.T * (q * q)
+        R = np.asarray([[r * r]], dtype=np.float64)
+
+        if self._x is None or self._P is None:
+            self._x = np.asarray([float(measurement_z_mm), 0.0], dtype=np.float64)
+            self._P = np.diag([r * r, self.initial_velocity_std_mm**2]).astype(np.float64)
+
+        x_pred = F @ self._x
+        P_pred = F @ self._P @ F.T + Q
+        innovation = np.asarray([float(measurement_z_mm)], dtype=np.float64) - H @ x_pred
+        S = H @ P_pred @ H.T + R
+        K_gain = P_pred @ H.T @ np.linalg.inv(S)
+        self._x = x_pred + (K_gain @ innovation).reshape(2)
+        self._P = (np.eye(2, dtype=np.float64) - K_gain @ H) @ P_pred
+        return float(self._x[0])
+
+    def _reprojection_rms(
+        self,
+        object_points: np.ndarray,
+        image_points: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+    ) -> float:
+        if len(object_points) == 0:
+            return math.nan
+        try:
+            import cv2
+
+            projected, _ = cv2.projectPoints(
+                np.asarray(object_points, dtype=np.float64).reshape(-1, 3),
+                np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+                np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+                self.K,
+                self.dist_coeffs,
+            )
+        except Exception:
+            return math.nan
+        residual = projected.reshape(-1, 2) - np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+        err2 = np.sum(residual * residual, axis=1)
+        return float(math.sqrt(float(np.mean(err2)))) if len(err2) else math.nan
 
 
 class AdaptiveKalmanFilterCV3D:

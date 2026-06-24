@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from tracking.hydramarker.tracker_pose import PoseTrackPoint
+from tracking.hydramarker.tracker_pose import MapPoseResult, PoseTrackPoint
 from tracking.hydramarker.tracker_types import (
     DenseProjectionMatchStats,
     DetectedCorner,
@@ -909,6 +909,30 @@ class DenseRefineMixin:
             for i in inlier_idx
             if 0 <= int(i) < len(tracker_corners)
         ]
+        inlier_points = [
+            track_points[int(i)]
+            for i in inlier_idx
+            if 0 <= int(i) < len(track_points)
+        ]
+        pose_for_filter = MapPoseResult(
+            success=True,
+            message="Dense robust pose accepted.",
+            rvec=np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+            tvec=np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+            T_marker_camera=make_transform_from_rvec_tvec(rvec, tvec),
+            inlier_indices=np.asarray(inlier_idx, dtype=np.int64).reshape(-1),
+            reprojection_mean_px=mean_err,
+            reprojection_max_px=max_err,
+            num_points=len(track_points),
+            num_inliers=len(inlier_idx),
+            points=inlier_points,
+            method=method,
+        )
+        filtered_depth = self._apply_depth_filter_to_pose(pose_for_filter, track_points)
+        rvec = np.asarray(pose_for_filter.rvec, dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(pose_for_filter.tvec, dtype=np.float64).reshape(3, 1)
+        mean_err = float(pose_for_filter.reprojection_mean_px)
+        max_err = float(pose_for_filter.reprojection_max_px)
         visual_corners = self._visual_corners_from_pose(
             inlier_corners,
             rvec,
@@ -924,7 +948,7 @@ class DenseRefineMixin:
             visual_corners = []
             visual_note += " Visual corners suppressed for dense robust pose."
 
-        T = make_transform_from_rvec_tvec(rvec, tvec)
+        T = pose_for_filter.T_marker_camera
         self.pose_tracker.rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1).copy()
         self.pose_tracker.tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1).copy()
         self.pose_tracker.T_marker_camera = np.asarray(T, dtype=np.float64).reshape(4, 4)
@@ -956,6 +980,7 @@ class DenseRefineMixin:
             pose_source=pose_source,
             pnp_method=method,
             timings_ms={"pnp_ms": (time.perf_counter() - pnp_t0) * 1000.0},
+            **self._depth_filter_kwargs(filtered_depth),
         )
 
 

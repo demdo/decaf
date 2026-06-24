@@ -29,6 +29,7 @@ from tracking.hydramarker.tracker_types import (
     TrackerMode,
     TrackerResult,
 )
+from tracking.pose_filters import PoseDepthKalmanFilter
 
 
 class HydraTracker(
@@ -74,6 +75,14 @@ class HydraTracker(
         self.patch_decoder = self._create_patch_decoder()
         self.correspondence_builder = self._create_correspondence_builder()
         self.pose_tracker = self._create_pose_tracker(K, dist_coeffs)
+        self.pose_depth_filter = PoseDepthKalmanFilter(
+            observation_std_mm=self.config.pose_depth_filter_observation_std_mm,
+            process_std_mm=self.config.pose_depth_filter_process_std_mm,
+            initial_velocity_std_mm=self.config.pose_depth_filter_initial_velocity_std_mm,
+            reprojection_guard_px=self.config.pose_depth_filter_reprojection_guard_px,
+            K=self.K,
+            dist_coeffs=self.dist_coeffs,
+        )
 
         self.mode = TrackerMode.LOST
         self.frame_index = 0
@@ -131,6 +140,7 @@ class HydraTracker(
         self._last_fast_path_debug = FastPathDebug()
 
         self.pose_tracker.reset()
+        self.pose_depth_filter.reset()
         self.checkerboard_detector.reset_tracking()
 
         # Full reset: recreate dot detector to clear all smoothed state.
@@ -269,6 +279,7 @@ class HydraTracker(
 
         if self.lost_frames > self.config.max_lost_frames:
             self.pose_tracker.reset()
+            self.pose_depth_filter.reset()
             self._clear_persistent_correspondences()
             self.mode = TrackerMode.LOST
 

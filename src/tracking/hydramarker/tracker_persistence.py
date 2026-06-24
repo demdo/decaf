@@ -399,6 +399,43 @@ class FastPathMixin:
             if self.pose_tracker.T_marker_camera is None
             else self.pose_tracker.T_marker_camera.copy()
         )
+        prev_depth_filter_state = self.pose_depth_filter.snapshot()
+        prev_last_rvec = (
+            None
+            if self._last_accepted_rvec is None
+            else self._last_accepted_rvec.copy()
+        )
+        prev_last_tvec = (
+            None
+            if self._last_accepted_tvec is None
+            else self._last_accepted_tvec.copy()
+        )
+        prev_last_T = (
+            None
+            if self._last_accepted_T_marker_camera is None
+            else self._last_accepted_T_marker_camera.copy()
+        )
+        prev_last_pose_frame = int(self._last_accepted_pose_frame)
+        prev_last_good_reproj_px = float(self._last_good_reproj_px)
+        prev_max_pts_seen = int(self._max_pts_seen)
+
+        def restore_seed_state() -> None:
+            self.pose_tracker.rvec = prev_pose_rvec
+            self.pose_tracker.tvec = prev_pose_tvec
+            self.pose_tracker.T_marker_camera = prev_pose_T
+            self.pose_depth_filter.restore(prev_depth_filter_state)
+            self._last_accepted_rvec = (
+                None if prev_last_rvec is None else prev_last_rvec.copy()
+            )
+            self._last_accepted_tvec = (
+                None if prev_last_tvec is None else prev_last_tvec.copy()
+            )
+            self._last_accepted_T_marker_camera = (
+                None if prev_last_T is None else prev_last_T.copy()
+            )
+            self._last_accepted_pose_frame = prev_last_pose_frame
+            self._last_good_reproj_px = prev_last_good_reproj_px
+            self._max_pts_seen = prev_max_pts_seen
 
         result = self._estimate_and_package_pose(
             points,
@@ -416,9 +453,7 @@ class FastPathMixin:
         result.timings_ms["persistent_match_ms"] = persistent_match_ms
 
         if not result.success:
-            self.pose_tracker.rvec = prev_pose_rvec
-            self.pose_tracker.tvec = prev_pose_tvec
-            self.pose_tracker.T_marker_camera = prev_pose_T
+            restore_seed_state()
             self._set_fast_path_debug(
                 attempted=True,
                 reason=result.message,
@@ -444,6 +479,29 @@ class FastPathMixin:
                 0.0,
             )
             result = dense_result
+        else:
+            debug = self._last_fast_path_debug
+            dense_reason = str(getattr(debug, "dense_refine_reason", ""))
+            current_corners = int(getattr(debug, "current_corners", 0))
+            sparse_match_ratio = float(len(points)) / float(max(current_corners, 1))
+            dense_validation_failed = (
+                bool(getattr(debug, "dense_refine_attempted", False))
+                and not bool(getattr(debug, "dense_refine_success", False))
+                and current_corners
+                >= int(self.config.fast_persistent_dense_min_points)
+                and sparse_match_ratio
+                < float(self.config.fast_persistent_dense_rescue_min_green_ratio)
+                and dense_reason not in ("disabled", "missing_seed_pose")
+            )
+            if dense_reason.startswith("rescue_failed:") or dense_validation_failed:
+                restore_seed_state()
+                debug.success = False
+                debug.reason = (
+                    "dense_validation_rejected_seed:"
+                    f"{dense_reason}; sparse_ratio={sparse_match_ratio:.3f}"
+                )
+                debug.matches = int(len(points))
+                return None
 
         self._attach_fast_path_debug(result)
         result.confidence *= 0.95
@@ -554,34 +612,39 @@ class FastPathMixin:
             )
             return None
 
-        if median_err > self.config.fast_persistent_dense_max_median_px:
-            self._set_dense_refine_debug(
-                attempted=True,
-                reason=f"median_error:{median_err:.3f}",
-                matches=match_count,
-                median_error_px=median_err,
-                p90_error_px=p90_err,
-                stats=dense_stats,
-            )
-            return None
-
-        if p90_err > self.config.fast_persistent_dense_max_p90_px:
-            self._set_dense_refine_debug(
-                attempted=True,
-                reason=f"p90_error:{p90_err:.3f}",
-                matches=match_count,
-                median_error_px=median_err,
-                p90_error_px=p90_err,
-                stats=dense_stats,
-            )
-            return None
-
         points, corners = self._points_from_correspondences(matched_corners)
         if len(points) < min_dense_points:
             self._set_dense_refine_debug(
                 attempted=True,
                 reason=f"too_few_unique_points:{len(points)}<{min_dense_points}",
                 matches=len(points),
+                median_error_px=median_err,
+                p90_error_px=p90_err,
+                stats=dense_stats,
+            )
+            return None
+
+        seed_error_reason = ""
+        if median_err > self.config.fast_persistent_dense_max_median_px:
+            seed_error_reason = f"median_error:{median_err:.3f}"
+        elif p90_err > self.config.fast_persistent_dense_max_p90_px:
+            seed_error_reason = f"p90_error:{p90_err:.3f}"
+
+        seed_green_ratio = float(seed_result.num_inliers) / float(
+            max(int(dense_stats.detected), 1)
+        )
+        rescue_required = bool(seed_error_reason) and (
+            seed_error_reason.startswith("p90_error")
+            or seed_green_ratio
+            < float(self.config.fast_persistent_dense_rescue_min_green_ratio)
+            or median_err
+            >= float(self.config.fast_persistent_dense_rescue_min_seed_median_px)
+        )
+        if seed_error_reason and not rescue_required:
+            self._set_dense_refine_debug(
+                attempted=True,
+                reason=seed_error_reason,
+                matches=match_count,
                 median_error_px=median_err,
                 p90_error_px=p90_err,
                 stats=dense_stats,
@@ -628,7 +691,13 @@ class FastPathMixin:
         dense_solver = str(
             self.config.fast_persistent_dense_pose_solver or "direct_prior"
         ).lower()
-        if dense_solver in ("sqpnp", "robust_sqpnp", "sqpnp_trim", "robust"):
+        use_robust_solver = rescue_required or dense_solver in (
+            "sqpnp",
+            "robust_sqpnp",
+            "sqpnp_trim",
+            "robust",
+        )
+        if use_robust_solver:
             dense_result = self._estimate_dense_pose_with_robust_solver(
                 points,
                 corners,
@@ -651,6 +720,16 @@ class FastPathMixin:
             not dense_result.success
             or dense_result.num_inliers < min_dense_points
         ):
+            if not dense_result.success:
+                reject_reason = dense_result.message
+            else:
+                reject_reason = (
+                    f"too_few_inliers:{dense_result.num_inliers}<"
+                    f"{min_dense_points}"
+                )
+            if seed_error_reason:
+                reject_reason = f"rescue_failed:{seed_error_reason}; {reject_reason}"
+
             self.pose_tracker.rvec = seed_rvec.copy()
             self.pose_tracker.tvec = seed_tvec.copy()
             self.pose_tracker.T_marker_camera = None if seed_T is None else seed_T.copy()
@@ -668,11 +747,7 @@ class FastPathMixin:
             self._max_pts_seen = seed_max_pts_seen
             self._set_dense_refine_debug(
                 attempted=True,
-                reason=(
-                    dense_result.message
-                    if not dense_result.success
-                    else f"too_few_inliers:{dense_result.num_inliers}<{min_dense_points}"
-                ),
+                reason=reject_reason,
                 matches=len(points),
                 median_error_px=median_err,
                 p90_error_px=p90_err,
@@ -683,7 +758,7 @@ class FastPathMixin:
         self._set_dense_refine_debug(
             attempted=True,
             success=True,
-            reason="ok",
+            reason=f"rescue_ok:{seed_error_reason}" if seed_error_reason else "ok",
             matches=len(points),
             median_error_px=median_err,
             p90_error_px=p90_err,

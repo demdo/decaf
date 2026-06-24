@@ -114,6 +114,12 @@ class TrackerResult:
     confidence: float = 0.0
     pose_source: PoseSource = PoseSource.NONE
     pnp_method: str = ""
+    depth_filter_applied: bool = False
+    depth_filter_delta_z_mm: float = 0.0
+    depth_filter_raw_z_mm: float = float("nan")
+    depth_filter_z_mm: float = float("nan")
+    depth_filter_reproj_excess_px: float = float("nan")
+    depth_filter_guard_alpha: float = 1.0
     fast_path_debug: FastPathDebug = field(default_factory=FastPathDebug)
     timings_ms: Dict[str, float] = field(default_factory=dict)
 

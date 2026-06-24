@@ -459,12 +459,14 @@ def make_tracker(field_path, marker_json_path, K, dist) -> HydraTracker:
             max_mean_reprojection_error_px=4.0,
             max_max_reprojection_error_px=15.0,
             max_lost_frames=8,
-            max_translation_jump_mm=120.0,
-            # Drill kann sich beliebig schnell drehen — Rotations-Gate deaktiviert.
-            # Nur Translation wird geprüft (max_translation_jump_mm).
-            max_rotation_jump_deg=360.0,
-            rotation_gate_scale_per_lost_frame=0.0,
-            rotation_gate_max_deg=360.0,
+            max_translation_jump_mm=40.0,
+            # Reject one-frame pose-branch jumps before they can seed history.
+            max_rotation_jump_deg=45.0,
+            rotation_gate_scale_per_lost_frame=8.0,
+            rotation_gate_max_deg=90.0,
+            decode_update_min_visual_corners=12,
+            decode_update_min_distinct_rows=3,
+            decode_update_min_distinct_cols=3,
             # On the drill/cylinder, low pts is often caused by visibility,
             # not LK drift. Do not reset dot state based on point count.
             dot_early_reset_pts_ratio=0.0,
@@ -474,6 +476,12 @@ def make_tracker(field_path, marker_json_path, K, dist) -> HydraTracker:
             pnp_ransac_confidence=0.99,
             use_pose_prior=True,
             pnp_direct_refine_method="vvs",   # "lm" / "vvs"
+            pose_depth_filter_enabled=True,
+            pose_depth_filter_observation_std_mm=16.0,
+            pose_depth_filter_process_std_mm=0.05,
+            pose_depth_filter_initial_velocity_std_mm=0.1,
+            pose_depth_filter_reprojection_guard_px=1.0,
+            pose_depth_filter_min_points=6,
             corr_min_votes=2,
             corr_discard_conflicts=True,
             corr_require_detection_stable=False,
@@ -524,6 +532,7 @@ def run_live_tracker(
         Callable[[Any, np.ndarray, np.ndarray], bool]
     ] = None,
     after_tracker_created: Optional[Callable[[HydraTracker], None]] = None,
+    on_space_key: Optional[Callable[[HydraTracker, Any, int], bool]] = None,
     on_log_open: Optional[Callable[[Path, Path, HydraTracker], None]] = None,
     draw_extra_overlay: Optional[Callable[[np.ndarray, bool], None]] = None,
     stop_after_log_close: bool = False,
@@ -722,7 +731,10 @@ def run_live_tracker(
                 auto_blocked=auto_acquire_blocked,
             )
             if draw_extra_overlay is not None:
-                draw_extra_overlay(vis, tracker_log.is_active())
+                try:
+                    draw_extra_overlay(vis, tracker_log.is_active(), result)
+                except TypeError:
+                    draw_extra_overlay(vis, tracker_log.is_active())
             draw_ms = (time.perf_counter() - draw_t0) * 1000.0
 
             # Run log - only while SPACE-started logging is active.
@@ -744,6 +756,8 @@ def run_live_tracker(
                 else:
                     enter_idle("manual stop", keep_armed=False)
             if key == ord(" "):
+                if on_space_key is not None and on_space_key(tracker, result, frame_idx):
+                    continue
                 if tracker_log.is_active():
                     log_path = tracker_log.current_path()
                     if log_path is not None:

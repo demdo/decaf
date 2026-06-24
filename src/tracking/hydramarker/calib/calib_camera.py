@@ -33,18 +33,20 @@ DICT_ID = cv2.aruco.DICT_5X5_50
 MAX_ARUCO = 31
 MAX_CHARUCO_CORNERS = (SQUARES_X - 1) * (SQUARES_Y - 1)
 
-N_VIEWS = 30
+N_VIEWS = 80
 MIN_CHARUCO_LIVE_FOUND = 8
-MIN_CHARUCO_CAPTURE = 12
+MIN_CHARUCO_CAPTURE = 6
+MIN_CHARUCO_EDGE_CAPTURE = 4
 
-AUTO_CAPTURE_INTERVAL_S = 0.15
-MAX_CAPTURE_CANDIDATES = 1500
-SELECTION_GRID_COLS = 5
-SELECTION_GRID_ROWS = 4
-COVERAGE_EDGE_FRACTION = 0.18
-MIN_COVERAGE_CELLS = 14
-MIN_EDGE_CORNERS = 16
-MIN_QUADRANT_CORNERS = 24
+AUTO_CAPTURE_INTERVAL_S = 0.08
+MAX_CAPTURE_CANDIDATES = 3000
+SELECTION_GRID_COLS = 7
+SELECTION_GRID_ROWS = 5
+COVERAGE_EDGE_FRACTION = 0.12
+MIN_COVERAGE_CELLS = 28
+MIN_EDGE_CORNERS = 36
+MIN_QUADRANT_CORNERS = 72
+MIN_CORNER_RADIUS_NORM = 0.75
 
 REALSENSE_WIDTH = 1920
 REALSENSE_HEIGHT = 1080
@@ -246,6 +248,7 @@ def _candidate_metrics(image: np.ndarray, det: CharucoDetection) -> Dict[str, fl
         "edge_margin_px": 0.0,
         "edge_margin_norm": 0.0,
         "radius_norm": float("nan"),
+        "corner_radius_norm_max": float("nan"),
     }
 
     if det.charuco_corners is None or det.num_charuco <= 0:
@@ -268,6 +271,14 @@ def _candidate_metrics(image: np.ndarray, det: CharucoDetection) -> Dict[str, fl
     u_norm = float(centroid[0] / max(w - 1, 1))
     v_norm = float(centroid[1] / max(h - 1, 1))
     radius_norm = float(np.hypot(u_norm - 0.5, v_norm - 0.5) / np.hypot(0.5, 0.5))
+    pts_norm = np.c_[
+        pts[:, 0] / max(w - 1, 1),
+        pts[:, 1] / max(h - 1, 1),
+    ]
+    corner_radius_norm_max = float(
+        np.max(np.hypot(pts_norm[:, 0] - 0.5, pts_norm[:, 1] - 0.5))
+        / np.hypot(0.5, 0.5)
+    )
 
     metrics.update(
         {
@@ -280,6 +291,7 @@ def _candidate_metrics(image: np.ndarray, det: CharucoDetection) -> Dict[str, fl
             "edge_margin_px": edge_margin,
             "edge_margin_norm": float(edge_margin / max(min(w, h), 1)),
             "radius_norm": radius_norm,
+            "corner_radius_norm_max": corner_radius_norm_max,
         }
     )
 
@@ -292,10 +304,39 @@ def _candidate_score(metrics: Dict[str, float]) -> float:
     sharpness_score = float(
         np.clip(np.log1p(max(metrics.get("sharpness", 0.0), 0.0)) / np.log1p(2500.0), 0.0, 1.0)
     )
-    margin_px = metrics.get("edge_margin_px", 0.0)
-    margin_score = 0.0 if margin_px < 8.0 else float(np.clip(margin_px / 40.0, 0.0, 1.0))
+    radius_score = float(np.clip(metrics.get("corner_radius_norm_max", 0.0), 0.0, 1.0))
+    edge_margin_norm = float(max(metrics.get("edge_margin_norm", 1.0), 0.0))
+    edge_score = 1.0 - float(
+        np.clip(edge_margin_norm / max(COVERAGE_EDGE_FRACTION, 1e-6), 0.0, 1.0)
+    )
 
-    return 0.50 * corner_score + 0.20 * area_score + 0.20 * sharpness_score + 0.10 * margin_score
+    return (
+        0.35 * corner_score
+        + 0.18 * area_score
+        + 0.22 * sharpness_score
+        + 0.15 * radius_score
+        + 0.10 * edge_score
+    )
+
+
+def _is_fov_edge_candidate(
+    metrics: Dict[str, float],
+    image_size: tuple[int, int],
+    *,
+    edge_fraction: float = COVERAGE_EDGE_FRACTION,
+) -> bool:
+    width, height = int(image_size[0]), int(image_size[1])
+    u = float(np.nan_to_num(metrics.get("centroid_u_norm", 0.5), nan=0.5))
+    v = float(np.nan_to_num(metrics.get("centroid_v_norm", 0.5), nan=0.5))
+    edge_margin_px = float(np.nan_to_num(metrics.get("edge_margin_px", np.inf), nan=np.inf))
+    edge_band_px = float(edge_fraction) * float(min(width, height))
+    centroid_in_edge_band = (
+        u <= edge_fraction
+        or u >= 1.0 - edge_fraction
+        or v <= edge_fraction
+        or v >= 1.0 - edge_fraction
+    )
+    return bool(centroid_in_edge_band or edge_margin_px <= edge_band_px)
 
 
 def make_calibration_candidate(
@@ -325,7 +366,7 @@ def _candidate_grid_cell(metrics: Dict[str, float]) -> tuple[int, int]:
 
 
 def _candidate_radius_bin(metrics: Dict[str, float]) -> int:
-    radius = float(np.nan_to_num(metrics.get("radius_norm", 0.0), nan=0.0))
+    radius = float(np.nan_to_num(metrics.get("corner_radius_norm_max", 0.0), nan=0.0))
     return int(np.clip(np.floor(radius * 4.0), 0, 3))
 
 
@@ -341,6 +382,7 @@ def _candidate_feature(metrics: Dict[str, float]) -> np.ndarray:
             float(np.nan_to_num(metrics.get("centroid_v_norm", 0.5), nan=0.5)),
             float(np.clip(metrics.get("bbox_area_norm", 0.0) / 0.25, 0.0, 1.0)),
             float(np.clip(metrics.get("corner_fraction", 0.0), 0.0, 1.0)),
+            float(np.clip(metrics.get("corner_radius_norm_max", 0.0), 0.0, 1.0)),
         ],
         dtype=np.float64,
     )
@@ -408,9 +450,18 @@ def compute_corner_coverage(
         min_u, min_v = np.min(stacked, axis=0)
         max_u, max_v = np.max(stacked, axis=0)
         total_corners = int(stacked.shape[0])
+        stacked_norm = np.c_[
+            stacked[:, 0] / max(width - 1, 1),
+            stacked[:, 1] / max(height - 1, 1),
+        ]
+        radius_norm = np.hypot(stacked_norm[:, 0] - 0.5, stacked_norm[:, 1] - 0.5) / np.hypot(0.5, 0.5)
+        max_corner_radius_norm = float(np.max(radius_norm))
+        p95_corner_radius_norm = float(np.percentile(radius_norm, 95))
     else:
         min_u = min_v = max_u = max_v = float("nan")
         total_corners = 0
+        max_corner_radius_norm = float("nan")
+        p95_corner_radius_norm = float("nan")
 
     covered_cells = int(np.count_nonzero(grid_counts > 0))
     total_cells = int(grid_cols * grid_rows)
@@ -427,6 +478,8 @@ def compute_corner_coverage(
         "max_u": float(max_u),
         "min_v": float(min_v),
         "max_v": float(max_v),
+        "max_corner_radius_norm": max_corner_radius_norm,
+        "p95_corner_radius_norm": p95_corner_radius_norm,
         "grid_cols": int(grid_cols),
         "grid_rows": int(grid_rows),
         "edge_fraction": float(edge_fraction),
@@ -439,6 +492,7 @@ def coverage_failures(
     min_coverage_cells: int = MIN_COVERAGE_CELLS,
     min_edge_corners: int = MIN_EDGE_CORNERS,
     min_quadrant_corners: int = MIN_QUADRANT_CORNERS,
+    min_corner_radius_norm: float = MIN_CORNER_RADIUS_NORM,
 ) -> list[str]:
     failures: list[str] = []
     if int(coverage.get("covered_cells", 0)) < int(min_coverage_cells):
@@ -459,6 +513,10 @@ def coverage_failures(
         if count < int(min_quadrant_corners):
             failures.append(f"{name} quadrant {count}/{min_quadrant_corners}")
 
+    max_radius = float(coverage.get("max_corner_radius_norm", float("nan")))
+    if not np.isfinite(max_radius) or max_radius < float(min_corner_radius_norm):
+        failures.append(f"corner radius {max_radius:.2f}/{float(min_corner_radius_norm):.2f}")
+
     return failures
 
 
@@ -469,7 +527,8 @@ def _coverage_short_text(coverage: Optional[Dict[str, Any]]) -> str:
     return (
         f"Coverage: {coverage.get('covered_cells', 0)}/{coverage.get('total_cells', 0)} cells "
         f"L/R/T/B={edges.get('left', 0)}/{edges.get('right', 0)}/"
-        f"{edges.get('top', 0)}/{edges.get('bottom', 0)}"
+        f"{edges.get('top', 0)}/{edges.get('bottom', 0)} "
+        f"Rmax={float(coverage.get('max_corner_radius_norm', float('nan'))):.2f}"
     )
 
 
@@ -478,17 +537,30 @@ def select_calibration_candidates(
     *,
     target_views: int,
     min_charuco_corners: int,
+    min_edge_charuco_corners: int = MIN_CHARUCO_EDGE_CAPTURE,
     image_size: tuple[int, int],
     grid_cols: int = SELECTION_GRID_COLS,
     grid_rows: int = SELECTION_GRID_ROWS,
     edge_fraction: float = COVERAGE_EDGE_FRACTION,
+    min_edge_corners: int = MIN_EDGE_CORNERS,
+    min_quadrant_corners: int = MIN_QUADRANT_CORNERS,
 ) -> list[CalibrationCandidate]:
     valid = [
         c
         for c in candidates
         if c.det.charuco_corners is not None
         and c.det.charuco_ids is not None
-        and c.det.num_charuco >= min_charuco_corners
+        and (
+            c.det.num_charuco >= min_charuco_corners
+            or (
+                c.det.num_charuco >= min_edge_charuco_corners
+                and _is_fov_edge_candidate(
+                    c.metrics,
+                    image_size,
+                    edge_fraction=edge_fraction,
+                )
+            )
+        )
     ]
 
     if len(valid) <= target_views:
@@ -536,7 +608,7 @@ def select_calibration_candidates(
                     "bottom": int(np.count_nonzero(pts[:, 1] >= (1.0 - edge_fraction) * height)),
                 }
                 for edge, count in edge_candidate_counts.items():
-                    need = max(0, MIN_EDGE_CORNERS - selected_edge_counts[edge])
+                    need = max(0, int(min_edge_corners) - selected_edge_counts[edge])
                     if need > 0:
                         diversity_bonus += 0.35 * min(1.0, count / max(need, 1))
 
@@ -547,7 +619,11 @@ def select_calibration_candidates(
                     candidate_quadrants[q_row, q_col] += 1
                 for row in range(2):
                     for col in range(2):
-                        need = max(0, MIN_QUADRANT_CORNERS - int(selected_quadrant_counts[row, col]))
+                        need = max(
+                            0,
+                            int(min_quadrant_corners)
+                            - int(selected_quadrant_counts[row, col]),
+                        )
                         if need > 0:
                             diversity_bonus += 0.20 * min(1.0, int(candidate_quadrants[row, col]) / max(need, 1))
 
@@ -790,6 +866,11 @@ def reprojection_error_charuco(
 ) -> Tuple[float, List[Optional[float]], Dict[str, Any]]:
     per_view = []
     all_err = []
+    all_corner_err: list[float] = []
+    edge_corner_err: list[float] = []
+    center_corner_err: list[float] = []
+    radial_residuals: list[float] = []
+    tangential_residuals: list[float] = []
 
     per_img_charuco = []
     per_img_aruco = []
@@ -819,14 +900,48 @@ def reprojection_error_charuco(
         proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist)
         proj = proj.reshape(-1, 2)
 
-        err = np.linalg.norm(obs - proj, axis=1)
+        residual = obs - proj
+        err = np.linalg.norm(residual, axis=1)
         mean_err = float(np.mean(err))
 
         per_view.append(mean_err)
         all_err.append(mean_err)
+        all_corner_err.extend(float(x) for x in err.reshape(-1))
         used_idx.append(i)
 
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        width, height = _image_size(img)
+        edge_band_u = COVERAGE_EDGE_FRACTION * float(width)
+        edge_band_v = COVERAGE_EDGE_FRACTION * float(height)
+        is_edge = (
+            (obs[:, 0] <= edge_band_u)
+            | (obs[:, 0] >= (1.0 - COVERAGE_EDGE_FRACTION) * float(width))
+            | (obs[:, 1] <= edge_band_v)
+            | (obs[:, 1] >= (1.0 - COVERAGE_EDGE_FRACTION) * float(height))
+        )
+        edge_corner_err.extend(float(x) for x in err[is_edge].reshape(-1))
+        center_corner_err.extend(float(x) for x in err[~is_edge].reshape(-1))
+
+        rel = obs.astype(np.float64) - np.asarray([cx, cy], dtype=np.float64)
+        radius = np.linalg.norm(rel, axis=1)
+        valid_radius = radius > 1e-9
+        if np.any(valid_radius):
+            radial_unit = rel[valid_radius] / radius[valid_radius, None]
+            tangential_unit = np.c_[-radial_unit[:, 1], radial_unit[:, 0]]
+            res_valid = residual[valid_radius].astype(np.float64)
+            radial_residuals.extend(
+                float(x) for x in np.sum(res_valid * radial_unit, axis=1)
+            )
+            tangential_residuals.extend(
+                float(x) for x in np.sum(res_valid * tangential_unit, axis=1)
+            )
+
     mean_px = float(np.mean(all_err)) if all_err else float("nan")
+    corner_err_arr = np.asarray(all_corner_err, dtype=np.float64)
+    edge_err_arr = np.asarray(edge_corner_err, dtype=np.float64)
+    center_err_arr = np.asarray(center_corner_err, dtype=np.float64)
+    radial_arr = np.asarray(radial_residuals, dtype=np.float64)
+    tangential_arr = np.asarray(tangential_residuals, dtype=np.float64)
 
     stats = {
         "num_images_total": len(test_images),
@@ -839,6 +954,29 @@ def reprojection_error_charuco(
             if hasattr(cv2.aruco, "interpolateCornersCharuco")
             else "CharucoDetector"
         ),
+        "corner_reprojection_mean_px": float(np.mean(corner_err_arr))
+        if corner_err_arr.size
+        else float("nan"),
+        "corner_reprojection_p95_px": float(np.percentile(corner_err_arr, 95))
+        if corner_err_arr.size
+        else float("nan"),
+        "edge_corner_reprojection_mean_px": float(np.mean(edge_err_arr))
+        if edge_err_arr.size
+        else float("nan"),
+        "center_corner_reprojection_mean_px": float(np.mean(center_err_arr))
+        if center_err_arr.size
+        else float("nan"),
+        "radial_residual_mean_px": float(np.mean(radial_arr))
+        if radial_arr.size
+        else float("nan"),
+        "radial_residual_abs_mean_px": float(np.mean(np.abs(radial_arr)))
+        if radial_arr.size
+        else float("nan"),
+        "tangential_residual_abs_mean_px": float(np.mean(np.abs(tangential_arr)))
+        if tangential_arr.size
+        else float("nan"),
+        "edge_corner_count": int(edge_err_arr.size),
+        "corner_count": int(corner_err_arr.size),
     }
 
     return mean_px, per_view, stats
@@ -949,6 +1087,40 @@ def radial_plausibility_stats(K: np.ndarray, dist: np.ndarray, image_size: tuple
         "radial_positive": positive,
         "radial_turn_count": turn_count,
     }
+
+
+def calibration_model_quality_score(stats: Dict[str, Any]) -> float:
+    def value(name: str, default: float = 0.0) -> float:
+        try:
+            out = float(stats.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+        return out if np.isfinite(out) else float(default)
+
+    mean_px = value("corner_reprojection_mean_px", value("selected_reprojection_mean_px", 10.0))
+    p95_px = value("corner_reprojection_p95_px", mean_px)
+    edge_px = value("edge_corner_reprojection_mean_px", mean_px)
+    radial_bias_px = abs(value("radial_residual_mean_px", 0.0))
+    radial_abs_px = value("radial_residual_abs_mean_px", mean_px)
+    tangential_abs_px = value("tangential_residual_abs_mean_px", 0.0)
+    dist_abs_max = value("dist_coeff_abs_max", 0.0)
+    radial_turns = int(value("radial_turn_count", 0.0))
+    radial_positive = bool(stats.get("radial_positive", True))
+
+    score = (
+        mean_px
+        + 0.35 * p95_px
+        + 0.75 * edge_px
+        + 1.20 * radial_bias_px
+        + 0.35 * radial_abs_px
+        + 0.10 * tangential_abs_px
+        + 0.012 * dist_abs_max
+    )
+    if not radial_positive:
+        score += 100.0
+    if radial_turns > 0:
+        score += 2.0 * float(radial_turns)
+    return float(score)
 
 
 def make_charuco_board() -> tuple[Any, Any, Any]:
@@ -1299,9 +1471,81 @@ def save_tracking_calibration_npz(
             int(stats.get("coverage_min_quadrant_corners", 0)),
             dtype=np.int32,
         ),
+        "coverage_min_corner_radius_norm": np.asarray(
+            float(stats.get("coverage_min_corner_radius_norm", MIN_CORNER_RADIUS_NORM)),
+            dtype=np.float64,
+        ),
+        "candidate_coverage_max_corner_radius_norm": np.asarray(
+            float(stats.get("candidate_coverage_max_corner_radius_norm", np.nan)),
+            dtype=np.float64,
+        ),
+        "candidate_coverage_p95_corner_radius_norm": np.asarray(
+            float(stats.get("candidate_coverage_p95_corner_radius_norm", np.nan)),
+            dtype=np.float64,
+        ),
+        "selected_coverage_max_corner_radius_norm": np.asarray(
+            float(stats.get("selected_coverage_max_corner_radius_norm", np.nan)),
+            dtype=np.float64,
+        ),
+        "selected_coverage_p95_corner_radius_norm": np.asarray(
+            float(stats.get("selected_coverage_p95_corner_radius_norm", np.nan)),
+            dtype=np.float64,
+        ),
+        "min_capture_corners": np.asarray(
+            int(stats.get("min_capture_corners", MIN_CHARUCO_CAPTURE)),
+            dtype=np.int32,
+        ),
+        "min_edge_capture_corners": np.asarray(
+            int(stats.get("min_edge_capture_corners", MIN_CHARUCO_EDGE_CAPTURE)),
+            dtype=np.int32,
+        ),
         "coverage_forced_save": np.asarray(
             bool(stats.get("coverage_forced_save", False)),
             dtype=np.bool_,
+        ),
+        "model_quality_score": np.asarray(
+            float(stats.get("model_quality_score", np.nan)),
+            dtype=np.float64,
+        ),
+        "dist_coeff_abs_max": np.asarray(
+            float(stats.get("dist_coeff_abs_max", np.nan)),
+            dtype=np.float64,
+        ),
+        "corner_reprojection_mean_px": np.asarray(
+            float(stats.get("corner_reprojection_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "corner_reprojection_p95_px": np.asarray(
+            float(stats.get("corner_reprojection_p95_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "edge_corner_reprojection_mean_px": np.asarray(
+            float(stats.get("edge_corner_reprojection_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "center_corner_reprojection_mean_px": np.asarray(
+            float(stats.get("center_corner_reprojection_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "radial_residual_mean_px": np.asarray(
+            float(stats.get("radial_residual_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "radial_residual_abs_mean_px": np.asarray(
+            float(stats.get("radial_residual_abs_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "tangential_residual_abs_mean_px": np.asarray(
+            float(stats.get("tangential_residual_abs_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "edge_corner_count": np.asarray(
+            int(stats.get("edge_corner_count", 0)),
+            dtype=np.int32,
+        ),
+        "corner_count": np.asarray(
+            int(stats.get("corner_count", 0)),
+            dtype=np.int32,
         ),
         "radial_r_max": np.asarray(
             float(stats.get("radial_r_max", np.nan)),
@@ -1336,6 +1580,9 @@ def save_tracking_calibration_npz(
         "camera_source": np.asarray("charuco_realsense_color"),
         "distortion_model": np.asarray(
             str(stats.get("distortion_model", "opencv_brown_conrady"))
+        ),
+        "recommended_primary_model": np.asarray(
+            str(stats.get("recommended_primary_model", ""))
         ),
         "charuco_interpolation_api": np.asarray(
             str(stats.get("charuco_interpolation_api", "unknown"))
@@ -1458,6 +1705,7 @@ def save_calibration_diagnostics(
         "edge_margin_px",
         "edge_margin_norm",
         "radius_norm",
+        "corner_radius_norm_max",
         "grid_col",
         "grid_row",
         "corner_grid_cells",
@@ -1581,6 +1829,7 @@ def run_model_sweep_for_images(
 
     model_rows: list[dict[str, Any]] = []
     first_success: Path | None = None
+    best_success: tuple[np.ndarray, np.ndarray, float, dict[str, Any]] | None = None
 
     for spec in calibration_model_specs():
         print(f"[calib_camera] Model {spec.name}: {spec.description}")
@@ -1594,7 +1843,7 @@ def run_model_sweep_for_images(
                 flags=spec.flags,
                 dist_coeff_count=spec.dist_coeff_count,
             )
-            reproj_mean_px, selected_reproj, _reproj_stats = reprojection_error_charuco(
+            reproj_mean_px, selected_reproj, reproj_stats = reprojection_error_charuco(
                 calib_images,
                 board=board,
                 aruco_dict=aruco_dict,
@@ -1608,6 +1857,7 @@ def run_model_sweep_for_images(
                 for value in selected_reproj
             ]
             radial_stats = radial_plausibility_stats(K, dist, image_size)
+            dist_flat = np.asarray(dist, dtype=np.float64).reshape(-1)
             stats.update(
                 {
                     "calibration_model": spec.name,
@@ -1619,9 +1869,14 @@ def run_model_sweep_for_images(
                     ),
                     "selected_reprojection_mean_px": float(reproj_mean_px),
                     "selected_reprojection_per_view_px": selected_reproj_float,
+                    "dist_coeff_abs_max": float(np.max(np.abs(dist_flat)))
+                    if dist_flat.size
+                    else 0.0,
+                    **reproj_stats,
                     **radial_stats,
                 }
             )
+            stats["model_quality_score"] = calibration_model_quality_score(stats)
 
             save_paths: list[Path] = []
             if spec.name == "standard5":
@@ -1642,8 +1897,11 @@ def run_model_sweep_for_images(
 
             if first_success is None:
                 first_success = save_paths[0]
+            if best_success is None or float(stats["model_quality_score"]) < float(
+                best_success[3].get("model_quality_score", float("inf"))
+            ):
+                best_success = (K, dist, float(rms), stats)
 
-            dist_flat = np.asarray(dist, dtype=np.float64).reshape(-1)
             model_rows.append(
                 {
                     "model": spec.name,
@@ -1658,12 +1916,22 @@ def run_model_sweep_for_images(
                     "cx": float(K[0, 2]),
                     "cy": float(K[1, 2]),
                     "dist": " ".join(f"{x:.12g}" for x in dist_flat),
+                    "model_quality_score": float(stats["model_quality_score"]),
+                    "corner_reprojection_p95_px": stats.get("corner_reprojection_p95_px"),
+                    "edge_corner_reprojection_mean_px": stats.get(
+                        "edge_corner_reprojection_mean_px"
+                    ),
+                    "radial_residual_mean_px": stats.get("radial_residual_mean_px"),
+                    "radial_residual_abs_mean_px": stats.get(
+                        "radial_residual_abs_mean_px"
+                    ),
                     **radial_stats,
                 }
             )
             print(
                 "[calib_camera]   "
                 f"rms={float(rms):.6f} reproj={float(reproj_mean_px):.6f}px "
+                f"score={float(stats['model_quality_score']):.6f} "
                 f"dist_n={dist_flat.size} radial_turns={radial_stats['radial_turn_count']} "
                 f"positive={radial_stats['radial_positive']}"
             )
@@ -1689,6 +1957,28 @@ def run_model_sweep_for_images(
     if first_success is None:
         raise RuntimeError("Calibration failed for all models.")
 
+    if best_success is not None:
+        K, dist, rms, stats = best_success
+        recommended_stats = dict(stats)
+        recommended_stats["recommended_primary_model"] = str(
+            stats.get("calibration_model", "")
+        )
+        save_tracking_calibration_npz(
+            output_path,
+            K=K,
+            dist=np.asarray(dist, dtype=np.float64).reshape(-1, 1),
+            image_size=image_size,
+            rms=float(rms),
+            stats=recommended_stats,
+        )
+        print(
+            "[calib_camera] Recommended primary model: "
+            f"{recommended_stats.get('recommended_primary_model')} "
+            f"(score={float(recommended_stats.get('model_quality_score', float('nan'))):.6f}) "
+            f"-> {output_path}"
+        )
+        return output_path
+
     return first_success
 
 
@@ -1700,6 +1990,7 @@ def run_live_calibration(
     fps: int = REALSENSE_FPS,
     target_views: int = N_VIEWS,
     min_capture_corners: int = MIN_CHARUCO_CAPTURE,
+    min_edge_capture_corners: int = MIN_CHARUCO_EDGE_CAPTURE,
     auto_capture_interval_s: float = AUTO_CAPTURE_INTERVAL_S,
     max_candidates: int = MAX_CAPTURE_CANDIDATES,
     save_selected_images: bool = True,
@@ -1708,11 +1999,13 @@ def run_live_calibration(
     min_coverage_cells: int = MIN_COVERAGE_CELLS,
     min_edge_corners: int = MIN_EDGE_CORNERS,
     min_quadrant_corners: int = MIN_QUADRANT_CORNERS,
+    min_corner_radius_norm: float = MIN_CORNER_RADIUS_NORM,
     force_save_insufficient_coverage: bool = False,
 ) -> Path:
     output_path = Path(output_path).expanduser().resolve()
     target_views = max(3, int(target_views))
     min_capture_corners = max(4, int(min_capture_corners))
+    min_edge_capture_corners = max(4, min(int(min_edge_capture_corners), min_capture_corners))
     auto_capture_interval_s = max(0.0, float(auto_capture_interval_s))
     max_candidates = max(target_views, int(max_candidates))
     coverage_grid_cols = max(2, int(coverage_grid_cols))
@@ -1720,6 +2013,7 @@ def run_live_calibration(
     min_coverage_cells = max(1, min(int(min_coverage_cells), coverage_grid_cols * coverage_grid_rows))
     min_edge_corners = max(1, int(min_edge_corners))
     min_quadrant_corners = max(1, int(min_quadrant_corners))
+    min_corner_radius_norm = float(np.clip(float(min_corner_radius_norm), 0.0, 1.0))
 
     board, aruco_dict, detector_params = make_charuco_board()
     state = reset_state()
@@ -1765,7 +2059,19 @@ def run_live_calibration(
             found = bool(last_det.num_charuco >= MIN_CHARUCO_LIVE_FOUND)
 
             now_s = time.monotonic()
-            capture_ready = bool(last_det.num_charuco >= min_capture_corners)
+            live_metrics = _candidate_metrics(frame, last_det)
+            edge_capture_ready = bool(
+                last_det.num_charuco >= min_edge_capture_corners
+                and _is_fov_edge_candidate(
+                    live_metrics,
+                    _image_size(frame),
+                    edge_fraction=COVERAGE_EDGE_FRACTION,
+                )
+            )
+            capture_ready = bool(
+                last_det.num_charuco >= min_capture_corners or edge_capture_ready
+            )
+            found = bool(found or capture_ready)
             can_store_candidate = (
                 state["recording"]
                 and got_new_frame
@@ -1816,6 +2122,7 @@ def run_live_calibration(
                     min_coverage_cells=min_coverage_cells,
                     min_edge_corners=min_edge_corners,
                     min_quadrant_corners=min_quadrant_corners,
+                    min_corner_radius_norm=min_corner_radius_norm,
                 ),
             )
 
@@ -1878,7 +2185,13 @@ def run_live_calibration(
                     "[calib_camera] Required coverage: "
                     f"{min_coverage_cells}/{coverage_grid_cols * coverage_grid_rows} grid cells, "
                     f"{min_edge_corners}+ corners near each edge, "
-                    f"{min_quadrant_corners}+ corners in each quadrant."
+                    f"{min_quadrant_corners}+ corners in each quadrant, "
+                    f"Rmax>={min_corner_radius_norm:.2f}."
+                )
+                print(
+                    "[calib_camera] Capture thresholds: "
+                    f"{min_capture_corners}+ ChArUco corners normally, "
+                    f"{min_edge_capture_corners}+ at the image edge/corners."
                 )
                 continue
 
@@ -1892,16 +2205,20 @@ def run_live_calibration(
                 state["candidates"],
                 target_views=target_views,
                 min_charuco_corners=min_capture_corners,
+                min_edge_charuco_corners=min_edge_capture_corners,
                 image_size=_image_size(frame),
                 grid_cols=coverage_grid_cols,
                 grid_rows=coverage_grid_rows,
+                min_edge_corners=min_edge_corners,
+                min_quadrant_corners=min_quadrant_corners,
             )
             state["selected_candidates"] = selected_candidates
 
             if len(selected_candidates) < 3:
                 print(
                     "[calib_camera] Calibration skipped: need at least 3 usable "
-                    f"candidates with {min_capture_corners}+ ChArUco corners."
+                    f"candidates ({min_capture_corners}+ normally, "
+                    f"{min_edge_capture_corners}+ at image edges)."
                 )
                 continue
 
@@ -1916,6 +2233,7 @@ def run_live_calibration(
                 min_coverage_cells=min_coverage_cells,
                 min_edge_corners=min_edge_corners,
                 min_quadrant_corners=min_quadrant_corners,
+                min_corner_radius_norm=min_corner_radius_norm,
             )
             selected_coverage = compute_corner_coverage(
                 selected_candidates,
@@ -1928,6 +2246,7 @@ def run_live_calibration(
                 min_coverage_cells=min_coverage_cells,
                 min_edge_corners=min_edge_corners,
                 min_quadrant_corners=min_quadrant_corners,
+                min_corner_radius_norm=min_corner_radius_norm,
             )
 
             if (candidate_failures or selected_failures) and not force_save_insufficient_coverage:
@@ -1982,6 +2301,12 @@ def run_live_calibration(
                     int(candidate_coverage["edge_counts"][edge])
                     for edge in ("left", "right", "top", "bottom")
                 ],
+                "candidate_coverage_max_corner_radius_norm": float(
+                    candidate_coverage.get("max_corner_radius_norm", np.nan)
+                ),
+                "candidate_coverage_p95_corner_radius_norm": float(
+                    candidate_coverage.get("p95_corner_radius_norm", np.nan)
+                ),
                 "selected_coverage_cells": int(selected_coverage["covered_cells"]),
                 "selected_coverage_total_cells": int(selected_coverage["total_cells"]),
                 "selected_coverage_grid_counts": selected_coverage["grid_counts"],
@@ -1989,15 +2314,25 @@ def run_live_calibration(
                     int(selected_coverage["edge_counts"][edge])
                     for edge in ("left", "right", "top", "bottom")
                 ],
+                "selected_coverage_max_corner_radius_norm": float(
+                    selected_coverage.get("max_corner_radius_norm", np.nan)
+                ),
+                "selected_coverage_p95_corner_radius_norm": float(
+                    selected_coverage.get("p95_corner_radius_norm", np.nan)
+                ),
                 "coverage_min_cells": int(min_coverage_cells),
                 "coverage_min_edge_corners": int(min_edge_corners),
                 "coverage_min_quadrant_corners": int(min_quadrant_corners),
+                "coverage_min_corner_radius_norm": float(min_corner_radius_norm),
+                "min_capture_corners": int(min_capture_corners),
+                "min_edge_capture_corners": int(min_edge_capture_corners),
                 "coverage_forced_save": bool(force_save_insufficient_coverage),
             }
 
             diagnostics_dir: Path | None = None
             model_rows: list[dict[str, Any]] = []
             first_success: tuple[np.ndarray, np.ndarray, float, dict[str, Any], Path] | None = None
+            best_success: tuple[np.ndarray, np.ndarray, float, dict[str, Any], Path] | None = None
             primary_success = False
 
             for spec in calibration_model_specs():
@@ -2008,19 +2343,19 @@ def run_live_calibration(
                         board=board,
                         aruco_dict=aruco_dict,
                         detector_params=detector_params,
-                        min_charuco_corners=min_capture_corners,
+                        min_charuco_corners=min_edge_capture_corners,
                         flags=spec.flags,
                         dist_coeff_count=spec.dist_coeff_count,
                     )
 
-                    reproj_mean_px, selected_reproj, _reproj_stats = reprojection_error_charuco(
+                    reproj_mean_px, selected_reproj, reproj_stats = reprojection_error_charuco(
                         selected_images,
                         board=board,
                         aruco_dict=aruco_dict,
                         K=K,
                         dist=dist,
                         detector_params=detector_params,
-                        min_charuco_corners=min_capture_corners,
+                        min_charuco_corners=min_edge_capture_corners,
                     )
                     selected_reproj_float = [
                         float("nan") if value is None else float(value)
@@ -2039,6 +2374,7 @@ def run_live_calibration(
                         )
 
                     radial_stats = radial_plausibility_stats(K, dist, image_size)
+                    dist_flat = np.asarray(dist, dtype=np.float64).reshape(-1)
                     stats.update(common_stats)
                     stats.update(
                         {
@@ -2052,9 +2388,14 @@ def run_live_calibration(
                             "selected_reprojection_mean_px": float(reproj_mean_px),
                             "selected_reprojection_per_view_px": selected_reproj_float,
                             "diagnostics_dir": "" if diagnostics_dir is None else str(diagnostics_dir),
+                            "dist_coeff_abs_max": float(np.max(np.abs(dist_flat)))
+                            if dist_flat.size
+                            else 0.0,
+                            **reproj_stats,
                             **radial_stats,
                         }
                     )
+                    stats["model_quality_score"] = calibration_model_quality_score(stats)
 
                     save_paths: list[Path] = []
                     if spec.name == "standard5":
@@ -2074,8 +2415,13 @@ def run_live_calibration(
                         )
 
                     primary_path = save_paths[0]
+                    success_tuple = (K, dist, float(rms), stats, primary_path)
                     if first_success is None:
-                        first_success = (K, dist, float(rms), stats, primary_path)
+                        first_success = success_tuple
+                    if best_success is None or float(stats["model_quality_score"]) < float(
+                        best_success[3].get("model_quality_score", float("inf"))
+                    ):
+                        best_success = success_tuple
                     if spec.name == "standard5":
                         primary_success = True
                         state["K"] = np.asarray(K, dtype=np.float64)
@@ -2085,7 +2431,6 @@ def run_live_calibration(
                         state["diagnostics_dir"] = diagnostics_dir
                         state["saved_path"] = primary_path
 
-                    dist_flat = np.asarray(dist, dtype=np.float64).reshape(-1)
                     model_rows.append(
                         {
                             "model": spec.name,
@@ -2100,12 +2445,24 @@ def run_live_calibration(
                             "cx": float(K[0, 2]),
                             "cy": float(K[1, 2]),
                             "dist": " ".join(f"{x:.12g}" for x in dist_flat),
+                            "model_quality_score": float(stats["model_quality_score"]),
+                            "corner_reprojection_p95_px": stats.get(
+                                "corner_reprojection_p95_px"
+                            ),
+                            "edge_corner_reprojection_mean_px": stats.get(
+                                "edge_corner_reprojection_mean_px"
+                            ),
+                            "radial_residual_mean_px": stats.get("radial_residual_mean_px"),
+                            "radial_residual_abs_mean_px": stats.get(
+                                "radial_residual_abs_mean_px"
+                            ),
                             **radial_stats,
                         }
                     )
                     print(
                         "[calib_camera]   "
                         f"rms={float(rms):.6f} reproj={float(reproj_mean_px):.6f}px "
+                        f"score={float(stats['model_quality_score']):.6f} "
                         f"dist_n={dist_flat.size} radial_turns={radial_stats['radial_turn_count']} "
                         f"positive={radial_stats['radial_positive']}"
                     )
@@ -2128,7 +2485,32 @@ def run_live_calibration(
             write_model_comparison_csv(comparison_csv, model_rows)
             print(f"[calib_camera] Saved model comparison -> {comparison_csv}")
 
-            if not primary_success and first_success is not None:
+            if best_success is not None:
+                K, dist, rms, stats, saved_path = best_success
+                recommended_stats = dict(stats)
+                recommended_stats["recommended_primary_model"] = str(
+                    stats.get("calibration_model", "")
+                )
+                saved_path = save_tracking_calibration_npz(
+                    output_path,
+                    K=K,
+                    dist=np.asarray(dist, dtype=np.float64).reshape(-1, 1),
+                    image_size=image_size,
+                    rms=float(rms),
+                    stats=recommended_stats,
+                )
+                state["K"] = np.asarray(K, dtype=np.float64)
+                state["dist"] = np.asarray(dist, dtype=np.float64).reshape(-1, 1)
+                state["rms"] = float(rms)
+                state["stats"] = recommended_stats
+                state["diagnostics_dir"] = diagnostics_dir
+                state["saved_path"] = saved_path
+                print(
+                    "[calib_camera] Recommended primary model: "
+                    f"{recommended_stats.get('recommended_primary_model')} "
+                    f"(score={float(recommended_stats.get('model_quality_score', float('nan'))):.6f})"
+                )
+            elif not primary_success and first_success is not None:
                 K, dist, rms, stats, saved_path = first_success
                 state["K"] = np.asarray(K, dtype=np.float64)
                 state["dist"] = np.asarray(dist, dtype=np.float64).reshape(-1, 1)
@@ -2189,7 +2571,19 @@ def parse_args() -> argparse.Namespace:
         "--min-corners",
         type=int,
         default=MIN_CHARUCO_CAPTURE,
-        help="Minimum ChArUco corners required for a frame to become a candidate.",
+        help=(
+            "Minimum ChArUco corners required for normal candidate frames. "
+            "Extreme edge/corner frames use --min-edge-corners-visible."
+        ),
+    )
+    parser.add_argument(
+        "--min-edge-corners-visible",
+        type=int,
+        default=MIN_CHARUCO_EDGE_CAPTURE,
+        help=(
+            "Minimum ChArUco corners for edge/corner candidates. "
+            "This lets the board cover extreme FOV regions where only a few corners are visible."
+        ),
     )
     parser.add_argument(
         "--capture-interval",
@@ -2234,6 +2628,15 @@ def parse_args() -> argparse.Namespace:
         help="Minimum ChArUco corner observations required in each image quadrant.",
     )
     parser.add_argument(
+        "--min-corner-radius-norm",
+        type=float,
+        default=MIN_CORNER_RADIUS_NORM,
+        help=(
+            "Required maximum normalized ChArUco-corner radius. "
+            "Use this to force true image-corner/FOV coverage."
+        ),
+    )
+    parser.add_argument(
         "--force-save",
         action="store_true",
         help="Save even when the hard FOV coverage check fails.",
@@ -2266,6 +2669,7 @@ def main() -> None:
         fps=args.fps,
         target_views=args.target_views,
         min_capture_corners=args.min_corners,
+        min_edge_capture_corners=args.min_edge_corners_visible,
         auto_capture_interval_s=args.capture_interval,
         max_candidates=args.max_candidates,
         save_selected_images=not args.no_save_selected_images,
@@ -2274,6 +2678,7 @@ def main() -> None:
         min_coverage_cells=args.min_coverage_cells,
         min_edge_corners=args.min_edge_corners,
         min_quadrant_corners=args.min_quadrant_corners,
+        min_corner_radius_norm=args.min_corner_radius_norm,
         force_save_insufficient_coverage=args.force_save,
     )
     print(f"[calib_camera] Done: {saved_path}")

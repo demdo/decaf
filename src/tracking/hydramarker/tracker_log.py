@@ -91,6 +91,12 @@ COLUMNS = [
     "camera_yaw_deg",
     "pose_rotation_delta_deg",
     "pose_translation_delta_mm",
+    "depth_filter_applied",
+    "depth_filter_delta_z_mm",
+    "depth_filter_raw_z_mm",
+    "depth_filter_z_mm",
+    "depth_filter_reproj_excess_px",
+    "depth_filter_guard_alpha",
 
     # board-relative pose diagnostics, filled by debug_tracker_translation
     "board_pose_available",
@@ -284,6 +290,36 @@ def set_debug_board_transform(T_B_C: Optional[np.ndarray]) -> None:
     _debug_board_origin_tvec = None
     _prev_board_R = None
     _prev_board_tvec = None
+
+
+def set_debug_board_origin_tvec(tvec_board_mm: Optional[np.ndarray]) -> None:
+    """Set the board/table-frame translation used as delta origin."""
+    global _debug_board_origin_tvec, _prev_board_R, _prev_board_tvec
+
+    _debug_board_origin_tvec = (
+        None
+        if tvec_board_mm is None
+        else np.asarray(tvec_board_mm, dtype=np.float64).reshape(3).copy()
+    )
+    _prev_board_R = None
+    _prev_board_tvec = None
+
+
+def board_tvec_from_pose(
+    rvec: Optional[np.ndarray],
+    tvec: Optional[np.ndarray],
+) -> Optional[np.ndarray]:
+    """Return tracker translation in the current board/table frame."""
+    if _debug_board_T_B_C is None:
+        return None
+    T_C_T = _make_pose_matrix(rvec, tvec)
+    if T_C_T is None:
+        return None
+    try:
+        T_B_T = _debug_board_T_B_C @ T_C_T
+        return np.asarray(T_B_T[:3, 3], dtype=np.float64).reshape(3).copy()
+    except Exception:
+        return None
 
 
 def _rotation_matrix_to_rpy_deg(R: np.ndarray) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -1748,6 +1784,14 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
         "camera_yaw_deg": _fmt_float(camera_yaw_deg),
         "pose_rotation_delta_deg": _fmt_float(rot_delta),
         "pose_translation_delta_mm": _fmt_float(trans_delta),
+        "depth_filter_applied": int(bool(getattr(result, "depth_filter_applied", False))),
+        "depth_filter_delta_z_mm": _fmt_float(getattr(result, "depth_filter_delta_z_mm", None)),
+        "depth_filter_raw_z_mm": _fmt_float(getattr(result, "depth_filter_raw_z_mm", None)),
+        "depth_filter_z_mm": _fmt_float(getattr(result, "depth_filter_z_mm", None)),
+        "depth_filter_reproj_excess_px": _fmt_float(
+            getattr(result, "depth_filter_reproj_excess_px", None)
+        ),
+        "depth_filter_guard_alpha": _fmt_float(getattr(result, "depth_filter_guard_alpha", None)),
 
         "board_pose_available": int(board_pose["available"]),
         "board_tvec_x_mm": _fmt_float(board_pose["x"]),

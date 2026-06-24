@@ -17,13 +17,13 @@ class TrackerConfig:
 
     max_lost_frames: int = 8
 
-    max_translation_jump_mm: float = 120.0
+    max_translation_jump_mm: float = 40.0
     max_rotation_jump_deg: float = 45.0
     # Adaptiver Motion Gate: Threshold waechst um diesen Wert pro verlorenem Frame.
     # Beispiel: 8.0 -> nach 5 Frames: 45 + 40 = 85 deg
     rotation_gate_scale_per_lost_frame: float = 8.0
     # Absolutes Maximum fuer den skalierten Rotation-Threshold.
-    rotation_gate_max_deg: float = 120.0
+    rotation_gate_max_deg: float = 90.0
 
     pnp_ransac_iterations: int = 500
     pnp_ransac_reprojection_px: float = 3.0
@@ -33,6 +33,16 @@ class TrackerConfig:
     pnp_direct_refine_method: str = "lm"
     pnp_direct_max_mean_reprojection_error_px: float = 1.5
     pnp_direct_max_max_reprojection_error_px: float = 3.0
+
+    # Runtime camera-Z stabilizer. This is the live, zero-latency version of
+    # the depth Kalman/guard replay experiments: x/y and rotation stay with the
+    # normal frame solver; only tvec[2] is filtered.
+    pose_depth_filter_enabled: bool = True
+    pose_depth_filter_observation_std_mm: float = 16.0
+    pose_depth_filter_process_std_mm: float = 0.05
+    pose_depth_filter_initial_velocity_std_mm: float = 0.1
+    pose_depth_filter_reprojection_guard_px: float = 1.0
+    pose_depth_filter_min_points: int = 6
 
     # Early smoothing reset when the current point count falls below this
     # fraction of the best recent count. This catches gradual LK drift before
@@ -87,12 +97,18 @@ class TrackerConfig:
     enable_fast_persistent_path: bool = True
     fast_persistent_min_points: int = 10
     fast_persistent_refresh_mean_error_px: float = 1.5
-    fast_persistent_dense_refine_enabled: bool = False
+    fast_persistent_dense_refine_enabled: bool = True
     fast_persistent_dense_min_points: int = 24
     fast_persistent_dense_match_max_px: float = 3.0
     fast_persistent_dense_min_second_best_margin_px: float = 2.0
     fast_persistent_dense_max_median_px: float = 1.2
     fast_persistent_dense_max_p90_px: float = 2.5
+    # Only suspicious fast-path seeds pay for robust dense re-solving. A frame
+    # is suspicious when the seed projection disagrees with dense visible
+    # corners, or when many detected corners were not carried by the sparse
+    # persistent pose.
+    fast_persistent_dense_rescue_min_green_ratio: float = 0.85
+    fast_persistent_dense_rescue_min_seed_median_px: float = 1.5
     fast_persistent_dense_min_image_coverage: float = 0.35
     fast_persistent_dense_min_object_span_mm: float = 12.0
     fast_persistent_dense_min_distinct_rows: int = 2
@@ -156,6 +172,11 @@ class TrackerConfig:
     fallback_pose_max_max_reprojection_error_px: float = 4.0
     visual_corner_max_reprojection_error_px: float = 3.0
     visual_corner_min_count: int = 6
+    # A freshly decoded pose is allowed to refresh pose history/persistence only
+    # when enough currently visible, pose-consistent marker corners remain.
+    decode_update_min_visual_corners: int = 12
+    decode_update_min_distinct_rows: int = 3
+    decode_update_min_distinct_cols: int = 3
     enable_uncoded_grid_bootstrap: bool = True
     uncoded_bootstrap_min_corners: int = 8
     uncoded_bootstrap_max_mean_reprojection_error_px: float = 1.2

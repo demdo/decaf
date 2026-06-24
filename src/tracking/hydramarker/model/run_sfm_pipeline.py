@@ -52,6 +52,14 @@ from tracking.hydramarker.model.diagnostics import (
 
 TOPOLOGY_REGULARIZATION_WEIGHT = 0.5
 CELL_SHAPE_REGULARIZATION_WEIGHT = 0.1
+CYLINDER_SURFACE_REGULARIZATION_WEIGHT = 0.35
+CYLINDER_GRID_REGULARIZATION_WEIGHT = 50.0
+BA_MAX_ITERATIONS = 100
+CYLINDER_BA_MAX_ITERATIONS = 80
+BA_SHOW_PROGRESS = True
+
+BOOTSTRAP_MAX_PAIRS = None
+BOOTSTRAP_MAX_CANDIDATE_PAIRS_TO_TRY = 5000
 
 BA_MIN_OBSERVATIONS = 15
 BA_MAX_MEDIAN_ERROR_PX = 1.5
@@ -60,12 +68,14 @@ OUTLIER_ABSOLUTE_THRESHOLD_PX = 2.0
 OUTLIER_MAD_SIGMA = 3.5
 OUTLIER_MAX_FRACTION = 0.03
 OUTLIER_MIN_ERROR_PX = 1.0
+OUTLIER_MAX_PER_MARKER_FRACTION = 0.15
+OUTLIER_MAX_PER_MARKER_COUNT = 24
 
 TRIANGULATE_MISSING_MIN_OBSERVATIONS = 8
 TRIANGULATE_MISSING_MIN_INLIERS = 6
 TRIANGULATE_MISSING_MAX_REPROJ_PX = 2.5
-TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER = 48
-TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER = 220
+TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER = 0
+TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER = 5000
 
 SHOW_PLOTS = True
 EXPORT_FILENAME = "marker_geometry_sfm.json"
@@ -148,6 +158,16 @@ def final_diagnostics_path() -> Path:
 
 
 def should_regularize_column_z(marker_json_path: Path) -> bool:
+    surface_model = load_surface_model(marker_json_path)
+
+    return (
+        is_cylinder_surface_model(surface_model)
+        and bool(surface_model.get("regularize_columns_z", False))
+        and not bool(surface_model.get("regularize_with_ba", True))
+    )
+
+
+def load_surface_model(marker_json_path: Path) -> dict:
     marker_json_path = Path(marker_json_path)
 
     with marker_json_path.open("r", encoding="utf-8") as f:
@@ -156,14 +176,184 @@ def should_regularize_column_z(marker_json_path: Path) -> bool:
     surface_model = meta.get("surface_model", {})
 
     if not isinstance(surface_model, dict):
-        return False
+        return {}
 
+    return surface_model
+
+
+def is_cylinder_surface_model(surface_model: dict) -> bool:
     model_type = str(surface_model.get("type", "")).lower()
 
-    if model_type != "cylinder":
-        return False
+    return model_type == "cylinder"
 
-    return bool(surface_model.get("regularize_columns_z", True))
+
+def cylinder_axis_is_supported(surface_model: dict) -> bool:
+    axis = str(surface_model.get("axis", "row")).lower()
+
+    return axis in {
+        "row",
+        "rows",
+        "y",
+        "marker_y",
+    }
+
+
+def cylinder_regularization_config(
+    marker_json_path: Path,
+) -> tuple[float, float | None, tuple[float, float] | None]:
+    surface_model = load_surface_model(marker_json_path)
+
+    if not is_cylinder_surface_model(surface_model):
+        return 0.0, None, None
+
+    if not cylinder_axis_is_supported(surface_model):
+        print(
+            "[SfM] cylinder regularization skipped: "
+            f"unsupported axis={surface_model.get('axis')!r}"
+        )
+        return 0.0, None, None
+
+    if not bool(surface_model.get("regularize_with_ba", True)):
+        return 0.0, None, None
+
+    weight = float(
+        surface_model.get(
+            "surface_regularization_weight",
+            surface_model.get(
+                "cylinder_regularization_weight",
+                CYLINDER_SURFACE_REGULARIZATION_WEIGHT,
+            ),
+        )
+    )
+
+    if weight <= 0.0:
+        return 0.0, None, None
+
+    radius = surface_model.get(
+        "radius_mm",
+        surface_model.get("cylinder_radius_mm"),
+    )
+    radius_value = None
+
+    if radius is not None:
+        radius_value = float(radius)
+        if radius_value <= 0.0:
+            radius_value = None
+
+    center = surface_model.get(
+        "center_xz_mm",
+        surface_model.get("cylinder_center_xz_mm"),
+    )
+    center_value = None
+
+    if center is not None:
+        center_arr = np.asarray(
+            center,
+            dtype=np.float64,
+        ).reshape(-1)
+        if center_arr.size >= 2:
+            center_value = (
+                float(center_arr[0]),
+                float(center_arr[1]),
+            )
+
+    return weight, radius_value, center_value
+
+
+def cylinder_grid_regularization_config(
+    marker_json_path: Path,
+) -> tuple[
+    float,
+    float | None,
+    tuple[float, float] | None,
+    bool,
+]:
+    surface_model = load_surface_model(marker_json_path)
+
+    if not is_cylinder_surface_model(surface_model):
+        return 0.0, None, None, True
+
+    if not cylinder_axis_is_supported(surface_model):
+        return 0.0, None, None, True
+
+    if not bool(surface_model.get("regularize_with_ba", True)):
+        return 0.0, None, None, True
+
+    weight = float(
+        surface_model.get(
+            "grid_regularization_weight",
+            surface_model.get(
+                "cylinder_grid_regularization_weight",
+                CYLINDER_GRID_REGULARIZATION_WEIGHT,
+            ),
+        )
+    )
+
+    if weight <= 0.0:
+        return 0.0, None, None, True
+
+    radius = surface_model.get(
+        "radius_mm",
+        surface_model.get("cylinder_radius_mm"),
+    )
+    radius_value = None
+
+    if radius is not None:
+        radius_value = float(radius)
+        if radius_value <= 0.0:
+            radius_value = None
+
+    center = surface_model.get(
+        "center_xz_mm",
+        surface_model.get("cylinder_center_xz_mm"),
+    )
+    center_value = None
+
+    if center is not None:
+        center_arr = np.asarray(
+            center,
+            dtype=np.float64,
+        ).reshape(-1)
+        if center_arr.size >= 2:
+            center_value = (
+                float(center_arr[0]),
+                float(center_arr[1]),
+            )
+
+    spacing_mode = str(
+        surface_model.get(
+            "grid_spacing_mode",
+            surface_model.get("cylinder_grid_spacing_mode", "chord"),
+        )
+    ).lower()
+
+    use_chord_spacing = spacing_mode not in {
+        "arc",
+        "surface",
+        "geodesic",
+    }
+
+    return weight, radius_value, center_value, use_chord_spacing
+
+
+def read_id_num_cols(marker_json_path: Path) -> int | None:
+    marker_json_path = Path(marker_json_path)
+
+    with marker_json_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    id_encoding = meta.get("id_encoding", {})
+
+    if isinstance(id_encoding, dict) and "num_cols" in id_encoding:
+        return int(id_encoding["num_cols"])
+
+    if "id_num_cols" in meta:
+        return int(meta["id_num_cols"])
+
+    if "corner_cols" in meta:
+        return int(meta["corner_cols"])
+
+    return None
 
 
 def call_silent(func, *args, **kwargs):
@@ -200,8 +390,9 @@ def run_first_bundle_adjustment(
         options=PyCeresOptions(
             loss="huber",
             loss_scale=1.0,
-            max_iterations=100,
-            report_full=True,
+            max_iterations=BA_MAX_ITERATIONS,
+            progress_to_stdout=BA_SHOW_PROGRESS,
+            report_full=False,
         ),
         update_state=True,
         marker_json_path=marker_json_path,
@@ -231,8 +422,9 @@ def run_second_bundle_adjustment(
         options=PyCeresOptions(
             loss="huber",
             loss_scale=1.0,
-            max_iterations=100,
-            report_full=True,
+            max_iterations=BA_MAX_ITERATIONS,
+            progress_to_stdout=BA_SHOW_PROGRESS,
+            report_full=False,
         ),
         update_state=True,
         marker_json_path=marker_json_path,
@@ -250,6 +442,126 @@ def run_second_bundle_adjustment(
     return ba_result
 
 
+def run_cylinder_bundle_adjustment(
+    state: SfMState,
+    ba_frame_ids: list[int],
+    marker_json_path: Path,
+    ignored_observations: set[tuple[int, int]],
+    adaptive_observation_weights: dict[tuple[int, int], float],
+) -> bool:
+    (
+        cylinder_weight,
+        cylinder_radius,
+        cylinder_center_xz,
+    ) = cylinder_regularization_config(marker_json_path)
+
+    (
+        cylinder_grid_weight,
+        cylinder_grid_radius,
+        cylinder_grid_center_xz,
+        cylinder_grid_use_chord_spacing,
+    ) = cylinder_grid_regularization_config(marker_json_path)
+
+    if cylinder_weight <= 0.0 and cylinder_grid_weight <= 0.0:
+        return False
+
+    print(
+        "[SfM] cylinder surface/grid BA: "
+        f"surface_weight={cylinder_weight:.3f}, "
+        f"grid_weight={cylinder_grid_weight:.3f}"
+    )
+
+    ba_result = run_bundle_adjustment(
+        state,
+        frame_ids=ba_frame_ids,
+        options=PyCeresOptions(
+            loss="huber",
+            loss_scale=1.0,
+            max_iterations=CYLINDER_BA_MAX_ITERATIONS,
+            progress_to_stdout=BA_SHOW_PROGRESS,
+            report_full=False,
+        ),
+        update_state=True,
+        marker_json_path=marker_json_path,
+        topology_regularization_weight=TOPOLOGY_REGULARIZATION_WEIGHT,
+        cell_shape_regularization_weight=CELL_SHAPE_REGULARIZATION_WEIGHT,
+        cylinder_regularization_weight=cylinder_weight,
+        cylinder_radius=cylinder_radius,
+        cylinder_center_xz=cylinder_center_xz,
+        cylinder_grid_regularization_weight=cylinder_grid_weight,
+        cylinder_grid_radius=cylinder_grid_radius,
+        cylinder_grid_center_xz=cylinder_grid_center_xz,
+        cylinder_grid_use_chord_spacing=cylinder_grid_use_chord_spacing,
+        ignored_observations=ignored_observations,
+        observation_weights=adaptive_observation_weights,
+    )
+
+    print_bundle_adjustment_summary(ba_result)
+
+    if not ba_result.success:
+        raise RuntimeError(ba_result.message)
+
+    return True
+
+
+def triangulate_missing_markers_for_stage(
+    state: SfMState,
+    *,
+    label: str,
+) -> list:
+    results = triangulate_missing_markers(
+        state,
+        min_observations=TRIANGULATE_MISSING_MIN_OBSERVATIONS,
+        min_inliers=TRIANGULATE_MISSING_MIN_INLIERS,
+        max_reprojection_error_px=TRIANGULATE_MISSING_MAX_REPROJ_PX,
+        max_observations_per_marker=(
+            TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER
+        ),
+        max_pair_candidates_per_marker=(
+            TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER
+        ),
+    )
+
+    triangulated_count = sum(1 for r in results if r.success)
+    failed_count = len(results) - triangulated_count
+
+    print(
+        f"[SfM] missing-marker triangulation {label}: "
+        f"added={triangulated_count}, failed={failed_count}, "
+        f"total_markers={len(state.marker_positions)}"
+    )
+
+    return results
+
+
+def register_remaining_frames_for_stage(
+    state: SfMState,
+    *,
+    min_points: int,
+    label: str,
+) -> list:
+    results = register_remaining_frames(
+        state,
+        min_points=min_points,
+        ransac_reprojection_error_px=1.5,
+        confidence=0.999,
+        iterations_count=200,
+        refine_lm=True,
+        max_mean_reprojection_error_px=None,
+    )
+
+    success_count = sum(1 for r in results if r.success)
+    failed_count = len(results) - success_count
+
+    print(
+        f"[SfM] frame registration {label}: "
+        f"added={success_count}, failed={failed_count}, "
+        f"total_poses={len(state.poses)}"
+    )
+
+    return results
+
+
 def run_sfm_pipeline(
     frames: list[FrameObservation],
     calibration: CameraCalibration,
@@ -260,6 +572,9 @@ def run_sfm_pipeline(
         calibration,
         min_shared_ids=20,
         min_frame_gap=5,
+        max_pairs=BOOTSTRAP_MAX_PAIRS,
+        max_candidate_pairs_to_try=BOOTSTRAP_MAX_CANDIDATE_PAIRS_TO_TRY,
+        id_num_cols=read_id_num_cols(marker_json_path),
         ransac_threshold_norm=1e-3,
         max_reprojection_error_norm=2e-3,
     )
@@ -284,14 +599,21 @@ def run_sfm_pipeline(
         f"bootstrap_markers={len(state.marker_positions)}"
     )
 
-    register_remaining_frames(
+    register_remaining_frames_for_stage(
         state,
         min_points=registration_min_points,
-        ransac_reprojection_error_px=1.5,
-        confidence=0.999,
-        iterations_count=200,
-        refine_lm=True,
-        max_mean_reprojection_error_px=None,
+        label="after bootstrap",
+    )
+
+    triangulation_results = triangulate_missing_markers_for_stage(
+        state,
+        label="before first BA",
+    )
+
+    register_remaining_frames_for_stage(
+        state,
+        min_points=12,
+        label="after pre-BA triangulation",
     )
 
     if SHOW_PLOTS:
@@ -317,27 +639,12 @@ def run_sfm_pipeline(
         marker_json_path=marker_json_path,
     )
 
-    triangulation_results = triangulate_missing_markers(
+    post_ba_triangulation_results = triangulate_missing_markers_for_stage(
         state,
-        min_observations=TRIANGULATE_MISSING_MIN_OBSERVATIONS,
-        min_inliers=TRIANGULATE_MISSING_MIN_INLIERS,
-        max_reprojection_error_px=TRIANGULATE_MISSING_MAX_REPROJ_PX,
-        max_observations_per_marker=(
-            TRIANGULATE_MISSING_MAX_OBSERVATIONS_PER_MARKER
-        ),
-        max_pair_candidates_per_marker=(
-            TRIANGULATE_MISSING_MAX_PAIR_CANDIDATES_PER_MARKER
-        ),
+        label="after first BA",
     )
 
-    triangulated_count = sum(1 for r in triangulation_results if r.success)
-    failed_count = len(triangulation_results) - triangulated_count
-
-    print(
-        "[SfM] missing-marker triangulation after first BA: "
-        f"added={triangulated_count}, failed={failed_count}, "
-        f"total_markers={len(state.marker_positions)}"
-    )
+    triangulation_results.extend(post_ba_triangulation_results)
 
     ba_frame_ids = call_silent(
         select_good_frames_for_bundle_adjustment,
@@ -370,6 +677,8 @@ def run_sfm_pipeline(
         mad_sigma=OUTLIER_MAD_SIGMA,
         max_fraction=OUTLIER_MAX_FRACTION,
         min_error_px=OUTLIER_MIN_ERROR_PX,
+        max_per_marker_fraction=OUTLIER_MAX_PER_MARKER_FRACTION,
+        max_per_marker_count=OUTLIER_MAX_PER_MARKER_COUNT,
     )
 
     run_second_bundle_adjustment(
@@ -404,6 +713,20 @@ def run_sfm_pipeline(
     )
 
     column_regularization_stats = {}
+
+    did_cylinder_ba = run_cylinder_bundle_adjustment(
+        state=state,
+        ba_frame_ids=ba_frame_ids,
+        marker_json_path=marker_json_path,
+        ignored_observations=ignored_observations,
+        adaptive_observation_weights=adaptive_observation_weights,
+    )
+
+    if did_cylinder_ba:
+        final_observation_errors = compute_observation_reprojection_errors(
+            state,
+            frame_ids=ba_frame_ids,
+        )
 
     if should_regularize_column_z(marker_json_path):
         column_regularization_stats = regularize_marker_columns_z_inplace(

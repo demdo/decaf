@@ -16,6 +16,7 @@ from tracking.hydramarker.tracker_types import (
     TrackerMode,
     TrackerResult,
 )
+from tracking.pose_filters import PoseDepthFilterResult
 from tracking.pose_solvers import make_transform_from_rvec_tvec
 
 
@@ -69,7 +70,7 @@ class MapPoseTrackerConfig:
     max_mean_reproj_px: float = 4.0
     max_max_reproj_px: float = 15.0
 
-    max_translation_jump_mm: float = 120.0
+    max_translation_jump_mm: float = 40.0
     max_rotation_jump_deg: float = 45.0
 
     # Adaptiver Motion Gate:
@@ -78,7 +79,7 @@ class MapPoseTrackerConfig:
     rotation_gate_scale_per_lost_frame: float = 8.0
 
     # Absolutes Maximum, unabhaengig von lost_frames.
-    rotation_gate_max_deg: float = 120.0
+    rotation_gate_max_deg: float = 90.0
 
     use_pose_prior: bool = True
     refine_with_iterative: bool = True
@@ -605,6 +606,89 @@ class MapPoseTracker:
 class PoseEstimationMixin:
     """Package internal PnP results into public tracker results."""
 
+    def _apply_depth_filter_to_pose(
+        self,
+        pose: MapPoseResult,
+        fallback_points: List[PoseTrackPoint],
+    ) -> PoseDepthFilterResult | None:
+        """Apply the configured camera-Z stabilizer to an accepted pose."""
+        if not bool(getattr(self.config, "pose_depth_filter_enabled", False)):
+            return None
+        if pose.rvec is None or pose.tvec is None:
+            return None
+
+        points = list(pose.points or fallback_points or [])
+        min_points = max(1, int(getattr(self.config, "pose_depth_filter_min_points", 6)))
+        if len(points) < min_points:
+            return None
+
+        object_points = np.asarray([p.xyz_mm for p in points], dtype=np.float64).reshape(-1, 3)
+        image_points = np.asarray([p.uv for p in points], dtype=np.float64).reshape(-1, 2)
+        filtered = self.pose_depth_filter.update(
+            rvec=pose.rvec,
+            tvec=pose.tvec,
+            object_points=object_points,
+            image_points=image_points,
+        )
+
+        pose.rvec = filtered.rvec.copy()
+        pose.tvec = filtered.tvec.copy()
+        pose.T_marker_camera = filtered.T_marker_camera.copy()
+        errors = self._reprojection_errors_for_pose(
+            object_points,
+            image_points,
+            filtered.rvec,
+            filtered.tvec,
+        )
+        if errors is not None and len(errors):
+            pose.reprojection_mean_px = float(np.mean(errors))
+            pose.reprojection_max_px = float(np.max(errors))
+
+        self.pose_tracker.rvec = filtered.rvec.copy()
+        self.pose_tracker.tvec = filtered.tvec.copy()
+        self.pose_tracker.T_marker_camera = filtered.T_marker_camera.copy()
+        return filtered
+
+    @staticmethod
+    def _depth_filter_kwargs(
+        filtered: PoseDepthFilterResult | None,
+    ) -> dict:
+        if filtered is None:
+            return {}
+        return {
+            "depth_filter_applied": bool(filtered.applied),
+            "depth_filter_delta_z_mm": float(filtered.delta_z_mm),
+            "depth_filter_raw_z_mm": float(filtered.raw_z_mm),
+            "depth_filter_z_mm": float(filtered.filtered_z_mm),
+            "depth_filter_reproj_excess_px": float(filtered.reprojection_excess_px),
+            "depth_filter_guard_alpha": float(filtered.guard_alpha),
+        }
+
+    def _decode_update_rejection_reason(
+        self,
+        visual_corners: List[TrackerCorner],
+    ) -> str:
+        """Return why a decoded pose is too weak to refresh tracker state."""
+        min_visual = max(0, int(self.config.decode_update_min_visual_corners))
+        if len(visual_corners) < min_visual:
+            return (
+                "Decode pose rejected by low visual coverage "
+                f"({len(visual_corners)}/{min_visual} visible corners)."
+            )
+
+        min_rows = max(0, int(self.config.decode_update_min_distinct_rows))
+        min_cols = max(0, int(self.config.decode_update_min_distinct_cols))
+        distinct_rows = len({int(c.global_row) for c in visual_corners})
+        distinct_cols = len({int(c.global_col) for c in visual_corners})
+
+        if distinct_rows < min_rows or distinct_cols < min_cols:
+            return (
+                "Decode pose rejected by narrow marker coverage "
+                f"(rows={distinct_rows}/{min_rows}, cols={distinct_cols}/{min_cols})."
+            )
+
+        return ""
+
     def _estimate_and_package_pose(
         self,
         track_points: List[PoseTrackPoint],
@@ -622,6 +706,7 @@ class PoseEstimationMixin:
             if self.pose_tracker.T_marker_camera is None
             else self.pose_tracker.T_marker_camera.copy()
         )
+        prev_depth_filter_state = self.pose_depth_filter.snapshot()
         prev_last_rvec = (
             None
             if self._last_accepted_rvec is None
@@ -718,8 +803,7 @@ class PoseEstimationMixin:
                     timings_ms={"pnp_ms": pnp_ms},
                 )
 
-        if update_persistence:
-            self._store_persistent_correspondences(inlier_corners)
+        filtered_depth = self._apply_depth_filter_to_pose(pose, track_points)
 
         visual_corners = self._visual_corners_from_pose(
             inlier_corners,
@@ -732,6 +816,33 @@ class PoseEstimationMixin:
                 f" Visual corners filtered {len(visual_corners)}/"
                 f"{len(inlier_corners)}."
             )
+        if update_persistence:
+            reject_reason = self._decode_update_rejection_reason(visual_corners)
+            if reject_reason:
+                self.pose_tracker.rvec = prev_pose_rvec
+                self.pose_tracker.tvec = prev_pose_tvec
+                self.pose_tracker.T_marker_camera = prev_pose_T
+                self.pose_depth_filter.restore(prev_depth_filter_state)
+                return TrackerResult(
+                    success=False,
+                    mode=self.mode,
+                    message=reject_reason + visual_note,
+                    rvec=pose.rvec,
+                    tvec=pose.tvec,
+                    T_marker_camera=pose.T_marker_camera,
+                    mean_reprojection_error_px=pose.reprojection_mean_px,
+                    max_reprojection_error_px=pose.reprojection_max_px,
+                    num_points=pose.num_points,
+                    num_inliers=pose.num_inliers,
+                    pose_source=pose_source,
+                    pnp_method=str(getattr(pose, "method", "")),
+                    corners=[],
+                    correspondence_corners=tracker_corners,
+                    timings_ms={"pnp_ms": pnp_ms},
+                )
+
+            self._store_persistent_correspondences(visual_corners)
+
         if not update_persistence and len(visual_corners) < self.config.visual_corner_min_count:
             visual_corners = []
             visual_note += " Visual corners suppressed for fallback pose."
@@ -780,6 +891,7 @@ class PoseEstimationMixin:
             pose_source=pose_source,
             pnp_method=str(getattr(pose, "method", "")),
             timings_ms={"pnp_ms": pnp_ms},
+            **self._depth_filter_kwargs(filtered_depth),
         )
 
     def _reprojection_errors_for_pose(

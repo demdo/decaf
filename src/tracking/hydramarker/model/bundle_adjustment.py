@@ -29,6 +29,20 @@ class BundleAdjustmentResult:
     num_cell_regularization_terms: int = 0
     cell_shape_regularization_weight: float = 0.0
 
+    num_cylinder_regularization_terms: int = 0
+    cylinder_regularization_weight: float = 0.0
+    cylinder_radius: float = float("nan")
+    cylinder_center_x: float = float("nan")
+    cylinder_center_z: float = float("nan")
+
+    num_cylinder_grid_regularization_terms: int = 0
+    cylinder_grid_regularization_weight: float = 0.0
+    cylinder_grid_radius: float = float("nan")
+    cylinder_grid_center_x: float = float("nan")
+    cylinder_grid_center_z: float = float("nan")
+    cylinder_grid_theta_step: float = float("nan")
+    cylinder_grid_y_step: float = float("nan")
+
     initial_median_error_px: float = float("nan")
     initial_mean_error_px: float = float("nan")
 
@@ -60,6 +74,7 @@ class PyCeresOptions:
     loss: Optional[str] = "huber"
     loss_scale: float = 1.0
     max_iterations: int = 100
+    progress_to_stdout: bool = False
     report_full: bool = False
 
 
@@ -537,6 +552,150 @@ class _CellShapeConsistencyCost(pyceres.CostFunction):
         return True
 
 
+class _CylinderSurfaceCost(pyceres.CostFunction):
+
+    __slots__ = (
+        "_center_x",
+        "_center_z",
+        "_radius",
+        "_weight",
+        "_eps",
+    )
+
+    def __init__(
+        self,
+        *,
+        center_x: float,
+        center_z: float,
+        radius: float,
+        weight: float,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+
+        self.set_num_residuals(1)
+        self.set_parameter_block_sizes([3])
+
+        self._center_x = float(center_x)
+        self._center_z = float(center_z)
+        self._radius = float(radius)
+        self._weight = float(weight)
+        self._eps = float(eps)
+
+    def _residual(
+        self,
+        point: np.ndarray,
+    ) -> float:
+        point = np.asarray(
+            point,
+            dtype=np.float64,
+        ).reshape(3)
+
+        dx = float(point[0] - self._center_x)
+        dz = float(point[2] - self._center_z)
+        radial_distance = float(np.hypot(dx, dz))
+
+        return self._weight * (
+            radial_distance - self._radius
+        )
+
+    def _finite_difference(
+        self,
+        point: np.ndarray,
+    ) -> np.ndarray:
+        jac = np.zeros(
+            (1, 3),
+            dtype=np.float64,
+        )
+
+        for col in range(3):
+            delta = np.zeros_like(point)
+            delta[col] = self._eps
+
+            r_plus = self._residual(point + delta)
+            r_minus = self._residual(point - delta)
+
+            jac[0, col] = (
+                r_plus - r_minus
+            ) / (2.0 * self._eps)
+
+        return jac
+
+    def Evaluate(
+        self,
+        parameters,
+        residuals,
+        jacobians,
+    ) -> bool:
+        point = np.asarray(
+            parameters[0],
+            dtype=np.float64,
+        ).reshape(3)
+
+        residuals[0] = self._residual(point)
+
+        if jacobians is not None and jacobians[0] is not None:
+            jac = self._finite_difference(point).reshape(-1)
+
+            for idx, value in enumerate(jac):
+                jacobians[0][idx] = value
+
+        return True
+
+
+class _PointPositionPriorCost(pyceres.CostFunction):
+
+    __slots__ = (
+        "_target",
+        "_weight",
+    )
+
+    def __init__(
+        self,
+        *,
+        target: np.ndarray,
+        weight: float,
+    ) -> None:
+        super().__init__()
+
+        self.set_num_residuals(3)
+        self.set_parameter_block_sizes([3])
+
+        self._target = np.asarray(
+            target,
+            dtype=np.float64,
+        ).reshape(3)
+
+        self._weight = float(weight)
+
+    def Evaluate(
+        self,
+        parameters,
+        residuals,
+        jacobians,
+    ) -> bool:
+        point = np.asarray(
+            parameters[0],
+            dtype=np.float64,
+        ).reshape(3)
+
+        residual = self._weight * (
+            point - self._target
+        )
+
+        for idx in range(3):
+            residuals[idx] = residual[idx]
+
+        if jacobians is not None and jacobians[0] is not None:
+            for row in range(3):
+                for col in range(3):
+                    jacobians[0][row * 3 + col] = (
+                        self._weight if row == col else 0.0
+                    )
+
+        return True
+
+
 def _marker_id_to_row_col(
     marker_id: int,
     *,
@@ -581,6 +740,29 @@ def _load_id_encoding_for_topology(
         raise KeyError("Could not determine id_num_cols from marker JSON.")
 
     return id_base, id_num_cols, origin_row, origin_col
+
+
+def _load_grid_spacing_mm(
+    marker_json_path: Path,
+) -> float:
+    with Path(marker_json_path).open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    if "square_size_mm" in meta:
+        spacing = float(meta["square_size_mm"])
+    elif "cell_size_mm" in meta:
+        spacing = float(meta["cell_size_mm"])
+    elif "square_size_cm" in meta:
+        spacing = 10.0 * float(meta["square_size_cm"])
+    else:
+        raise KeyError(
+            "Could not determine marker grid spacing from marker JSON."
+        )
+
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError("Marker grid spacing must be positive.")
+
+    return float(spacing)
 
 
 def _collect_topology_edges_from_marker_blocks(
@@ -698,6 +880,325 @@ def _estimate_target_spacing_from_edges(
             )
         )
     )
+
+
+def _fit_cylinder_xz_from_marker_blocks(
+    marker_blocks: dict[int, np.ndarray],
+) -> tuple[float, float, float]:
+    points = np.asarray(
+        [
+            np.asarray(block, dtype=np.float64).reshape(3)[[0, 2]]
+            for block in marker_blocks.values()
+        ],
+        dtype=np.float64,
+    ).reshape(-1, 2)
+
+    points = points[np.isfinite(points).all(axis=1)]
+
+    if points.shape[0] < 3:
+        raise ValueError(
+            "Need at least three finite points to fit cylinder cross-section."
+        )
+
+    x = points[:, 0]
+    z = points[:, 1]
+
+    A = np.column_stack(
+        [
+            x,
+            z,
+            np.ones_like(x),
+        ]
+    )
+    b = -(
+        x * x
+        + z * z
+    )
+
+    coeffs, *_ = np.linalg.lstsq(
+        A,
+        b,
+        rcond=None,
+    )
+
+    a, b_coeff, c = (
+        float(coeffs[0]),
+        float(coeffs[1]),
+        float(coeffs[2]),
+    )
+
+    center_x = -0.5 * a
+    center_z = -0.5 * b_coeff
+    radius_sq = center_x * center_x + center_z * center_z - c
+
+    if not np.isfinite(radius_sq) or radius_sq <= 1e-12:
+        raise ValueError("Could not fit valid cylinder radius.")
+
+    radius = float(np.sqrt(radius_sq))
+
+    return center_x, center_z, radius
+
+
+def _normalize_cylinder_center_xz(
+    center_xz: Optional[Sequence[float]],
+) -> tuple[float, float] | None:
+    if center_xz is None:
+        return None
+
+    arr = np.asarray(
+        center_xz,
+        dtype=np.float64,
+    ).reshape(-1)
+
+    if arr.size < 2:
+        raise ValueError(
+            "cylinder_center_xz must contain at least two values."
+        )
+
+    center_x = float(arr[0])
+    center_z = float(arr[1])
+
+    if not np.isfinite(center_x) or not np.isfinite(center_z):
+        raise ValueError("cylinder_center_xz contains non-finite values.")
+
+    return center_x, center_z
+
+
+@dataclass(slots=True)
+class _CylinderGridTargets:
+    positions: dict[int, np.ndarray]
+    center_x: float
+    center_z: float
+    radius: float
+    theta_step: float
+    y_step: float
+
+
+def _robust_line_intercept(
+    values: np.ndarray,
+    coords: np.ndarray,
+    slope: float,
+) -> float:
+    return float(
+        np.median(
+            values
+            - float(slope) * coords
+        )
+    )
+
+
+def _build_cylinder_grid_targets_from_marker_blocks(
+    marker_blocks: dict[int, np.ndarray],
+    *,
+    id_base: int,
+    id_num_cols: int,
+    origin_col: int,
+    target_spacing: float,
+    cylinder_radius: Optional[float] = None,
+    cylinder_center_xz: Optional[Sequence[float]] = None,
+    use_chord_spacing: bool = True,
+) -> _CylinderGridTargets:
+    if len(marker_blocks) < 3:
+        raise ValueError(
+            "Need at least three marker points for cylinder grid targets."
+        )
+
+    center_xz = _normalize_cylinder_center_xz(
+        cylinder_center_xz
+    )
+
+    fitted_center_x = fitted_center_z = fitted_radius = None
+
+    if (
+        center_xz is None
+        or cylinder_radius is None
+        or not np.isfinite(float(cylinder_radius))
+        or float(cylinder_radius) <= 1e-12
+    ):
+        (
+            fitted_center_x,
+            fitted_center_z,
+            fitted_radius,
+        ) = _fit_cylinder_xz_from_marker_blocks(marker_blocks)
+
+    if center_xz is None:
+        center_x = float(fitted_center_x)
+        center_z = float(fitted_center_z)
+    else:
+        center_x = float(center_xz[0])
+        center_z = float(center_xz[1])
+
+    if (
+        cylinder_radius is None
+        or not np.isfinite(float(cylinder_radius))
+        or float(cylinder_radius) <= 1e-12
+    ):
+        radius = float(fitted_radius)
+    else:
+        radius = float(cylinder_radius)
+
+    if not np.isfinite(radius) or radius <= 1e-12:
+        raise ValueError("Cylinder grid radius must be positive.")
+
+    rows = []
+    cols = []
+    angles = []
+    y_values = []
+    by_col: dict[int, list[float]] = {}
+
+    for marker_id, block in marker_blocks.items():
+        point = np.asarray(
+            block,
+            dtype=np.float64,
+        ).reshape(3)
+
+        if not np.isfinite(point).all():
+            continue
+
+        row, col = _marker_id_to_row_col(
+            int(marker_id),
+            id_base=id_base,
+            id_num_cols=id_num_cols,
+            origin_col=origin_col,
+        )
+
+        theta = float(
+            np.arctan2(
+                point[2] - center_z,
+                point[0] - center_x,
+            )
+        )
+
+        rows.append(float(row))
+        cols.append(float(col))
+        angles.append(theta)
+        y_values.append(float(point[1]))
+        by_col.setdefault(int(col), []).append(theta)
+
+    if len(rows) < 3 or len(by_col) < 2:
+        raise ValueError(
+            "Need at least two populated columns for cylinder grid targets."
+        )
+
+    unique_cols = np.asarray(
+        sorted(by_col),
+        dtype=np.float64,
+    )
+
+    col_angles = np.asarray(
+        [
+            float(
+                np.median(
+                    np.asarray(
+                        by_col[int(col)],
+                        dtype=np.float64,
+                    )
+                )
+            )
+            for col in unique_cols
+        ],
+        dtype=np.float64,
+    )
+
+    unwrapped_col_angles = np.unwrap(col_angles)
+
+    if unique_cols.size >= 2:
+        fitted_theta_step, _ = np.polyfit(
+            unique_cols,
+            unwrapped_col_angles,
+            deg=1,
+        )
+        fitted_theta_step = float(fitted_theta_step)
+    else:
+        fitted_theta_step = 0.0
+
+    if use_chord_spacing and 0.0 < float(target_spacing) < 2.0 * radius:
+        theta_step_abs = float(
+            2.0
+            * np.arcsin(
+                min(
+                    1.0,
+                    float(target_spacing) / (2.0 * radius),
+                )
+            )
+        )
+    elif (not use_chord_spacing) and float(target_spacing) > 0.0:
+        theta_step_abs = float(target_spacing) / radius
+    else:
+        theta_step_abs = abs(float(fitted_theta_step))
+
+    if theta_step_abs <= 1e-12:
+        raise ValueError(
+            "Could not estimate a valid cylinder grid column step."
+        )
+
+    sign = 1.0 if fitted_theta_step >= 0.0 else -1.0
+    theta_step = sign * theta_step_abs
+
+    theta0 = _robust_line_intercept(
+        unwrapped_col_angles,
+        unique_cols,
+        theta_step,
+    )
+
+    rows_arr = np.asarray(
+        rows,
+        dtype=np.float64,
+    )
+
+    y_arr = np.asarray(
+        y_values,
+        dtype=np.float64,
+    )
+
+    y_step = float(target_spacing)
+    y0 = _robust_line_intercept(
+        y_arr,
+        rows_arr,
+        y_step,
+    )
+
+    positions: dict[int, np.ndarray] = {}
+
+    for marker_id, block in marker_blocks.items():
+        point = np.asarray(
+            block,
+            dtype=np.float64,
+        ).reshape(3)
+
+        if not np.isfinite(point).all():
+            continue
+
+        row, col = _marker_id_to_row_col(
+            int(marker_id),
+            id_base=id_base,
+            id_num_cols=id_num_cols,
+            origin_col=origin_col,
+        )
+
+        theta = theta0 + theta_step * float(col)
+
+        positions[int(marker_id)] = np.asarray(
+            [
+                center_x + radius * np.cos(theta),
+                y0 + y_step * float(row),
+                center_z + radius * np.sin(theta),
+            ],
+            dtype=np.float64,
+        )
+
+    if not positions:
+        raise ValueError("Cylinder grid target map is empty.")
+
+    return _CylinderGridTargets(
+        positions=positions,
+        center_x=float(center_x),
+        center_z=float(center_z),
+        radius=float(radius),
+        theta_step=float(theta_step),
+        y_step=float(y_step),
+    )
+
 
 def _build_frame_list(
     state: SfMState,
@@ -899,6 +1400,8 @@ def select_observation_outliers(
     mad_sigma: float = 3.5,
     max_fraction: float = 0.03,
     min_error_px: float = 1.0,
+    max_per_marker_fraction: Optional[float] = None,
+    max_per_marker_count: Optional[int] = None,
 ) -> set[tuple[int, int]]:
 
     if not errors:
@@ -952,6 +1455,63 @@ def select_observation_outliers(
 
         max_count = max(1, max_count)
         candidates = candidates[:max_count]
+
+    if (
+        max_per_marker_fraction is not None
+        and max_per_marker_fraction > 0.0
+    ) or (
+        max_per_marker_count is not None
+        and max_per_marker_count > 0
+    ):
+        total_by_marker: dict[int, int] = {}
+        kept_by_marker: dict[int, int] = {}
+        balanced_candidates = []
+
+        for e in errors:
+            total_by_marker[int(e.marker_id)] = (
+                total_by_marker.get(int(e.marker_id), 0)
+                + 1
+            )
+
+        for e in candidates:
+            marker_id = int(e.marker_id)
+            marker_total = max(1, total_by_marker.get(marker_id, 1))
+            marker_limit = marker_total
+
+            if (
+                max_per_marker_fraction is not None
+                and max_per_marker_fraction > 0.0
+            ):
+                marker_limit = min(
+                    marker_limit,
+                    max(
+                        1,
+                        int(
+                            np.ceil(
+                                float(max_per_marker_fraction)
+                                * marker_total
+                            )
+                        ),
+                    ),
+                )
+
+            if (
+                max_per_marker_count is not None
+                and max_per_marker_count > 0
+            ):
+                marker_limit = min(
+                    marker_limit,
+                    int(max_per_marker_count),
+                )
+
+            already_kept = kept_by_marker.get(marker_id, 0)
+            if already_kept >= marker_limit:
+                continue
+
+            balanced_candidates.append(e)
+            kept_by_marker[marker_id] = already_kept + 1
+
+        candidates = balanced_candidates
 
     ignored = {
         (
@@ -1381,6 +1941,13 @@ def run_bundle_adjustment(
     marker_json_path: Optional[Path] = None,
     topology_regularization_weight: float = 0.0,
     cell_shape_regularization_weight: float = 0.0,
+    cylinder_regularization_weight: float = 0.0,
+    cylinder_radius: Optional[float] = None,
+    cylinder_center_xz: Optional[Sequence[float]] = None,
+    cylinder_grid_regularization_weight: float = 0.0,
+    cylinder_grid_radius: Optional[float] = None,
+    cylinder_grid_center_xz: Optional[Sequence[float]] = None,
+    cylinder_grid_use_chord_spacing: bool = True,
     ignored_observations: Optional[set[tuple[int, int]]] = None,
     observation_weights: Optional[dict[tuple[int, int], float]] = None,
 ) -> BundleAdjustmentResult:
@@ -1388,6 +1955,16 @@ def run_bundle_adjustment(
     num_regularization_edges = 0
     regularization_target_spacing = float("nan")
     num_cell_regularization_terms = 0
+    num_cylinder_regularization_terms = 0
+    cylinder_radius_used = float("nan")
+    cylinder_center_x_used = float("nan")
+    cylinder_center_z_used = float("nan")
+    num_cylinder_grid_regularization_terms = 0
+    cylinder_grid_radius_used = float("nan")
+    cylinder_grid_center_x_used = float("nan")
+    cylinder_grid_center_z_used = float("nan")
+    cylinder_grid_theta_step_used = float("nan")
+    cylinder_grid_y_step_used = float("nan")
 
     ignored = _normalize_ignored_observations(
         ignored_observations
@@ -1606,6 +2183,111 @@ def run_bundle_adjustment(
 
                     num_cell_regularization_terms += 1
 
+            if float(cylinder_grid_regularization_weight) > 0.0:
+                target_spacing = _load_grid_spacing_mm(
+                    Path(marker_json_path)
+                )
+
+                grid_radius = (
+                    cylinder_grid_radius
+                    if cylinder_grid_radius is not None
+                    else cylinder_radius
+                )
+
+                grid_center_xz = (
+                    cylinder_grid_center_xz
+                    if cylinder_grid_center_xz is not None
+                    else cylinder_center_xz
+                )
+
+                grid_targets = _build_cylinder_grid_targets_from_marker_blocks(
+                    marker_blocks,
+                    id_base=id_base,
+                    id_num_cols=id_num_cols,
+                    origin_col=origin_col,
+                    target_spacing=target_spacing,
+                    cylinder_radius=grid_radius,
+                    cylinder_center_xz=grid_center_xz,
+                    use_chord_spacing=bool(cylinder_grid_use_chord_spacing),
+                )
+
+                cylinder_grid_radius_used = grid_targets.radius
+                cylinder_grid_center_x_used = grid_targets.center_x
+                cylinder_grid_center_z_used = grid_targets.center_z
+                cylinder_grid_theta_step_used = grid_targets.theta_step
+                cylinder_grid_y_step_used = grid_targets.y_step
+
+                for marker_id, target in grid_targets.positions.items():
+                    if int(marker_id) not in marker_blocks:
+                        continue
+
+                    cost_function = _PointPositionPriorCost(
+                        target=target,
+                        weight=float(cylinder_grid_regularization_weight),
+                    )
+
+                    problem.add_residual_block(
+                        cost_function,
+                        pyceres.TrivialLoss(),
+                        [
+                            marker_blocks[int(marker_id)],
+                        ],
+                    )
+
+                    num_cylinder_grid_regularization_terms += 1
+
+        if float(cylinder_regularization_weight) > 0.0:
+            center_xz = _normalize_cylinder_center_xz(
+                cylinder_center_xz
+            )
+
+            if (
+                center_xz is None
+                or cylinder_radius is None
+                or not np.isfinite(float(cylinder_radius))
+                or float(cylinder_radius) <= 1e-12
+            ):
+                (
+                    fitted_center_x,
+                    fitted_center_z,
+                    fitted_radius,
+                ) = _fit_cylinder_xz_from_marker_blocks(marker_blocks)
+
+                if center_xz is None:
+                    center_xz = (
+                        fitted_center_x,
+                        fitted_center_z,
+                    )
+
+                if (
+                    cylinder_radius is None
+                    or not np.isfinite(float(cylinder_radius))
+                    or float(cylinder_radius) <= 1e-12
+                ):
+                    cylinder_radius = fitted_radius
+
+            cylinder_center_x_used = float(center_xz[0])
+            cylinder_center_z_used = float(center_xz[1])
+            cylinder_radius_used = float(cylinder_radius)
+
+            for block in marker_blocks.values():
+                cost_function = _CylinderSurfaceCost(
+                    center_x=cylinder_center_x_used,
+                    center_z=cylinder_center_z_used,
+                    radius=cylinder_radius_used,
+                    weight=float(cylinder_regularization_weight),
+                )
+
+                problem.add_residual_block(
+                    cost_function,
+                    pyceres.TrivialLoss(),
+                    [
+                        block,
+                    ],
+                )
+
+                num_cylinder_regularization_terms += 1
+
         if num_observations == 0:
             raise ValueError(
                 "No valid observations added to Ceres problem."
@@ -1617,7 +2299,10 @@ def run_bundle_adjustment(
             opts.linear_solver
             or pyceres.LinearSolverType.DENSE_SCHUR
         )
-        solver_options.minimizer_progress_to_stdout = opts.report_full
+        solver_options.minimizer_progress_to_stdout = (
+            bool(opts.progress_to_stdout)
+            or bool(opts.report_full)
+        )
 
         summary = pyceres.SolverSummary()
 
@@ -1647,6 +2332,26 @@ def run_bundle_adjustment(
                 cell_shape_regularization_weight=float(
                     cell_shape_regularization_weight
                 ),
+                num_cylinder_regularization_terms=(
+                    num_cylinder_regularization_terms
+                ),
+                cylinder_regularization_weight=float(
+                    cylinder_regularization_weight
+                ),
+                cylinder_radius=cylinder_radius_used,
+                cylinder_center_x=cylinder_center_x_used,
+                cylinder_center_z=cylinder_center_z_used,
+                num_cylinder_grid_regularization_terms=(
+                    num_cylinder_grid_regularization_terms
+                ),
+                cylinder_grid_regularization_weight=float(
+                    cylinder_grid_regularization_weight
+                ),
+                cylinder_grid_radius=cylinder_grid_radius_used,
+                cylinder_grid_center_x=cylinder_grid_center_x_used,
+                cylinder_grid_center_z=cylinder_grid_center_z_used,
+                cylinder_grid_theta_step=cylinder_grid_theta_step_used,
+                cylinder_grid_y_step=cylinder_grid_y_step_used,
                 initial_median_error_px=median_before,
                 initial_mean_error_px=mean_before,
             )
@@ -1681,6 +2386,26 @@ def run_bundle_adjustment(
             cell_shape_regularization_weight=float(
                 cell_shape_regularization_weight
             ),
+            num_cylinder_regularization_terms=(
+                num_cylinder_regularization_terms
+            ),
+            cylinder_regularization_weight=float(
+                cylinder_regularization_weight
+            ),
+            cylinder_radius=cylinder_radius_used,
+            cylinder_center_x=cylinder_center_x_used,
+            cylinder_center_z=cylinder_center_z_used,
+            num_cylinder_grid_regularization_terms=(
+                num_cylinder_grid_regularization_terms
+            ),
+            cylinder_grid_regularization_weight=float(
+                cylinder_grid_regularization_weight
+            ),
+            cylinder_grid_radius=cylinder_grid_radius_used,
+            cylinder_grid_center_x=cylinder_grid_center_x_used,
+            cylinder_grid_center_z=cylinder_grid_center_z_used,
+            cylinder_grid_theta_step=cylinder_grid_theta_step_used,
+            cylinder_grid_y_step=cylinder_grid_y_step_used,
             initial_median_error_px=median_before,
             initial_mean_error_px=mean_before,
             final_median_error_px=median_after,
@@ -1700,6 +2425,26 @@ def run_bundle_adjustment(
             cell_shape_regularization_weight=float(
                 cell_shape_regularization_weight
             ),
+            num_cylinder_regularization_terms=(
+                num_cylinder_regularization_terms
+            ),
+            cylinder_regularization_weight=float(
+                cylinder_regularization_weight
+            ),
+            cylinder_radius=cylinder_radius_used,
+            cylinder_center_x=cylinder_center_x_used,
+            cylinder_center_z=cylinder_center_z_used,
+            num_cylinder_grid_regularization_terms=(
+                num_cylinder_grid_regularization_terms
+            ),
+            cylinder_grid_regularization_weight=float(
+                cylinder_grid_regularization_weight
+            ),
+            cylinder_grid_radius=cylinder_grid_radius_used,
+            cylinder_grid_center_x=cylinder_grid_center_x_used,
+            cylinder_grid_center_z=cylinder_grid_center_z_used,
+            cylinder_grid_theta_step=cylinder_grid_theta_step_used,
+            cylinder_grid_y_step=cylinder_grid_y_step_used,
         )
 
 
@@ -1728,6 +2473,29 @@ def print_bundle_adjustment_summary(
     print("cell shape regularization")
     print(f"  cells                : {result.num_cell_regularization_terms}")
     print(f"  weight               : {result.cell_shape_regularization_weight:.6f}")
+
+    print()
+    print("cylinder regularization")
+    print(f"  points               : {result.num_cylinder_regularization_terms}")
+    print(f"  weight               : {result.cylinder_regularization_weight:.6f}")
+    print(f"  radius               : {result.cylinder_radius:.6f}")
+    print(
+        "  center x/z           : "
+        f"{result.cylinder_center_x:.6f}, {result.cylinder_center_z:.6f}"
+    )
+
+    print()
+    print("cylinder grid regularization")
+    print(f"  points               : {result.num_cylinder_grid_regularization_terms}")
+    print(f"  weight               : {result.cylinder_grid_regularization_weight:.6f}")
+    print(f"  radius               : {result.cylinder_grid_radius:.6f}")
+    print(
+        "  center x/z           : "
+        f"{result.cylinder_grid_center_x:.6f}, "
+        f"{result.cylinder_grid_center_z:.6f}"
+    )
+    print(f"  theta step           : {result.cylinder_grid_theta_step:.6f}")
+    print(f"  y step               : {result.cylinder_grid_y_step:.6f}")
 
     print()
     print("reprojection error [px]")

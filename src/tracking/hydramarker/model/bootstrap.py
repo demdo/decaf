@@ -48,6 +48,12 @@ class BootstrapResult:
     depths_a: np.ndarray | None = None
     depths_b: np.ndarray | None = None
 
+    num_valid_cols: int = 0
+    num_valid_rows: int = 0
+    valid_col_span: int = 0
+    valid_row_span: int = 0
+    median_triangulation_angle_deg: float = float("nan")
+
 
 def _frame_points_for_ids(
     frame: FrameObservation,
@@ -57,6 +63,111 @@ def _frame_points_for_ids(
         [frame.observations[mid].uv for mid in ids],
         dtype=np.float64,
     ).reshape(-1, 2)
+
+
+def _coverage_metrics(
+    marker_ids: np.ndarray | list[int],
+    *,
+    id_num_cols: int | None,
+) -> tuple[int, int, int, int]:
+    if id_num_cols is None or int(id_num_cols) <= 0:
+        return 0, 0, 0, 0
+
+    ids = np.asarray(
+        marker_ids,
+        dtype=np.int64,
+    ).reshape(-1)
+
+    if ids.size == 0:
+        return 0, 0, 0, 0
+
+    rows = ids // int(id_num_cols)
+    cols = ids % int(id_num_cols)
+
+    unique_rows = np.unique(rows)
+    unique_cols = np.unique(cols)
+
+    row_span = int(np.max(unique_rows) - np.min(unique_rows) + 1)
+    col_span = int(np.max(unique_cols) - np.min(unique_cols) + 1)
+
+    return (
+        int(unique_cols.size),
+        int(unique_rows.size),
+        col_span,
+        row_span,
+    )
+
+
+def _shared_id_score(
+    shared_ids: list[int],
+    *,
+    gap: int,
+    id_num_cols: int | None,
+) -> float:
+    num_cols, num_rows, col_span, row_span = _coverage_metrics(
+        shared_ids,
+        id_num_cols=id_num_cols,
+    )
+
+    return (
+        1000.0 * float(len(shared_ids))
+        + 50.0 * float(num_cols)
+        + 10.0 * float(col_span)
+        + 5.0 * float(num_rows)
+        + float(row_span)
+        + 0.001 * float(gap)
+    )
+
+
+def triangulation_angles_deg(
+    points_a: np.ndarray,
+    R_ba: np.ndarray,
+    t_ba: np.ndarray,
+) -> np.ndarray:
+    points_a = np.asarray(
+        points_a,
+        dtype=np.float64,
+    ).reshape(-1, 3)
+
+    if points_a.size == 0:
+        return np.empty((0,), dtype=np.float64)
+
+    R_ba = np.asarray(R_ba, dtype=np.float64).reshape(3, 3)
+    t_ba = np.asarray(t_ba, dtype=np.float64).reshape(3)
+
+    camera_a_center = np.zeros(3, dtype=np.float64)
+    camera_b_center = -R_ba.T @ t_ba
+
+    rays_a = points_a - camera_a_center.reshape(1, 3)
+    rays_b = points_a - camera_b_center.reshape(1, 3)
+
+    norm_a = np.linalg.norm(rays_a, axis=1)
+    norm_b = np.linalg.norm(rays_b, axis=1)
+    valid = (
+        np.isfinite(rays_a).all(axis=1)
+        & np.isfinite(rays_b).all(axis=1)
+        & (norm_a > 1e-12)
+        & (norm_b > 1e-12)
+    )
+
+    angles = np.full(
+        points_a.shape[0],
+        np.nan,
+        dtype=np.float64,
+    )
+
+    if np.any(valid):
+        dots = np.sum(
+            rays_a[valid] * rays_b[valid],
+            axis=1,
+        ) / (
+            norm_a[valid]
+            * norm_b[valid]
+        )
+        dots = np.clip(dots, -1.0, 1.0)
+        angles[valid] = np.degrees(np.arccos(dots))
+
+    return angles
 
 
 def undistort_points_normalized(
@@ -78,8 +189,9 @@ def select_bootstrap_pair(
     frames: list[FrameObservation],
     *,
     min_shared_ids: int = 20,
-    max_pairs: int = 2000,
+    max_pairs: int | None = 2000,
     min_frame_gap: int = 5,
+    id_num_cols: int | None = None,
 ) -> BootstrapPair:
     if len(frames) < 2:
         raise ValueError("Need at least two frames for SfM bootstrap.")
@@ -101,7 +213,11 @@ def select_bootstrap_pair(
             if n_shared < min_shared_ids:
                 continue
 
-            score = float(n_shared) + 0.01 * float(gap)
+            score = _shared_id_score(
+                shared,
+                gap=gap,
+                id_num_cols=id_num_cols,
+            )
 
             if best is None or score > best.score:
                 best = BootstrapPair(
@@ -112,10 +228,10 @@ def select_bootstrap_pair(
                 )
 
             tested += 1
-            if tested >= max_pairs:
+            if max_pairs is not None and max_pairs > 0 and tested >= max_pairs:
                 break
 
-        if tested >= max_pairs:
+        if max_pairs is not None and max_pairs > 0 and tested >= max_pairs:
             break
 
     if best is None:
@@ -130,8 +246,9 @@ def select_bootstrap_pair_candidates(
     frames: list[FrameObservation],
     *,
     min_shared_ids: int = 20,
-    max_pairs: int = 2000,
+    max_pairs: int | None = 2000,
     min_frame_gap: int = 5,
+    id_num_cols: int | None = None,
 ) -> list[BootstrapPair]:
     if len(frames) < 2:
         raise ValueError("Need at least two frames for SfM bootstrap.")
@@ -158,15 +275,19 @@ def select_bootstrap_pair_candidates(
                     frame_a=frame_a,
                     frame_b=frame_b,
                     shared_ids=shared,
-                    score=float(n_shared) + 0.01 * float(gap),
+                    score=_shared_id_score(
+                        shared,
+                        gap=gap,
+                        id_num_cols=id_num_cols,
+                    ),
                 )
             )
 
             tested += 1
-            if tested >= max_pairs:
+            if max_pairs is not None and max_pairs > 0 and tested >= max_pairs:
                 break
 
-        if tested >= max_pairs:
+        if max_pairs is not None and max_pairs > 0 and tested >= max_pairs:
             break
 
     candidates.sort(key=lambda pair: pair.score, reverse=True)
@@ -295,8 +416,9 @@ def run_bootstrap(
     *,
     min_shared_ids: int = 20,
     min_frame_gap: int = 5,
-    max_pairs: int = 2000,
+    max_pairs: int | None = 2000,
     max_candidate_pairs_to_try: int = 50,
+    id_num_cols: int | None = None,
     ransac_threshold_norm: float = 1e-3,
     max_reprojection_error_norm: float = 2e-3,
 ) -> BootstrapResult:
@@ -306,6 +428,7 @@ def run_bootstrap(
             min_shared_ids=min_shared_ids,
             min_frame_gap=min_frame_gap,
             max_pairs=max_pairs,
+            id_num_cols=id_num_cols,
         )
 
         if not candidates:
@@ -345,8 +468,28 @@ def run_bootstrap(
                 if len(reproj) > 0
                 else float("inf")
             )
+            num_cols, num_rows, col_span, row_span = _coverage_metrics(
+                ids_valid,
+                id_num_cols=id_num_cols,
+            )
+            angles = triangulation_angles_deg(
+                points_valid,
+                R_ba,
+                t_ba,
+            )
+            finite_angles = angles[np.isfinite(angles)]
+            median_angle = (
+                float(np.median(finite_angles))
+                if finite_angles.size > 0
+                else float("-inf")
+            )
             candidate_score = (
                 int(len(ids_valid)),
+                int(num_cols),
+                int(col_span),
+                int(num_rows),
+                int(row_span),
+                float(median_angle),
                 -median_reproj,
                 int(len(pair.shared_ids)),
                 float(pair.score),
@@ -366,6 +509,11 @@ def run_bootstrap(
                     depths_a,
                     depths_b,
                     reproj,
+                    num_cols,
+                    num_rows,
+                    col_span,
+                    row_span,
+                    median_angle,
                 )
 
         if best is None:
@@ -388,6 +536,11 @@ def run_bootstrap(
             depths_a,
             depths_b,
             reproj,
+            num_cols,
+            num_rows,
+            col_span,
+            row_span,
+            median_angle,
         ) = best
 
         if len(ids_valid) < 8:
@@ -412,6 +565,11 @@ def run_bootstrap(
             reprojection_errors=reproj,
             depths_a=depths_a,
             depths_b=depths_b,
+            num_valid_cols=num_cols,
+            num_valid_rows=num_rows,
+            valid_col_span=col_span,
+            valid_row_span=row_span,
+            median_triangulation_angle_deg=median_angle,
         )
 
     except Exception as exc:

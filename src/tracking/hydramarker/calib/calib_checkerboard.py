@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import cv2
 import numpy as np
 
+from tracking.hydramarker.calib import calib_camera
 from tracking.pose_solvers import (
     _build_ippe_candidates,
     compute_reprojection_error_px,
@@ -36,8 +37,14 @@ DEFAULT_AMBIGUITY_MIN_TRANSLATION_DELTA_MM = 0.1
 DEFAULT_AMBIGUITY_MIN_ROTATION_DELTA_DEG = 0.03
 DEFAULT_BURST_REFINE_CANDIDATE_MAX_RMS_GAP_PX = 0.25
 DEFAULT_BURST_REFINE_CANDIDATE_MAX_RMS_RATIO = 2.0
+CHARUCO_TABLE_MIN_FRAMES_PER_POSITION = 100
+CHARUCO_TABLE_MAX_FRAMES_PER_POSITION = 300
+CHARUCO_TABLE_MIN_POSITIONS = 3
+CHARUCO_TABLE_TARGET_POSITIONS = 5
+CHARUCO_TABLE_MIN_CORNERS = max(24, calib_camera.MIN_CHARUCO_CAPTURE)
 
 WINDOW_NAME = "HydraMarker Checkerboard Pose Calibration"
+CHARUCO_TABLE_WINDOW_NAME = "HydraMarker ChArUco Table Calibration"
 
 StatusCallback = Callable[[str], None]
 
@@ -115,6 +122,122 @@ class CheckerboardPose:
     @property
     def max_corner_std_px(self) -> float:
         return float(np.max(self.corner_std_px))
+
+
+@dataclass(frozen=True)
+class CharucoTableFramePose:
+    frame_index: int
+    rvec_cb: np.ndarray
+    tvec_cb_mm: np.ndarray
+    R_C_B: np.ndarray
+    normal_camera: np.ndarray
+    x_axis_camera: np.ndarray
+    origin_camera_mm: np.ndarray
+    object_points_mm: np.ndarray
+    image_points_uv: np.ndarray
+    errors_px: np.ndarray
+    rms_px: float
+    mean_px: float
+    p95_px: float
+    max_px: float
+    num_charuco: int
+    num_aruco: int
+
+
+@dataclass(frozen=True)
+class CharucoTablePosition:
+    position_index: int
+    frames: tuple[CharucoTableFramePose, ...]
+    frame_mask: np.ndarray
+
+    @property
+    def used_frames(self) -> tuple[CharucoTableFramePose, ...]:
+        return tuple(frame for frame, keep in zip(self.frames, self.frame_mask) if bool(keep))
+
+    @property
+    def normal_camera(self) -> np.ndarray:
+        return _mean_unit_vectors([frame.normal_camera for frame in self.used_frames])
+
+    @property
+    def x_axis_camera(self) -> np.ndarray:
+        return _mean_unit_vectors([frame.x_axis_camera for frame in self.used_frames])
+
+    @property
+    def origin_camera_mm(self) -> np.ndarray:
+        used = self.used_frames
+        if not used:
+            return np.zeros(3, dtype=np.float64)
+        return np.mean([frame.origin_camera_mm for frame in used], axis=0)
+
+    @property
+    def median_rms_px(self) -> float:
+        used = self.used_frames
+        if not used:
+            return float("nan")
+        return float(np.median([frame.rms_px for frame in used]))
+
+
+@dataclass(frozen=True)
+class CharucoTableCalibration:
+    rvec_cb: np.ndarray
+    tvec_cb_mm: np.ndarray
+    T_C_B: np.ndarray
+    T_B_C: np.ndarray
+    positions: tuple[CharucoTablePosition, ...]
+    frame_mask: np.ndarray
+    all_errors_px: np.ndarray
+    frame_rms_px: np.ndarray
+    normal_camera: np.ndarray
+    x_axis_camera: np.ndarray
+    y_axis_camera: np.ndarray
+    source_position_index: int
+    square_length_mm: float
+    marker_length_mm: float
+    aruco_dictionary_id: int
+    solver_mode: str = "charuco_table_multi_position"
+    pnp_flag: int = cv2.SOLVEPNP_ITERATIVE
+
+    @property
+    def frames_total(self) -> int:
+        return int(self.frame_mask.size)
+
+    @property
+    def frames_used(self) -> int:
+        return int(np.count_nonzero(self.frame_mask))
+
+    @property
+    def positions_used(self) -> int:
+        return len(self.positions)
+
+    @property
+    def reproj_mean_px(self) -> float:
+        return float(np.mean(self.all_errors_px)) if self.all_errors_px.size else float("nan")
+
+    @property
+    def reproj_median_px(self) -> float:
+        return float(np.median(self.all_errors_px)) if self.all_errors_px.size else float("nan")
+
+    @property
+    def reproj_p95_px(self) -> float:
+        return float(np.percentile(self.all_errors_px, 95)) if self.all_errors_px.size else float("nan")
+
+    @property
+    def reproj_max_px(self) -> float:
+        return float(np.max(self.all_errors_px)) if self.all_errors_px.size else float("nan")
+
+    @property
+    def collected_frames(self) -> int:
+        return self.frames_total
+
+    @property
+    def mean_corner_std_px(self) -> float:
+        kept = self.frame_rms_px[self.frame_mask]
+        return float(np.std(kept)) if kept.size else float("nan")
+
+    @property
+    def max_corner_std_px(self) -> float:
+        kept = self.frame_rms_px[self.frame_mask]
+        return float(np.max(kept) - np.min(kept)) if kept.size else float("nan")
 
 
 def checkerboard_object_points_mm(
@@ -844,6 +967,459 @@ def draw_capture_overlay(
     return _draw_text_box(vis, lines, color=color)
 
 
+def _normalize_vector(v: np.ndarray) -> np.ndarray:
+    arr = np.asarray(v, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-12 or not np.isfinite(norm):
+        return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    return arr / norm
+
+
+def _mean_unit_vectors(vectors: Sequence[np.ndarray]) -> np.ndarray:
+    values = [_normalize_vector(v) for v in vectors]
+    if not values:
+        return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    reference = values[0]
+    aligned = []
+    for value in values:
+        aligned.append(-value if float(np.dot(value, reference)) < 0.0 else value)
+    return _normalize_vector(np.mean(aligned, axis=0))
+
+
+def _angular_error_deg(vectors: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    vectors = np.asarray(vectors, dtype=np.float64).reshape(-1, 3)
+    reference = _normalize_vector(reference)
+    dots = np.clip(vectors @ reference, -1.0, 1.0)
+    return np.degrees(np.arccos(dots))
+
+
+def _robust_scalar_mask(values: np.ndarray, mad_scale: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return np.zeros(0, dtype=bool)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    sigma = 1.4826 * mad
+    threshold = median + float(mad_scale) * max(sigma, 1e-12)
+    return values <= threshold
+
+
+def _charuco_object_points_mm(board: Any, charuco_ids: np.ndarray) -> np.ndarray:
+    obj_m = calib_camera._charuco_object_points(board, charuco_ids)
+    return np.asarray(obj_m, dtype=np.float64).reshape(-1, 3) * 1000.0
+
+
+def estimate_charuco_table_frame_pose(
+    frame_bgr: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    *,
+    board: Any,
+    aruco_dict: Any,
+    detector_params: Any,
+    frame_index: int,
+    min_charuco_corners: int = CHARUCO_TABLE_MIN_CORNERS,
+) -> tuple[CharucoTableFramePose | None, calib_camera.CharucoDetection]:
+    det = calib_camera.detect_charuco(frame_bgr, board, aruco_dict, detector_params)
+    if det.charuco_ids is None or det.charuco_corners is None:
+        return None, det
+    if det.num_charuco < int(min_charuco_corners):
+        return None, det
+
+    object_points = _charuco_object_points_mm(board, det.charuco_ids)
+    image_points = np.asarray(det.charuco_corners, dtype=np.float64).reshape(-1, 2)
+    try:
+        rvec, tvec, _flag = solve_best_checkerboard_pose(
+            object_points,
+            image_points,
+            K,
+            dist,
+        )
+    except RuntimeError:
+        return None, det
+
+    rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+    tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+    if hasattr(cv2, "solvePnPRefineVVS"):
+        try:
+            rvec, tvec = cv2.solvePnPRefineVVS(
+                object_points,
+                image_points,
+                np.asarray(K, dtype=np.float64).reshape(3, 3),
+                np.asarray(dist, dtype=np.float64).reshape(-1, 1),
+                rvec,
+                tvec,
+            )
+        except cv2.error:
+            pass
+
+    residual = reprojection_vectors_px(object_points, image_points, rvec, tvec, K, dist)
+    errors = np.linalg.norm(residual, axis=1)
+    R_C_B, _ = cv2.Rodrigues(rvec)
+    R_C_B = np.asarray(R_C_B, dtype=np.float64).reshape(3, 3)
+
+    pose = CharucoTableFramePose(
+        frame_index=int(frame_index),
+        rvec_cb=rvec.reshape(3, 1).copy(),
+        tvec_cb_mm=tvec.reshape(3, 1).copy(),
+        R_C_B=R_C_B.copy(),
+        normal_camera=_normalize_vector(R_C_B[:, 2]),
+        x_axis_camera=_normalize_vector(R_C_B[:, 0]),
+        origin_camera_mm=tvec.reshape(3).copy(),
+        object_points_mm=np.asarray(object_points, dtype=np.float64).reshape(-1, 3).copy(),
+        image_points_uv=np.asarray(image_points, dtype=np.float64).reshape(-1, 2).copy(),
+        errors_px=np.asarray(errors, dtype=np.float64).reshape(-1),
+        rms_px=float(np.sqrt(np.mean(errors * errors))),
+        mean_px=float(np.mean(errors)),
+        p95_px=float(np.percentile(errors, 95)),
+        max_px=float(np.max(errors)),
+        num_charuco=int(det.num_charuco),
+        num_aruco=int(det.num_aruco),
+    )
+    return pose, det
+
+
+def _charuco_position_from_frames(
+    frames: Sequence[CharucoTableFramePose],
+    *,
+    position_index: int,
+    mad_scale: float,
+) -> CharucoTablePosition:
+    if not frames:
+        raise RuntimeError("No ChArUco pose frames collected for this table position.")
+    rms = np.asarray([frame.rms_px for frame in frames], dtype=np.float64)
+    keep = _robust_scalar_mask(rms, mad_scale)
+    if int(np.count_nonzero(keep)) < max(8, min(len(frames), 20)):
+        keep = np.ones(len(frames), dtype=bool)
+
+    normals = np.asarray([frame.normal_camera for frame in frames], dtype=np.float64)
+    normal_ref = _mean_unit_vectors(normals[keep])
+    angular = _angular_error_deg(normals, normal_ref)
+    keep_angle = _robust_scalar_mask(angular, mad_scale)
+    combined = keep & keep_angle
+    if int(np.count_nonzero(combined)) >= max(8, min(len(frames), 20)):
+        keep = combined
+
+    return CharucoTablePosition(
+        position_index=int(position_index),
+        frames=tuple(frames),
+        frame_mask=np.asarray(keep, dtype=bool).reshape(-1),
+    )
+
+
+def _build_charuco_table_calibration(
+    positions: Sequence[CharucoTablePosition],
+    *,
+    mad_scale: float,
+) -> CharucoTableCalibration:
+    if len(positions) < CHARUCO_TABLE_MIN_POSITIONS:
+        raise RuntimeError(
+            f"Need at least {CHARUCO_TABLE_MIN_POSITIONS} ChArUco table positions."
+        )
+
+    all_kept_frames: list[CharucoTableFramePose] = []
+    frame_mask_parts: list[np.ndarray] = []
+    for position in positions:
+        all_kept_frames.extend(position.used_frames)
+        frame_mask_parts.append(position.frame_mask)
+    if not all_kept_frames:
+        raise RuntimeError("No robust ChArUco table frames left after outlier rejection.")
+
+    normals = np.asarray([frame.normal_camera for frame in all_kept_frames], dtype=np.float64)
+    normal_ref = _mean_unit_vectors(normals)
+    angular = _angular_error_deg(normals, normal_ref)
+    normal_keep = _robust_scalar_mask(angular, mad_scale)
+    if int(np.count_nonzero(normal_keep)) >= max(20, len(all_kept_frames) // 2):
+        normal = _mean_unit_vectors(normals[normal_keep])
+    else:
+        normal = normal_ref
+
+    source_position = min(positions, key=lambda pos: pos.median_rms_px)
+    source_x = source_position.x_axis_camera
+    x_axis = source_x - float(np.dot(source_x, normal)) * normal
+    if float(np.linalg.norm(x_axis)) <= 1e-9:
+        source_y = _mean_unit_vectors([frame.R_C_B[:, 1] for frame in source_position.used_frames])
+        x_axis = np.cross(source_y, normal)
+    x_axis = _normalize_vector(x_axis)
+    y_axis = _normalize_vector(np.cross(normal, x_axis))
+    x_axis = _normalize_vector(np.cross(y_axis, normal))
+
+    R_C_B = np.column_stack([x_axis, y_axis, normal]).astype(np.float64)
+    origin_camera = source_position.origin_camera_mm.reshape(3)
+    T_C_B = np.eye(4, dtype=np.float64)
+    T_C_B[:3, :3] = R_C_B
+    T_C_B[:3, 3] = origin_camera
+    T_B_C = invert_transform(T_C_B)
+    rvec, _ = cv2.Rodrigues(R_C_B)
+
+    all_errors = np.concatenate([frame.errors_px for frame in all_kept_frames])
+    all_rms = np.asarray(
+        [frame.rms_px for position in positions for frame in position.frames],
+        dtype=np.float64,
+    )
+    frame_mask = np.concatenate(frame_mask_parts).astype(bool)
+
+    return CharucoTableCalibration(
+        rvec_cb=np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+        tvec_cb_mm=origin_camera.reshape(3, 1),
+        T_C_B=T_C_B,
+        T_B_C=T_B_C,
+        positions=tuple(positions),
+        frame_mask=frame_mask,
+        all_errors_px=np.asarray(all_errors, dtype=np.float64).reshape(-1),
+        frame_rms_px=all_rms.reshape(-1),
+        normal_camera=normal.reshape(3),
+        x_axis_camera=x_axis.reshape(3),
+        y_axis_camera=y_axis.reshape(3),
+        source_position_index=int(source_position.position_index),
+        square_length_mm=float(calib_camera.SQUARE_LEN_M * 1000.0),
+        marker_length_mm=float(calib_camera.MARKER_LEN_M * 1000.0),
+        aruco_dictionary_id=int(calib_camera.DICT_ID),
+    )
+
+
+def draw_charuco_table_capture_overlay(
+    frame_bgr: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    pose: CharucoTableFramePose | None,
+    det: calib_camera.CharucoDetection | None,
+    positions: Sequence[CharucoTablePosition],
+    current_frames: Sequence[CharucoTableFramePose],
+    *,
+    recording: bool,
+    min_positions: int,
+    target_positions: int,
+    min_frames_per_position: int,
+) -> np.ndarray:
+    vis = frame_bgr.copy()
+    if det is not None:
+        if det.aruco_ids is not None and len(det.aruco_ids) > 0:
+            cv2.aruco.drawDetectedMarkers(vis, det.aruco_corners, det.aruco_ids)
+        if det.charuco_corners is not None and det.charuco_ids is not None:
+            try:
+                cv2.aruco.drawDetectedCornersCharuco(
+                    vis,
+                    det.charuco_corners,
+                    det.charuco_ids,
+                    (255, 255, 0),
+                )
+            except Exception:
+                pts = np.asarray(det.charuco_corners, dtype=np.float64).reshape(-1, 2)
+                for u, v in pts:
+                    cv2.circle(vis, (int(round(u)), int(round(v))), 4, (255, 255, 0), 2)
+
+    if pose is not None:
+        _draw_axes(vis, K, dist, pose.rvec_cb, pose.tvec_cb_mm)
+
+    color = (0, 210, 255) if recording else ((0, 255, 0) if pose is not None else (0, 0, 255))
+    found = 0 if det is None else int(det.num_charuco)
+    status = (
+        "RECORDING table position (SPACE stores it)"
+        if recording
+        else "READY (SPACE records this table position)"
+    )
+    lines = [
+        status,
+        f"ChArUco corners: {found}/{calib_camera.MAX_CHARUCO_CORNERS}",
+        (
+            f"positions: {len(positions)}/{target_positions} "
+            f"(finish ENTER after {min_positions}+)"
+        ),
+        f"current position frames: {len(current_frames)}/{min_frames_per_position}+",
+        "Move board to another table spot between positions; keep it flat.",
+        "Keys: SPACE start/store | ENTER finish | Q/ESC abort",
+    ]
+    if pose is not None:
+        lines.append(
+            f"live reproj mean={pose.mean_px:.3f}px p95={pose.p95_px:.3f}px"
+        )
+    if len(positions) >= min_positions and not recording:
+        lines.append("Enough positions collected; ENTER accepts calibration.")
+    return _draw_text_box(vis, lines, color=color)
+
+
+def capture_charuco_table_calibration_from_pipeline(
+    pipeline,
+    K: np.ndarray,
+    dist: np.ndarray,
+    *,
+    min_positions: int = CHARUCO_TABLE_MIN_POSITIONS,
+    target_positions: int = CHARUCO_TABLE_TARGET_POSITIONS,
+    min_frames_per_position: int = CHARUCO_TABLE_MIN_FRAMES_PER_POSITION,
+    max_frames_per_position: int = CHARUCO_TABLE_MAX_FRAMES_PER_POSITION,
+    capture_interval_s: float = DEFAULT_CAPTURE_INTERVAL_S,
+    window_name: str = CHARUCO_TABLE_WINDOW_NAME,
+    min_charuco_corners: int = CHARUCO_TABLE_MIN_CORNERS,
+    mad_scale: float = DEFAULT_FRAME_OUTLIER_MAD_SCALE,
+    status_callback: StatusCallback | None = None,
+) -> CharucoTableCalibration | None:
+    board, aruco_dict, detector_params = calib_camera.make_charuco_board()
+    positions: list[CharucoTablePosition] = []
+    current_frames: list[CharucoTableFramePose] = []
+    recording = False
+    last_capture_s = -float("inf")
+    last_frame: np.ndarray | None = None
+    frame_index = 0
+
+    def store_current_position() -> bool:
+        nonlocal current_frames, recording
+        if len(current_frames) < int(min_frames_per_position):
+            return False
+        position = _charuco_position_from_frames(
+            current_frames,
+            position_index=len(positions) + 1,
+            mad_scale=mad_scale,
+        )
+        positions.append(position)
+        if status_callback is not None:
+            status_callback(
+                f"charuco_table_position:{len(positions)}:"
+                f"frames={len(position.used_frames)}:"
+                f"rms={position.median_rms_px:.3f}"
+            )
+        current_frames = []
+        recording = False
+        return True
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    try:
+        if status_callback is not None:
+            status_callback("charuco_table_capture_ready")
+
+        while True:
+            frame = wait_color_frame_bgr(pipeline)
+            got_new_frame = frame is not None
+            if frame is None:
+                frame = last_frame
+            if frame is None:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    return None
+                continue
+
+            if got_new_frame:
+                frame_index += 1
+            last_frame = frame
+
+            pose, det = estimate_charuco_table_frame_pose(
+                frame,
+                K,
+                dist,
+                board=board,
+                aruco_dict=aruco_dict,
+                detector_params=detector_params,
+                frame_index=frame_index,
+                min_charuco_corners=min_charuco_corners,
+            )
+
+            now_s = time.monotonic()
+            if (
+                recording
+                and got_new_frame
+                and pose is not None
+                and len(current_frames) < int(max_frames_per_position)
+                and now_s - last_capture_s >= float(capture_interval_s)
+            ):
+                current_frames.append(pose)
+                last_capture_s = now_s
+                if status_callback is not None:
+                    status_callback(f"charuco_table_frames:{len(current_frames)}")
+
+            if recording and len(current_frames) >= int(max_frames_per_position):
+                store_current_position()
+
+            vis = draw_charuco_table_capture_overlay(
+                frame,
+                K,
+                dist,
+                pose,
+                det,
+                positions,
+                current_frames,
+                recording=recording,
+                min_positions=min_positions,
+                target_positions=target_positions,
+                min_frames_per_position=min_frames_per_position,
+            )
+            cv2.imshow(window_name, vis)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key in (27, ord("q")):
+                return None
+
+            if key == 32:
+                if not recording:
+                    recording = True
+                    current_frames = []
+                    last_capture_s = -float("inf")
+                    if status_callback is not None:
+                        status_callback("charuco_table_position_started")
+                elif not store_current_position():
+                    recording = True
+                    if status_callback is not None:
+                        status_callback("charuco_table_position_needs_more_frames")
+
+            if key in (10, 13) and not recording and len(positions) >= int(min_positions):
+                if status_callback is not None:
+                    status_callback("charuco_table_capture_finished")
+                break
+
+        return _build_charuco_table_calibration(
+            positions,
+            mad_scale=mad_scale,
+        )
+    finally:
+        try:
+            cv2.destroyWindow(window_name)
+        except cv2.error:
+            pass
+        cv2.waitKey(1)
+
+
+def capture_charuco_table_calibration(
+    K: np.ndarray,
+    dist: np.ndarray,
+    *,
+    width: int = REALSENSE_WIDTH,
+    height: int = REALSENSE_HEIGHT,
+    fps: int = REALSENSE_FPS,
+    min_positions: int = CHARUCO_TABLE_MIN_POSITIONS,
+    target_positions: int = CHARUCO_TABLE_TARGET_POSITIONS,
+    min_frames_per_position: int = CHARUCO_TABLE_MIN_FRAMES_PER_POSITION,
+    max_frames_per_position: int = CHARUCO_TABLE_MAX_FRAMES_PER_POSITION,
+    capture_interval_s: float = DEFAULT_CAPTURE_INTERVAL_S,
+    window_name: str = CHARUCO_TABLE_WINDOW_NAME,
+    min_charuco_corners: int = CHARUCO_TABLE_MIN_CORNERS,
+    mad_scale: float = DEFAULT_FRAME_OUTLIER_MAD_SCALE,
+    status_callback: StatusCallback | None = None,
+) -> CharucoTableCalibration | None:
+    pipeline = None
+    try:
+        pipeline, _profile = start_realsense_color_stream(
+            width=int(width),
+            height=int(height),
+            fps=int(fps),
+        )
+        return capture_charuco_table_calibration_from_pipeline(
+            pipeline,
+            K,
+            dist,
+            min_positions=min_positions,
+            target_positions=target_positions,
+            min_frames_per_position=min_frames_per_position,
+            max_frames_per_position=max_frames_per_position,
+            capture_interval_s=capture_interval_s,
+            window_name=window_name,
+            min_charuco_corners=min_charuco_corners,
+            mad_scale=mad_scale,
+            status_callback=status_callback,
+        )
+    finally:
+        if pipeline is not None:
+            pipeline.stop()
+
+
 def align_detection_to_reference(corners: np.ndarray, reference: np.ndarray) -> np.ndarray:
     corners = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
     reference = np.asarray(reference, dtype=np.float64).reshape(-1, 2)
@@ -1078,9 +1654,10 @@ def capture_checkerboard_pose(
     )
 
 
-def pose_quality_dict(pose: CheckerboardPose) -> dict[str, float | int]:
+def pose_quality_dict(pose: CheckerboardPose | CharucoTableCalibration) -> dict[str, float | int]:
     kept_errors = pose.frame_rms_px[pose.frame_mask]
     all_errors = pose.all_errors_px
+    corner_std = np.asarray(getattr(pose, "corner_std_px", kept_errors), dtype=np.float64)
     return {
         "frames_total": int(pose.frame_mask.size),
         "frames_used": int(np.count_nonzero(pose.frame_mask)),
@@ -1091,17 +1668,23 @@ def pose_quality_dict(pose: CheckerboardPose) -> dict[str, float | int]:
         "corner_error_median_px": float(np.median(all_errors)),
         "corner_error_p95_px": float(np.percentile(all_errors, 95)),
         "corner_error_max_px": float(np.max(all_errors)),
-        "corner_std_mean_px": float(np.mean(pose.corner_std_px)),
-        "corner_std_max_px": float(np.max(pose.corner_std_px)),
-        "pnp_flag": int(pose.pnp_flag),
-        "solver_mode": pose.solver_mode,
-        "candidate_count": int(pose.candidate_count),
-        "selected_candidate_index": pose.selected_candidate_index,
-        "alternative_rms_px": float(pose.alternative_rms_px),
-        "alternative_error_gap_px": float(pose.alternative_error_gap_px),
-        "alternative_error_ratio": float(pose.alternative_error_ratio),
-        "alternative_likelihood_ratio": float(pose.alternative_likelihood_ratio),
-        "alternative_translation_delta_mm": float(pose.alternative_translation_delta_mm),
-        "alternative_rotation_delta_deg": float(pose.alternative_rotation_delta_deg),
-        "pose_ambiguous": bool(pose.pose_ambiguous),
+        "corner_std_mean_px": float(np.mean(corner_std)),
+        "corner_std_max_px": float(np.max(corner_std)),
+        "pnp_flag": int(getattr(pose, "pnp_flag", cv2.SOLVEPNP_ITERATIVE)),
+        "solver_mode": str(getattr(pose, "solver_mode", "unknown")),
+        "candidate_count": int(getattr(pose, "candidate_count", 0) or 0),
+        "selected_candidate_index": getattr(pose, "selected_candidate_index", None),
+        "alternative_rms_px": float(getattr(pose, "alternative_rms_px", float("nan"))),
+        "alternative_error_gap_px": float(getattr(pose, "alternative_error_gap_px", float("nan"))),
+        "alternative_error_ratio": float(getattr(pose, "alternative_error_ratio", float("nan"))),
+        "alternative_likelihood_ratio": float(
+            getattr(pose, "alternative_likelihood_ratio", float("nan"))
+        ),
+        "alternative_translation_delta_mm": float(
+            getattr(pose, "alternative_translation_delta_mm", float("nan"))
+        ),
+        "alternative_rotation_delta_deg": float(
+            getattr(pose, "alternative_rotation_delta_deg", float("nan"))
+        ),
+        "pose_ambiguous": bool(getattr(pose, "pose_ambiguous", False)),
     }

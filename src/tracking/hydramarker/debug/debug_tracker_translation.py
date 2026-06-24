@@ -4,8 +4,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
-
 import numpy as np
 
 os.environ.setdefault("QT_API", "pyside6")
@@ -15,6 +13,15 @@ COMPONENTS = (
     ("x", "x", "#1f77b4"),
     ("y", "y", "#2ca02c"),
     ("z", "z", "#d62728"),
+)
+
+DEPTH_FILTER_COLUMNS = (
+    "depth_filter_applied",
+    "depth_filter_delta_z_mm",
+    "depth_filter_raw_z_mm",
+    "depth_filter_z_mm",
+    "depth_filter_reproj_excess_px",
+    "depth_filter_guard_alpha",
 )
 
 
@@ -28,21 +35,11 @@ def _ensure_src_on_path() -> None:
 
 _ensure_src_on_path()
 
-from tracking.hydramarker.calib import calib_checkerboard
+from tracking.hydramarker.calib import calib_camera, calib_checkerboard
 
 
-BoardPoseCalibration = calib_checkerboard.CheckerboardPose
-CHECKERBOARD_PATTERN = calib_checkerboard.CHECKERBOARD_PATTERN
-CHECKERBOARD_SQUARE_SIZE_MM = calib_checkerboard.CHECKERBOARD_SQUARE_SIZE_MM
-BOARD_REFINE_TARGET_FRAMES = calib_checkerboard.DEFAULT_MAX_FRAMES
-BOARD_REFINE_MIN_FRAMES = calib_checkerboard.DEFAULT_MIN_FRAMES
-BOARD_AXIS_LENGTH_MM = calib_checkerboard.BOARD_AXIS_LENGTH_MM
-
-
-def _tracker_log_module():
-    from tracking.hydramarker import tracker_log
-
-    return tracker_log
+BoardPoseCalibration = calib_checkerboard.CharucoTableCalibration
+BOARD_AXIS_LENGTH_MM = 80.0
 
 
 def _force_dense_refine_config(tracker) -> None:
@@ -63,21 +60,35 @@ def _force_dense_refine_config(tracker) -> None:
         "fast_persistent_dense_min_distinct_cols": 2,
         "fast_persistent_dense_pose_solver": "direct_prior",
     }
-    for name, value in dense_settings.items():
+    peak_guard_settings = {
+        "max_translation_jump_mm": 40.0,
+        "max_rotation_jump_deg": 45.0,
+        "rotation_gate_scale_per_lost_frame": 8.0,
+        "rotation_gate_max_deg": 90.0,
+        "decode_update_min_visual_corners": 12,
+        "decode_update_min_distinct_rows": 3,
+        "decode_update_min_distinct_cols": 3,
+    }
+    pose_cfg = getattr(getattr(tracker, "pose_tracker", None), "config", None)
+    for name, value in {**dense_settings, **peak_guard_settings}.items():
         setattr(cfg, name, value)
+        if pose_cfg is not None and hasattr(pose_cfg, name):
+            setattr(pose_cfg, name, value)
 
     print(
         "[debug_tracker_translation] dense refine enabled "
         f"(min_points={getattr(cfg, 'fast_persistent_dense_min_points', '?')}, "
         f"max_px={getattr(cfg, 'fast_persistent_dense_match_max_px', '?')}, "
-        f"solver={getattr(cfg, 'fast_persistent_dense_pose_solver', '?')})"
+        f"solver={getattr(cfg, 'fast_persistent_dense_pose_solver', '?')}, "
+        f"max_jump={getattr(cfg, 'max_translation_jump_mm', '?')}mm, "
+        f"max_rot={getattr(cfg, 'rotation_gate_max_deg', '?')}deg)"
     )
 
 
 def _load_qt_widgets():
-    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    from PySide6.QtWidgets import QApplication, QFileDialog
 
-    return QApplication, QFileDialog, QMessageBox
+    return QApplication, QFileDialog
 
 
 def _load_pyplot():
@@ -104,16 +115,8 @@ def _to_int(value, default: int = 0) -> int:
         return default
 
 
-def _json_default(value):
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    return str(value)
-
-
 def _qt_app():
-    QApplication, _, _ = _load_qt_widgets()
+    QApplication, _ = _load_qt_widgets()
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -122,7 +125,7 @@ def _qt_app():
 
 def select_jsonl_with_qt() -> Path | None:
     _qt_app()
-    _, QFileDialog, _ = _load_qt_widgets()
+    _, QFileDialog = _load_qt_widgets()
 
     script_path = Path(__file__).resolve()
     default_dir = script_path.parents[1] / "tests" / "hydramarker_tracker_runs"
@@ -141,6 +144,326 @@ def select_jsonl_with_qt() -> Path | None:
     return Path(path)
 
 
+def _camera_from_run_start(record: dict) -> tuple[np.ndarray | None, np.ndarray | None]:
+    info = dict(record.get("camera_intrinsics") or {})
+    K_value = (
+        info.get("tracker_K")
+        or info.get("K")
+        or info.get("camera_matrix")
+        or info.get("camera_intrinsics")
+    )
+    if K_value is None:
+        fx = _to_float(info.get("fx"))
+        fy = _to_float(info.get("fy"))
+        cx = _to_float(info.get("ppx", info.get("cx")))
+        cy = _to_float(info.get("ppy", info.get("cy")))
+        if np.all(np.isfinite([fx, fy, cx, cy])):
+            K_value = [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
+
+    dist_value = (
+        info.get("tracker_dist_coeffs")
+        or info.get("effective_opencv_dist_coeffs")
+        or info.get("opencv_dist_coeffs")
+        or info.get("dist_coeffs")
+        or info.get("coeffs")
+    )
+
+    K = None if K_value is None else np.asarray(K_value, dtype=np.float64).reshape(3, 3)
+    dist = (
+        np.zeros((5, 1), dtype=np.float64)
+        if dist_value is None
+        else np.asarray(dist_value, dtype=np.float64).reshape(-1, 1)
+    )
+    return K, dist
+
+
+def _pose_from_frame_data(data: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    rvec = np.asarray(
+        [
+            _to_float(data.get("rvec_x_rad")),
+            _to_float(data.get("rvec_y_rad")),
+            _to_float(data.get("rvec_z_rad")),
+        ],
+        dtype=np.float64,
+    ).reshape(3, 1)
+    tvec = np.asarray(
+        [
+            _to_float(data.get("tvec_x_mm")),
+            _to_float(data.get("tvec_y_mm")),
+            _to_float(data.get("tvec_z_mm")),
+        ],
+        dtype=np.float64,
+    ).reshape(3, 1)
+    if not np.all(np.isfinite(rvec)) or not np.all(np.isfinite(tvec)):
+        return None
+    return rvec, tvec
+
+
+def _points_from_frame_detail(detail: dict) -> tuple[np.ndarray, np.ndarray]:
+    corners = list(detail.get("pose_corners") or [])
+    if not corners:
+        corners = list(detail.get("correspondence_corners") or [])
+
+    object_points: list[np.ndarray] = []
+    image_points: list[np.ndarray] = []
+    for corner in corners:
+        if not isinstance(corner, dict):
+            continue
+        xyz = corner.get("xyz_mm")
+        uv = corner.get("uv_px")
+        if not isinstance(xyz, (list, tuple)) or not isinstance(uv, (list, tuple)):
+            continue
+        if len(xyz) < 3 or len(uv) < 2:
+            continue
+        xyz_arr = np.asarray([_to_float(v) for v in xyz[:3]], dtype=np.float64)
+        uv_arr = np.asarray([_to_float(v) for v in uv[:2]], dtype=np.float64)
+        if np.all(np.isfinite(xyz_arr)) and np.all(np.isfinite(uv_arr)):
+            object_points.append(xyz_arr.reshape(3))
+            image_points.append(uv_arr.reshape(2))
+
+    if not object_points:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 2), dtype=np.float64),
+        )
+    return (
+        np.asarray(object_points, dtype=np.float64).reshape(-1, 3),
+        np.asarray(image_points, dtype=np.float64).reshape(-1, 2),
+    )
+
+
+def _fmt_debug_float(value: float, digits: int = 3) -> str:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(value):
+        return ""
+    return f"{value:.{digits}f}"
+
+
+def _reprojection_stats(
+    *,
+    K: np.ndarray,
+    dist: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+) -> dict[str, str]:
+    if len(object_points) == 0:
+        return {}
+    try:
+        import cv2
+
+        projected, _ = cv2.projectPoints(
+            object_points.reshape(-1, 3),
+            rvec.reshape(3, 1),
+            tvec.reshape(3, 1),
+            K,
+            dist.reshape(-1, 1),
+        )
+    except Exception:
+        return {}
+
+    residual = projected.reshape(-1, 2) - image_points.reshape(-1, 2)
+    err = np.linalg.norm(residual, axis=1)
+    return {
+        "mean_err": _fmt_debug_float(float(np.mean(err))),
+        "max_err": _fmt_debug_float(float(np.max(err))),
+        "pose_reproj_mean_px": _fmt_debug_float(float(np.mean(err))),
+        "pose_reproj_median_px": _fmt_debug_float(float(np.median(err))),
+        "pose_reproj_p95_px": _fmt_debug_float(float(np.percentile(err, 95))),
+        "pose_reproj_max_px": _fmt_debug_float(float(np.max(err))),
+        "pose_reproj_mean_du_px": _fmt_debug_float(float(np.mean(residual[:, 0]))),
+        "pose_reproj_mean_dv_px": _fmt_debug_float(float(np.mean(residual[:, 1]))),
+        "pose_reproj_std_du_px": _fmt_debug_float(float(np.std(residual[:, 0]))),
+        "pose_reproj_std_dv_px": _fmt_debug_float(float(np.std(residual[:, 1]))),
+    }
+
+
+def _ensure_columns(columns: list[str], extra_columns: tuple[str, ...]) -> list[str]:
+    out = list(columns)
+    for column in extra_columns:
+        if column not in out:
+            out.append(column)
+    return out
+
+
+def replay_depth_filter_on_run(path: Path, output_path: Path | None = None) -> Path:
+    _ensure_src_on_path()
+    from tracking.hydramarker.config import TrackerConfig
+    from tracking.pose_filters import PoseDepthKalmanFilter
+
+    path = Path(path)
+    if output_path is None:
+        output_path = path.with_name(f"{path.stem}_depth_filter_replay.jsonl")
+
+    records: list[dict] = []
+    details_by_frame: dict[int, dict] = {}
+    K: np.ndarray | None = None
+    dist: np.ndarray | None = None
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSONL at line {line_no}: {exc}") from exc
+
+            if record.get("type") == "run_start":
+                K, dist = _camera_from_run_start(record)
+            elif record.get("type") == "frame_detail":
+                frame = _to_int(record.get("frame"), default=-1)
+                if frame >= 0:
+                    details_by_frame[frame] = record
+            records.append(record)
+
+    if K is None or dist is None:
+        raise RuntimeError("No camera intrinsics found in run_start record.")
+
+    cfg = TrackerConfig()
+    depth_filter = PoseDepthKalmanFilter(
+        observation_std_mm=float(cfg.pose_depth_filter_observation_std_mm),
+        process_std_mm=float(cfg.pose_depth_filter_process_std_mm),
+        initial_velocity_std_mm=float(cfg.pose_depth_filter_initial_velocity_std_mm),
+        reprojection_guard_px=float(cfg.pose_depth_filter_reprojection_guard_px),
+        K=K,
+        dist_coeffs=dist,
+    )
+    min_points = max(1, int(cfg.pose_depth_filter_min_points))
+
+    applied_count = 0
+    filtered_count = 0
+    skipped_count = 0
+    previous_filtered_tvec: np.ndarray | None = None
+    lost_frames = 0
+    max_lost_frames = int(getattr(cfg, "max_lost_frames", 8))
+
+    for record in records:
+        record_type = record.get("type")
+        if record_type == "run_start":
+            columns = list(record.get("columns") or [])
+            record["columns"] = _ensure_columns(columns, DEPTH_FILTER_COLUMNS)
+            config = dict(record.get("config") or {})
+            config.update(
+                {
+                    "pose_depth_filter_enabled": True,
+                    "pose_depth_filter_observation_std_mm": float(
+                        cfg.pose_depth_filter_observation_std_mm
+                    ),
+                    "pose_depth_filter_process_std_mm": float(
+                        cfg.pose_depth_filter_process_std_mm
+                    ),
+                    "pose_depth_filter_initial_velocity_std_mm": float(
+                        cfg.pose_depth_filter_initial_velocity_std_mm
+                    ),
+                    "pose_depth_filter_reprojection_guard_px": float(
+                        cfg.pose_depth_filter_reprojection_guard_px
+                    ),
+                    "pose_depth_filter_min_points": int(cfg.pose_depth_filter_min_points),
+                    "offline_depth_filter_replay": True,
+                }
+            )
+            record["config"] = config
+            continue
+
+        if record_type != "frame":
+            continue
+
+        data = record.get("data") or {}
+        if _to_int(data.get("success"), default=0) == 0:
+            lost_frames += 1
+            previous_filtered_tvec = None
+            if lost_frames > max_lost_frames:
+                depth_filter.reset()
+            continue
+        lost_frames = 0
+
+        frame = _to_int(data.get("frame"), default=-1)
+        pose = _pose_from_frame_data(data)
+        detail = details_by_frame.get(frame, {})
+        object_points, image_points = _points_from_frame_detail(detail)
+        if pose is None or len(object_points) < min_points:
+            skipped_count += 1
+            continue
+
+        rvec, tvec = pose
+        filtered = depth_filter.update(
+            rvec=rvec,
+            tvec=tvec,
+            object_points=object_points,
+            image_points=image_points,
+        )
+        filtered_count += 1
+        applied_count += int(bool(filtered.applied))
+
+        out_tvec = filtered.tvec.reshape(3, 1)
+        data["tvec_z_mm"] = _fmt_debug_float(float(out_tvec[2, 0]))
+        data["depth_filter_applied"] = int(bool(filtered.applied))
+        data["depth_filter_delta_z_mm"] = _fmt_debug_float(float(filtered.delta_z_mm))
+        data["depth_filter_raw_z_mm"] = _fmt_debug_float(float(filtered.raw_z_mm))
+        data["depth_filter_z_mm"] = _fmt_debug_float(float(filtered.filtered_z_mm))
+        data["depth_filter_reproj_excess_px"] = _fmt_debug_float(
+            float(filtered.reprojection_excess_px)
+        )
+        data["depth_filter_guard_alpha"] = _fmt_debug_float(float(filtered.guard_alpha), digits=6)
+        data.update(
+            _reprojection_stats(
+                K=K,
+                dist=dist,
+                rvec=filtered.rvec,
+                tvec=out_tvec,
+                object_points=object_points,
+                image_points=image_points,
+            )
+        )
+
+        if previous_filtered_tvec is None:
+            data["pose_translation_delta_mm"] = ""
+        else:
+            delta = float(np.linalg.norm(out_tvec.reshape(3) - previous_filtered_tvec.reshape(3)))
+            data["pose_translation_delta_mm"] = _fmt_debug_float(delta)
+        previous_filtered_tvec = out_tvec.copy()
+
+    for record in records:
+        if record.get("type") == "run_summary":
+            summary = dict(record.get("summary") or {})
+            summary.update(
+                {
+                    "offline_depth_filter_replay": True,
+                    "depth_filter_replayed_frames": filtered_count,
+                    "depth_filter_applied_frames": applied_count,
+                    "depth_filter_skipped_frames": skipped_count,
+                }
+            )
+            record["summary"] = summary
+
+    with output_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    print(
+        "[depth_filter_replay] "
+        f"frames={filtered_count}, applied={applied_count}, skipped={skipped_count}"
+    )
+    print(f"[depth_filter_replay] wrote -> {output_path.resolve()}")
+    return output_path
+
+
+def _make_pose_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
+    import cv2
+
+    R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = R
+    out[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
+    return out
+
+
 def _camera_tvec_to_board_mm(tvec_camera_mm: np.ndarray, T_B_C: np.ndarray) -> np.ndarray:
     p_c = np.ones(4, dtype=np.float64)
     p_c[:3] = np.asarray(tvec_camera_mm, dtype=np.float64).reshape(3)
@@ -148,111 +471,194 @@ def _camera_tvec_to_board_mm(tvec_camera_mm: np.ndarray, T_B_C: np.ndarray) -> n
     return p_b[:3]
 
 
-def confirm_board_pose(pose: BoardPoseCalibration) -> bool:
-    _qt_app()
-    _, _, QMessageBox = _load_qt_widgets()
-    t = pose.tvec_cb_mm.reshape(3)
-    quality = calib_checkerboard.pose_quality_dict(pose)
-    reply = QMessageBox.question(
-        None,
-        "Checkerboard pose uebernehmen?",
-        (
-            "Checkerboard-Pose uebernehmen?\n\n"
-            f"Reprojection mean: {pose.reproj_mean_px:.3f} px\n"
-            f"Reprojection p95:  {pose.reproj_p95_px:.3f} px\n"
-            f"Reprojection max:  {pose.reproj_max_px:.3f} px\n"
-            f"Collected frames:  {pose.collected_frames}\n"
-            f"Used frames:       {quality['frames_used']}\n"
-            f"Corner noise mean: {pose.mean_corner_std_px:.3f} px\n"
-            f"Solver:            {pose.solver_mode} "
-            f"(candidate={pose.selected_candidate_index}, "
-            f"ambiguous={pose.pose_ambiguous})\n"
-            f"IPPE alt gap:      {pose.alternative_error_gap_px:.4f} px\n"
-            f"Camera board tvec: x={t[0]:.1f} mm, y={t[1]:.1f} mm, z={t[2]:.1f} mm\n\n"
-            "Yes: use this board pose and start the tracker view.\n"
-            "No: repeat checkerboard detection."
-        ),
-        QMessageBox.Yes | QMessageBox.No,
-        QMessageBox.Yes,
-    )
-    return reply == QMessageBox.Yes
-
-
-def calibrate_checkerboard_pose(
-    pipe,
-    K: np.ndarray,
-    dist: np.ndarray,
-) -> BoardPoseCalibration | None:
-    while True:
-        pose = calib_checkerboard.capture_checkerboard_pose_from_pipeline(
-            pipe,
-            K,
-            dist,
-            min_frames=BOARD_REFINE_MIN_FRAMES,
-            max_frames=BOARD_REFINE_TARGET_FRAMES,
-            window_name="HydraTracker Translation Debug",
+def _board_tvec_from_result(result, T_B_C: np.ndarray) -> np.ndarray | None:
+    rvec = getattr(result, "rvec", None)
+    tvec = getattr(result, "tvec", None)
+    if rvec is None or tvec is None:
+        return None
+    try:
+        T_B_T = np.asarray(T_B_C, dtype=np.float64).reshape(4, 4) @ _make_pose_matrix(
+            rvec,
+            tvec,
         )
-        if pose is None:
-            return None
-        if confirm_board_pose(pose):
-            return pose
+        return np.asarray(T_B_T[:3, 3], dtype=np.float64).reshape(3)
+    except Exception:
+        return None
 
 
-def board_pose_record(board_pose: BoardPoseCalibration, run_id: str) -> dict[str, Any]:
-    quality = calib_checkerboard.pose_quality_dict(board_pose)
+def table_calibration_record(table_pose: BoardPoseCalibration, run_id: str) -> dict:
+    quality = calib_checkerboard.pose_quality_dict(table_pose)
+    normal = np.asarray(table_pose.normal_camera, dtype=np.float64).reshape(3)
     return {
-        "type": "board_pose",
+        "type": "table_calibration",
         "run_id": run_id,
-        "coordinate_frame": "checkerboard",
-        "pattern_inner_corners": list(CHECKERBOARD_PATTERN),
-        "printed_cells": [10, 10],
-        "square_size_mm": CHECKERBOARD_SQUARE_SIZE_MM,
-        "rvec_cb": board_pose.rvec_cb.reshape(3).tolist(),
-        "tvec_cb_mm": board_pose.tvec_cb_mm.reshape(3).tolist(),
-        "T_C_B": board_pose.T_C_B.tolist(),
-        "T_B_C": board_pose.T_B_C.tolist(),
-        "reprojection": {
-            "mean_px": board_pose.reproj_mean_px,
-            "median_px": board_pose.reproj_median_px,
-            "p95_px": board_pose.reproj_p95_px,
-            "max_px": board_pose.reproj_max_px,
-            "frames_used": quality["frames_used"],
-            "frames_total": quality["frames_total"],
-            "collected_frames": board_pose.collected_frames,
-            "frame_rms_mean_px": quality["frame_rms_mean_px"],
-            "frame_rms_median_px": quality["frame_rms_median_px"],
-            "frame_rms_p95_px": quality["frame_rms_p95_px"],
-            "mean_corner_std_px": board_pose.mean_corner_std_px,
-            "max_corner_std_px": board_pose.max_corner_std_px,
-            "pnp_flag": quality["pnp_flag"],
+        "coordinate_frame": "charuco_table",
+        "board": {
+            "kind": "charuco",
+            "squares_x": int(calib_camera.SQUARES_X),
+            "squares_y": int(calib_camera.SQUARES_Y),
+            "square_length_mm": float(table_pose.square_length_mm),
+            "marker_length_mm": float(table_pose.marker_length_mm),
+            "aruco_dictionary_id": int(table_pose.aruco_dictionary_id),
         },
-        "solver": {
-            "mode": board_pose.solver_mode,
-            "candidate_count": board_pose.candidate_count,
-            "selected_candidate_index": board_pose.selected_candidate_index,
-            "alternative_rms_px": board_pose.alternative_rms_px,
-            "alternative_error_gap_px": board_pose.alternative_error_gap_px,
-            "alternative_error_ratio": board_pose.alternative_error_ratio,
-            "alternative_likelihood_ratio": board_pose.alternative_likelihood_ratio,
-            "alternative_translation_delta_mm": board_pose.alternative_translation_delta_mm,
-            "alternative_rotation_delta_deg": board_pose.alternative_rotation_delta_deg,
-            "pose_ambiguous": board_pose.pose_ambiguous,
-        },
+        "T_C_B": np.asarray(table_pose.T_C_B, dtype=np.float64).tolist(),
+        "T_B_C": np.asarray(table_pose.T_B_C, dtype=np.float64).tolist(),
+        "normal_camera": normal.tolist(),
+        "x_axis_camera": np.asarray(table_pose.x_axis_camera, dtype=np.float64).tolist(),
+        "y_axis_camera": np.asarray(table_pose.y_axis_camera, dtype=np.float64).tolist(),
+        "source_position_index": int(table_pose.source_position_index),
+        "positions_used": int(table_pose.positions_used),
+        "raw_observations_available": True,
+        "raw_observations_record_type": "table_calibration_observations",
+        "quality": quality,
     }
 
 
-def write_board_pose_to_live_log(
-    board_pose: BoardPoseCalibration,
-    tracker_log=None,
+def table_calibration_observation_records(
+    table_pose: BoardPoseCalibration,
+    run_id: str,
+) -> list[dict]:
+    records: list[dict] = []
+    for position in table_pose.positions:
+        frame_mask = np.asarray(position.frame_mask, dtype=bool).reshape(-1)
+        frames: list[dict] = []
+        for idx, frame in enumerate(position.frames):
+            used = bool(frame_mask[idx]) if idx < frame_mask.size else False
+            frames.append(
+                {
+                    "frame_index": int(frame.frame_index),
+                    "used": used,
+                    "num_charuco": int(frame.num_charuco),
+                    "num_aruco": int(frame.num_aruco),
+                    "rvec_cb": np.asarray(frame.rvec_cb, dtype=np.float64)
+                    .reshape(3)
+                    .tolist(),
+                    "tvec_cb_mm": np.asarray(frame.tvec_cb_mm, dtype=np.float64)
+                    .reshape(3)
+                    .tolist(),
+                    "normal_camera": np.asarray(frame.normal_camera, dtype=np.float64)
+                    .reshape(3)
+                    .tolist(),
+                    "x_axis_camera": np.asarray(frame.x_axis_camera, dtype=np.float64)
+                    .reshape(3)
+                    .tolist(),
+                    "origin_camera_mm": np.asarray(frame.origin_camera_mm, dtype=np.float64)
+                    .reshape(3)
+                    .tolist(),
+                    "object_points_mm": np.asarray(
+                        frame.object_points_mm,
+                        dtype=np.float64,
+                    )
+                    .reshape(-1, 3)
+                    .tolist(),
+                    "image_points_uv": np.asarray(
+                        frame.image_points_uv,
+                        dtype=np.float64,
+                    )
+                    .reshape(-1, 2)
+                    .tolist(),
+                    "errors_px": np.asarray(frame.errors_px, dtype=np.float64)
+                    .reshape(-1)
+                    .tolist(),
+                    "rms_px": float(frame.rms_px),
+                    "mean_px": float(frame.mean_px),
+                    "p95_px": float(frame.p95_px),
+                    "max_px": float(frame.max_px),
+                }
+            )
+
+        records.append(
+            {
+                "type": "table_calibration_observations",
+                "run_id": run_id,
+                "coordinate_frame": "charuco_table",
+                "position_index": int(position.position_index),
+                "frame_mask": frame_mask.tolist(),
+                "frames_total": int(len(position.frames)),
+                "frames_used": int(np.count_nonzero(frame_mask)),
+                "median_rms_px": float(position.median_rms_px),
+                "normal_camera": np.asarray(position.normal_camera, dtype=np.float64)
+                .reshape(3)
+                .tolist(),
+                "x_axis_camera": np.asarray(position.x_axis_camera, dtype=np.float64)
+                .reshape(3)
+                .tolist(),
+                "origin_camera_mm": np.asarray(position.origin_camera_mm, dtype=np.float64)
+                .reshape(3)
+                .tolist(),
+                "frames": frames,
+            }
+        )
+    return records
+
+
+def table_origin_record(origin_tvec_board_mm: np.ndarray, run_id: str, frame_idx: int) -> dict:
+    return {
+        "type": "table_origin",
+        "run_id": run_id,
+        "frame": int(frame_idx),
+        "origin_tvec_board_mm": np.asarray(
+            origin_tvec_board_mm,
+            dtype=np.float64,
+        ).reshape(3).tolist(),
+    }
+
+
+def _draw_table_axes_near_result(
+    vis: np.ndarray,
+    result,
+    *,
+    K: np.ndarray,
+    dist: np.ndarray,
+    T_C_B: np.ndarray,
+    T_B_C: np.ndarray,
+    axis_length_mm: float = BOARD_AXIS_LENGTH_MM,
 ) -> None:
-    if tracker_log is None:
-        tracker_log = _tracker_log_module()
-    if not tracker_log.is_active():
-        raise RuntimeError("Cannot write board pose: tracker log is not active.")
-    tracker_log.write_record(
-        board_pose_record(board_pose, tracker_log.current_run_id())
+    import cv2
+
+    anchor_board = None
+    if getattr(result, "success", False):
+        anchor_board = _board_tvec_from_result(result, T_B_C)
+    if anchor_board is None:
+        anchor_board = np.zeros(3, dtype=np.float64)
+    anchor_board = np.asarray(anchor_board, dtype=np.float64).reshape(3)
+    anchor_board[2] = 0.0
+
+    points_board = np.asarray(
+        [
+            anchor_board,
+            anchor_board + np.asarray([axis_length_mm, 0.0, 0.0], dtype=np.float64),
+            anchor_board + np.asarray([0.0, axis_length_mm, 0.0], dtype=np.float64),
+        ],
+        dtype=np.float64,
     )
-    print("[debug_tracker_translation] wrote board_pose record to active run log")
+    points_h = np.c_[points_board, np.ones(3, dtype=np.float64)]
+    points_camera = (np.asarray(T_C_B, dtype=np.float64).reshape(4, 4) @ points_h.T).T[:, :3]
+    if np.any(points_camera[:, 2] <= 1e-6):
+        return
+
+    projected, _ = cv2.projectPoints(
+        points_camera.reshape(-1, 3),
+        np.zeros((3, 1), dtype=np.float64),
+        np.zeros((3, 1), dtype=np.float64),
+        np.asarray(K, dtype=np.float64).reshape(3, 3),
+        np.asarray(dist, dtype=np.float64).reshape(-1, 1),
+    )
+    pts = projected.reshape(-1, 2)
+    h, w = vis.shape[:2]
+
+    def pt(idx: int) -> tuple[int, int]:
+        x = int(round(float(np.clip(pts[idx, 0], -2000, w + 2000))))
+        y = int(round(float(np.clip(pts[idx, 1], -2000, h + 2000))))
+        return x, y
+
+    origin = pt(0)
+    x_end = pt(1)
+    y_end = pt(2)
+    cv2.arrowedLine(vis, origin, x_end, (0, 80, 255), 4, cv2.LINE_AA, tipLength=0.18)
+    cv2.arrowedLine(vis, origin, y_end, (0, 255, 0), 4, cv2.LINE_AA, tipLength=0.18)
+    cv2.putText(vis, "+X", x_end, cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 80, 255), 3, cv2.LINE_AA)
+    cv2.putText(vis, "+Y", y_end, cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3, cv2.LINE_AA)
 
 
 def load_live_tracker_module():
@@ -273,13 +679,89 @@ def load_live_tracker_module():
     return live
 
 
-def run_live_tracker_translation() -> Path | None:
+def create_color_only_realsense_pipeline(live):
+    rs = live.rs
+    pipe = rs.pipeline()
+    cfg = rs.config()
+    cfg.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
+    profile = pipe.start(cfg)
+    print("[debug_tracker_translation] RealSense running (color=1920x1080@30, no IMU)")
+    return pipe, profile
+
+
+def _apply_live_debug_options(
+    tracker,
+    *,
+    no_fast_persistent: bool = False,
+    no_temporal_persistence: bool = False,
+    decode_only: bool = False,
+) -> None:
+    cfg = getattr(tracker, "config", None)
+    if cfg is None:
+        return
+
+    if decode_only:
+        cfg.decode_only_mode = True
+        cfg.enable_fast_persistent_path = False
+        cfg.fast_persistent_dense_refine_enabled = False
+        cfg.enable_temporal_correspondence_persistence = False
+        print("[debug_tracker_translation] decode-only mode enabled")
+        return
+
+    if no_fast_persistent:
+        cfg.enable_fast_persistent_path = False
+        cfg.fast_persistent_dense_refine_enabled = False
+        print("[debug_tracker_translation] fast persistent path disabled")
+
+    if no_temporal_persistence:
+        cfg.enable_temporal_correspondence_persistence = False
+        print("[debug_tracker_translation] temporal correspondence persistence disabled")
+
+
+def run_live_tracker_translation(
+    *,
+    no_fast_persistent: bool = False,
+    no_temporal_persistence: bool = False,
+    decode_only: bool = False,
+) -> Path | None:
     live = load_live_tracker_module()
+    live.create_realsense_pipeline = lambda: create_color_only_realsense_pipeline(live)
     tracker_log = live.tracker_log
-    board_pose_ref: dict[str, BoardPoseCalibration | None] = {"pose": None}
+    table_ref: dict[str, BoardPoseCalibration | None] = {"pose": None}
+    origin_ref: dict[str, np.ndarray | None] = {"tvec": None}
+    origin_frame_ref: dict[str, int] = {"frame": -1}
+    camera_ref: dict[str, np.ndarray | None] = {"K": None, "dist": None}
 
     def after_camera_ready(pipe, K_rgb: np.ndarray, dist_rgb: np.ndarray) -> bool:
         camera_info = tracker_log.camera_intrinsics_info()
+        camera_ref["K"] = np.asarray(K_rgb, dtype=np.float64).reshape(3, 3).copy()
+        camera_ref["dist"] = np.asarray(dist_rgb, dtype=np.float64).reshape(-1, 1).copy()
+        print("[debug_tracker_translation] starting ChArUco table calibration")
+        table_pose = calib_checkerboard.capture_charuco_table_calibration_from_pipeline(
+            pipe,
+            K_rgb,
+            dist_rgb,
+            min_positions=calib_checkerboard.CHARUCO_TABLE_MIN_POSITIONS,
+            target_positions=calib_checkerboard.CHARUCO_TABLE_TARGET_POSITIONS,
+            min_frames_per_position=calib_checkerboard.CHARUCO_TABLE_MIN_FRAMES_PER_POSITION,
+            max_frames_per_position=calib_checkerboard.CHARUCO_TABLE_MAX_FRAMES_PER_POSITION,
+            window_name="HydraTracker ChArUco Table Calibration",
+        )
+        if table_pose is None:
+            print("[debug_tracker_translation] ChArUco table calibration cancelled")
+            return False
+
+        table_ref["pose"] = table_pose
+        tracker_log.set_debug_board_transform(table_pose.T_B_C)
+        quality = calib_checkerboard.pose_quality_dict(table_pose)
+        print(
+            "[debug_tracker_translation] ChArUco table ready "
+            f"(positions={table_pose.positions_used}, "
+            f"frames={quality['frames_used']}/{quality['frames_total']}, "
+            f"mean={quality['corner_error_mean_px']:.3f}px, "
+            f"p95={quality['corner_error_p95_px']:.3f}px)"
+        )
+
         tracker_log.update_camera_intrinsics_info(
             {
                 "debug_rectification_mode": "disabled_raw_realsense",
@@ -289,59 +771,113 @@ def run_live_tracker_translation() -> Path | None:
                 ),
                 "tracker_K": K_rgb.tolist(),
                 "tracker_dist_coeffs": dist_rgb.reshape(-1).tolist(),
+                "debug_translation_reference_frame": "charuco_table",
+                "debug_table_pose_available": True,
+                "debug_table_T_B_C": table_pose.T_B_C.tolist(),
+                "debug_table_T_C_B": table_pose.T_C_B.tolist(),
+                "debug_table_normal_camera": table_pose.normal_camera.tolist(),
+                "debug_table_x_axis_camera": table_pose.x_axis_camera.tolist(),
+                "debug_table_y_axis_camera": table_pose.y_axis_camera.tolist(),
+                "debug_table_positions_used": int(table_pose.positions_used),
+                "debug_table_frames_used": int(quality["frames_used"]),
+                "debug_table_reprojection_mean_px": float(quality["corner_error_mean_px"]),
+                "debug_table_reprojection_p95_px": float(quality["corner_error_p95_px"]),
+                "debug_corner_refinement": "gradient_saddle_cornerSubPix",
             }
         )
-
-        board_pose = calibrate_checkerboard_pose(
-            pipe,
-            K_rgb,
-            dist_rgb,
-        )
-        if board_pose is None:
-            print("[debug_tracker_translation] checkerboard board pose was not confirmed")
-            return False
-
-        board_pose_ref["pose"] = board_pose
-        tracker_log.set_debug_board_transform(board_pose.T_B_C)
-        tracker_log.update_camera_intrinsics_info(
-            {
-                "debug_translation_reference_frame": "checkerboard",
-                "debug_board_pose_available": True,
-                "debug_board_T_B_C": board_pose.T_B_C.tolist(),
-                "debug_board_reprojection_mean_px": board_pose.reproj_mean_px,
-                "debug_board_reprojection_p95_px": board_pose.reproj_p95_px,
-                "debug_board_solver_mode": board_pose.solver_mode,
-                "debug_board_selected_candidate_index": board_pose.selected_candidate_index,
-                "debug_board_pose_ambiguous": board_pose.pose_ambiguous,
-                "debug_board_alternative_error_gap_px": board_pose.alternative_error_gap_px,
-                "debug_board_alternative_likelihood_ratio": board_pose.alternative_likelihood_ratio,
-            }
-        )
-        print(
-            "[debug_tracker_translation] board pose fixed; "
-            "subsequent frame diagnostics use checkerboard coordinates"
-        )
+        print("[debug_tracker_translation] table-frame translation debug ready")
         return True
 
     def after_tracker_created(tracker) -> None:
         _force_dense_refine_config(tracker)
+        _apply_live_debug_options(
+            tracker,
+            no_fast_persistent=no_fast_persistent,
+            no_temporal_persistence=no_temporal_persistence,
+            decode_only=decode_only,
+        )
+
+    def on_space_key(_tracker, result, frame_idx: int) -> bool:
+        table_pose = table_ref["pose"]
+        if table_pose is None or origin_ref["tvec"] is not None:
+            return False
+
+        origin_tvec = _board_tvec_from_result(result, table_pose.T_B_C)
+        if origin_tvec is None:
+            print("[debug_tracker_translation] origin not set: no valid current tracker pose")
+            return True
+
+        origin_ref["tvec"] = origin_tvec.copy()
+        origin_frame_ref["frame"] = int(frame_idx)
+        tracker_log.set_debug_board_origin_tvec(origin_tvec)
+        print(
+            "[debug_tracker_translation] table origin set at frame "
+            f"{frame_idx}: x={origin_tvec[0]:.3f} y={origin_tvec[1]:.3f} "
+            f"z={origin_tvec[2]:.3f} mm"
+        )
+        return True
 
     def on_log_open(_field_path, _marker_json_path, _tracker) -> None:
-        board_pose = board_pose_ref["pose"]
-        if board_pose is None:
-            raise RuntimeError(
-                "Translation debug recording started without a checkerboard board pose."
+        table_pose = table_ref["pose"]
+        if table_pose is None:
+            raise RuntimeError("Translation debug recording started without table calibration.")
+        tracker_log.set_debug_board_transform(table_pose.T_B_C)
+        if origin_ref["tvec"] is not None:
+            tracker_log.set_debug_board_origin_tvec(origin_ref["tvec"])
+        run_id = tracker_log.current_run_id()
+        tracker_log.write_record(table_calibration_record(table_pose, run_id))
+        for record in table_calibration_observation_records(table_pose, run_id):
+            tracker_log.write_record(record)
+        if origin_ref["tvec"] is not None:
+            tracker_log.write_record(
+                table_origin_record(
+                    origin_ref["tvec"],
+                    run_id,
+                    frame_idx=origin_frame_ref["frame"],
+                )
             )
-        if not tracker_log.is_active():
-            tracker_log.log_open(_field_path, _marker_json_path, _tracker)
-        write_board_pose_to_live_log(board_pose, tracker_log)
 
-    def draw_extra_overlay(vis: np.ndarray, log_active: bool) -> None:
+    def draw_extra_overlay(vis: np.ndarray, log_active: bool, result=None) -> None:
+        import cv2
+
+        table_pose = table_ref["pose"]
+        if table_pose is not None and camera_ref["K"] is not None and camera_ref["dist"] is not None:
+            _draw_table_axes_near_result(
+                vis,
+                result,
+                K=camera_ref["K"],
+                dist=camera_ref["dist"],
+                T_C_B=table_pose.T_C_B,
+                T_B_C=table_pose.T_B_C,
+            )
+
+        if origin_ref["tvec"] is None:
+            action = "SPACE=set ORIGIN here"
+            color = (0, 255, 255)
+        else:
+            action = "SPACE=STOP recording and analyze" if log_active else "SPACE=START recording"
+            color = (0, 255, 0)
+
+        cv2.rectangle(vis, (18, 168), (1500, 260), (0, 0, 0), thickness=-1)
+        current_board = None if table_pose is None else _board_tvec_from_result(result, table_pose.T_B_C)
+        if current_board is not None:
+            live.put_text(
+                vis,
+                (
+                    f"current T_B_T: x={current_board[0]:.1f} "
+                    f"y={current_board[1]:.1f} z={current_board[2]:.1f} mm"
+                ),
+                (25, 185),
+                color=(255, 255, 255),
+                scale=0.48,
+            )
+
         state_line = (
-            "Board pose fixed | camera=selected_opencv_calibration | s=start/stop tracking | "
-            f"SPACE={'STOP recording and analyze' if log_active else 'START recording'} | q=quit"
+            "ChArUco table frame | orange=+X, green=+Y | "
+            "move along +Y for FB/RL | "
+            f"{action} | s=start/stop tracking | q=quit"
         )
-        live.put_text(vis, state_line, (25, 245), color=(0, 255, 255), scale=0.48)
+        live.put_text(vis, state_line, (25, 215), color=color, scale=0.48)
 
     def final_cleanup() -> None:
         tracker_log.set_debug_board_transform(None)
@@ -351,27 +887,12 @@ def run_live_tracker_translation() -> Path | None:
         console_prefix="[debug_tracker_translation]",
         after_camera_ready=after_camera_ready,
         after_tracker_created=after_tracker_created,
+        on_space_key=on_space_key,
         on_log_open=on_log_open,
         draw_extra_overlay=draw_extra_overlay,
         stop_after_log_close=True,
         final_cleanup=final_cleanup,
     )
-
-
-def _parse_board_pose_record(record: dict) -> dict[str, Any] | None:
-    T_B_C = record.get("T_B_C")
-    if T_B_C is None:
-        return None
-    try:
-        return {
-            "T_B_C": np.asarray(T_B_C, dtype=np.float64).reshape(4, 4),
-            "T_C_B": np.asarray(record.get("T_C_B"), dtype=np.float64).reshape(4, 4)
-            if record.get("T_C_B") is not None
-            else None,
-            "record": record,
-        }
-    except Exception:
-        return None
 
 
 def load_tracker_run(path: Path) -> dict:
@@ -380,13 +901,26 @@ def load_tracker_run(path: Path) -> dict:
     pose_is_fresh: list[int] = []
     pose_source: list[str] = []
     tvec_camera: list[list[float]] = []
+    tvec_board: list[list[float]] = []
+    board_available: list[int] = []
     logged_delta: list[float] = []
+    num_points: list[float] = []
+    global_row_min: list[float] = []
+    global_row_max: list[float] = []
+    global_col_min: list[float] = []
+    global_col_max: list[float] = []
+    reproj_mean_px: list[float] = []
+    roll_deg: list[float] = []
+    pitch_deg: list[float] = []
+    yaw_deg: list[float] = []
+    best_method: list[str] = []
 
     run_id = path.stem
     run_timestamp = ""
     columns: list[str] = []
     summary: dict = {}
-    board_pose: dict[str, Any] | None = None
+    table_origin_tvec: np.ndarray | None = None
+    table_origin_frame: int | None = None
 
     with path.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -407,14 +941,20 @@ def load_tracker_run(path: Path) -> dict:
                 columns = list(record.get("columns") or [])
                 continue
 
-            if record_type == "board_pose":
-                parsed = _parse_board_pose_record(record)
-                if parsed is not None:
-                    board_pose = parsed
-                continue
-
             if record_type == "run_summary":
                 summary = dict(record.get("summary") or {})
+                continue
+
+            if record_type == "table_origin":
+                value = record.get("origin_tvec_board_mm")
+                if isinstance(value, (list, tuple)) and len(value) >= 3:
+                    table_origin_tvec = np.asarray(
+                        [_to_float(v) for v in value[:3]],
+                        dtype=np.float64,
+                    ).reshape(3)
+                    if not np.all(np.isfinite(table_origin_tvec)):
+                        table_origin_tvec = None
+                table_origin_frame = _to_int(record.get("frame"), default=-1)
                 continue
 
             if record_type != "frame":
@@ -426,11 +966,29 @@ def load_tracker_run(path: Path) -> dict:
             pose_is_fresh.append(_to_int(data.get("pose_is_fresh"), default=0))
             pose_source.append(str(data.get("pose_source") or ""))
             logged_delta.append(_to_float(data.get("pose_translation_delta_mm")))
+            board_available.append(_to_int(data.get("board_pose_available"), default=0))
+            num_points.append(_to_float(data.get("num_points")))
+            global_row_min.append(_to_float(data.get("pose_global_row_min")))
+            global_row_max.append(_to_float(data.get("pose_global_row_max")))
+            global_col_min.append(_to_float(data.get("pose_global_col_min")))
+            global_col_max.append(_to_float(data.get("pose_global_col_max")))
+            reproj_mean_px.append(_to_float(data.get("pose_reproj_mean_px")))
+            roll_deg.append(_to_float(data.get("camera_roll_deg")))
+            pitch_deg.append(_to_float(data.get("camera_pitch_deg")))
+            yaw_deg.append(_to_float(data.get("camera_yaw_deg")))
+            best_method.append(str(data.get("pose_candidate_best_method") or ""))
             tvec_camera.append(
                 [
                     _to_float(data.get("tvec_x_mm")),
                     _to_float(data.get("tvec_y_mm")),
                     _to_float(data.get("tvec_z_mm")),
+                ]
+            )
+            tvec_board.append(
+                [
+                    _to_float(data.get("board_tvec_x_mm")),
+                    _to_float(data.get("board_tvec_y_mm")),
+                    _to_float(data.get("board_tvec_z_mm")),
                 ]
             )
 
@@ -454,13 +1012,12 @@ def load_tracker_run(path: Path) -> dict:
     coordinate_frame = "camera"
     absolute_label = "T_C_T"
     tvec_abs = tvec_camera_arr.copy()
-    if board_pose is not None:
-        T_B_C = np.asarray(board_pose["T_B_C"], dtype=np.float64).reshape(4, 4)
-        tvec_abs = np.full_like(tvec_camera_arr, np.nan, dtype=np.float64)
-        for idx, p_c in enumerate(tvec_camera_arr):
-            if np.all(np.isfinite(p_c)):
-                tvec_abs[idx] = _camera_tvec_to_board_mm(p_c, T_B_C)
-        coordinate_frame = "checkerboard"
+    tvec_board_arr = np.asarray(tvec_board, dtype=np.float64).reshape(-1, 3)
+    board_available_arr = np.asarray(board_available, dtype=np.int64)
+    has_board_tvec = (board_available_arr == 1) & np.all(np.isfinite(tvec_board_arr), axis=1)
+    if np.any(has_board_tvec):
+        tvec_abs = tvec_board_arr.copy()
+        coordinate_frame = "charuco_table"
         absolute_label = "T_B_T"
 
     has_tvec = np.all(np.isfinite(tvec_abs), axis=1)
@@ -468,13 +1025,6 @@ def load_tracker_run(path: Path) -> dict:
     origin_frame = int(frame_arr[origin_idx])
     origin_tvec = tvec_abs[origin_idx].copy()
     relative_tvec = tvec_abs - origin_tvec
-    z_vs_y_slope_mm_per_100mm = np.nan
-    if coordinate_frame == "checkerboard":
-        valid_yz = has_tvec & np.isfinite(relative_tvec[:, 1]) & np.isfinite(relative_tvec[:, 2])
-        if int(np.count_nonzero(valid_yz)) >= 8 and np.ptp(relative_tvec[valid_yz, 1]) > 1e-6:
-            A = np.c_[relative_tvec[valid_yz, 1], np.ones(int(np.count_nonzero(valid_yz)))]
-            slope, _ = np.linalg.lstsq(A, relative_tvec[valid_yz, 2], rcond=None)[0]
-            z_vs_y_slope_mm_per_100mm = float(100.0 * slope)
 
     computed_delta = np.full(len(frame_arr), np.nan, dtype=np.float64)
     for idx in range(1, len(frame_arr)):
@@ -499,10 +1049,18 @@ def load_tracker_run(path: Path) -> dict:
         "origin_tvec": origin_tvec,
         "has_tvec": has_tvec,
         "delta_mm": plot_delta,
-        "board_pose": board_pose,
         "coordinate_frame": coordinate_frame,
         "absolute_label": absolute_label,
-        "z_vs_y_slope_mm_per_100mm": z_vs_y_slope_mm_per_100mm,
+        "num_points": np.asarray(num_points, dtype=np.float64),
+        "global_row_min": np.asarray(global_row_min, dtype=np.float64),
+        "global_row_max": np.asarray(global_row_max, dtype=np.float64),
+        "global_col_min": np.asarray(global_col_min, dtype=np.float64),
+        "global_col_max": np.asarray(global_col_max, dtype=np.float64),
+        "reproj_mean_px": np.asarray(reproj_mean_px, dtype=np.float64),
+        "roll_deg": np.asarray(roll_deg, dtype=np.float64),
+        "pitch_deg": np.asarray(pitch_deg, dtype=np.float64),
+        "yaw_deg": np.asarray(yaw_deg, dtype=np.float64),
+        "best_method": np.asarray(best_method, dtype=object),
     }
 
 
@@ -585,6 +1143,12 @@ def plot_translation(run: dict) -> Path:
     delta_mm: np.ndarray = run["delta_mm"]
     absolute_label = str(run.get("absolute_label", "T_C_T"))
     coordinate_frame = str(run.get("coordinate_frame", "camera"))
+    num_points: np.ndarray = run["num_points"]
+    global_row_min: np.ndarray = run["global_row_min"]
+    global_row_max: np.ndarray = run["global_row_max"]
+    roll_deg: np.ndarray = run["roll_deg"]
+    pitch_deg: np.ndarray = run["pitch_deg"]
+    yaw_deg: np.ndarray = run["yaw_deg"]
 
     missing_mask = (success == 0) | ~has_tvec
     held_mask = (success == 1) & has_tvec & (fresh == 0)
@@ -593,12 +1157,13 @@ def plot_translation(run: dict) -> Path:
     peak_frames, peak_threshold = robust_peak_frames(frames, delta_mm)
 
     fig, axes = plt.subplots(
-        3,
+        5,
         1,
-        figsize=(15.5, 9.0),
+        figsize=(15.5, 12.0),
         sharex=True,
-        constrained_layout=True,
+        constrained_layout=False,
     )
+    fig.subplots_adjust(top=0.86, hspace=0.34)
 
     run_label = run["run_id"]
     if run["run_timestamp"]:
@@ -612,7 +1177,17 @@ def plot_translation(run: dict) -> Path:
         f"HydraTracker relative translation components ({absolute_label}, {coordinate_frame} frame)\n"
         f"{run_label}"
     )
-    fig.suptitle(title, fontsize=16, fontweight="bold")
+    fig.suptitle(title, fontsize=16, fontweight="bold", y=0.985)
+
+    def mark_ranges(ax) -> None:
+        for start, end in missing_ranges:
+            ax.axvspan(start - 0.5, end + 0.5, color="#e45756", alpha=0.14, lw=0)
+
+        for start, end in held_ranges:
+            ax.axvspan(start - 0.5, end + 0.5, color="#f2b701", alpha=0.14, lw=0)
+
+        for peak_frame in peak_frames:
+            ax.axvline(int(peak_frame), color="#7f3c8d", alpha=0.38, linewidth=1.1)
 
     for comp_idx, (_, label, color) in enumerate(COMPONENTS):
         ax = axes[comp_idx]
@@ -640,18 +1215,59 @@ def plot_translation(run: dict) -> Path:
         else:
             ax.set_title(f"{label.upper()} relative component", loc="left")
 
-        for start, end in missing_ranges:
-            ax.axvspan(start - 0.5, end + 0.5, color="#e45756", alpha=0.14, lw=0)
-
-        for start, end in held_ranges:
-            ax.axvspan(start - 0.5, end + 0.5, color="#f2b701", alpha=0.14, lw=0)
-
-        for peak_frame in peak_frames:
-            ax.axvline(int(peak_frame), color="#7f3c8d", alpha=0.38, linewidth=1.1)
-
+        mark_ranges(ax)
         ax.set_ylabel(f"delta {absolute_label} {label} [mm]")
         ax.grid(True, axis="both")
         ax.legend(loc="upper right")
+
+    point_ax = axes[3]
+    points = num_points.copy()
+    points[~np.isfinite(points)] = np.nan
+    point_ax.plot(
+        frames,
+        points,
+        color="#4c78a8",
+        linewidth=1.8,
+        marker="o",
+        markersize=2.4,
+        markerfacecolor="white",
+        markeredgewidth=0.7,
+        label="pose points",
+    )
+    point_ax.set_ylabel("points")
+    point_ax.set_title("Pose diagnostics   point count and global row range", loc="left")
+    point_ax.grid(True, axis="both")
+    mark_ranges(point_ax)
+
+    row_ax = point_ax.twinx()
+    row_ax.plot(frames, global_row_min, color="#f58518", linewidth=1.2, label="row min")
+    row_ax.plot(frames, global_row_max, color="#b279a2", linewidth=1.2, label="row max")
+    row_ax.set_ylabel("global row")
+
+    point_lines, point_labels = point_ax.get_legend_handles_labels()
+    row_lines, row_labels = row_ax.get_legend_handles_labels()
+    point_ax.legend(point_lines + row_lines, point_labels + row_labels, loc="upper right")
+
+    orient_ax = axes[4]
+    orientation = (
+        (roll_deg, "roll", "#4c78a8"),
+        (pitch_deg, "pitch", "#54a24b"),
+        (yaw_deg, "yaw", "#e45756"),
+    )
+    for values, label, color in orientation:
+        rel_values = values.astype(np.float64).copy()
+        finite = np.isfinite(rel_values)
+        if np.any(finite):
+            rel_values = rel_values - rel_values[np.where(finite)[0][0]]
+            rel_values[~finite] = np.nan
+        orient_ax.plot(frames, rel_values, color=color, linewidth=1.6, label=f"{label} delta")
+
+    orient_ax.axhline(0.0, color="#888888", alpha=0.3, linewidth=1.0, linestyle="--")
+    orient_ax.set_ylabel("rotation delta [deg]")
+    orient_ax.set_title("Orientation diagnostics   camera-frame Euler deltas", loc="left")
+    orient_ax.grid(True, axis="both")
+    orient_ax.legend(loc="upper right")
+    mark_ranges(orient_ax)
 
     axes[-1].set_xlabel("frame")
 
@@ -664,65 +1280,41 @@ def plot_translation(run: dict) -> Path:
     if np.isfinite(peak_threshold) and len(peak_frames) > 0:
         info += f"   peak threshold={peak_threshold:.2f} mm   peaks={', '.join(str(int(f)) for f in peak_frames)}"
 
-    board_pose = run.get("board_pose")
-    if board_pose is not None:
-        reproj = (board_pose.get("record") or {}).get("reprojection") or {}
-        if reproj:
-            info += (
-                f"   board reproj mean={float(reproj.get('mean_px', np.nan)):.3f}px"
-                f" p95={float(reproj.get('p95_px', np.nan)):.3f}px"
-            )
-        z_vs_y = float(run.get("z_vs_y_slope_mm_per_100mm", np.nan))
-        if np.isfinite(z_vs_y):
-            info += f"   z~y slope={z_vs_y:.2f} mm/100mm"
-
-    axes[0].text(
+    fig.text(
         0.01,
-        1.02,
+        0.925,
         info,
-        transform=axes[0].transAxes,
         ha="left",
-        va="bottom",
-        fontsize=10,
+        va="top",
+        fontsize=9.5,
         color="#333333",
     )
 
+    status_text = ""
     if missing_ranges:
-        axes[0].text(
-            0.99,
-            1.02,
-            "red = missing pose   yellow = held/stale pose   purple = large translation jump",
-            transform=axes[0].transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=10,
-            color="#555555",
-        )
+        status_text = "red = missing pose   yellow = held/stale pose   purple = large translation jump"
     elif held_ranges or len(peak_frames) > 0:
-        axes[0].text(
+        status_text = "yellow = held/stale pose   purple = large translation jump"
+
+    if status_text:
+        fig.text(
             0.99,
-            1.02,
-            "yellow = held/stale pose   purple = large translation jump",
-            transform=axes[0].transAxes,
+            0.925,
+            status_text,
             ha="right",
-            va="bottom",
-            fontsize=10,
+            va="top",
+            fontsize=9.5,
             color="#555555",
         )
 
-    suffix = "translation_board_relative_plot" if coordinate_frame == "checkerboard" else "translation_relative_plot"
-    out_path = path.with_name(f"{path.stem}_{suffix}.png")
+    out_path = path.with_name(f"{path.stem}_translation_relative_plot.png")
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     print(f"[translation_plot] saved -> {out_path.resolve()}")
     plt.show()
     return out_path
 
 
-def plot_existing_run(
-    path: Path | None = None,
-    *,
-    require_board_pose: bool = True,
-) -> Path | None:
+def plot_existing_run(path: Path | None = None) -> Path | None:
     if path is None:
         path = select_jsonl_with_qt()
 
@@ -731,26 +1323,30 @@ def plot_existing_run(
         return None
 
     run = load_tracker_run(path)
-    if require_board_pose and run.get("board_pose") is None:
-        raise RuntimeError(
-            "This run has no board_pose record, so it cannot be plotted as the "
-            "translation debug checkerboard-frame run.\n"
-            "Run hydramarker/debug/debug_tracker_translation.py live and confirm "
-            "the checkerboard pose before recording."
-        )
     return plot_translation(run)
 
 
 def main() -> None:
     args = sys.argv[1:]
+    if args and args[0] in (
+        "--offline-depth-filter",
+        "--depth-filter-replay",
+        "depth-filter-replay",
+    ):
+        if len(args) < 2:
+            raise RuntimeError(
+                "Missing JSONL path.\n"
+                "Usage: debug_tracker_translation.py --offline-depth-filter <run.jsonl> [output.jsonl]"
+            )
+        input_path = Path(args[1])
+        output_path = Path(args[2]) if len(args) > 2 else None
+        replay_path = replay_depth_filter_on_run(input_path, output_path)
+        plot_existing_run(replay_path)
+        return
+
     if args and args[0] in ("--plot", "plot"):
         path = Path(args[1]) if len(args) > 1 else None
         plot_existing_run(path)
-        return
-
-    if args and args[0] in ("--plot-camera", "plot-camera"):
-        path = Path(args[1]) if len(args) > 1 else None
-        plot_existing_run(path, require_board_pose=False)
         return
 
     if args and args[0] in ("--select", "select"):
@@ -761,7 +1357,24 @@ def main() -> None:
         plot_existing_run(Path(args[0]))
         return
 
-    recorded_path = run_live_tracker_translation()
+    allowed_live_flags = {
+        "--no-fast-persistent",
+        "--no-temporal-persistence",
+        "--decode-only",
+    }
+    unknown = [arg for arg in args if arg not in allowed_live_flags]
+    if unknown:
+        raise RuntimeError(
+            "Unknown live option(s): "
+            + ", ".join(unknown)
+            + "\nKnown live options: "
+            + ", ".join(sorted(allowed_live_flags))
+        )
+    recorded_path = run_live_tracker_translation(
+        no_fast_persistent="--no-fast-persistent" in args,
+        no_temporal_persistence="--no-temporal-persistence" in args,
+        decode_only="--decode-only" in args,
+    )
     if recorded_path is None:
         print("No recording to analyze.")
         return
