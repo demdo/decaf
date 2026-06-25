@@ -631,7 +631,7 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
         if (tracked && tracked->valid()) {
             tracked->tracking = true;
 
-            const bool refresh_due =
+            const bool refresh_cadence_due =
                 config_.refresh_interval_frames > 0 &&
                 (frame_index_ % config_.refresh_interval_frames == 0);
 
@@ -644,6 +644,57 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
             const bool geometry_degraded =
                 detectionMinSpacingRatio(*tracked) < 0.35f;
 
+            int persistent_missed_count = 0;
+            int persistent_predicted_count = 0;
+            for (const auto& pc : persistent_corners_) {
+                if (pc.missed_frames > 0) {
+                    ++persistent_missed_count;
+                }
+                if (pc.corner.predicted || pc.predicted_frames > 0) {
+                    ++persistent_predicted_count;
+                }
+            }
+
+            const int full_build_interval =
+                config_.tracking_recovery_full_build_interval_frames;
+            const bool periodic_full_build_due =
+                full_build_interval <= 1 ||
+                (frame_index_ % full_build_interval == 0);
+            const bool tracked_decodeable =
+                hasDecodeableCellSpan(
+                    *tracked,
+                    config_.min_tracking_decode_cell_span);
+            const int tracked_corner_count =
+                static_cast<int>(tracked->corners.size());
+            const int tracked_cell_count =
+                static_cast<int>(tracked->cells.size());
+            const bool tracked_dense_enough =
+                tracked_cell_count >=
+                std::max(12, config_.min_tracking_cells * 6);
+            const bool persistent_state_not_critical =
+                persistent_missed_count <
+                    std::max(24, tracked_corner_count / 2) &&
+                persistent_predicted_count <
+                    std::max(24, tracked_corner_count / 2);
+            const bool recovery_state_weak =
+                !tracked->stable ||
+                !tracked_decodeable ||
+                !tracked_dense_enough ||
+                !persistent_state_not_critical ||
+                roi_align_fail_frames_ > 0 ||
+                roi_recovery_fail_frames_ > 0;
+            const int stable_refresh_interval =
+                config_.tracking_recovery_stable_interval_frames;
+            const bool stable_refresh_due =
+                stable_refresh_interval <= 0 ||
+                (frame_index_ % std::max(1, stable_refresh_interval) == 0);
+            const bool refresh_due =
+                refresh_cadence_due &&
+                (recovery_state_weak || stable_refresh_due);
+            if (refresh_cadence_due && !refresh_due) {
+                addTimingMs("refresh_recovery_stable_deferred_count", 1.0);
+            }
+
             const bool do_refresh = refresh_due || corner_loss || geometry_degraded;
             if (do_refresh) {
                 const int roi_fail_retry_after_frames =
@@ -655,38 +706,6 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 const bool allow_roi_fail_full_retry =
                     allow_roi_fail_count_retry;
 
-                int persistent_missed_count = 0;
-                int persistent_predicted_count = 0;
-                for (const auto& pc : persistent_corners_) {
-                    if (pc.missed_frames > 0) {
-                        ++persistent_missed_count;
-                    }
-                    if (pc.corner.predicted || pc.predicted_frames > 0) {
-                        ++persistent_predicted_count;
-                    }
-                }
-
-                const int full_build_interval =
-                    config_.tracking_recovery_full_build_interval_frames;
-                const bool periodic_full_build_due =
-                    full_build_interval <= 1 ||
-                    (frame_index_ % full_build_interval == 0);
-                const bool tracked_decodeable =
-                    hasDecodeableCellSpan(
-                        *tracked,
-                        config_.min_tracking_decode_cell_span);
-                const int tracked_corner_count =
-                    static_cast<int>(tracked->corners.size());
-                const int tracked_cell_count =
-                    static_cast<int>(tracked->cells.size());
-                const bool tracked_dense_enough =
-                    tracked_cell_count >=
-                    std::max(12, config_.min_tracking_cells * 6);
-                const bool persistent_state_not_critical =
-                    persistent_missed_count <
-                        std::max(24, tracked_corner_count / 2) &&
-                    persistent_predicted_count <
-                        std::max(24, tracked_corner_count / 2);
                 const bool roi_candidates_only =
                     config_.use_tracking_roi_recovery &&
                     full_build_interval > 1 &&
@@ -1013,12 +1032,95 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
             const auto update_t0 = cv::getTickCount();
             updateTrackingState(gray, *tracked);
             addTimingMs("update_tracking_state_ms", elapsedMs(update_t0));
-            const int locally_completed =
-                tryCompleteMissingCorners(gray, true);
-            if (locally_completed > 0) {
-                addTimingMs(
-                    "tracking_local_completion_added_count",
-                    static_cast<double>(locally_completed));
+            int local_completion_missed_count = 0;
+            int local_completion_predicted_count = 0;
+            int persistent_weak_count = 0;
+            for (const auto& pc : persistent_corners_) {
+                const bool predicted =
+                    pc.corner.predicted || pc.predicted_frames > 0;
+                if (pc.missed_frames > 0) {
+                    ++local_completion_missed_count;
+                }
+                if (predicted) {
+                    ++local_completion_predicted_count;
+                }
+                if (pc.missed_frames == 0 &&
+                    pc.smoothed_visibility_score >= 0.05f &&
+                    (predicted ||
+                     pc.low_visibility_frames >= 2 ||
+                     pc.smoothed_visibility_score < 0.35f)) {
+                    ++persistent_weak_count;
+                }
+            }
+            addTimingMs(
+                "tracking_local_completion_state_missed_count",
+                static_cast<double>(local_completion_missed_count));
+            addTimingMs(
+                "tracking_local_completion_state_predicted_count",
+                static_cast<double>(local_completion_predicted_count));
+            addTimingMs(
+                "tracking_local_completion_state_weak_count",
+                static_cast<double>(persistent_weak_count));
+            addTimingMs(
+                "tracking_local_completion_state_pending_count",
+                static_cast<double>(pending_completion_corners_.size()));
+
+            const bool last_decodeable =
+                last_detection_.valid() &&
+                hasDecodeableCellSpan(
+                    last_detection_,
+                    config_.min_tracking_decode_cell_span);
+            const bool local_completion_has_hard_work =
+                !pending_completion_corners_.empty() ||
+                !last_decodeable ||
+                corner_loss ||
+                geometry_degraded;
+            const bool local_completion_has_soft_state =
+                local_completion_missed_count > 0 ||
+                local_completion_predicted_count > 0 ||
+                persistent_weak_count > 0;
+            const int local_completion_probe_interval =
+                config_.tracking_local_completion_probe_interval_frames;
+            const bool local_completion_probe_due =
+                local_completion_probe_interval <= 1 ||
+                (frame_index_ % local_completion_probe_interval == 0);
+            const bool skip_local_completion =
+                config_.tracking_local_completion_skip_enabled &&
+                last_detection_.valid() &&
+                !local_completion_has_hard_work &&
+                (!local_completion_has_soft_state ||
+                 !local_completion_probe_due);
+            if (skip_local_completion) {
+                if (local_completion_has_soft_state) {
+                    addTimingMs(
+                        "tracking_local_completion_skipped_soft_count",
+                        1.0);
+                } else {
+                    addTimingMs(
+                        "tracking_local_completion_skipped_idle_count",
+                        1.0);
+                }
+            } else {
+                if (config_.tracking_local_completion_skip_enabled &&
+                    !local_completion_has_hard_work &&
+                    local_completion_probe_due) {
+                    if (local_completion_has_soft_state) {
+                        addTimingMs(
+                            "tracking_local_completion_soft_probe_count",
+                            1.0);
+                    } else {
+                        addTimingMs(
+                            "tracking_local_completion_idle_probe_count",
+                            1.0);
+                    }
+                }
+                const int locally_completed =
+                    tryCompleteMissingCorners(gray, true);
+                if (locally_completed > 0) {
+                    addTimingMs(
+                        "tracking_local_completion_added_count",
+                        static_cast<double>(locally_completed));
+                }
             }
             if (!last_detection_.valid()) {
                 const auto recovery_t0 = cv::getTickCount();

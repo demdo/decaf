@@ -46,6 +46,9 @@ set(HYDRAMARKER_SOURCES
     src/lk_tracker.cpp
     src/tracking_validator.cpp
     src/geometry_utils.cpp
+    src/tracker_pose.cpp
+    src/tracker_persistence.cpp
+    src/tracker_engine.cpp
 )
 
 # ============================================================

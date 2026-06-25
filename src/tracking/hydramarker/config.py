@@ -106,6 +106,10 @@ class TrackerConfig:
     dot_cell_cache_max_corner_motion_px: float = 35.0
 
     checker_min_tracking_decode_cell_span: int = 3
+    checker_refresh_interval_frames: int = 1
+    checker_tracking_recovery_stable_interval_frames: int = 9
+    checker_local_completion_skip_enabled: bool = True
+    checker_local_completion_probe_interval_frames: int = 6
     checker_max_undecodeable_tracking_frames: int = 12
     checker_min_fresh_correspondences_for_stable_tracking: int = 8
     checker_max_low_fresh_correspondence_frames: int = 12
@@ -127,6 +131,10 @@ class TrackerConfig:
     decode_only_mode: bool = False
 
     enable_fast_persistent_path: bool = True
+    # Use the C++ implementation for cached-identity to detection-corner
+    # matching. Python remains the fallback path for development and parity
+    # checks.
+    cpp_persistent_matcher_enabled: bool = True
     fast_persistent_min_points: int = 10
     fast_persistent_refresh_mean_error_px: float = 1.5
     fast_persistent_dense_refine_enabled: bool = True
@@ -139,6 +147,7 @@ class TrackerConfig:
     # is suspicious when the seed projection disagrees with dense visible
     # corners, or when many detected corners were not carried by the sparse
     # persistent pose.
+    fast_persistent_dense_rescue_enabled: bool = False
     fast_persistent_dense_rescue_min_green_ratio: float = 0.85
     fast_persistent_dense_rescue_min_seed_median_px: float = 1.5
     fast_persistent_dense_min_image_coverage: float = 0.35
@@ -152,6 +161,13 @@ class TrackerConfig:
     fast_persistent_dense_robust_min_keep_ratio: float = 0.75
     fast_persistent_dense_robust_max_mean_px: float = 1.2
     fast_persistent_dense_robust_max_max_px: float = 2.5
+    # Avoid paying dense validation on clean fast-path seeds. Dense is still
+    # used when the sparse persistent match looks risky.
+    fast_persistent_dense_adaptive_refine_enabled: bool = True
+    fast_persistent_dense_adaptive_min_match_ratio: float = 0.85
+    fast_persistent_dense_adaptive_motion_px: float = 8.0
+    fast_persistent_dense_adaptive_max_seed_mean_px: float = 1.2
+    fast_persistent_dense_adaptive_max_seed_max_px: float = 2.8
 
     enable_temporal_correspondence_persistence: bool = True
     persistence_max_frames: int = 8
@@ -174,6 +190,10 @@ class TrackerConfig:
     # to where the last accepted pose predicts that exact 3D corner.
     persistence_use_pose_projection: bool = True
     persistence_projection_max_reproj_px: float = 9.0
+    persistence_projection_adaptive_match_enabled: bool = True
+    persistence_projection_adaptive_motion_start_px: float = 6.0
+    persistence_projection_adaptive_motion_scale: float = 1.0
+    persistence_projection_adaptive_max_reproj_px: float = 18.0
     persistence_projection_max_pose_error_px: float = 1.5
     persistence_match_min_second_best_margin_px: float = 3.0
 

@@ -31,6 +31,22 @@ class TrackerFactoryMixin:
         cfg = hm.CheckerboardDetectorConfig()
         cfg.recovery_correction_weight = 0.5
         cfg.recovery_correction_max_dist_rel = 0.6
+        if hasattr(cfg, "refresh_interval_frames"):
+            cfg.refresh_interval_frames = int(
+                self.config.checker_refresh_interval_frames
+            )
+        if hasattr(cfg, "tracking_recovery_stable_interval_frames"):
+            cfg.tracking_recovery_stable_interval_frames = int(
+                self.config.checker_tracking_recovery_stable_interval_frames
+            )
+        if hasattr(cfg, "tracking_local_completion_skip_enabled"):
+            cfg.tracking_local_completion_skip_enabled = bool(
+                self.config.checker_local_completion_skip_enabled
+            )
+        if hasattr(cfg, "tracking_local_completion_probe_interval_frames"):
+            cfg.tracking_local_completion_probe_interval_frames = int(
+                self.config.checker_local_completion_probe_interval_frames
+            )
         if hasattr(cfg, "min_tracking_decode_cell_span"):
             cfg.min_tracking_decode_cell_span = (
                 self.config.checker_min_tracking_decode_cell_span

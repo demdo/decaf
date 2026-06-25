@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from tracking.hydramarker.backend import cpp_impl as hm
 from tracking.hydramarker.tracker_pose import PoseTrackPoint
 from tracking.hydramarker.tracker_types import (
     GlobalCornerIdentity,
@@ -24,6 +25,238 @@ from tracking.hydramarker.tracker_types import (
 
 class PersistenceMixin:
     """Maintain and reuse global corner identities across short decode outages."""
+
+    def _cpp_persistent_matcher_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self.config,
+                "cpp_persistent_matcher_enabled",
+                True,
+            )
+        )
+
+    def _cpp_persistent_matcher_config_signature(self) -> Tuple[object, ...]:
+        names = (
+            "persistence_max_frames",
+            "persistence_use_pose_projection",
+            "persistence_projection_max_reproj_px",
+            "persistence_projection_adaptive_match_enabled",
+            "persistence_projection_adaptive_motion_start_px",
+            "persistence_projection_adaptive_motion_scale",
+            "persistence_projection_adaptive_max_reproj_px",
+            "persistence_projection_max_pose_error_px",
+            "persistence_match_min_second_best_margin_px",
+            "persistence_uv_match_dist_px",
+        )
+        return tuple(getattr(self.config, name, None) for name in names)
+
+    def _ensure_cpp_persistent_matcher(self):
+        """Create the C++ persistent matcher on demand."""
+        if not self._cpp_persistent_matcher_enabled():
+            return None
+
+        if bool(getattr(self, "_cpp_persistent_matcher_unavailable", False)):
+            return None
+
+        signature = self._cpp_persistent_matcher_config_signature()
+        matcher = getattr(self, "_cpp_persistent_matcher", None)
+        if (
+            matcher is not None
+            and getattr(
+                self,
+                "_cpp_persistent_matcher_config_state",
+                None,
+            ) == signature
+        ):
+            return matcher
+
+        try:
+            matcher = hm.create_persistent_matcher(self.config)
+        except Exception:
+            self._cpp_persistent_matcher_unavailable = True
+            self._cpp_persistent_matcher = None
+            return None
+
+        self._cpp_persistent_matcher = matcher
+        self._cpp_persistent_matcher_config_state = signature
+        self._sync_cpp_persistent_matcher()
+        return matcher
+
+    def _sync_cpp_persistent_matcher(self) -> None:
+        """Mirror Python persistent identities into the C++ matcher."""
+        if not self._cpp_persistent_matcher_enabled():
+            return
+
+        matcher = getattr(self, "_cpp_persistent_matcher", None)
+        if matcher is None:
+            return
+
+        identities = self._identity_store.all()
+        if self._persistent_frame_index < 0 or not identities:
+            try:
+                matcher.clear_identities()
+            except Exception:
+                self._cpp_persistent_matcher_unavailable = True
+            return
+
+        try:
+            matcher.replace_identities(
+                hm.global_corner_identities_from_python(identities),
+                int(self._persistent_frame_index),
+            )
+        except Exception:
+            self._cpp_persistent_matcher_unavailable = True
+
+    @staticmethod
+    def _persistent_match_stats_from_cpp(stats) -> PersistentMatchStats:
+        return PersistentMatchStats(
+            age=int(getattr(stats, "age", 0)),
+            identities=int(getattr(stats, "identities", 0)),
+            current_corners=int(getattr(stats, "current_corners", 0)),
+            accepted=int(getattr(stats, "accepted", 0)),
+            used_pose_projection=bool(
+                getattr(stats, "used_pose_projection", False)
+            ),
+            adaptive_motion_px=float(
+                getattr(stats, "adaptive_motion_px", 0.0)
+            ),
+            adaptive_max_dist_px=float(
+                getattr(stats, "adaptive_max_dist_px", 0.0)
+            ),
+            rejected_no_projection=int(
+                getattr(stats, "rejected_no_projection", 0)
+            ),
+            rejected_far=int(getattr(stats, "rejected_far", 0)),
+            rejected_ambiguous=int(getattr(stats, "rejected_ambiguous", 0)),
+            rejected_claimed=int(getattr(stats, "rejected_claimed", 0)),
+        )
+
+    @staticmethod
+    def _pose_track_points_from_cpp(points) -> List[PoseTrackPoint]:
+        return [
+            PoseTrackPoint(
+                global_row=int(point.global_row),
+                global_col=int(point.global_col),
+                xyz_mm=tuple(float(v) for v in point.xyz_mm),
+                uv=tuple(float(v) for v in point.uv),
+                votes=int(getattr(point, "votes", 0)),
+            )
+            for point in points
+        ]
+
+    @staticmethod
+    def _tracker_corners_from_cpp(corners) -> List[TrackerCorner]:
+        return [
+            TrackerCorner(
+                local_row=int(corner.local_row),
+                local_col=int(corner.local_col),
+                global_row=int(corner.global_row),
+                global_col=int(corner.global_col),
+                xyz_mm=tuple(float(v) for v in corner.xyz_mm),
+                uv=tuple(float(v) for v in corner.uv),
+                votes=int(getattr(corner, "votes", 0)),
+            )
+            for corner in corners
+        ]
+
+    def _persistent_correspondences_for_detection_cpp(
+        self,
+        detection,
+    ) -> Optional[Tuple[List[PoseTrackPoint], List[TrackerCorner]]]:
+        """Match cached identities through the C++ implementation when enabled."""
+        matcher = self._ensure_cpp_persistent_matcher()
+        if matcher is None:
+            return None
+
+        try:
+            result = matcher.match(
+                detection,
+                int(self.frame_index),
+                self.K,
+                self.dist_coeffs,
+                None if self.pose_tracker.rvec is None else self.pose_tracker.rvec,
+                None if self.pose_tracker.tvec is None else self.pose_tracker.tvec,
+                float(self._last_good_reproj_px),
+            )
+        except Exception:
+            return None
+
+        self._last_persistent_match_stats = self._persistent_match_stats_from_cpp(
+            result.stats
+        )
+        self._last_persistent_match_backend = "cpp"
+        return (
+            self._pose_track_points_from_cpp(result.points),
+            self._tracker_corners_from_cpp(result.corners),
+        )
+
+    def _persistent_detection_motion_px(self, current_uvs: np.ndarray) -> float:
+        """Estimate robust image motion between consecutive checker detections."""
+        current_uvs = np.asarray(current_uvs, dtype=np.float64).reshape(-1, 2)
+        prev_uvs = getattr(self, "_persistent_match_prev_detection_uv", None)
+        prev_frame = int(getattr(self, "_persistent_match_prev_detection_frame", -1))
+
+        if prev_frame == int(self.frame_index):
+            return float(getattr(self, "_persistent_match_last_motion_px", 0.0))
+
+        motion_px = 0.0
+        if (
+            prev_uvs is not None
+            and len(prev_uvs) > 0
+            and len(current_uvs) > 0
+        ):
+            previous = np.asarray(prev_uvs, dtype=np.float64).reshape(-1, 2)
+            diff = current_uvs[:, None, :] - previous[None, :, :]
+            distances = np.linalg.norm(diff, axis=2)
+            nearest = np.min(distances, axis=1)
+            nearest = nearest[np.isfinite(nearest)]
+            if len(nearest) > 0:
+                motion_px = float(np.median(nearest))
+
+        self._persistent_match_prev_detection_uv = current_uvs.copy()
+        self._persistent_match_prev_detection_frame = int(self.frame_index)
+        self._persistent_match_last_motion_px = float(motion_px)
+        return float(motion_px)
+
+    def _adaptive_persistence_projection_match_radius_px(
+        self,
+        base_radius_px: float,
+        motion_px: float,
+    ) -> float:
+        """Return a conservative motion-adaptive radius for projected IDs."""
+        if not bool(
+            getattr(
+                self.config,
+                "persistence_projection_adaptive_match_enabled",
+                True,
+            )
+        ):
+            return float(base_radius_px)
+
+        start_px = float(
+            getattr(
+                self.config,
+                "persistence_projection_adaptive_motion_start_px",
+                6.0,
+            )
+        )
+        scale = float(
+            getattr(
+                self.config,
+                "persistence_projection_adaptive_motion_scale",
+                1.0,
+            )
+        )
+        max_radius_px = float(
+            getattr(
+                self.config,
+                "persistence_projection_adaptive_max_reproj_px",
+                base_radius_px,
+            )
+        )
+        max_radius_px = max(float(base_radius_px), max_radius_px)
+        extra_px = max(0.0, float(motion_px) - max(0.0, start_px)) * max(0.0, scale)
+        return min(max_radius_px, max(float(base_radius_px), float(base_radius_px) + extra_px))
 
     def _merge_with_persistent_correspondences(
         self,
@@ -111,6 +344,11 @@ class PersistenceMixin:
         detection,
     ) -> Tuple[List[PoseTrackPoint], List[TrackerCorner]]:
         """Match cached global identities to the current checkerboard detection."""
+        cpp_result = self._persistent_correspondences_for_detection_cpp(detection)
+        if cpp_result is not None:
+            return cpp_result
+
+        self._last_persistent_match_backend = "python"
         identities = self._identity_store.all()
         stats = PersistentMatchStats(identities=len(identities))
         self._last_persistent_match_stats = stats
@@ -142,6 +380,7 @@ class PersistenceMixin:
             [(float(c.uv[0]), float(c.uv[1])) for c in current_corners],
             dtype=np.float64,
         )  # shape (N, 2)
+        motion_px = self._persistent_detection_motion_px(current_uvs)
 
         use_pose_projection = (
             self.config.persistence_use_pose_projection
@@ -152,6 +391,15 @@ class PersistenceMixin:
             <= self.config.persistence_projection_max_pose_error_px
         )
         stats.used_pose_projection = bool(use_pose_projection)
+        stats.adaptive_motion_px = float(motion_px)
+        stats.adaptive_max_dist_px = float(self.config.persistence_uv_match_dist_px)
+        projection_max_dist = float(self.config.persistence_projection_max_reproj_px)
+        if use_pose_projection:
+            projection_max_dist = self._adaptive_persistence_projection_match_radius_px(
+                projection_max_dist,
+                motion_px,
+            )
+            stats.adaptive_max_dist_px = float(projection_max_dist)
 
         points: List[PoseTrackPoint] = []
         corners: List[TrackerCorner] = []
@@ -168,7 +416,7 @@ class PersistenceMixin:
                 if projected_uv is None:
                     stats.rejected_no_projection += 1
                     continue
-                max_dist = float(self.config.persistence_projection_max_reproj_px)
+                max_dist = float(projection_max_dist)
                 predicted_uv = projected_uv
             else:
                 max_dist = float(self.config.persistence_uv_match_dist_px)
@@ -315,11 +563,18 @@ class PersistenceMixin:
         if len(identities) >= self.config.persistence_min_points:
             self._identity_store.replace(identities)
             self._persistent_frame_index = self.frame_index
+            self._sync_cpp_persistent_matcher()
 
     def _clear_persistent_correspondences(self) -> None:
         """Clear all cached persistent identities."""
         self._identity_store.clear()
         self._persistent_frame_index = -1
+        matcher = getattr(self, "_cpp_persistent_matcher", None)
+        if matcher is not None:
+            try:
+                matcher.clear_identities()
+            except Exception:
+                self._cpp_persistent_matcher_unavailable = True
     @property
     def _persistent_corners(self) -> List[TrackerCorner]:
         """
@@ -347,12 +602,106 @@ class PersistenceMixin:
 class FastPathMixin:
     """Estimate pose directly from persistent identities before full decode."""
 
+    def _fast_dense_refine_required_for_seed(
+        self,
+        *,
+        seed_pose,
+        match_count: int,
+        stats: PersistentMatchStats,
+    ) -> Tuple[bool, str, Dict[str, float]]:
+        """Return whether a fast-path seed needs dense projection validation."""
+        current_corners = max(0, int(getattr(stats, "current_corners", 0)))
+        sparse_ratio = float(match_count) / float(max(current_corners, 1))
+        motion_px = float(getattr(stats, "adaptive_motion_px", 0.0))
+        ambiguous = max(0, int(getattr(stats, "rejected_ambiguous", 0)))
+        seed_mean_px = float(getattr(seed_pose, "reprojection_mean_px", -1.0))
+        seed_max_px = float(getattr(seed_pose, "reprojection_max_px", -1.0))
+
+        metrics = {
+            "match_ratio": sparse_ratio,
+            "motion_px": motion_px,
+            "ambiguous_count": float(ambiguous),
+            "seed_mean_px": seed_mean_px,
+            "seed_max_px": seed_max_px,
+        }
+
+        if not bool(
+            getattr(
+                self.config,
+                "fast_persistent_dense_adaptive_refine_enabled",
+                True,
+            )
+        ):
+            return True, "adaptive_disabled", metrics
+
+        reasons: List[str] = []
+        min_ratio = float(
+            getattr(
+                self.config,
+                "fast_persistent_dense_adaptive_min_match_ratio",
+                0.85,
+            )
+        )
+        if min_ratio > 0.0 and sparse_ratio < min_ratio:
+            reasons.append("low_match_ratio")
+
+        motion_threshold = float(
+            getattr(
+                self.config,
+                "fast_persistent_dense_adaptive_motion_px",
+                8.0,
+            )
+        )
+        if motion_threshold > 0.0 and motion_px >= motion_threshold:
+            reasons.append("motion")
+
+        if ambiguous > 0:
+            reasons.append("ambiguous")
+
+        max_seed_mean = float(
+            getattr(
+                self.config,
+                "fast_persistent_dense_adaptive_max_seed_mean_px",
+                1.2,
+            )
+        )
+        if (
+            max_seed_mean > 0.0
+            and np.isfinite(seed_mean_px)
+            and seed_mean_px > max_seed_mean
+        ):
+            reasons.append("seed_mean")
+
+        max_seed_max = float(
+            getattr(
+                self.config,
+                "fast_persistent_dense_adaptive_max_seed_max_px",
+                2.8,
+            )
+        )
+        if (
+            max_seed_max > 0.0
+            and np.isfinite(seed_max_px)
+            and seed_max_px > max_seed_max
+        ):
+            reasons.append("seed_max")
+
+        if reasons:
+            return True, "+".join(reasons), metrics
+
+        return False, "clean_seed", metrics
+
     def _try_fast_pose_from_persistent_correspondences(
         self,
         detection,
     ) -> Optional[TrackerResult]:
         """Attempt a fast pose solve from the persistence cache."""
         self._last_persistent_match_stats = PersistentMatchStats()
+        fast_timings: Dict[str, float] = {}
+        self._last_fast_path_timings = fast_timings
+
+        def mark_fast_timing(name: str, start: float) -> None:
+            fast_timings[name] = (time.perf_counter() - start) * 1000.0
 
         if self.config.decode_only_mode:
             self._set_fast_path_debug(
@@ -378,11 +727,28 @@ class FastPathMixin:
         match_t0 = time.perf_counter()
         points, corners = self._persistent_correspondences_for_detection(detection)
         persistent_match_ms = (time.perf_counter() - match_t0) * 1000.0
+        fast_timings["fast_persistent_match_ms"] = persistent_match_ms
+        fast_timings["fast_persistent_points_count"] = float(len(points))
+        fast_timings["fast_persistent_corners_count"] = float(len(corners))
+        stats = self._last_persistent_match_stats
+        match_backend = str(
+            getattr(self, "_last_persistent_match_backend", "unknown")
+        )
+        fast_timings["fast_persistent_match_cpp_count"] = (
+            1.0 if match_backend == "cpp" else 0.0
+        )
+        fast_timings["fast_persistent_match_motion_px"] = float(
+            getattr(stats, "adaptive_motion_px", 0.0)
+        )
+        fast_timings["fast_persistent_match_radius_px"] = float(
+            getattr(stats, "adaptive_max_dist_px", 0.0)
+        )
         min_points = max(
             int(self.config.min_points),
             int(self.config.persistence_min_points),
             int(self.config.fast_persistent_min_points),
         )
+        fast_timings["fast_persistent_min_points_count"] = float(min_points)
         if len(points) < min_points:
             self._set_fast_path_debug(
                 attempted=True,
@@ -391,7 +757,7 @@ class FastPathMixin:
             )
             return None
 
-        stats = self._last_persistent_match_stats
+        snapshot_t0 = time.perf_counter()
         prev_pose_rvec = None if self.pose_tracker.rvec is None else self.pose_tracker.rvec.copy()
         prev_pose_tvec = None if self.pose_tracker.tvec is None else self.pose_tracker.tvec.copy()
         prev_pose_T = (
@@ -418,8 +784,10 @@ class FastPathMixin:
         prev_last_pose_frame = int(self._last_accepted_pose_frame)
         prev_last_good_reproj_px = float(self._last_good_reproj_px)
         prev_max_pts_seen = int(self._max_pts_seen)
+        mark_fast_timing("fast_persistent_snapshot_ms", snapshot_t0)
 
         def restore_seed_state() -> None:
+            restore_t0 = time.perf_counter()
             self.pose_tracker.rvec = prev_pose_rvec
             self.pose_tracker.tvec = prev_pose_tvec
             self.pose_tracker.T_marker_camera = prev_pose_T
@@ -436,54 +804,142 @@ class FastPathMixin:
             self._last_accepted_pose_frame = prev_last_pose_frame
             self._last_good_reproj_px = prev_last_good_reproj_px
             self._max_pts_seen = prev_max_pts_seen
+            fast_timings["fast_persistent_restore_seed_ms"] = (
+                fast_timings.get("fast_persistent_restore_seed_ms", 0.0)
+                + (time.perf_counter() - restore_t0) * 1000.0
+            )
 
-        result = self._estimate_and_package_pose(
+        seed_t0 = time.perf_counter()
+        seed_pose = self.pose_tracker.estimate_pose(
             points,
-            corners,
-            success_message=(
-                "Fast pose estimated from persistent correspondences "
-                f"(matches={len(points)}, identities={stats.identities}, "
-                f"far={stats.rejected_far}, ambiguous={stats.rejected_ambiguous}, "
-                f"claimed={stats.rejected_claimed})."
-            ),
-            update_persistence=False,
-            pose_source=PoseSource.FAST_PERSISTENT,
-            detection=detection,
+            lost_frames=self.lost_frames,
         )
-        result.timings_ms["persistent_match_ms"] = persistent_match_ms
+        seed_pnp_ms = (time.perf_counter() - seed_t0) * 1000.0
+        fast_timings["fast_persistent_seed_pnp_ms"] = seed_pnp_ms
 
-        if not result.success:
+        if not seed_pose.success:
             restore_seed_state()
             self._set_fast_path_debug(
                 attempted=True,
-                reason=result.message,
+                reason=seed_pose.message,
                 matches=len(points),
             )
             return None
 
+        if not self._persistent_pose_motion_plausible(
+            seed_pose.rvec,
+            seed_pose.tvec,
+            prev_last_rvec,
+            prev_last_tvec,
+        ):
+            restore_seed_state()
+            self._set_fast_path_debug(
+                attempted=True,
+                reason="Persistent pose rejected by motion gate.",
+                matches=len(points),
+            )
+            return None
+
+        reject_reason = self._fallback_pose_rejection_reason(
+            detection,
+            seed_pose.rvec,
+            seed_pose.tvec,
+            seed_pose.reprojection_mean_px,
+            seed_pose.reprojection_max_px,
+        )
+        if reject_reason:
+            restore_seed_state()
+            self._set_fast_path_debug(
+                attempted=True,
+                reason=reject_reason,
+                matches=len(points),
+            )
+            return None
+
+        debug_t0 = time.perf_counter()
         self._set_fast_path_debug(
             attempted=True,
             success=True,
             reason="ok",
             matches=len(points),
         )
+        mark_fast_timing("fast_persistent_debug_success_ms", debug_t0)
 
-        dense_t0 = time.perf_counter()
-        dense_result = self._try_dense_projection_refine_from_fast_pose(
-            detection,
-            seed_result=result,
+        success_message = (
+            "Fast pose estimated from persistent correspondences "
+            f"(matches={len(points)}, identities={stats.identities}, "
+            f"far={stats.rejected_far}, ambiguous={stats.rejected_ambiguous}, "
+            f"claimed={stats.rejected_claimed})."
         )
-        dense_total_ms = (time.perf_counter() - dense_t0) * 1000.0
+        seed_result = TrackerResult(
+            success=True,
+            mode=self.mode,
+            message=success_message,
+            rvec=seed_pose.rvec,
+            tvec=seed_pose.tvec,
+            T_marker_camera=seed_pose.T_marker_camera,
+            mean_reprojection_error_px=seed_pose.reprojection_mean_px,
+            max_reprojection_error_px=seed_pose.reprojection_max_px,
+            num_points=seed_pose.num_points,
+            num_inliers=seed_pose.num_inliers,
+            pose_source=PoseSource.FAST_PERSISTENT,
+            pnp_method=str(getattr(seed_pose, "method", "")),
+            corners=[],
+            correspondence_corners=corners,
+            timings_ms={"pnp_ms": seed_pnp_ms},
+        )
+
+        dense_required, dense_gate_reason, dense_gate_metrics = (
+            self._fast_dense_refine_required_for_seed(
+                seed_pose=seed_pose,
+                match_count=len(points),
+                stats=stats,
+            )
+        )
+        fast_timings["fast_dense_adaptive_required_count"] = (
+            1.0 if dense_required else 0.0
+        )
+        fast_timings["fast_dense_adaptive_skipped_count"] = (
+            0.0 if dense_required else 1.0
+        )
+        fast_timings["fast_dense_adaptive_match_ratio"] = float(
+            dense_gate_metrics["match_ratio"]
+        )
+        fast_timings["fast_dense_adaptive_motion_px"] = float(
+            dense_gate_metrics["motion_px"]
+        )
+        fast_timings["fast_dense_adaptive_ambiguous_count"] = float(
+            dense_gate_metrics["ambiguous_count"]
+        )
+        fast_timings["fast_dense_adaptive_seed_mean_px"] = float(
+            dense_gate_metrics["seed_mean_px"]
+        )
+        fast_timings["fast_dense_adaptive_seed_max_px"] = float(
+            dense_gate_metrics["seed_max_px"]
+        )
+
+        if dense_required:
+            dense_t0 = time.perf_counter()
+            dense_result = self._try_dense_projection_refine_from_fast_pose(
+                detection,
+                seed_result=seed_result,
+            )
+            dense_total_ms = (time.perf_counter() - dense_t0) * 1000.0
+        else:
+            dense_result = None
+            dense_total_ms = 0.0
+            self._set_dense_refine_debug(
+                attempted=False,
+                reason=f"adaptive_skip:{dense_gate_reason}",
+            )
+        fast_timings["fast_dense_total_ms"] = dense_total_ms
         if dense_result is not None:
             dense_result.timings_ms["persistent_match_ms"] = persistent_match_ms
             dense_result.timings_ms["fast_dense_total_ms"] = dense_total_ms
-            dense_result.timings_ms["fast_seed_pnp_ms"] = result.timings_ms.get(
-                "pnp_ms",
-                0.0,
-            )
+            dense_result.timings_ms["fast_seed_pnp_ms"] = seed_pnp_ms
             result = dense_result
         else:
-            result.timings_ms["fast_dense_total_ms"] = dense_total_ms
+            post_dense_t0 = time.perf_counter()
             debug = self._last_fast_path_debug
             dense_reason = str(getattr(debug, "dense_refine_reason", ""))
             current_corners = int(getattr(debug, "current_corners", 0))
@@ -497,7 +953,15 @@ class FastPathMixin:
                 < float(self.config.fast_persistent_dense_rescue_min_green_ratio)
                 and dense_reason not in ("disabled", "missing_seed_pose")
             )
-            if dense_reason.startswith("rescue_failed:") or dense_validation_failed:
+            mark_fast_timing(
+                "fast_persistent_post_dense_gate_ms",
+                post_dense_t0,
+            )
+            if (
+                dense_reason.startswith("rescue_failed:")
+                or dense_reason.startswith("rescue_skipped_decode:")
+                or dense_validation_failed
+            ):
                 restore_seed_state()
                 debug.success = False
                 debug.reason = (
@@ -505,6 +969,38 @@ class FastPathMixin:
                     f"{dense_reason}; sparse_ratio={sparse_match_ratio:.3f}"
                 )
                 debug.matches = int(len(points))
+                fast_timings["fast_persistent_preflight_decode_route_count"] = 1.0
+                return None
+
+            estimate_t0 = time.perf_counter()
+            result = self._estimate_and_package_pose(
+                points,
+                corners,
+                success_message=success_message,
+                update_persistence=False,
+                pose_source=PoseSource.FAST_PERSISTENT,
+                detection=detection,
+                precomputed_pose=seed_pose,
+                precomputed_pnp_ms=seed_pnp_ms,
+                previous_pose_rvec=prev_pose_rvec,
+                previous_pose_tvec=prev_pose_tvec,
+                previous_pose_T=prev_pose_T,
+                previous_depth_filter_state=prev_depth_filter_state,
+                previous_last_rvec=prev_last_rvec,
+                previous_last_tvec=prev_last_tvec,
+            )
+            mark_fast_timing("fast_persistent_estimate_package_ms", estimate_t0)
+            result.timings_ms["persistent_match_ms"] = persistent_match_ms
+            result.timings_ms["fast_dense_total_ms"] = dense_total_ms
+            result.timings_ms["fast_seed_pnp_ms"] = seed_pnp_ms
+
+            if not result.success:
+                restore_seed_state()
+                self._set_fast_path_debug(
+                    attempted=True,
+                    reason=result.message,
+                    matches=len(points),
+                )
                 return None
 
         self._attach_fast_path_debug(result)
@@ -543,6 +1039,24 @@ class FastPathMixin:
             )
             return None
 
+        min_dense_points = max(
+            int(self.config.fast_persistent_dense_min_points),
+            int(seed_result.num_inliers) + 1,
+        )
+        detection_corners = getattr(detection, "corners", None)
+        detected_corner_count = 0 if detection_corners is None else len(detection_corners)
+        if detected_corner_count < min_dense_points:
+            # Dense matching cannot produce more matches than detected corners.
+            self._set_dense_refine_debug(
+                attempted=True,
+                reason=(
+                    "too_few_detection_corners:"
+                    f"{detected_corner_count}<{min_dense_points}"
+                ),
+                matches=detected_corner_count,
+            )
+            return None
+
         match_t0 = time.perf_counter()
         matched_corners, dense_stats = (
             self._strict_projected_tracker_corners_for_detection_pose(
@@ -560,10 +1074,6 @@ class FastPathMixin:
         median_err = float(dense_stats.median_error_px)
         p90_err = float(dense_stats.p90_error_px)
 
-        min_dense_points = max(
-            int(self.config.fast_persistent_dense_min_points),
-            int(seed_result.num_inliers) + 1,
-        )
         if match_count < min_dense_points:
             self._set_dense_refine_debug(
                 attempted=True,
@@ -648,6 +1158,24 @@ class FastPathMixin:
             or median_err
             >= float(self.config.fast_persistent_dense_rescue_min_seed_median_px)
         )
+        if (
+            rescue_required
+            and not bool(self.config.fast_persistent_dense_rescue_enabled)
+        ):
+            fast_timings = getattr(self, "_last_fast_path_timings", None)
+            if fast_timings is not None:
+                fast_timings["fast_dense_rescue_skipped_count"] = 1.0
+                fast_timings["fast_dense_route_decode_count"] = 1.0
+            self._set_dense_refine_debug(
+                attempted=True,
+                reason=f"rescue_skipped_decode:{seed_error_reason}",
+                matches=match_count,
+                median_error_px=median_err,
+                p90_error_px=p90_err,
+                stats=dense_stats,
+            )
+            return None
+
         if seed_error_reason and not rescue_required:
             self._set_dense_refine_debug(
                 attempted=True,

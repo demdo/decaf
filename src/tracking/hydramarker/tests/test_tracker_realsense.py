@@ -488,6 +488,8 @@ def make_tracker(field_path, marker_json_path, K, dist) -> HydraTracker:
             corr_enable_dominant_rotation_filter=True,
             corr_min_rotation_support=2,
             corr_min_rotation_support_ratio=0.55,
+            checker_refresh_interval_frames=3,
+            checker_tracking_recovery_stable_interval_frames=9,
             checker_max_undecodeable_tracking_frames=12,
             checker_max_low_fresh_correspondence_frames=12,
             # Use only real checkerboard detections for dot decoding.
@@ -534,8 +536,10 @@ def run_live_tracker(
     after_tracker_created: Optional[Callable[[HydraTracker], None]] = None,
     on_space_key: Optional[Callable[[HydraTracker, Any, int], bool]] = None,
     on_log_open: Optional[Callable[[Path, Path, HydraTracker], None]] = None,
+    on_log_close: Optional[Callable[[Path], None]] = None,
     draw_extra_overlay: Optional[Callable[[np.ndarray, bool], None]] = None,
     stop_after_log_close: bool = False,
+    quit_on_q: bool = True,
     final_cleanup: Optional[Callable[[], None]] = None,
 ) -> Optional[Path]:
     """Run the shared RealSense tracker loop used by tests and debug tools."""
@@ -743,10 +747,12 @@ def run_live_tracker(
             cv2.imshow(window_name, vis)
 
             key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
+            if key == 27 or (quit_on_q and key == ord("q")):
                 if tracker_log.is_active() and tracker_log.current_path() is not None:
                     recorded_log_path = Path(tracker_log.current_path())
                     tracker_log.log_close()
+                    if on_log_close is not None:
+                        on_log_close(recorded_log_path)
                 break
             if key == ord("r"):
                 enter_idle("reset", keep_armed=False)
@@ -760,9 +766,13 @@ def run_live_tracker(
                     continue
                 if tracker_log.is_active():
                     log_path = tracker_log.current_path()
+                    closed_log_path = None
                     if log_path is not None:
                         recorded_log_path = Path(log_path)
+                        closed_log_path = recorded_log_path
                     tracker_log.log_close()
+                    if closed_log_path is not None and on_log_close is not None:
+                        on_log_close(closed_log_path)
                     if stop_after_log_close:
                         break
                 else:

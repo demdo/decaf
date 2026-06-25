@@ -79,6 +79,18 @@ struct CheckerboardDetectorConfig {
     // corners that appeared since the last full detection.
     // 1 = every frame.
     int refresh_interval_frames = 1;
+    // Stable, decodeable LK tracking does not need a full recovery probe at
+    // the normal refresh cadence. In that case use this slower cadence while
+    // still allowing immediate recovery for corner loss, bad geometry, or weak
+    // decode topology. 0 disables the slower stable cadence.
+    int tracking_recovery_stable_interval_frames = 9;
+
+    // Skip local corner completion when the persistent LK state has no
+    // actionable missed/pending corners. Predicted/weak-only states are
+    // handled by periodic probes so partial visibility remains recoverable
+    // without paying the corner-completion cost every frame.
+    bool tracking_local_completion_skip_enabled = false;
+    int tracking_local_completion_probe_interval_frames = 6;
 
     // Fraction of previously tracked corners that must be lost before an
     // immediate mid-interval recovery refresh is triggered.

@@ -863,37 +863,76 @@ class PoseEstimationMixin:
         update_persistence: bool,
         pose_source: PoseSource,
         detection=None,
+        precomputed_pose: Optional[MapPoseResult] = None,
+        precomputed_pnp_ms: Optional[float] = None,
+        previous_pose_rvec: Optional[np.ndarray] = None,
+        previous_pose_tvec: Optional[np.ndarray] = None,
+        previous_pose_T: Optional[np.ndarray] = None,
+        previous_depth_filter_state: Optional[tuple] = None,
+        previous_last_rvec: Optional[np.ndarray] = None,
+        previous_last_tvec: Optional[np.ndarray] = None,
     ) -> TrackerResult:
         """Run pose estimation, validate fallback poses, and update accepted state."""
-        prev_pose_rvec = None if self.pose_tracker.rvec is None else self.pose_tracker.rvec.copy()
-        prev_pose_tvec = None if self.pose_tracker.tvec is None else self.pose_tracker.tvec.copy()
-        prev_pose_T = (
-            None
-            if self.pose_tracker.T_marker_camera is None
-            else self.pose_tracker.T_marker_camera.copy()
-        )
-        prev_depth_filter_state = self.pose_depth_filter.snapshot()
-        prev_last_rvec = (
-            None
-            if self._last_accepted_rvec is None
-            else self._last_accepted_rvec.copy()
-        )
-        prev_last_tvec = (
-            None
-            if self._last_accepted_tvec is None
-            else self._last_accepted_tvec.copy()
-        )
         pose_timings: dict[str, float] = {}
+
+        snapshot_t0 = time.perf_counter()
+        if precomputed_pose is None:
+            prev_pose_rvec = None if self.pose_tracker.rvec is None else self.pose_tracker.rvec.copy()
+            prev_pose_tvec = None if self.pose_tracker.tvec is None else self.pose_tracker.tvec.copy()
+            prev_pose_T = (
+                None
+                if self.pose_tracker.T_marker_camera is None
+                else self.pose_tracker.T_marker_camera.copy()
+            )
+            prev_depth_filter_state = self.pose_depth_filter.snapshot()
+            prev_last_rvec = (
+                None
+                if self._last_accepted_rvec is None
+                else self._last_accepted_rvec.copy()
+            )
+            prev_last_tvec = (
+                None
+                if self._last_accepted_tvec is None
+                else self._last_accepted_tvec.copy()
+            )
+        else:
+            prev_pose_rvec = (
+                None if previous_pose_rvec is None else previous_pose_rvec.copy()
+            )
+            prev_pose_tvec = (
+                None if previous_pose_tvec is None else previous_pose_tvec.copy()
+            )
+            prev_pose_T = (
+                None if previous_pose_T is None else previous_pose_T.copy()
+            )
+            prev_depth_filter_state = (
+                self.pose_depth_filter.snapshot()
+                if previous_depth_filter_state is None
+                else previous_depth_filter_state
+            )
+            prev_last_rvec = (
+                None if previous_last_rvec is None else previous_last_rvec.copy()
+            )
+            prev_last_tvec = (
+                None if previous_last_tvec is None else previous_last_tvec.copy()
+            )
+        pose_timings["pose_state_snapshot_ms"] = (
+            time.perf_counter() - snapshot_t0
+        ) * 1000.0
 
         def mark_pose_timing(name: str, start: float) -> None:
             pose_timings[name] = (time.perf_counter() - start) * 1000.0
 
-        pnp_t0 = time.perf_counter()
-        pose = self.pose_tracker.estimate_pose(
-            track_points,
-            lost_frames=self.lost_frames,
-        )
-        pnp_ms = (time.perf_counter() - pnp_t0) * 1000.0
+        if precomputed_pose is None:
+            pnp_t0 = time.perf_counter()
+            pose = self.pose_tracker.estimate_pose(
+                track_points,
+                lost_frames=self.lost_frames,
+            )
+            pnp_ms = (time.perf_counter() - pnp_t0) * 1000.0
+        else:
+            pose = precomputed_pose
+            pnp_ms = 0.0 if precomputed_pnp_ms is None else float(precomputed_pnp_ms)
         pose_timings["pnp_ms"] = pnp_ms
 
         if not pose.success:
@@ -976,7 +1015,9 @@ class PoseEstimationMixin:
                     timings_ms=dict(pose_timings),
                 )
 
+        stage_t0 = time.perf_counter()
         raw_pose = self._clone_map_pose_result(pose)
+        mark_pose_timing("pose_clone_map_result_ms", stage_t0)
         stage_t0 = time.perf_counter()
         filtered_depth = self._apply_depth_filter_to_pose(pose, track_points)
         mark_pose_timing("pose_depth_filter_pre_ms", stage_t0)
@@ -1070,6 +1111,7 @@ class PoseEstimationMixin:
             or len(visual_corners) >= self.config.visual_corner_min_count
         )
 
+        stage_t0 = time.perf_counter()
         # Max-pts und Reprojektionsfehler nur fuer verlaessliche Posen aktualisieren.
         if reliable_pose:
             if pose.num_inliers > self._max_pts_seen:
@@ -1086,13 +1128,15 @@ class PoseEstimationMixin:
                     dtype=np.float64,
                 ).copy()
             self._last_accepted_pose_frame = self.frame_index
+        mark_pose_timing("pose_accept_state_update_ms", stage_t0)
 
         confidence = self._confidence(
             pose.num_inliers,
             pose.reprojection_mean_px,
         )
 
-        return TrackerResult(
+        stage_t0 = time.perf_counter()
+        result = TrackerResult(
             success=True,
             mode=TrackerMode.TRACKING,
             message=success_message + visual_note,
@@ -1117,6 +1161,9 @@ class PoseEstimationMixin:
                 applied=plateau_applied,
             ),
         )
+        mark_pose_timing("pose_result_build_ms", stage_t0)
+        result.timings_ms = dict(pose_timings)
+        return result
 
     def _reprojection_errors_for_pose(
         self,

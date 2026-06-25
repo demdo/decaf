@@ -151,6 +151,8 @@ class PersistentMatchStats:
     current_corners: int = 0
     accepted: int = 0
     used_pose_projection: bool = False
+    adaptive_motion_px: float = 0.0
+    adaptive_max_dist_px: float = 0.0
     rejected_no_projection: int = 0
     rejected_far: int = 0
     rejected_ambiguous: int = 0

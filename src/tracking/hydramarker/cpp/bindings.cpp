@@ -5,6 +5,7 @@
 #include <pybind11/numpy.h>
 
 #include <optional>
+#include <memory>
 #include <stdexcept>
 
 #include <opencv2/core.hpp>
@@ -28,6 +29,11 @@
 
 #include "patch_extractor.hpp"
 #include "patch_decoder.hpp"
+#include "tracker_config.hpp"
+#include "tracker_engine.hpp"
+#include "tracker_persistence.hpp"
+#include "tracker_pose.hpp"
+#include "tracker_types.hpp"
 
 namespace py = pybind11;
 
@@ -92,6 +98,38 @@ py::array_t<uint8_t> mat1bToNumpy(const cv::Mat1b& mat)
     return arr;
 }
 
+cv::Matx33d numpyToMatx33d(
+    py::array_t<double, py::array::c_style | py::array::forcecast> arr
+) {
+    py::buffer_info info = arr.request();
+
+    if (info.size != 9) {
+        throw std::runtime_error("Camera matrix K must contain exactly 9 values");
+    }
+
+    const double* data = static_cast<const double*>(info.ptr);
+    return cv::Matx33d(
+        data[0], data[1], data[2],
+        data[3], data[4], data[5],
+        data[6], data[7], data[8]
+    );
+}
+
+std::vector<double> optionalNumpyToVectorDouble(py::object obj)
+{
+    if (obj.is_none()) {
+        return {};
+    }
+
+    auto arr = py::cast<
+        py::array_t<double, py::array::c_style | py::array::forcecast>
+    >(obj);
+    py::buffer_info info = arr.request();
+
+    const double* data = static_cast<const double*>(info.ptr);
+    return std::vector<double>(data, data + info.size);
+}
+
 } // namespace
 
 PYBIND11_MODULE(hydramarker_cpp, m) {
@@ -124,6 +162,352 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         py::arg("max_trial") = 100000,
         py::arg("is_print") = false
     );
+
+    py::enum_<TrackerMode>(m, "TrackerMode")
+        .value("LOST", TrackerMode::Lost)
+        .value("DETECTING", TrackerMode::Detecting)
+        .value("TRACKING", TrackerMode::Tracking)
+        .value("RECOVERING", TrackerMode::Recovering);
+
+    py::enum_<PoseSource>(m, "PoseSource")
+        .value("NONE", PoseSource::None)
+        .value("DECODE", PoseSource::Decode)
+        .value("PERSISTENT", PoseSource::Persistent)
+        .value("FAST_PERSISTENT", PoseSource::FastPersistent)
+        .value("UNCODED_GRID", PoseSource::UncodedGrid)
+        .value("HOLD", PoseSource::Hold);
+
+    py::class_<PoseTrackPoint>(m, "PoseTrackPoint")
+        .def(py::init<>())
+        .def_readwrite("global_row", &PoseTrackPoint::global_row)
+        .def_readwrite("global_col", &PoseTrackPoint::global_col)
+        .def_readwrite("xyz_mm", &PoseTrackPoint::xyz_mm)
+        .def_readwrite("uv", &PoseTrackPoint::uv)
+        .def_readwrite("votes", &PoseTrackPoint::votes);
+
+    py::class_<MapPoseResult>(m, "MapPoseResult")
+        .def(py::init<>())
+        .def_readwrite("success", &MapPoseResult::success)
+        .def_readwrite("message", &MapPoseResult::message)
+        .def_readwrite("rvec", &MapPoseResult::rvec)
+        .def_readwrite("tvec", &MapPoseResult::tvec)
+        .def_readwrite("T_marker_camera", &MapPoseResult::T_marker_camera)
+        .def_readwrite("inlier_indices", &MapPoseResult::inlier_indices)
+        .def_readwrite("reprojection_mean_px", &MapPoseResult::reprojection_mean_px)
+        .def_readwrite("reprojection_max_px", &MapPoseResult::reprojection_max_px)
+        .def_readwrite("num_points", &MapPoseResult::num_points)
+        .def_readwrite("num_inliers", &MapPoseResult::num_inliers)
+        .def_readwrite("points", &MapPoseResult::points)
+        .def_readwrite("method", &MapPoseResult::method);
+
+    py::class_<MapPoseTrackerConfig>(m, "MapPoseTrackerConfig")
+        .def(py::init<>())
+        .def_readwrite("min_points", &MapPoseTrackerConfig::min_points)
+        .def_readwrite("min_inliers", &MapPoseTrackerConfig::min_inliers)
+        .def_readwrite("ransac_reproj_px", &MapPoseTrackerConfig::ransac_reproj_px)
+        .def_readwrite("ransac_confidence", &MapPoseTrackerConfig::ransac_confidence)
+        .def_readwrite("ransac_iterations", &MapPoseTrackerConfig::ransac_iterations)
+        .def_readwrite("max_mean_reproj_px", &MapPoseTrackerConfig::max_mean_reproj_px)
+        .def_readwrite("max_max_reproj_px", &MapPoseTrackerConfig::max_max_reproj_px)
+        .def_readwrite("max_translation_jump_mm", &MapPoseTrackerConfig::max_translation_jump_mm)
+        .def_readwrite("max_rotation_jump_deg", &MapPoseTrackerConfig::max_rotation_jump_deg)
+        .def_readwrite("rotation_gate_scale_per_lost_frame", &MapPoseTrackerConfig::rotation_gate_scale_per_lost_frame)
+        .def_readwrite("rotation_gate_max_deg", &MapPoseTrackerConfig::rotation_gate_max_deg)
+        .def_readwrite("use_pose_prior", &MapPoseTrackerConfig::use_pose_prior)
+        .def_readwrite("refine_with_iterative", &MapPoseTrackerConfig::refine_with_iterative)
+        .def_readwrite("use_direct_prior_solver", &MapPoseTrackerConfig::use_direct_prior_solver)
+        .def_readwrite("direct_refine_method", &MapPoseTrackerConfig::direct_refine_method)
+        .def_readwrite("direct_max_mean_reproj_px", &MapPoseTrackerConfig::direct_max_mean_reproj_px)
+        .def_readwrite("direct_max_max_reproj_px", &MapPoseTrackerConfig::direct_max_max_reproj_px);
+
+    py::class_<MapPoseTracker>(m, "MapPoseTracker")
+        .def(
+            py::init([](
+                py::array_t<double, py::array::c_style | py::array::forcecast> K,
+                py::object dist_coeffs,
+                const MapPoseTrackerConfig& config
+            ) {
+                return std::make_unique<MapPoseTracker>(
+                    numpyToMatx33d(K),
+                    optionalNumpyToVectorDouble(dist_coeffs),
+                    config
+                );
+            }),
+            py::arg("K"),
+            py::arg("dist_coeffs") = py::none(),
+            py::arg("config") = MapPoseTrackerConfig()
+        )
+        .def(
+            "estimate_pose",
+            &MapPoseTracker::estimatePose,
+            py::arg("points"),
+            py::arg("lost_frames") = 0
+        )
+        .def("reset", &MapPoseTracker::reset)
+        .def("has_pose", &MapPoseTracker::hasPose)
+        .def_property_readonly("rvec", &MapPoseTracker::rvec)
+        .def_property_readonly("tvec", &MapPoseTracker::tvec)
+        .def_property_readonly("T_marker_camera", &MapPoseTracker::TMarkerCamera)
+        .def_property_readonly(
+            "config",
+            [](const MapPoseTracker& self) { return self.config(); },
+            py::return_value_policy::copy
+        );
+
+    py::class_<GlobalCornerIdentity>(m, "GlobalCornerIdentity")
+        .def(py::init<>())
+        .def_readwrite("global_row", &GlobalCornerIdentity::global_row)
+        .def_readwrite("global_col", &GlobalCornerIdentity::global_col)
+        .def_readwrite("xyz_mm", &GlobalCornerIdentity::xyz_mm)
+        .def_readwrite("uv", &GlobalCornerIdentity::uv)
+        .def_readwrite("votes", &GlobalCornerIdentity::votes);
+
+    py::class_<TrackerCorner>(m, "TrackerCorner")
+        .def(py::init<>())
+        .def_readwrite("local_row", &TrackerCorner::local_row)
+        .def_readwrite("local_col", &TrackerCorner::local_col)
+        .def_readwrite("global_row", &TrackerCorner::global_row)
+        .def_readwrite("global_col", &TrackerCorner::global_col)
+        .def_readwrite("xyz_mm", &TrackerCorner::xyz_mm)
+        .def_readwrite("uv", &TrackerCorner::uv)
+        .def_readwrite("votes", &TrackerCorner::votes);
+
+    py::class_<PersistentMatchStats>(m, "PersistentMatchStats")
+        .def(py::init<>())
+        .def_readwrite("age", &PersistentMatchStats::age)
+        .def_readwrite("identities", &PersistentMatchStats::identities)
+        .def_readwrite("current_corners", &PersistentMatchStats::current_corners)
+        .def_readwrite("accepted", &PersistentMatchStats::accepted)
+        .def_readwrite("used_pose_projection", &PersistentMatchStats::used_pose_projection)
+        .def_readwrite("adaptive_motion_px", &PersistentMatchStats::adaptive_motion_px)
+        .def_readwrite("adaptive_max_dist_px", &PersistentMatchStats::adaptive_max_dist_px)
+        .def_readwrite("rejected_no_projection", &PersistentMatchStats::rejected_no_projection)
+        .def_readwrite("rejected_far", &PersistentMatchStats::rejected_far)
+        .def_readwrite("rejected_ambiguous", &PersistentMatchStats::rejected_ambiguous)
+        .def_readwrite("rejected_claimed", &PersistentMatchStats::rejected_claimed);
+
+    py::class_<PersistentMatchResult>(m, "PersistentMatchResult")
+        .def(py::init<>())
+        .def_readwrite("points", &PersistentMatchResult::points)
+        .def_readwrite("corners", &PersistentMatchResult::corners)
+        .def_readwrite("stats", &PersistentMatchResult::stats)
+        .def_readwrite("message", &PersistentMatchResult::message)
+        .def("valid", &PersistentMatchResult::valid);
+
+    py::class_<TrackerConfig>(m, "TrackerConfig")
+        .def(py::init<>())
+        .def_readwrite("min_points", &TrackerConfig::min_points)
+        .def_readwrite("min_inliers", &TrackerConfig::min_inliers)
+        .def_readwrite("max_mean_reprojection_error_px", &TrackerConfig::max_mean_reprojection_error_px)
+        .def_readwrite("max_max_reprojection_error_px", &TrackerConfig::max_max_reprojection_error_px)
+        .def_readwrite("max_lost_frames", &TrackerConfig::max_lost_frames)
+        .def_readwrite("max_translation_jump_mm", &TrackerConfig::max_translation_jump_mm)
+        .def_readwrite("max_rotation_jump_deg", &TrackerConfig::max_rotation_jump_deg)
+        .def_readwrite("rotation_gate_scale_per_lost_frame", &TrackerConfig::rotation_gate_scale_per_lost_frame)
+        .def_readwrite("rotation_gate_max_deg", &TrackerConfig::rotation_gate_max_deg)
+        .def_readwrite("pnp_ransac_iterations", &TrackerConfig::pnp_ransac_iterations)
+        .def_readwrite("pnp_ransac_reprojection_px", &TrackerConfig::pnp_ransac_reprojection_px)
+        .def_readwrite("pnp_ransac_confidence", &TrackerConfig::pnp_ransac_confidence)
+        .def_readwrite("use_pose_prior", &TrackerConfig::use_pose_prior)
+        .def_readwrite("pnp_direct_prior_enabled", &TrackerConfig::pnp_direct_prior_enabled)
+        .def_readwrite("pnp_direct_refine_method", &TrackerConfig::pnp_direct_refine_method)
+        .def_readwrite("pnp_direct_max_mean_reprojection_error_px", &TrackerConfig::pnp_direct_max_mean_reprojection_error_px)
+        .def_readwrite("pnp_direct_max_max_reprojection_error_px", &TrackerConfig::pnp_direct_max_max_reprojection_error_px)
+        .def_readwrite("checker_min_tracking_decode_cell_span", &TrackerConfig::checker_min_tracking_decode_cell_span)
+        .def_readwrite("checker_refresh_interval_frames", &TrackerConfig::checker_refresh_interval_frames)
+        .def_readwrite("checker_tracking_recovery_stable_interval_frames", &TrackerConfig::checker_tracking_recovery_stable_interval_frames)
+        .def_readwrite("checker_local_completion_skip_enabled", &TrackerConfig::checker_local_completion_skip_enabled)
+        .def_readwrite("checker_local_completion_probe_interval_frames", &TrackerConfig::checker_local_completion_probe_interval_frames)
+        .def_readwrite("checker_max_undecodeable_tracking_frames", &TrackerConfig::checker_max_undecodeable_tracking_frames)
+        .def_readwrite("dot_canonical_size", &TrackerConfig::dot_canonical_size)
+        .def_readwrite("dot_canonical_margin_px", &TrackerConfig::dot_canonical_margin_px)
+        .def_readwrite("dot_min_dot_contrast", &TrackerConfig::dot_min_dot_contrast)
+        .def_readwrite("dot_strong_dot_contrast", &TrackerConfig::dot_strong_dot_contrast)
+        .def_readwrite("dot_commit_threshold", &TrackerConfig::dot_commit_threshold)
+        .def_readwrite("dot_revoke_threshold", &TrackerConfig::dot_revoke_threshold)
+        .def_readwrite("dot_uncertainty_low", &TrackerConfig::dot_uncertainty_low)
+        .def_readwrite("dot_uncertainty_high", &TrackerConfig::dot_uncertainty_high)
+        .def_readwrite("dot_warmup_frames", &TrackerConfig::dot_warmup_frames)
+        .def_readwrite("dot_temporal_alpha", &TrackerConfig::dot_temporal_alpha)
+        .def_readwrite("dot_commit_frames", &TrackerConfig::dot_commit_frames)
+        .def_readwrite("dot_revoke_frames", &TrackerConfig::dot_revoke_frames)
+        .def_readwrite("dot_use_temporal_smoothing", &TrackerConfig::dot_use_temporal_smoothing)
+        .def_readwrite("dot_use_cell_value_cache", &TrackerConfig::dot_use_cell_value_cache)
+        .def_readwrite("dot_cell_cache_max_age_frames", &TrackerConfig::dot_cell_cache_max_age_frames)
+        .def_readwrite("dot_cell_cache_max_corner_motion_px", &TrackerConfig::dot_cell_cache_max_corner_motion_px)
+        .def_readwrite("decoder_require_geometry_valid", &TrackerConfig::decoder_require_geometry_valid)
+        .def_readwrite("decoder_accept_ambiguous", &TrackerConfig::decoder_accept_ambiguous)
+        .def_readwrite("corr_min_votes", &TrackerConfig::corr_min_votes)
+        .def_readwrite("corr_discard_conflicts", &TrackerConfig::corr_discard_conflicts)
+        .def_readwrite("corr_require_detection_stable", &TrackerConfig::corr_require_detection_stable)
+        .def_readwrite("corr_enable_dominant_rotation_filter", &TrackerConfig::corr_enable_dominant_rotation_filter)
+        .def_readwrite("corr_min_rotation_support", &TrackerConfig::corr_min_rotation_support)
+        .def_readwrite("corr_min_rotation_support_ratio", &TrackerConfig::corr_min_rotation_support_ratio)
+        .def_readwrite("decode_only_mode", &TrackerConfig::decode_only_mode)
+        .def_readwrite("enable_fast_persistent_path", &TrackerConfig::enable_fast_persistent_path)
+        .def_readwrite("fast_persistent_min_points", &TrackerConfig::fast_persistent_min_points)
+        .def_readwrite("fast_persistent_refresh_mean_error_px", &TrackerConfig::fast_persistent_refresh_mean_error_px)
+        .def_readwrite("enable_temporal_correspondence_persistence", &TrackerConfig::enable_temporal_correspondence_persistence)
+        .def_readwrite("persistence_max_frames", &TrackerConfig::persistence_max_frames)
+        .def_readwrite("persistence_min_points", &TrackerConfig::persistence_min_points)
+        .def_readwrite("persistence_min_fresh_points_for_merge", &TrackerConfig::persistence_min_fresh_points_for_merge)
+        .def_readwrite("persistence_min_points_after_decode_fail", &TrackerConfig::persistence_min_points_after_decode_fail)
+        .def_readwrite("persistence_refresh_mean_error_px", &TrackerConfig::persistence_refresh_mean_error_px)
+        .def_readwrite("persistence_use_pose_projection", &TrackerConfig::persistence_use_pose_projection)
+        .def_readwrite("persistence_projection_max_reproj_px", &TrackerConfig::persistence_projection_max_reproj_px)
+        .def_readwrite("persistence_projection_adaptive_match_enabled", &TrackerConfig::persistence_projection_adaptive_match_enabled)
+        .def_readwrite("persistence_projection_adaptive_motion_start_px", &TrackerConfig::persistence_projection_adaptive_motion_start_px)
+        .def_readwrite("persistence_projection_adaptive_motion_scale", &TrackerConfig::persistence_projection_adaptive_motion_scale)
+        .def_readwrite("persistence_projection_adaptive_max_reproj_px", &TrackerConfig::persistence_projection_adaptive_max_reproj_px)
+        .def_readwrite("persistence_projection_max_pose_error_px", &TrackerConfig::persistence_projection_max_pose_error_px)
+        .def_readwrite("persistence_match_min_second_best_margin_px", &TrackerConfig::persistence_match_min_second_best_margin_px)
+        .def_readwrite("persistence_uv_match_dist_px", &TrackerConfig::persistence_uv_match_dist_px)
+        .def_readwrite("enable_pose_propagation", &TrackerConfig::enable_pose_propagation)
+        .def_readwrite("pose_propagation_max_reproj_px", &TrackerConfig::pose_propagation_max_reproj_px)
+        .def_readwrite("pose_propagation_border_px", &TrackerConfig::pose_propagation_border_px)
+        .def_readwrite("pose_hold_max_frames", &TrackerConfig::pose_hold_max_frames)
+        .def_readwrite("pose_hold_min_detection_corners", &TrackerConfig::pose_hold_min_detection_corners)
+        .def_readwrite("emergency_pose_hold_enabled", &TrackerConfig::emergency_pose_hold_enabled)
+        .def_readwrite("emergency_pose_hold_max_frames", &TrackerConfig::emergency_pose_hold_max_frames)
+        .def_readwrite("fallback_pose_min_detection_matches", &TrackerConfig::fallback_pose_min_detection_matches)
+        .def_readwrite("fallback_pose_max_median_corner_error_px", &TrackerConfig::fallback_pose_max_median_corner_error_px)
+        .def_readwrite("fallback_pose_max_p90_corner_error_px", &TrackerConfig::fallback_pose_max_p90_corner_error_px)
+        .def_readwrite("fallback_pose_max_mean_reprojection_error_px", &TrackerConfig::fallback_pose_max_mean_reprojection_error_px)
+        .def_readwrite("fallback_pose_max_max_reprojection_error_px", &TrackerConfig::fallback_pose_max_max_reprojection_error_px)
+        .def_readwrite("visual_corner_max_reprojection_error_px", &TrackerConfig::visual_corner_max_reprojection_error_px)
+        .def_readwrite("visual_corner_min_count", &TrackerConfig::visual_corner_min_count)
+        .def_readwrite("decode_update_min_visual_corners", &TrackerConfig::decode_update_min_visual_corners)
+        .def_readwrite("decode_update_min_distinct_rows", &TrackerConfig::decode_update_min_distinct_rows)
+        .def_readwrite("decode_update_min_distinct_cols", &TrackerConfig::decode_update_min_distinct_cols);
+
+    py::class_<PersistentMatcher>(m, "PersistentMatcher")
+        .def(py::init<const TrackerConfig&>(), py::arg("config") = TrackerConfig())
+        .def("reset", &PersistentMatcher::reset)
+        .def("clear_identities", &PersistentMatcher::clearIdentities)
+        .def(
+            "replace_identities",
+            &PersistentMatcher::replaceIdentities,
+            py::arg("identities"),
+            py::arg("frame_index")
+        )
+        .def(
+            "match",
+            [](
+                PersistentMatcher& self,
+                const CheckerboardDetection& detection,
+                int frame_index,
+                py::array_t<double, py::array::c_style | py::array::forcecast> K,
+                py::object dist_coeffs,
+                py::object rvec,
+                py::object tvec,
+                double last_good_reproj_px
+            ) {
+                return self.match(
+                    detection,
+                    frame_index,
+                    numpyToMatx33d(K),
+                    optionalNumpyToVectorDouble(dist_coeffs),
+                    optionalNumpyToVectorDouble(rvec),
+                    optionalNumpyToVectorDouble(tvec),
+                    last_good_reproj_px
+                );
+            },
+            py::arg("detection"),
+            py::arg("frame_index"),
+            py::arg("K"),
+            py::arg("dist_coeffs") = py::none(),
+            py::arg("rvec") = py::none(),
+            py::arg("tvec") = py::none(),
+            py::arg("last_good_reproj_px") = -1.0
+        )
+        .def_property_readonly(
+            "identities",
+            [](const PersistentMatcher& self) { return self.identities(); },
+            py::return_value_policy::copy
+        )
+        .def_property_readonly(
+            "persistent_frame_index",
+            &PersistentMatcher::persistentFrameIndex
+        )
+        .def_property_readonly(
+            "config",
+            [](const PersistentMatcher& self) { return self.config(); },
+            py::return_value_policy::copy
+        );
+
+    py::class_<TrackerFrameResult>(m, "TrackerFrameResult")
+        .def(py::init<>())
+        .def_readwrite("success", &TrackerFrameResult::success)
+        .def_readwrite("mode", &TrackerFrameResult::mode)
+        .def_readwrite("message", &TrackerFrameResult::message)
+        .def_readwrite("detection_valid", &TrackerFrameResult::detection_valid)
+        .def_readwrite("detection_tracking", &TrackerFrameResult::detection_tracking)
+        .def_readwrite("detection_stable", &TrackerFrameResult::detection_stable)
+        .def_readwrite("detection_corner_count", &TrackerFrameResult::detection_corner_count)
+        .def_readwrite("detection_cell_count", &TrackerFrameResult::detection_cell_count)
+        .def_readwrite("frame_index", &TrackerFrameResult::frame_index)
+        .def_readwrite("lost_frames", &TrackerFrameResult::lost_frames)
+        .def_readwrite("pose_source", &TrackerFrameResult::pose_source)
+        .def_readwrite("rvec", &TrackerFrameResult::rvec)
+        .def_readwrite("tvec", &TrackerFrameResult::tvec)
+        .def_readwrite("T_marker_camera", &TrackerFrameResult::T_marker_camera)
+        .def_readwrite("num_points", &TrackerFrameResult::num_points)
+        .def_readwrite("num_inliers", &TrackerFrameResult::num_inliers)
+        .def_readwrite("mean_reprojection_error_px", &TrackerFrameResult::mean_reprojection_error_px)
+        .def_readwrite("max_reprojection_error_px", &TrackerFrameResult::max_reprojection_error_px)
+        .def_readwrite("confidence", &TrackerFrameResult::confidence)
+        .def_readwrite("dot_cell_count", &TrackerFrameResult::dot_cell_count)
+        .def_readwrite("dot_valid_cell_count", &TrackerFrameResult::dot_valid_cell_count)
+        .def_readwrite("patch_count", &TrackerFrameResult::patch_count)
+        .def_readwrite("decoded_patch_count", &TrackerFrameResult::decoded_patch_count)
+        .def_readwrite("decoded_valid_patch_count", &TrackerFrameResult::decoded_valid_patch_count)
+        .def_readwrite("correspondence_count", &TrackerFrameResult::correspondence_count)
+        .def_readwrite("timings_ms", &TrackerFrameResult::timings_ms);
+
+    py::class_<TrackerEngine>(m, "TrackerEngine")
+        .def(
+            py::init([](
+                const std::string& field_path,
+                const std::string& marker_json_path,
+                py::array_t<double, py::array::c_style | py::array::forcecast> K,
+                py::object dist_coeffs,
+                const TrackerConfig& config
+            ) {
+                return std::make_unique<TrackerEngine>(
+                    field_path,
+                    marker_json_path,
+                    numpyToMatx33d(K),
+                    optionalNumpyToVectorDouble(dist_coeffs),
+                    config
+                );
+            }),
+            py::arg("field_path"),
+            py::arg("marker_json_path"),
+            py::arg("K"),
+            py::arg("dist_coeffs") = py::none(),
+            py::arg("config") = TrackerConfig()
+        )
+        .def(
+            "process_frame",
+            [](TrackerEngine& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> img,
+               bool run_detection) -> TrackerFrameResult
+            {
+                cv::Mat mat = numpyToMat(img);
+                return self.processFrame(mat, run_detection);
+            },
+            py::arg("frame"),
+            py::arg("run_detection") = true
+        )
+        .def("reset", &TrackerEngine::reset)
+        .def("frame_index", &TrackerEngine::frameIndex)
+        .def("mode", &TrackerEngine::mode)
+        .def("marker_assets_loaded", &TrackerEngine::markerAssetsLoaded)
+        .def_property_readonly(
+            "config",
+            [](const TrackerEngine& self) { return self.config(); },
+            py::return_value_policy::copy
+        );
 
     py::class_<cv::Point2f>(m, "Point2f")
         .def(py::init<>())
@@ -219,6 +603,9 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("min_tracking_corner_ratio", &CheckerboardDetectorConfig::min_tracking_corner_ratio)
         .def_readwrite("max_tracking_homography_error_px", &CheckerboardDetectorConfig::max_tracking_homography_error_px)
         .def_readwrite("refresh_interval_frames", &CheckerboardDetectorConfig::refresh_interval_frames)
+        .def_readwrite("tracking_recovery_stable_interval_frames", &CheckerboardDetectorConfig::tracking_recovery_stable_interval_frames)
+        .def_readwrite("tracking_local_completion_skip_enabled", &CheckerboardDetectorConfig::tracking_local_completion_skip_enabled)
+        .def_readwrite("tracking_local_completion_probe_interval_frames", &CheckerboardDetectorConfig::tracking_local_completion_probe_interval_frames)
         .def_readwrite("lk_win_size", &CheckerboardDetectorConfig::lk_win_size)
         .def_readwrite("lk_max_level", &CheckerboardDetectorConfig::lk_max_level)
         .def_readwrite("lk_max_iters", &CheckerboardDetectorConfig::lk_max_iters)

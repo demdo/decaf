@@ -69,6 +69,11 @@ def _force_dense_refine_config(tracker) -> None:
         "fast_persistent_dense_min_distinct_rows": 2,
         "fast_persistent_dense_min_distinct_cols": 2,
         "fast_persistent_dense_pose_solver": "direct_prior",
+        "fast_persistent_dense_adaptive_refine_enabled": True,
+        "fast_persistent_dense_adaptive_min_match_ratio": 0.85,
+        "fast_persistent_dense_adaptive_motion_px": 8.0,
+        "fast_persistent_dense_adaptive_max_seed_mean_px": 1.2,
+        "fast_persistent_dense_adaptive_max_seed_max_px": 2.8,
     }
     peak_guard_settings = {
         "max_translation_jump_mm": 40.0,
@@ -90,6 +95,9 @@ def _force_dense_refine_config(tracker) -> None:
         f"(min_points={getattr(cfg, 'fast_persistent_dense_min_points', '?')}, "
         f"max_px={getattr(cfg, 'fast_persistent_dense_match_max_px', '?')}, "
         f"solver={getattr(cfg, 'fast_persistent_dense_pose_solver', '?')}, "
+        f"adaptive={getattr(cfg, 'fast_persistent_dense_adaptive_refine_enabled', '?')}, "
+        f"checker_refresh={getattr(cfg, 'checker_refresh_interval_frames', '?')}/"
+        f"{getattr(cfg, 'checker_tracking_recovery_stable_interval_frames', '?')}, "
         f"max_jump={getattr(cfg, 'max_translation_jump_mm', '?')}mm, "
         f"max_rot={getattr(cfg, 'rotation_gate_max_deg', '?')}deg)"
     )
@@ -954,7 +962,7 @@ def run_live_tracker_translation(
     no_fast_persistent: bool = False,
     no_temporal_persistence: bool = False,
     decode_only: bool = False,
-) -> Path | None:
+) -> list[Path]:
     live = load_live_tracker_module()
     live.create_realsense_pipeline = lambda: create_color_only_realsense_pipeline(live)
     tracker_log = live.tracker_log
@@ -962,6 +970,7 @@ def run_live_tracker_translation(
     origin_ref: dict[str, np.ndarray | None] = {"tvec": None}
     origin_frame_ref: dict[str, int] = {"frame": -1}
     camera_ref: dict[str, np.ndarray | None] = {"K": None, "dist": None}
+    recorded_paths: list[Path] = []
 
     def after_camera_ready(pipe, K_rgb: np.ndarray, dist_rgb: np.ndarray) -> bool:
         camera_info = tracker_log.camera_intrinsics_info()
@@ -1068,6 +1077,15 @@ def run_live_tracker_translation(
                 )
             )
 
+    def on_log_close(path: Path) -> None:
+        path = Path(path)
+        if path not in recorded_paths:
+            recorded_paths.append(path)
+        print(
+            "[debug_tracker_translation] recording saved; "
+            "SPACE starts the next run, ESC finishes and analyzes all runs"
+        )
+
     def draw_extra_overlay(vis: np.ndarray, log_active: bool, result=None) -> None:
         import cv2
 
@@ -1086,7 +1104,7 @@ def run_live_tracker_translation(
             action = "SPACE=set ORIGIN here"
             color = (0, 255, 255)
         else:
-            action = "SPACE=STOP recording and analyze" if log_active else "SPACE=START recording"
+            action = "SPACE=STOP recording" if log_active else "SPACE=START new recording"
             color = (0, 255, 0)
 
         cv2.rectangle(vis, (18, 168), (1500, 260), (0, 0, 0), thickness=-1)
@@ -1106,24 +1124,29 @@ def run_live_tracker_translation(
         state_line = (
             "ChArUco table frame | orange=+X, green=+Y | "
             "move along +Y for FB/RL | "
-            f"{action} | s=start/stop tracking | q=quit"
+            f"{action} | s=start/stop tracking | ESC=finish/analyze"
         )
         live.put_text(vis, state_line, (25, 215), color=color, scale=0.48)
 
     def final_cleanup() -> None:
         tracker_log.set_debug_board_transform(None)
 
-    return live.run_live_tracker(
+    last_recorded_path = live.run_live_tracker(
         window_name="HydraTracker Translation Debug",
         console_prefix="[debug_tracker_translation]",
         after_camera_ready=after_camera_ready,
         after_tracker_created=after_tracker_created,
         on_space_key=on_space_key,
         on_log_open=on_log_open,
+        on_log_close=on_log_close,
         draw_extra_overlay=draw_extra_overlay,
-        stop_after_log_close=True,
+        stop_after_log_close=False,
+        quit_on_q=False,
         final_cleanup=final_cleanup,
     )
+    if last_recorded_path is not None and last_recorded_path not in recorded_paths:
+        recorded_paths.append(last_recorded_path)
+    return recorded_paths
 
 
 def load_tracker_run(path: Path) -> dict:
@@ -1626,16 +1649,17 @@ def main() -> None:
             + "\nKnown live options: "
             + ", ".join(sorted(allowed_live_flags))
         )
-    recorded_path = run_live_tracker_translation(
+    recorded_paths = run_live_tracker_translation(
         no_fast_persistent="--no-fast-persistent" in args,
         no_temporal_persistence="--no-temporal-persistence" in args,
         decode_only="--decode-only" in args,
     )
-    if recorded_path is None:
+    if not recorded_paths:
         print("No recording to analyze.")
         return
 
-    plot_existing_run(recorded_path)
+    for recorded_path in recorded_paths:
+        plot_existing_run(recorded_path)
 
 
 if __name__ == "__main__":

@@ -144,6 +144,13 @@ class HydraTracker(
         self._last_uncoded_bootstrap_reason: str = ""
         self._last_persistent_match_stats = PersistentMatchStats()
         self._last_fast_path_debug = FastPathDebug()
+        self._persistent_match_prev_detection_uv: Optional[np.ndarray] = None
+        self._persistent_match_prev_detection_frame: int = -1
+        self._persistent_match_last_motion_px: float = 0.0
+        self._cpp_persistent_matcher = None
+        self._cpp_persistent_matcher_unavailable: bool = False
+        self._cpp_persistent_matcher_config_state = None
+        self._last_persistent_match_backend: str = "none"
 
     @property
     def rvec(self) -> Optional[np.ndarray]:
@@ -174,6 +181,10 @@ class HydraTracker(
         self._last_uncoded_bootstrap_reason = ""
         self._last_persistent_match_stats = PersistentMatchStats()
         self._last_fast_path_debug = FastPathDebug()
+        self._persistent_match_prev_detection_uv = None
+        self._persistent_match_prev_detection_frame = -1
+        self._persistent_match_last_motion_px = 0.0
+        self._last_persistent_match_backend = "none"
 
         self.pose_tracker.reset()
         self.pose_depth_filter.reset()
@@ -265,6 +276,9 @@ class HydraTracker(
         stage_t0 = time.perf_counter()
         fast_result = self._try_fast_pose_from_persistent_correspondences(detection)
         mark("fast_persistent_ms", stage_t0)
+        fast_path_timings = getattr(self, "_last_fast_path_timings", None)
+        if fast_path_timings:
+            timings_ms.update(fast_path_timings)
         if fast_result is not None:
             self._attach_detection_info(fast_result, detection)
             self._attach_fast_path_debug(fast_result)
