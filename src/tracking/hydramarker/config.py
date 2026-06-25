@@ -141,6 +141,7 @@ class TrackerConfig:
     cpp_fast_persistent_seed_enabled: bool = True
     cpp_dense_projection_matcher_enabled: bool = True
     cpp_visual_corner_filter_enabled: bool = True
+    cpp_dense_robust_solver_enabled: bool = True
     fast_persistent_min_points: int = 10
     fast_persistent_refresh_mean_error_px: float = 1.5
     fast_persistent_dense_refine_enabled: bool = True

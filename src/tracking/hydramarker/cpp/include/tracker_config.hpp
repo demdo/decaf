@@ -65,6 +65,13 @@ struct TrackerConfig {
     bool enable_fast_persistent_path = true;
     int fast_persistent_min_points = 10;
     double fast_persistent_refresh_mean_error_px = 1.5;
+    std::string fast_persistent_dense_pose_solver = "direct_prior";
+    std::string fast_persistent_dense_robust_refine_method = "auto";
+    bool fast_persistent_dense_robust_trim_enabled = true;
+    double fast_persistent_dense_robust_trim_quantile = 0.85;
+    double fast_persistent_dense_robust_min_keep_ratio = 0.75;
+    double fast_persistent_dense_robust_max_mean_px = 1.2;
+    double fast_persistent_dense_robust_max_max_px = 2.5;
 
     bool enable_temporal_correspondence_persistence = true;
     int persistence_max_frames = 8;
@@ -72,6 +79,8 @@ struct TrackerConfig {
     int persistence_min_fresh_points_for_merge = 6;
     int persistence_min_points_after_decode_fail = 10;
     double persistence_refresh_mean_error_px = 1.5;
+    double persistence_max_translation_jump_mm = 60.0;
+    double persistence_max_rotation_jump_deg = 20.0;
     bool persistence_use_pose_projection = true;
     double persistence_projection_max_reproj_px = 9.0;
     bool persistence_projection_adaptive_match_enabled = true;

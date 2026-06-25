@@ -341,17 +341,24 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::init([](
                 const MarkerGeometry& geometry,
                 py::array_t<double, py::array::c_style | py::array::forcecast> K,
-                py::object dist_coeffs
+                py::object dist_coeffs,
+                py::object config
             ) {
+                TrackerConfig cpp_config;
+                if (!config.is_none()) {
+                    cpp_config = config.cast<TrackerConfig>();
+                }
                 return std::make_unique<TrackerGeometry>(
                     geometry,
                     numpyToMatx33d(K),
-                    optionalNumpyToVectorDouble(dist_coeffs)
+                    optionalNumpyToVectorDouble(dist_coeffs),
+                    cpp_config
                 );
             }),
             py::arg("geometry"),
             py::arg("K"),
-            py::arg("dist_coeffs") = py::none()
+            py::arg("dist_coeffs") = py::none(),
+            py::arg("config") = py::none()
         )
         .def(
             "strict_projected_match",
@@ -418,6 +425,33 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("rvec"),
             py::arg("tvec"),
             py::arg("max_error_px")
+        )
+        .def(
+            "estimate_dense_robust_pose",
+            [](
+                const TrackerGeometry& self,
+                const std::vector<PoseTrackPoint>& points,
+                const CheckerboardDetection& detection,
+                py::object seed_rvec,
+                py::object seed_tvec,
+                py::object previous_rvec,
+                py::object previous_tvec
+            ) {
+                return self.estimateDenseRobustPose(
+                    points,
+                    detection,
+                    optionalNumpyToVectorDouble(seed_rvec),
+                    optionalNumpyToVectorDouble(seed_tvec),
+                    optionalNumpyToVectorDouble(previous_rvec),
+                    optionalNumpyToVectorDouble(previous_tvec)
+                );
+            },
+            py::arg("points"),
+            py::arg("detection"),
+            py::arg("seed_rvec") = py::none(),
+            py::arg("seed_tvec") = py::none(),
+            py::arg("previous_rvec") = py::none(),
+            py::arg("previous_tvec") = py::none()
         );
 
     py::class_<TrackerConfig>(m, "TrackerConfig")
@@ -473,12 +507,21 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("enable_fast_persistent_path", &TrackerConfig::enable_fast_persistent_path)
         .def_readwrite("fast_persistent_min_points", &TrackerConfig::fast_persistent_min_points)
         .def_readwrite("fast_persistent_refresh_mean_error_px", &TrackerConfig::fast_persistent_refresh_mean_error_px)
+        .def_readwrite("fast_persistent_dense_pose_solver", &TrackerConfig::fast_persistent_dense_pose_solver)
+        .def_readwrite("fast_persistent_dense_robust_refine_method", &TrackerConfig::fast_persistent_dense_robust_refine_method)
+        .def_readwrite("fast_persistent_dense_robust_trim_enabled", &TrackerConfig::fast_persistent_dense_robust_trim_enabled)
+        .def_readwrite("fast_persistent_dense_robust_trim_quantile", &TrackerConfig::fast_persistent_dense_robust_trim_quantile)
+        .def_readwrite("fast_persistent_dense_robust_min_keep_ratio", &TrackerConfig::fast_persistent_dense_robust_min_keep_ratio)
+        .def_readwrite("fast_persistent_dense_robust_max_mean_px", &TrackerConfig::fast_persistent_dense_robust_max_mean_px)
+        .def_readwrite("fast_persistent_dense_robust_max_max_px", &TrackerConfig::fast_persistent_dense_robust_max_max_px)
         .def_readwrite("enable_temporal_correspondence_persistence", &TrackerConfig::enable_temporal_correspondence_persistence)
         .def_readwrite("persistence_max_frames", &TrackerConfig::persistence_max_frames)
         .def_readwrite("persistence_min_points", &TrackerConfig::persistence_min_points)
         .def_readwrite("persistence_min_fresh_points_for_merge", &TrackerConfig::persistence_min_fresh_points_for_merge)
         .def_readwrite("persistence_min_points_after_decode_fail", &TrackerConfig::persistence_min_points_after_decode_fail)
         .def_readwrite("persistence_refresh_mean_error_px", &TrackerConfig::persistence_refresh_mean_error_px)
+        .def_readwrite("persistence_max_translation_jump_mm", &TrackerConfig::persistence_max_translation_jump_mm)
+        .def_readwrite("persistence_max_rotation_jump_deg", &TrackerConfig::persistence_max_rotation_jump_deg)
         .def_readwrite("persistence_use_pose_projection", &TrackerConfig::persistence_use_pose_projection)
         .def_readwrite("persistence_projection_max_reproj_px", &TrackerConfig::persistence_projection_max_reproj_px)
         .def_readwrite("persistence_projection_adaptive_match_enabled", &TrackerConfig::persistence_projection_adaptive_match_enabled)

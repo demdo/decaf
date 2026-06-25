@@ -226,7 +226,7 @@ def create_persistent_matcher(config=None):
     return PersistentMatcher(tracker_config_from_python(config))
 
 
-def create_tracker_geometry(geometry, K, dist_coeffs=None):
+def create_tracker_geometry(geometry, K, dist_coeffs=None, config=None):
     """Create the C++ geometry projector/matcher for a marker geometry."""
     K_arr = np.asarray(K, dtype=np.float64).reshape(3, 3)
     dist_arr = (
@@ -238,6 +238,7 @@ def create_tracker_geometry(geometry, K, dist_coeffs=None):
         geometry,
         K_arr,
         dist_arr,
+        tracker_config_from_python(config),
     )
 
 

@@ -1,9 +1,13 @@
 #include "tracker_geometry.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <iomanip>
 #include <limits>
+#include <numeric>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 #include <opencv2/calib3d.hpp>
@@ -25,11 +29,13 @@ double pointDistance(const cv::Point2d& a, const cv::Point2d& b) {
 TrackerGeometry::TrackerGeometry(
     const MarkerGeometry& geometry,
     const cv::Matx33d& K,
-    const std::vector<double>& dist_coeffs
+    const std::vector<double>& dist_coeffs,
+    const TrackerConfig& config
 )
     : geometry_(geometry),
       K_(K),
-      dist_coeffs_(makeDistCoeffsMat(dist_coeffs))
+      dist_coeffs_(makeDistCoeffsMat(dist_coeffs)),
+      config_(config)
 {
     cached_corners_.clear();
     for (int row = 0; row < geometry_.cornerRows(); ++row) {
@@ -421,6 +427,364 @@ std::vector<TrackerCorner> TrackerGeometry::visualCornersFromPose(
     return accepted;
 }
 
+MapPoseResult TrackerGeometry::estimateDenseRobustPose(
+    const std::vector<PoseTrackPoint>& points,
+    const CheckerboardDetection& detection,
+    const std::vector<double>& seed_rvec,
+    const std::vector<double>& seed_tvec,
+    const std::vector<double>& previous_rvec,
+    const std::vector<double>& previous_tvec
+) const
+{
+    MapPoseResult result;
+    result.num_points = static_cast<int>(points.size());
+
+    if (points.empty()) {
+        result.success = false;
+        result.message = "Dense robust solver failed: no candidate.";
+        result.method = "dense_robust_failed";
+        return result;
+    }
+
+    std::vector<cv::Point3d> object_points;
+    std::vector<cv::Point2d> image_points;
+    object_points.reserve(points.size());
+    image_points.reserve(points.size());
+    for (const PoseTrackPoint& point : points) {
+        object_points.emplace_back(
+            point.xyz_mm[0],
+            point.xyz_mm[1],
+            point.xyz_mm[2]
+        );
+        image_points.emplace_back(point.uv[0], point.uv[1]);
+    }
+
+    cv::Mat seed_rvec_mat;
+    cv::Mat seed_tvec_mat;
+    const bool has_seed =
+        vectorToMat3x1(seed_rvec, seed_rvec_mat) &&
+        vectorToMat3x1(seed_tvec, seed_tvec_mat);
+
+    std::vector<DensePoseCandidate> candidates;
+    if (has_seed) {
+        std::vector<DensePoseCandidate> seed_candidates =
+            denseRefinePoseVariants(
+                object_points,
+                image_points,
+                seed_rvec_mat,
+                seed_tvec_mat,
+                "dense_seed"
+            );
+        candidates.insert(
+            candidates.end(),
+            seed_candidates.begin(),
+            seed_candidates.end()
+        );
+    }
+
+    const std::vector<std::pair<int, std::string>> solve_flags = {
+        {cv::SOLVEPNP_SQPNP, "dense_sqpnp"},
+        {cv::SOLVEPNP_EPNP, "dense_epnp"}
+    };
+
+    for (const auto& [flag, name] : solve_flags) {
+        try {
+            cv::Mat rvec;
+            cv::Mat tvec;
+            const bool success = cv::solvePnP(
+                object_points,
+                image_points,
+                K_,
+                dist_coeffs_,
+                rvec,
+                tvec,
+                false,
+                flag
+            );
+            if (!success) {
+                continue;
+            }
+
+            std::vector<DensePoseCandidate> variants =
+                denseRefinePoseVariants(
+                    object_points,
+                    image_points,
+                    rvec,
+                    tvec,
+                    name
+                );
+            candidates.insert(
+                candidates.end(),
+                variants.begin(),
+                variants.end()
+            );
+        } catch (...) {
+        }
+    }
+
+    if (has_seed) {
+        try {
+            cv::Mat rvec = seed_rvec_mat.clone();
+            cv::Mat tvec = seed_tvec_mat.clone();
+            const bool success = cv::solvePnP(
+                object_points,
+                image_points,
+                K_,
+                dist_coeffs_,
+                rvec,
+                tvec,
+                true,
+                cv::SOLVEPNP_ITERATIVE
+            );
+            if (success) {
+                std::vector<DensePoseCandidate> variants =
+                    denseRefinePoseVariants(
+                        object_points,
+                        image_points,
+                        rvec,
+                        tvec,
+                        "dense_iterative_guess"
+                    );
+                candidates.insert(
+                    candidates.end(),
+                    variants.begin(),
+                    variants.end()
+                );
+            }
+        } catch (...) {
+        }
+    }
+
+    bool has_best = false;
+    double best_score = std::numeric_limits<double>::infinity();
+    cv::Mat best_rvec;
+    cv::Mat best_tvec;
+    std::string best_method;
+    std::vector<double> best_errors;
+
+    for (const DensePoseCandidate& candidate : candidates) {
+        DensePoseScore scored;
+        if (!scoreDensePoseCandidate(
+                object_points,
+                image_points,
+                candidate.rvec,
+                candidate.tvec,
+                scored
+            )) {
+            continue;
+        }
+
+        if (!has_best || scored.score < best_score) {
+            has_best = true;
+            best_score = scored.score;
+            best_rvec = candidate.rvec.reshape(1, 3).clone();
+            best_tvec = candidate.tvec.reshape(1, 3).clone();
+            best_method = candidate.method;
+            best_errors = scored.errors;
+        }
+    }
+
+    if (!has_best) {
+        result.success = false;
+        result.message = "Dense robust solver failed: no candidate.";
+        result.num_inliers = 0;
+        result.method = "dense_robust_failed";
+        return result;
+    }
+
+    std::vector<int> inlier_indices(points.size());
+    std::iota(inlier_indices.begin(), inlier_indices.end(), 0);
+
+    if (
+        config_.fast_persistent_dense_robust_trim_enabled &&
+        best_errors.size() >= 12
+    ) {
+        const double median = percentile(best_errors, 50.0);
+        std::vector<double> abs_deviation;
+        abs_deviation.reserve(best_errors.size());
+        for (double error : best_errors) {
+            abs_deviation.push_back(std::abs(error - median));
+        }
+
+        const double mad = percentile(abs_deviation, 50.0);
+        const double robust_sigma = 1.4826 * mad;
+        const double robust_threshold = std::max(
+            0.75,
+            median + 4.0 * robust_sigma
+        );
+        const double max_threshold =
+            config_.fast_persistent_dense_robust_max_max_px;
+        double threshold = std::min(max_threshold, robust_threshold);
+
+        const double quantile =
+            config_.fast_persistent_dense_robust_trim_quantile;
+        if (quantile > 0.0 && quantile < 1.0) {
+            threshold = std::min(
+                threshold,
+                percentile(best_errors, quantile * 100.0)
+            );
+        }
+
+        std::vector<int> trim_indices;
+        trim_indices.reserve(best_errors.size());
+        for (int idx = 0; idx < static_cast<int>(best_errors.size()); ++idx) {
+            if (best_errors[static_cast<size_t>(idx)] <= threshold) {
+                trim_indices.push_back(idx);
+            }
+        }
+
+        const int min_keep = std::max(
+            config_.min_inliers,
+            static_cast<int>(std::ceil(
+                config_.fast_persistent_dense_robust_min_keep_ratio *
+                static_cast<double>(best_errors.size())
+            ))
+        );
+
+        if (
+            static_cast<int>(trim_indices.size()) >= min_keep &&
+            trim_indices.size() < best_errors.size()
+        ) {
+            std::vector<cv::Point3d> object_trim;
+            std::vector<cv::Point2d> image_trim;
+            object_trim.reserve(trim_indices.size());
+            image_trim.reserve(trim_indices.size());
+            for (int idx : trim_indices) {
+                object_trim.push_back(object_points[static_cast<size_t>(idx)]);
+                image_trim.push_back(image_points[static_cast<size_t>(idx)]);
+            }
+
+            std::vector<DensePoseCandidate> trim_candidates =
+                denseRefinePoseVariants(
+                    object_trim,
+                    image_trim,
+                    best_rvec,
+                    best_tvec,
+                    best_method + "_trim" +
+                        std::to_string(trim_indices.size())
+                );
+
+            bool has_trim_best = false;
+            double trim_best_score = std::numeric_limits<double>::infinity();
+            cv::Mat trim_best_rvec;
+            cv::Mat trim_best_tvec;
+            std::string trim_best_method;
+            std::vector<double> trim_best_errors;
+
+            for (const DensePoseCandidate& candidate : trim_candidates) {
+                DensePoseScore scored;
+                if (!scoreDensePoseCandidate(
+                        object_trim,
+                        image_trim,
+                        candidate.rvec,
+                        candidate.tvec,
+                        scored
+                    )) {
+                    continue;
+                }
+                if (!has_trim_best || scored.score < trim_best_score) {
+                    has_trim_best = true;
+                    trim_best_score = scored.score;
+                    trim_best_rvec = candidate.rvec.reshape(1, 3).clone();
+                    trim_best_tvec = candidate.tvec.reshape(1, 3).clone();
+                    trim_best_method = candidate.method;
+                    trim_best_errors = scored.errors;
+                }
+            }
+
+            if (has_trim_best) {
+                best_rvec = trim_best_rvec;
+                best_tvec = trim_best_tvec;
+                best_method = trim_best_method;
+                best_errors = trim_best_errors;
+                inlier_indices = trim_indices;
+            }
+        }
+    }
+
+    const double mean_error = std::accumulate(
+        best_errors.begin(),
+        best_errors.end(),
+        0.0
+    ) / static_cast<double>(best_errors.size());
+    const double max_error = *std::max_element(
+        best_errors.begin(),
+        best_errors.end()
+    );
+
+    auto fill_pose = [&]() {
+        result.rvec = mat3x1ToVector(best_rvec);
+        result.tvec = mat3x1ToVector(best_tvec);
+        result.T_marker_camera = transformToVector(
+            makeTransform(best_rvec, best_tvec)
+        );
+        result.reprojection_mean_px = mean_error;
+        result.reprojection_max_px = max_error;
+        result.num_points = static_cast<int>(points.size());
+        result.num_inliers = static_cast<int>(inlier_indices.size());
+        result.inlier_indices = inlier_indices;
+        result.method = best_method;
+    };
+
+    if (
+        mean_error > config_.fast_persistent_dense_robust_max_mean_px ||
+        max_error > config_.fast_persistent_dense_robust_max_max_px
+    ) {
+        result.success = false;
+        result.message =
+            "Dense robust pose rejected by reprojection gate (mean=" +
+            formatDouble(mean_error, 3) +
+            ", max=" + formatDouble(max_error, 3) + ").";
+        fill_pose();
+        return result;
+    }
+
+    cv::Mat previous_rvec_mat;
+    cv::Mat previous_tvec_mat;
+    const bool has_previous =
+        vectorToMat3x1(previous_rvec, previous_rvec_mat) &&
+        vectorToMat3x1(previous_tvec, previous_tvec_mat);
+    if (
+        has_previous &&
+        !persistentMotionPlausible(
+            best_rvec,
+            best_tvec,
+            previous_rvec_mat,
+            previous_tvec_mat
+        )
+    ) {
+        result.success = false;
+        result.message = "Dense robust pose rejected by motion gate.";
+        fill_pose();
+        return result;
+    }
+
+    const std::string fallback_reason = fallbackPoseRejectionReason(
+        detection,
+        best_rvec,
+        best_tvec,
+        mean_error,
+        max_error
+    );
+    if (!fallback_reason.empty()) {
+        result.success = false;
+        result.message = fallback_reason;
+        fill_pose();
+        return result;
+    }
+
+    result.success = true;
+    result.message = "Dense robust pose accepted.";
+    fill_pose();
+    result.points.reserve(inlier_indices.size());
+    for (int idx : inlier_indices) {
+        if (idx >= 0 && idx < static_cast<int>(points.size())) {
+            result.points.push_back(points[static_cast<size_t>(idx)]);
+        }
+    }
+    return result;
+}
+
 cv::Mat TrackerGeometry::makeDistCoeffsMat(
     const std::vector<double>& dist_coeffs
 )
@@ -475,6 +839,302 @@ double TrackerGeometry::percentile(std::vector<double> values, double q)
 
     const double alpha = pos - static_cast<double>(lo);
     return values[lo] * (1.0 - alpha) + values[hi] * alpha;
+}
+
+std::string TrackerGeometry::formatDouble(double value, int precision)
+{
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(precision) << value;
+    return stream.str();
+}
+
+std::string TrackerGeometry::lowerAscii(std::string value)
+{
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); }
+    );
+    return value;
+}
+
+std::vector<double> TrackerGeometry::mat3x1ToVector(const cv::Mat& mat)
+{
+    cv::Mat reshaped = mat.reshape(1, 3);
+    return {
+        reshaped.at<double>(0, 0),
+        reshaped.at<double>(1, 0),
+        reshaped.at<double>(2, 0)
+    };
+}
+
+std::vector<double> TrackerGeometry::transformToVector(const cv::Matx44d& T)
+{
+    std::vector<double> values;
+    values.reserve(16);
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            values.push_back(T(r, c));
+        }
+    }
+    return values;
+}
+
+cv::Matx44d TrackerGeometry::makeTransform(
+    const cv::Mat& rvec,
+    const cv::Mat& tvec
+)
+{
+    cv::Mat R_mat;
+    cv::Rodrigues(rvec, R_mat);
+
+    cv::Matx44d T = cv::Matx44d::eye();
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            T(r, c) = R_mat.at<double>(r, c);
+        }
+    }
+    T(0, 3) = tvec.at<double>(0, 0);
+    T(1, 3) = tvec.at<double>(1, 0);
+    T(2, 3) = tvec.at<double>(2, 0);
+    return T;
+}
+
+std::vector<TrackerGeometry::DensePoseCandidate>
+TrackerGeometry::denseRefinePoseVariants(
+    const std::vector<cv::Point3d>& object_points,
+    const std::vector<cv::Point2d>& image_points,
+    const cv::Mat& rvec,
+    const cv::Mat& tvec,
+    const std::string& method_prefix
+) const
+{
+    std::vector<DensePoseCandidate> variants;
+    DensePoseCandidate base;
+    base.rvec = rvec.reshape(1, 3).clone();
+    base.tvec = tvec.reshape(1, 3).clone();
+    base.method = method_prefix;
+    variants.push_back(base);
+
+    const std::string configured = lowerAscii(
+        config_.fast_persistent_dense_robust_refine_method
+    );
+
+    std::vector<std::string> methods;
+    if (configured == "auto") {
+        methods = {"lm", "vvs"};
+    } else if (configured == "lm" || configured == "vvs") {
+        methods = {configured};
+    }
+
+    for (const std::string& method : methods) {
+        if (method == "lm") {
+            try {
+                cv::Mat rvec_ref = base.rvec.clone();
+                cv::Mat tvec_ref = base.tvec.clone();
+                cv::solvePnPRefineLM(
+                    object_points,
+                    image_points,
+                    K_,
+                    dist_coeffs_,
+                    rvec_ref,
+                    tvec_ref
+                );
+                DensePoseCandidate refined;
+                refined.rvec = rvec_ref.reshape(1, 3).clone();
+                refined.tvec = tvec_ref.reshape(1, 3).clone();
+                refined.method = method_prefix + "_lm";
+                variants.push_back(refined);
+            } catch (...) {
+            }
+        }
+
+        if (method == "vvs") {
+            try {
+                cv::Mat rvec_ref = base.rvec.clone();
+                cv::Mat tvec_ref = base.tvec.clone();
+                cv::solvePnPRefineVVS(
+                    object_points,
+                    image_points,
+                    K_,
+                    dist_coeffs_,
+                    rvec_ref,
+                    tvec_ref
+                );
+                DensePoseCandidate refined;
+                refined.rvec = rvec_ref.reshape(1, 3).clone();
+                refined.tvec = tvec_ref.reshape(1, 3).clone();
+                refined.method = method_prefix + "_vvs";
+                variants.push_back(refined);
+            } catch (...) {
+            }
+        }
+    }
+
+    return variants;
+}
+
+bool TrackerGeometry::scoreDensePoseCandidate(
+    const std::vector<cv::Point3d>& object_points,
+    const std::vector<cv::Point2d>& image_points,
+    const cv::Mat& rvec,
+    const cv::Mat& tvec,
+    DensePoseScore& score
+) const
+{
+    std::vector<double> errors;
+    if (!reprojectionErrors(object_points, image_points, rvec, tvec, errors)) {
+        return false;
+    }
+
+    for (double error : errors) {
+        if (!std::isfinite(error)) {
+            return false;
+        }
+    }
+
+    const double median = percentile(errors, 50.0);
+    const double p90 = percentile(errors, 90.0);
+    const double mean = std::accumulate(errors.begin(), errors.end(), 0.0) /
+                        static_cast<double>(errors.size());
+    score.score = median + 0.35 * p90 + 0.15 * mean;
+    score.errors = std::move(errors);
+    return true;
+}
+
+bool TrackerGeometry::reprojectionErrors(
+    const std::vector<cv::Point3d>& object_points,
+    const std::vector<cv::Point2d>& image_points,
+    const cv::Mat& rvec,
+    const cv::Mat& tvec,
+    std::vector<double>& errors
+) const
+{
+    if (object_points.empty() || object_points.size() != image_points.size()) {
+        return false;
+    }
+
+    std::vector<cv::Point2d> projected;
+    try {
+        cv::projectPoints(
+            object_points,
+            rvec,
+            tvec,
+            K_,
+            dist_coeffs_,
+            projected
+        );
+    } catch (...) {
+        return false;
+    }
+
+    if (projected.size() != image_points.size()) {
+        return false;
+    }
+
+    errors.clear();
+    errors.reserve(projected.size());
+    for (size_t idx = 0; idx < projected.size(); ++idx) {
+        errors.push_back(pointDistance(projected[idx], image_points[idx]));
+    }
+    return true;
+}
+
+bool TrackerGeometry::persistentMotionPlausible(
+    const cv::Mat& rvec,
+    const cv::Mat& tvec,
+    const cv::Mat& previous_rvec,
+    const cv::Mat& previous_tvec
+) const
+{
+    if (rvec.empty() || tvec.empty()) {
+        return false;
+    }
+    if (previous_rvec.empty() || previous_tvec.empty()) {
+        return true;
+    }
+
+    try {
+        cv::Mat prev_R;
+        cv::Mat curr_R;
+        cv::Rodrigues(previous_rvec, prev_R);
+        cv::Rodrigues(rvec, curr_R);
+        const cv::Mat dR = curr_R * prev_R.t();
+        double trace = cv::trace(dR)[0];
+        double cos_a = (trace - 1.0) * 0.5;
+        cos_a = std::clamp(cos_a, -1.0, 1.0);
+        const double rot_delta_deg =
+            std::acos(cos_a) * 180.0 / CV_PI;
+        const double trans_delta_mm = cv::norm(tvec - previous_tvec);
+        return (
+            rot_delta_deg <= config_.persistence_max_rotation_jump_deg &&
+            trans_delta_mm <= config_.persistence_max_translation_jump_mm
+        );
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string TrackerGeometry::fallbackPoseRejectionReason(
+    const CheckerboardDetection& detection,
+    const cv::Mat& rvec,
+    const cv::Mat& tvec,
+    double mean_reproj_px,
+    double max_reproj_px
+) const
+{
+    if (mean_reproj_px > config_.fallback_pose_max_mean_reprojection_error_px) {
+        return (
+            "Fallback pose rejected by mean reprojection gate (" +
+            formatDouble(mean_reproj_px, 2) +
+            "px)."
+        );
+    }
+
+    if (max_reproj_px > config_.fallback_pose_max_max_reprojection_error_px) {
+        return (
+            "Fallback pose rejected by max reprojection gate (" +
+            formatDouble(max_reproj_px, 2) +
+            "px)."
+        );
+    }
+
+    DenseProjectionMatchResult visual = greedyProjectedMatch(
+        detection,
+        mat3x1ToVector(rvec),
+        mat3x1ToVector(tvec),
+        config_.fallback_pose_max_p90_corner_error_px
+    );
+    const int match_count = static_cast<int>(visual.corners.size());
+    const double median_err = visual.stats.median_error_px;
+    const double p90_err = visual.stats.p90_error_px;
+
+    if (match_count < config_.fallback_pose_min_detection_matches) {
+        return (
+            "Fallback pose rejected by blue-corner alignment (" +
+            std::to_string(match_count) +
+            " matches)."
+        );
+    }
+
+    if (median_err > config_.fallback_pose_max_median_corner_error_px) {
+        return (
+            "Fallback pose rejected by median blue-corner error (" +
+            formatDouble(median_err, 2) +
+            "px)."
+        );
+    }
+
+    if (p90_err > config_.fallback_pose_max_p90_corner_error_px) {
+        return (
+            "Fallback pose rejected by p90 blue-corner error (" +
+            formatDouble(p90_err, 2) +
+            "px)."
+        );
+    }
+
+    return "";
 }
 
 std::vector<TrackerGeometry::ProjectedCorner> TrackerGeometry::projectGeometry(

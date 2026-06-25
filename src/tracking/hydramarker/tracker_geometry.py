@@ -211,6 +211,7 @@ class GeometryMixin:
         return bool(
             getattr(self.config, "cpp_dense_projection_matcher_enabled", True)
             or getattr(self.config, "cpp_visual_corner_filter_enabled", True)
+            or getattr(self.config, "cpp_dense_robust_solver_enabled", True)
         )
 
     def _ensure_cpp_tracker_geometry(self):
@@ -230,6 +231,7 @@ class GeometryMixin:
                 self.geometry,
                 self.K,
                 self.dist_coeffs,
+                self.config,
             )
         except Exception:
             self._cpp_tracker_geometry_unavailable = True
@@ -817,6 +819,17 @@ class DenseRefineMixin:
         detection=None,
     ) -> TrackerResult:
         """Estimate a dense fallback pose by trying and robustly trimming candidates."""
+        if bool(getattr(self.config, "cpp_dense_robust_solver_enabled", True)):
+            result = self._estimate_dense_pose_with_robust_solver_cpp(
+                track_points,
+                tracker_corners,
+                success_message,
+                pose_source,
+                detection=detection,
+            )
+            if result is not None:
+                return result
+
         pnp_t0 = time.perf_counter()
 
         object_points = np.asarray(
@@ -1138,6 +1151,136 @@ class DenseRefineMixin:
             **self._depth_filter_kwargs(filtered_depth),
         )
 
+    def _estimate_dense_pose_with_robust_solver_cpp(
+        self,
+        track_points: List[PoseTrackPoint],
+        tracker_corners: List[TrackerCorner],
+        success_message: str,
+        pose_source: PoseSource,
+        detection=None,
+    ) -> Optional[TrackerResult]:
+        """Use the C++ dense robust solver while Python keeps packaging/state."""
+        helper = self._ensure_cpp_tracker_geometry()
+        if helper is None:
+            return None
+
+        pnp_t0 = time.perf_counter()
+        try:
+            pose_cpp = helper.estimate_dense_robust_pose(
+                hm.pose_track_points_from_python(track_points),
+                detection,
+                self.pose_tracker.rvec,
+                self.pose_tracker.tvec,
+                self._last_accepted_rvec,
+                self._last_accepted_tvec,
+            )
+        except Exception:
+            self._cpp_tracker_geometry_unavailable = True
+            return None
+
+        pnp_ms = (time.perf_counter() - pnp_t0) * 1000.0
+        pose = self._map_pose_result_from_cpp(pose_cpp)
+        if pose.inlier_indices is None:
+            inlier_idx = np.asarray([], dtype=np.int64)
+        else:
+            inlier_idx = np.asarray(pose.inlier_indices, dtype=np.int64).reshape(-1)
+
+        if not pose.success:
+            return TrackerResult(
+                success=False,
+                mode=self.mode,
+                message=pose.message,
+                rvec=pose.rvec,
+                tvec=pose.tvec,
+                T_marker_camera=pose.T_marker_camera,
+                mean_reprojection_error_px=float(pose.reprojection_mean_px),
+                max_reprojection_error_px=float(pose.reprojection_max_px),
+                num_points=len(track_points),
+                num_inliers=int(len(inlier_idx)),
+                pnp_method=pose.method,
+                corners=[],
+                correspondence_corners=tracker_corners,
+                timings_ms={"pnp_ms": pnp_ms},
+            )
+
+        if pose.rvec is None or pose.tvec is None or pose.T_marker_camera is None:
+            return None
+
+        inlier_corners = [
+            tracker_corners[int(i)]
+            for i in inlier_idx
+            if 0 <= int(i) < len(tracker_corners)
+        ]
+        pose_for_filter = pose
+        pose_for_filter.points = [
+            track_points[int(i)]
+            for i in inlier_idx
+            if 0 <= int(i) < len(track_points)
+        ]
+        filtered_depth = self._apply_depth_filter_to_pose(
+            pose_for_filter,
+            track_points,
+        )
+
+        rvec = np.asarray(pose_for_filter.rvec, dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(pose_for_filter.tvec, dtype=np.float64).reshape(3, 1)
+        mean_err = float(pose_for_filter.reprojection_mean_px)
+        max_err = float(pose_for_filter.reprojection_max_px)
+
+        visual_corners = self._visual_corners_from_pose(
+            inlier_corners,
+            rvec,
+            tvec,
+        )
+        visual_note = ""
+        if len(visual_corners) != len(inlier_corners):
+            visual_note = (
+                f" Visual corners filtered {len(visual_corners)}/"
+                f"{len(inlier_corners)}."
+            )
+        if len(visual_corners) < self.config.visual_corner_min_count:
+            visual_corners = []
+            visual_note += " Visual corners suppressed for dense robust pose."
+
+        T = pose_for_filter.T_marker_camera
+        self.pose_tracker.rvec = rvec.copy()
+        self.pose_tracker.tvec = tvec.copy()
+        self.pose_tracker.T_marker_camera = np.asarray(
+            T,
+            dtype=np.float64,
+        ).reshape(4, 4)
+
+        if len(visual_corners) >= self.config.visual_corner_min_count:
+            if len(inlier_idx) > self._max_pts_seen:
+                self._max_pts_seen = len(inlier_idx)
+            self._last_good_reproj_px = mean_err
+            self._last_accepted_rvec = self.pose_tracker.rvec.copy()
+            self._last_accepted_tvec = self.pose_tracker.tvec.copy()
+            self._last_accepted_T_marker_camera = (
+                self.pose_tracker.T_marker_camera.copy()
+            )
+            self._last_accepted_pose_frame = self.frame_index
+
+        confidence = self._confidence(len(inlier_idx), mean_err)
+        return TrackerResult(
+            success=True,
+            mode=TrackerMode.TRACKING,
+            message=success_message + visual_note,
+            corners=visual_corners,
+            correspondence_corners=tracker_corners,
+            rvec=self.pose_tracker.rvec.copy(),
+            tvec=self.pose_tracker.tvec.copy(),
+            T_marker_camera=self.pose_tracker.T_marker_camera.copy(),
+            mean_reprojection_error_px=mean_err,
+            max_reprojection_error_px=max_err,
+            num_points=len(track_points),
+            num_inliers=len(inlier_idx),
+            confidence=confidence,
+            pose_source=pose_source,
+            pnp_method=pose.method,
+            timings_ms={"pnp_ms": pnp_ms},
+            **self._depth_filter_kwargs(filtered_depth),
+        )
 
     def _set_dense_refine_debug(
         self,

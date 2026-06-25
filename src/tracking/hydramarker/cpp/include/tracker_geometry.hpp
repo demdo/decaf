@@ -1,12 +1,14 @@
 #pragma once
 
 #include <limits>
+#include <string>
 #include <vector>
 
 #include <opencv2/core.hpp>
 
 #include "checkerboard_types.hpp"
 #include "marker_geometry.hpp"
+#include "tracker_config.hpp"
 #include "tracker_persistence.hpp"
 
 namespace hydramarker {
@@ -42,7 +44,8 @@ public:
     TrackerGeometry(
         const MarkerGeometry& geometry,
         const cv::Matx33d& K,
-        const std::vector<double>& dist_coeffs = {}
+        const std::vector<double>& dist_coeffs = {},
+        const TrackerConfig& config = TrackerConfig()
     );
 
     DenseProjectionMatchResult strictProjectedMatch(
@@ -67,7 +70,27 @@ public:
         double max_error_px
     ) const;
 
+    MapPoseResult estimateDenseRobustPose(
+        const std::vector<PoseTrackPoint>& points,
+        const CheckerboardDetection& detection,
+        const std::vector<double>& seed_rvec = {},
+        const std::vector<double>& seed_tvec = {},
+        const std::vector<double>& previous_rvec = {},
+        const std::vector<double>& previous_tvec = {}
+    ) const;
+
 private:
+    struct DensePoseCandidate {
+        cv::Mat rvec;
+        cv::Mat tvec;
+        std::string method;
+    };
+
+    struct DensePoseScore {
+        double score = std::numeric_limits<double>::infinity();
+        std::vector<double> errors;
+    };
+
     struct ProjectedCorner {
         int global_row = -1;
         int global_col = -1;
@@ -78,16 +101,61 @@ private:
     MarkerGeometry geometry_;
     cv::Matx33d K_;
     cv::Mat dist_coeffs_;
+    TrackerConfig config_;
     std::vector<ProjectedCorner> cached_corners_;
 
     static cv::Mat makeDistCoeffsMat(const std::vector<double>& dist_coeffs);
     static bool vectorToMat3x1(const std::vector<double>& values, cv::Mat& mat);
     static double percentile(std::vector<double> values, double q);
+    static std::string formatDouble(double value, int precision);
+    static std::string lowerAscii(std::string value);
+    static std::vector<double> mat3x1ToVector(const cv::Mat& mat);
+    static std::vector<double> transformToVector(const cv::Matx44d& T);
+    static cv::Matx44d makeTransform(const cv::Mat& rvec, const cv::Mat& tvec);
 
     std::vector<ProjectedCorner> projectGeometry(
         const cv::Mat& rvec,
         const cv::Mat& tvec,
         int& rejected_no_projection
+    ) const;
+
+    std::vector<DensePoseCandidate> denseRefinePoseVariants(
+        const std::vector<cv::Point3d>& object_points,
+        const std::vector<cv::Point2d>& image_points,
+        const cv::Mat& rvec,
+        const cv::Mat& tvec,
+        const std::string& method_prefix
+    ) const;
+
+    bool scoreDensePoseCandidate(
+        const std::vector<cv::Point3d>& object_points,
+        const std::vector<cv::Point2d>& image_points,
+        const cv::Mat& rvec,
+        const cv::Mat& tvec,
+        DensePoseScore& score
+    ) const;
+
+    bool reprojectionErrors(
+        const std::vector<cv::Point3d>& object_points,
+        const std::vector<cv::Point2d>& image_points,
+        const cv::Mat& rvec,
+        const cv::Mat& tvec,
+        std::vector<double>& errors
+    ) const;
+
+    bool persistentMotionPlausible(
+        const cv::Mat& rvec,
+        const cv::Mat& tvec,
+        const cv::Mat& previous_rvec,
+        const cv::Mat& previous_tvec
+    ) const;
+
+    std::string fallbackPoseRejectionReason(
+        const CheckerboardDetection& detection,
+        const cv::Mat& rvec,
+        const cv::Mat& tvec,
+        double mean_reproj_px,
+        double max_reproj_px
     ) const;
 };
 
