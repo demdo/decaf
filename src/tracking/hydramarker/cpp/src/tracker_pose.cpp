@@ -57,6 +57,26 @@ void MapPoseTracker::reset()
     T_marker_camera_ = cv::Matx44d::eye();
 }
 
+bool MapPoseTracker::setPose(
+    const std::vector<double>& rvec,
+    const std::vector<double>& tvec
+)
+{
+    if (rvec.size() != 3 || tvec.size() != 3) {
+        return false;
+    }
+
+    cv::Mat rvec_mat(3, 1, CV_64F);
+    cv::Mat tvec_mat(3, 1, CV_64F);
+    for (int i = 0; i < 3; ++i) {
+        rvec_mat.at<double>(i, 0) = rvec[static_cast<size_t>(i)];
+        tvec_mat.at<double>(i, 0) = tvec[static_cast<size_t>(i)];
+    }
+
+    acceptPose(rvec_mat, tvec_mat);
+    return true;
+}
+
 MapPoseResult MapPoseTracker::estimatePose(
     const std::vector<PoseTrackPoint>& points,
     int lost_frames

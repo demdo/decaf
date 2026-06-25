@@ -150,6 +150,8 @@ class HydraTracker(
         self._cpp_persistent_matcher = None
         self._cpp_persistent_matcher_unavailable: bool = False
         self._cpp_persistent_matcher_config_state = None
+        self._cpp_tracker_geometry = None
+        self._cpp_tracker_geometry_unavailable: bool = False
         self._last_persistent_match_backend: str = "none"
 
     @property

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from tracking.hydramarker.backend import cpp_impl as hm
-from tracking.hydramarker.tracker_pose import PoseTrackPoint
+from tracking.hydramarker.tracker_pose import MapPoseResult, PoseTrackPoint
 from tracking.hydramarker.tracker_types import (
     GlobalCornerIdentity,
     GridKey,
@@ -35,8 +35,20 @@ class PersistenceMixin:
             )
         )
 
+    def _cpp_fast_persistent_seed_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self.config,
+                "cpp_fast_persistent_seed_enabled",
+                True,
+            )
+        )
+
     def _cpp_persistent_matcher_config_signature(self) -> Tuple[object, ...]:
         names = (
+            "min_points",
+            "min_inliers",
+            "persistence_min_points",
             "persistence_max_frames",
             "persistence_use_pose_projection",
             "persistence_projection_max_reproj_px",
@@ -47,6 +59,21 @@ class PersistenceMixin:
             "persistence_projection_max_pose_error_px",
             "persistence_match_min_second_best_margin_px",
             "persistence_uv_match_dist_px",
+            "fast_persistent_min_points",
+            "pnp_ransac_reprojection_px",
+            "pnp_ransac_confidence",
+            "pnp_ransac_iterations",
+            "max_mean_reprojection_error_px",
+            "max_max_reprojection_error_px",
+            "max_translation_jump_mm",
+            "max_rotation_jump_deg",
+            "rotation_gate_scale_per_lost_frame",
+            "rotation_gate_max_deg",
+            "use_pose_prior",
+            "pnp_direct_prior_enabled",
+            "pnp_direct_refine_method",
+            "pnp_direct_max_mean_reprojection_error_px",
+            "pnp_direct_max_max_reprojection_error_px",
         )
         return tuple(getattr(self.config, name, None) for name in names)
 
@@ -159,6 +186,55 @@ class PersistenceMixin:
             for corner in corners
         ]
 
+    @staticmethod
+    def _cpp_pose_vector_to_array(
+        values,
+        shape: Tuple[int, ...],
+    ) -> Optional[np.ndarray]:
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.size == 0:
+            return None
+        try:
+            return arr.reshape(shape).copy()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _map_pose_result_from_cpp(pose) -> MapPoseResult:
+        inliers = np.asarray(
+            getattr(pose, "inlier_indices", []),
+            dtype=np.int64,
+        ).reshape(-1)
+        return MapPoseResult(
+            success=bool(getattr(pose, "success", False)),
+            message=str(getattr(pose, "message", "")),
+            rvec=PersistenceMixin._cpp_pose_vector_to_array(
+                getattr(pose, "rvec", []),
+                (3, 1),
+            ),
+            tvec=PersistenceMixin._cpp_pose_vector_to_array(
+                getattr(pose, "tvec", []),
+                (3, 1),
+            ),
+            T_marker_camera=PersistenceMixin._cpp_pose_vector_to_array(
+                getattr(pose, "T_marker_camera", []),
+                (4, 4),
+            ),
+            inlier_indices=inliers.copy() if inliers.size > 0 else None,
+            reprojection_mean_px=float(
+                getattr(pose, "reprojection_mean_px", -1.0)
+            ),
+            reprojection_max_px=float(
+                getattr(pose, "reprojection_max_px", -1.0)
+            ),
+            num_points=int(getattr(pose, "num_points", 0)),
+            num_inliers=int(getattr(pose, "num_inliers", 0)),
+            points=PersistenceMixin._pose_track_points_from_cpp(
+                getattr(pose, "points", [])
+            ),
+            method=str(getattr(pose, "method", "")),
+        )
+
     def _persistent_correspondences_for_detection_cpp(
         self,
         detection,
@@ -188,6 +264,42 @@ class PersistenceMixin:
         return (
             self._pose_track_points_from_cpp(result.points),
             self._tracker_corners_from_cpp(result.corners),
+        )
+
+    def _fast_persistent_seed_pose_cpp(self, detection):
+        """Run persistent matching and seed pose solving in one C++ call."""
+        if not self._cpp_fast_persistent_seed_enabled():
+            return None
+
+        matcher = self._ensure_cpp_persistent_matcher()
+        if matcher is None:
+            return None
+
+        try:
+            result = matcher.estimate_pose(
+                detection,
+                int(self.frame_index),
+                self.K,
+                self.dist_coeffs,
+                None if self.pose_tracker.rvec is None else self.pose_tracker.rvec,
+                None if self.pose_tracker.tvec is None else self.pose_tracker.tvec,
+                float(self._last_good_reproj_px),
+                int(self.lost_frames),
+            )
+        except Exception:
+            return None
+
+        self._last_persistent_match_stats = self._persistent_match_stats_from_cpp(
+            result.stats
+        )
+        self._last_persistent_match_backend = "cpp_seed"
+        return (
+            self._pose_track_points_from_cpp(result.points),
+            self._tracker_corners_from_cpp(result.corners),
+            self._map_pose_result_from_cpp(result.pose),
+            float(getattr(result, "match_ms", 0.0)),
+            float(getattr(result, "pose_ms", 0.0)),
+            float(getattr(result, "total_ms", 0.0)),
         )
 
     def _persistent_detection_motion_px(self, current_uvs: np.ndarray) -> float:
@@ -724,9 +836,28 @@ class FastPathMixin:
             )
             return None
 
-        match_t0 = time.perf_counter()
-        points, corners = self._persistent_correspondences_for_detection(detection)
-        persistent_match_ms = (time.perf_counter() - match_t0) * 1000.0
+        seed_pose: Optional[MapPoseResult] = None
+        seed_pnp_ms = 0.0
+        cpp_seed_total_ms = 0.0
+        seed_bundle = self._fast_persistent_seed_pose_cpp(detection)
+        if seed_bundle is not None:
+            (
+                points,
+                corners,
+                seed_pose,
+                persistent_match_ms,
+                seed_pnp_ms,
+                cpp_seed_total_ms,
+            ) = seed_bundle
+            fast_timings["fast_persistent_seed_cpp_count"] = 1.0
+            fast_timings["fast_persistent_seed_cpp_total_ms"] = cpp_seed_total_ms
+            fast_timings["fast_persistent_seed_cpp_pose_ms"] = seed_pnp_ms
+            fast_timings["fast_persistent_seed_cpp_match_ms"] = persistent_match_ms
+        else:
+            match_t0 = time.perf_counter()
+            points, corners = self._persistent_correspondences_for_detection(detection)
+            persistent_match_ms = (time.perf_counter() - match_t0) * 1000.0
+            fast_timings["fast_persistent_seed_cpp_count"] = 0.0
         fast_timings["fast_persistent_match_ms"] = persistent_match_ms
         fast_timings["fast_persistent_points_count"] = float(len(points))
         fast_timings["fast_persistent_corners_count"] = float(len(corners))
@@ -735,7 +866,7 @@ class FastPathMixin:
             getattr(self, "_last_persistent_match_backend", "unknown")
         )
         fast_timings["fast_persistent_match_cpp_count"] = (
-            1.0 if match_backend == "cpp" else 0.0
+            1.0 if match_backend in ("cpp", "cpp_seed") else 0.0
         )
         fast_timings["fast_persistent_match_motion_px"] = float(
             getattr(stats, "adaptive_motion_px", 0.0)
@@ -809,12 +940,27 @@ class FastPathMixin:
                 + (time.perf_counter() - restore_t0) * 1000.0
             )
 
-        seed_t0 = time.perf_counter()
-        seed_pose = self.pose_tracker.estimate_pose(
-            points,
-            lost_frames=self.lost_frames,
-        )
-        seed_pnp_ms = (time.perf_counter() - seed_t0) * 1000.0
+        if seed_pose is None:
+            seed_t0 = time.perf_counter()
+            seed_pose = self.pose_tracker.estimate_pose(
+                points,
+                lost_frames=self.lost_frames,
+            )
+            seed_pnp_ms = (time.perf_counter() - seed_t0) * 1000.0
+        elif (
+            seed_pose.success
+            and (
+                seed_pose.rvec is None
+                or seed_pose.tvec is None
+                or seed_pose.T_marker_camera is None
+            )
+        ):
+            seed_pose.success = False
+            seed_pose.message = "C++ seed pose missing pose vectors."
+        elif seed_pose.success:
+            self.pose_tracker.rvec = seed_pose.rvec.copy()
+            self.pose_tracker.tvec = seed_pose.tvec.copy()
+            self.pose_tracker.T_marker_camera = seed_pose.T_marker_camera.copy()
         fast_timings["fast_persistent_seed_pnp_ms"] = seed_pnp_ms
 
         if not seed_pose.success:

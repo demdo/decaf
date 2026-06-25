@@ -55,6 +55,22 @@ struct PersistentMatchResult {
     }
 };
 
+struct PersistentPoseSeedResult {
+    std::vector<PoseTrackPoint> points;
+    std::vector<TrackerCorner> corners;
+    PersistentMatchStats stats;
+    MapPoseResult pose;
+    std::string message;
+
+    double match_ms = 0.0;
+    double pose_ms = 0.0;
+    double total_ms = 0.0;
+
+    bool validMatch() const {
+        return !points.empty() && points.size() == corners.size();
+    }
+};
+
 class PersistentMatcher {
 public:
     explicit PersistentMatcher(
@@ -80,6 +96,17 @@ public:
         const std::vector<double>& rvec = {},
         const std::vector<double>& tvec = {},
         double last_good_reproj_px = -1.0
+    );
+
+    PersistentPoseSeedResult estimatePose(
+        const CheckerboardDetection& detection,
+        int frame_index,
+        const cv::Matx33d& K,
+        const std::vector<double>& dist_coeffs = {},
+        const std::vector<double>& rvec = {},
+        const std::vector<double>& tvec = {},
+        double last_good_reproj_px = -1.0,
+        int lost_frames = 0
     );
 
 private:
@@ -141,6 +168,10 @@ private:
         const cv::Mat& rvec,
         const cv::Mat& tvec,
         cv::Point2d& uv
+    );
+
+    static MapPoseTrackerConfig makeMapPoseTrackerConfig(
+        const TrackerConfig& config
     );
 };
 

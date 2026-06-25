@@ -1,6 +1,7 @@
 #include "tracker_persistence.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -267,6 +268,80 @@ PersistentMatchResult PersistentMatcher::match(
     return result;
 }
 
+PersistentPoseSeedResult PersistentMatcher::estimatePose(
+    const CheckerboardDetection& detection,
+    int frame_index,
+    const cv::Matx33d& K,
+    const std::vector<double>& dist_coeffs,
+    const std::vector<double>& rvec,
+    const std::vector<double>& tvec,
+    double last_good_reproj_px,
+    int lost_frames
+)
+{
+    const std::int64_t total_t0 = cv::getTickCount();
+    PersistentPoseSeedResult result;
+
+    const std::int64_t match_t0 = cv::getTickCount();
+    PersistentMatchResult match_result = match(
+        detection,
+        frame_index,
+        K,
+        dist_coeffs,
+        rvec,
+        tvec,
+        last_good_reproj_px
+    );
+    result.match_ms = (
+        static_cast<double>(cv::getTickCount() - match_t0) /
+        cv::getTickFrequency()
+    ) * 1000.0;
+
+    result.points = std::move(match_result.points);
+    result.corners = std::move(match_result.corners);
+    result.stats = match_result.stats;
+
+    const int min_points = std::max({
+        config_.min_points,
+        config_.persistence_min_points,
+        config_.fast_persistent_min_points
+    });
+    if (static_cast<int>(result.points.size()) < min_points) {
+        result.pose.success = false;
+        result.pose.message =
+            "Too few matches: " + std::to_string(result.points.size()) +
+            " < " + std::to_string(min_points);
+        result.pose.num_points = static_cast<int>(result.points.size());
+        result.message = result.pose.message;
+        result.total_ms = (
+            static_cast<double>(cv::getTickCount() - total_t0) /
+            cv::getTickFrequency()
+        ) * 1000.0;
+        return result;
+    }
+
+    MapPoseTracker pose_tracker(
+        K,
+        dist_coeffs,
+        makeMapPoseTrackerConfig(config_)
+    );
+    pose_tracker.setPose(rvec, tvec);
+
+    const std::int64_t pose_t0 = cv::getTickCount();
+    result.pose = pose_tracker.estimatePose(result.points, lost_frames);
+    result.pose_ms = (
+        static_cast<double>(cv::getTickCount() - pose_t0) /
+        cv::getTickFrequency()
+    ) * 1000.0;
+
+    result.message = result.pose.message;
+    result.total_ms = (
+        static_cast<double>(cv::getTickCount() - total_t0) /
+        cv::getTickFrequency()
+    ) * 1000.0;
+    return result;
+}
+
 double PersistentMatcher::detectionMotionPx(
     const std::vector<cv::Point2d>& current_uvs,
     int frame_index
@@ -480,6 +555,38 @@ bool PersistentMatcher::projectPoint(
 
     uv = projected[0];
     return std::isfinite(uv.x) && std::isfinite(uv.y);
+}
+
+MapPoseTrackerConfig PersistentMatcher::makeMapPoseTrackerConfig(
+    const TrackerConfig& config
+)
+{
+    MapPoseTrackerConfig pose_config;
+    pose_config.min_points = std::max({
+        config.min_points,
+        config.persistence_min_points,
+        config.fast_persistent_min_points
+    });
+    pose_config.min_inliers = config.min_inliers;
+    pose_config.ransac_reproj_px = config.pnp_ransac_reprojection_px;
+    pose_config.ransac_confidence = config.pnp_ransac_confidence;
+    pose_config.ransac_iterations = config.pnp_ransac_iterations;
+    pose_config.max_mean_reproj_px = config.max_mean_reprojection_error_px;
+    pose_config.max_max_reproj_px = config.max_max_reprojection_error_px;
+    pose_config.max_translation_jump_mm = config.max_translation_jump_mm;
+    pose_config.max_rotation_jump_deg = config.max_rotation_jump_deg;
+    pose_config.rotation_gate_scale_per_lost_frame =
+        config.rotation_gate_scale_per_lost_frame;
+    pose_config.rotation_gate_max_deg = config.rotation_gate_max_deg;
+    pose_config.use_pose_prior = config.use_pose_prior;
+    pose_config.refine_with_iterative = true;
+    pose_config.use_direct_prior_solver = config.pnp_direct_prior_enabled;
+    pose_config.direct_refine_method = config.pnp_direct_refine_method;
+    pose_config.direct_max_mean_reproj_px =
+        config.pnp_direct_max_mean_reprojection_error_px;
+    pose_config.direct_max_max_reproj_px =
+        config.pnp_direct_max_max_reprojection_error_px;
+    return pose_config;
 }
 
 } // namespace hydramarker

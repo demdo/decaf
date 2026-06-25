@@ -71,6 +71,10 @@ public:
     );
 
     void reset();
+    bool setPose(
+        const std::vector<double>& rvec,
+        const std::vector<double>& tvec
+    );
 
     MapPoseResult estimatePose(
         const std::vector<PoseTrackPoint>& points,

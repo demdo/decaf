@@ -73,7 +73,11 @@ PersistentTrackerCorner = _hm.TrackerCorner
 TrackerCorner = _hm.TrackerCorner
 PersistentMatchStats = _hm.PersistentMatchStats
 PersistentMatchResult = _hm.PersistentMatchResult
+PersistentPoseSeedResult = _hm.PersistentPoseSeedResult
 PersistentMatcher = _hm.PersistentMatcher
+DenseProjectionMatchStats = _hm.DenseProjectionMatchStats
+DenseProjectionMatchResult = _hm.DenseProjectionMatchResult
+TrackerGeometry = _hm.TrackerGeometry
 
 _MarkerField = _hm.MarkerField
 _generate_planar_field = _hm.generate_planar_field
@@ -220,6 +224,21 @@ def create_map_pose_tracker(K, dist_coeffs=None, config=None):
 def create_persistent_matcher(config=None):
     """Create the isolated C++ PersistentMatcher with Python config overrides."""
     return PersistentMatcher(tracker_config_from_python(config))
+
+
+def create_tracker_geometry(geometry, K, dist_coeffs=None):
+    """Create the C++ geometry projector/matcher for a marker geometry."""
+    K_arr = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    dist_arr = (
+        None
+        if dist_coeffs is None
+        else np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+    )
+    return TrackerGeometry(
+        geometry,
+        K_arr,
+        dist_arr,
+    )
 
 
 class MarkerFieldCpp:

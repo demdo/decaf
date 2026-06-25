@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+from tracking.hydramarker.backend import cpp_impl as hm
 from tracking.hydramarker.tracker_pose import MapPoseResult, PoseTrackPoint
 from tracking.hydramarker.tracker_types import (
     DenseProjectionMatchStats,
@@ -206,6 +207,105 @@ class GeometryMixin:
             xyz_mm=np.asarray(xyz, dtype=np.float64).reshape(-1, 3),
         )
 
+    def _cpp_tracker_geometry_enabled(self) -> bool:
+        return bool(
+            getattr(self.config, "cpp_dense_projection_matcher_enabled", True)
+            or getattr(self.config, "cpp_visual_corner_filter_enabled", True)
+        )
+
+    def _ensure_cpp_tracker_geometry(self):
+        """Create the C++ geometry helper on demand."""
+        if not self._cpp_tracker_geometry_enabled():
+            return None
+
+        if bool(getattr(self, "_cpp_tracker_geometry_unavailable", False)):
+            return None
+
+        helper = getattr(self, "_cpp_tracker_geometry", None)
+        if helper is not None:
+            return helper
+
+        try:
+            helper = hm.create_tracker_geometry(
+                self.geometry,
+                self.K,
+                self.dist_coeffs,
+            )
+        except Exception:
+            self._cpp_tracker_geometry_unavailable = True
+            self._cpp_tracker_geometry = None
+            return None
+
+        self._cpp_tracker_geometry = helper
+        return helper
+
+    @staticmethod
+    def _dense_projection_match_stats_from_cpp(stats) -> DenseProjectionMatchStats:
+        return DenseProjectionMatchStats(
+            detected=int(getattr(stats, "detected", 0)),
+            projected=int(getattr(stats, "projected", 0)),
+            rejected_no_projection=int(
+                getattr(stats, "rejected_no_projection", 0)
+            ),
+            rejected_far=int(getattr(stats, "rejected_far", 0)),
+            rejected_ambiguous=int(
+                getattr(stats, "rejected_ambiguous", 0)
+            ),
+            rejected_non_mutual=int(
+                getattr(stats, "rejected_non_mutual", 0)
+            ),
+            median_error_px=float(
+                getattr(stats, "median_error_px", float("inf"))
+            ),
+            p90_error_px=float(
+                getattr(stats, "p90_error_px", float("inf"))
+            ),
+            image_coverage=float(
+                getattr(stats, "image_coverage", -1.0)
+            ),
+            image_span_u_px=float(
+                getattr(stats, "image_span_u_px", -1.0)
+            ),
+            image_span_v_px=float(
+                getattr(stats, "image_span_v_px", -1.0)
+            ),
+            object_span_mm=float(
+                getattr(stats, "object_span_mm", -1.0)
+            ),
+            distinct_rows=int(getattr(stats, "distinct_rows", 0)),
+            distinct_cols=int(getattr(stats, "distinct_cols", 0)),
+        )
+
+    @staticmethod
+    def _geometry_tracker_corners_from_cpp(corners) -> List[TrackerCorner]:
+        return [
+            TrackerCorner(
+                local_row=int(corner.local_row),
+                local_col=int(corner.local_col),
+                global_row=int(corner.global_row),
+                global_col=int(corner.global_col),
+                xyz_mm=tuple(float(v) for v in corner.xyz_mm),
+                uv=tuple(float(v) for v in corner.uv),
+                votes=int(getattr(corner, "votes", 0)),
+            )
+            for corner in corners
+        ]
+
+    @staticmethod
+    def _geometry_tracker_corners_to_cpp(corners: List[TrackerCorner]):
+        converted = []
+        for corner in corners:
+            out = hm.TrackerCorner()
+            out.local_row = int(corner.local_row)
+            out.local_col = int(corner.local_col)
+            out.global_row = int(corner.global_row)
+            out.global_col = int(corner.global_col)
+            out.xyz_mm = tuple(float(v) for v in corner.xyz_mm)
+            out.uv = tuple(float(v) for v in corner.uv)
+            out.votes = int(getattr(corner, "votes", 0))
+            converted.append(out)
+        return converted
+
 
 class ProjectionMixin:
     """Project marker geometry and match projected corners against detections."""
@@ -301,6 +401,21 @@ class ProjectionMixin:
         if rvec is None or tvec is None:
             return []
 
+        if bool(getattr(self.config, "cpp_visual_corner_filter_enabled", True)):
+            helper = self._ensure_cpp_tracker_geometry()
+            if helper is not None:
+                try:
+                    return self._geometry_tracker_corners_from_cpp(
+                        helper.visual_corners_from_pose(
+                            self._geometry_tracker_corners_to_cpp(corners),
+                            rvec,
+                            tvec,
+                            float(self.config.visual_corner_max_reprojection_error_px),
+                        )
+                    )
+                except Exception:
+                    self._cpp_tracker_geometry_unavailable = True
+
         max_err = float(self.config.visual_corner_max_reprojection_error_px)
         accepted: List[TrackerCorner] = []
 
@@ -335,6 +450,24 @@ class ProjectionMixin:
 
         if detection is None or rvec is None or tvec is None:
             return [], stats
+
+        if bool(getattr(self.config, "cpp_dense_projection_matcher_enabled", True)):
+            helper = self._ensure_cpp_tracker_geometry()
+            if helper is not None:
+                try:
+                    result = helper.strict_projected_match(
+                        detection,
+                        rvec,
+                        tvec,
+                        float(max_dist_px),
+                        float(ambiguity_margin_px),
+                    )
+                    return (
+                        self._geometry_tracker_corners_from_cpp(result.corners),
+                        self._dense_projection_match_stats_from_cpp(result.stats),
+                    )
+                except Exception:
+                    self._cpp_tracker_geometry_unavailable = True
 
         detected = self._detected_corners_from_detection(detection)
         stats.detected = len(detected)
@@ -482,6 +615,28 @@ class ProjectionMixin:
         """Greedily align detected corners to projected geometry for visual validation."""
         if detection is None or rvec is None or tvec is None:
             return [], 0, float("inf"), float("inf")
+
+        if bool(getattr(self.config, "cpp_dense_projection_matcher_enabled", True)):
+            helper = self._ensure_cpp_tracker_geometry()
+            if helper is not None:
+                try:
+                    result = helper.greedy_projected_match(
+                        detection,
+                        rvec,
+                        tvec,
+                        float(max_dist_px),
+                    )
+                    stats = self._dense_projection_match_stats_from_cpp(
+                        result.stats
+                    )
+                    return (
+                        self._geometry_tracker_corners_from_cpp(result.corners),
+                        len(result.corners),
+                        float(stats.median_error_px),
+                        float(stats.p90_error_px),
+                    )
+                except Exception:
+                    self._cpp_tracker_geometry_unavailable = True
 
         detected = self._detected_corners_from_detection(detection)
         if not detected:

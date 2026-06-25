@@ -31,6 +31,7 @@
 #include "patch_decoder.hpp"
 #include "tracker_config.hpp"
 #include "tracker_engine.hpp"
+#include "tracker_geometry.hpp"
 #include "tracker_persistence.hpp"
 #include "tracker_pose.hpp"
 #include "tracker_types.hpp"
@@ -244,6 +245,12 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("lost_frames") = 0
         )
         .def("reset", &MapPoseTracker::reset)
+        .def(
+            "set_pose",
+            &MapPoseTracker::setPose,
+            py::arg("rvec"),
+            py::arg("tvec")
+        )
         .def("has_pose", &MapPoseTracker::hasPose)
         .def_property_readonly("rvec", &MapPoseTracker::rvec)
         .def_property_readonly("tvec", &MapPoseTracker::tvec)
@@ -293,6 +300,125 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("stats", &PersistentMatchResult::stats)
         .def_readwrite("message", &PersistentMatchResult::message)
         .def("valid", &PersistentMatchResult::valid);
+
+    py::class_<PersistentPoseSeedResult>(m, "PersistentPoseSeedResult")
+        .def(py::init<>())
+        .def_readwrite("points", &PersistentPoseSeedResult::points)
+        .def_readwrite("corners", &PersistentPoseSeedResult::corners)
+        .def_readwrite("stats", &PersistentPoseSeedResult::stats)
+        .def_readwrite("pose", &PersistentPoseSeedResult::pose)
+        .def_readwrite("message", &PersistentPoseSeedResult::message)
+        .def_readwrite("match_ms", &PersistentPoseSeedResult::match_ms)
+        .def_readwrite("pose_ms", &PersistentPoseSeedResult::pose_ms)
+        .def_readwrite("total_ms", &PersistentPoseSeedResult::total_ms)
+        .def("valid_match", &PersistentPoseSeedResult::validMatch);
+
+    py::class_<DenseProjectionMatchStats>(m, "DenseProjectionMatchStats")
+        .def(py::init<>())
+        .def_readwrite("detected", &DenseProjectionMatchStats::detected)
+        .def_readwrite("projected", &DenseProjectionMatchStats::projected)
+        .def_readwrite("rejected_no_projection", &DenseProjectionMatchStats::rejected_no_projection)
+        .def_readwrite("rejected_far", &DenseProjectionMatchStats::rejected_far)
+        .def_readwrite("rejected_ambiguous", &DenseProjectionMatchStats::rejected_ambiguous)
+        .def_readwrite("rejected_non_mutual", &DenseProjectionMatchStats::rejected_non_mutual)
+        .def_readwrite("median_error_px", &DenseProjectionMatchStats::median_error_px)
+        .def_readwrite("p90_error_px", &DenseProjectionMatchStats::p90_error_px)
+        .def_readwrite("image_coverage", &DenseProjectionMatchStats::image_coverage)
+        .def_readwrite("image_span_u_px", &DenseProjectionMatchStats::image_span_u_px)
+        .def_readwrite("image_span_v_px", &DenseProjectionMatchStats::image_span_v_px)
+        .def_readwrite("object_span_mm", &DenseProjectionMatchStats::object_span_mm)
+        .def_readwrite("distinct_rows", &DenseProjectionMatchStats::distinct_rows)
+        .def_readwrite("distinct_cols", &DenseProjectionMatchStats::distinct_cols);
+
+    py::class_<DenseProjectionMatchResult>(m, "DenseProjectionMatchResult")
+        .def(py::init<>())
+        .def_readwrite("corners", &DenseProjectionMatchResult::corners)
+        .def_readwrite("stats", &DenseProjectionMatchResult::stats)
+        .def("valid", &DenseProjectionMatchResult::valid);
+
+    py::class_<TrackerGeometry>(m, "TrackerGeometry")
+        .def(
+            py::init([](
+                const MarkerGeometry& geometry,
+                py::array_t<double, py::array::c_style | py::array::forcecast> K,
+                py::object dist_coeffs
+            ) {
+                return std::make_unique<TrackerGeometry>(
+                    geometry,
+                    numpyToMatx33d(K),
+                    optionalNumpyToVectorDouble(dist_coeffs)
+                );
+            }),
+            py::arg("geometry"),
+            py::arg("K"),
+            py::arg("dist_coeffs") = py::none()
+        )
+        .def(
+            "strict_projected_match",
+            [](
+                const TrackerGeometry& self,
+                const CheckerboardDetection& detection,
+                py::object rvec,
+                py::object tvec,
+                double max_dist_px,
+                double ambiguity_margin_px
+            ) {
+                return self.strictProjectedMatch(
+                    detection,
+                    optionalNumpyToVectorDouble(rvec),
+                    optionalNumpyToVectorDouble(tvec),
+                    max_dist_px,
+                    ambiguity_margin_px
+                );
+            },
+            py::arg("detection"),
+            py::arg("rvec"),
+            py::arg("tvec"),
+            py::arg("max_dist_px"),
+            py::arg("ambiguity_margin_px")
+        )
+        .def(
+            "greedy_projected_match",
+            [](
+                const TrackerGeometry& self,
+                const CheckerboardDetection& detection,
+                py::object rvec,
+                py::object tvec,
+                double max_dist_px
+            ) {
+                return self.greedyProjectedMatch(
+                    detection,
+                    optionalNumpyToVectorDouble(rvec),
+                    optionalNumpyToVectorDouble(tvec),
+                    max_dist_px
+                );
+            },
+            py::arg("detection"),
+            py::arg("rvec"),
+            py::arg("tvec"),
+            py::arg("max_dist_px")
+        )
+        .def(
+            "visual_corners_from_pose",
+            [](
+                const TrackerGeometry& self,
+                const std::vector<TrackerCorner>& corners,
+                py::object rvec,
+                py::object tvec,
+                double max_error_px
+            ) {
+                return self.visualCornersFromPose(
+                    corners,
+                    optionalNumpyToVectorDouble(rvec),
+                    optionalNumpyToVectorDouble(tvec),
+                    max_error_px
+                );
+            },
+            py::arg("corners"),
+            py::arg("rvec"),
+            py::arg("tvec"),
+            py::arg("max_error_px")
+        );
 
     py::class_<TrackerConfig>(m, "TrackerConfig")
         .def(py::init<>())
@@ -419,6 +545,39 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("rvec") = py::none(),
             py::arg("tvec") = py::none(),
             py::arg("last_good_reproj_px") = -1.0
+        )
+        .def(
+            "estimate_pose",
+            [](
+                PersistentMatcher& self,
+                const CheckerboardDetection& detection,
+                int frame_index,
+                py::array_t<double, py::array::c_style | py::array::forcecast> K,
+                py::object dist_coeffs,
+                py::object rvec,
+                py::object tvec,
+                double last_good_reproj_px,
+                int lost_frames
+            ) {
+                return self.estimatePose(
+                    detection,
+                    frame_index,
+                    numpyToMatx33d(K),
+                    optionalNumpyToVectorDouble(dist_coeffs),
+                    optionalNumpyToVectorDouble(rvec),
+                    optionalNumpyToVectorDouble(tvec),
+                    last_good_reproj_px,
+                    lost_frames
+                );
+            },
+            py::arg("detection"),
+            py::arg("frame_index"),
+            py::arg("K"),
+            py::arg("dist_coeffs") = py::none(),
+            py::arg("rvec") = py::none(),
+            py::arg("tvec") = py::none(),
+            py::arg("last_good_reproj_px") = -1.0,
+            py::arg("lost_frames") = 0
         )
         .def_property_readonly(
             "identities",
