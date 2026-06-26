@@ -33,7 +33,8 @@ def _ensure_src_on_path() -> None:
 _ensure_src_on_path()
 
 from tracking.hydramarker.debug.debug_tracker_translation import _camera_from_run_start
-from tracking.pose_filters import PoseDepthKalmanFilter
+from tracking.hydramarker import tracker as hydramarker_cpp
+from tracking.hydramarker.config import TrackerConfig
 
 
 RUN_PATH = Path("hydramarker/tests/hydramarker_tracker_runs/hydramarker_tracker_run_forward.jsonl")
@@ -295,13 +296,15 @@ def replay_model(
     if recomputed_table is not None:
         table_T_B_C = recomputed_table
 
-    depth_filter = PoseDepthKalmanFilter(
-        observation_std_mm=16.0,
-        process_std_mm=0.05,
-        initial_velocity_std_mm=0.1,
-        reprojection_guard_px=1.0,
-        K=K,
-        dist_coeffs=dist,
+    depth_filter = hydramarker_cpp.create_pose_depth_filter(
+        K,
+        dist,
+        TrackerConfig(
+            pose_depth_filter_observation_std_mm=16.0,
+            pose_depth_filter_process_std_mm=0.05,
+            pose_depth_filter_initial_velocity_std_mm=0.1,
+            pose_depth_filter_reprojection_guard_px=1.0,
+        ),
     )
     dist_flat = np.asarray(dist, dtype=np.float64).reshape(-1)
     info.update(

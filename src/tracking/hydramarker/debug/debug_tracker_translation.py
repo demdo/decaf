@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 import numpy as np
 
 os.environ.setdefault("QT_API", "pyside6")
@@ -14,24 +15,6 @@ COMPONENTS = (
     ("x", "x", "#1f77b4"),
     ("y", "y", "#2ca02c"),
     ("z", "z", "#d62728"),
-)
-
-DEPTH_FILTER_COLUMNS = (
-    "depth_filter_applied",
-    "depth_filter_delta_z_mm",
-    "depth_filter_raw_z_mm",
-    "depth_filter_z_mm",
-    "depth_filter_reproj_excess_px",
-    "depth_filter_guard_alpha",
-    "depth_filter_innovation_z_mm",
-    "depth_filter_innovation_mean_z_mm",
-    "depth_filter_innovation_cusum_pos_mm",
-    "depth_filter_innovation_cusum_neg_mm",
-    "depth_filter_innovation_bias_detected",
-    "depth_filter_innovation_bias_direction",
-    "depth_filter_innovation_bias_limited",
-    "depth_filter_object_z_span_mm",
-    "depth_filter_negative_delta_guard_limited",
 )
 
 
@@ -45,10 +28,14 @@ def _ensure_src_on_path() -> None:
 
 _ensure_src_on_path()
 
-from tracking.hydramarker.calib import calib_camera, calib_checkerboard
+
+def _load_calib_modules():
+    from tracking.hydramarker.calib import calib_camera, calib_checkerboard
+
+    return calib_camera, calib_checkerboard
 
 
-BoardPoseCalibration = calib_checkerboard.CharucoTableCalibration
+BoardPoseCalibration = Any
 BOARD_AXIS_LENGTH_MM = 80.0
 
 
@@ -317,382 +304,6 @@ def _camera_from_run_start(record: dict) -> tuple[np.ndarray | None, np.ndarray 
     return K, dist
 
 
-def _pose_from_frame_data(data: dict) -> tuple[np.ndarray, np.ndarray] | None:
-    rvec = np.asarray(
-        [
-            _to_float(data.get("rvec_x_rad")),
-            _to_float(data.get("rvec_y_rad")),
-            _to_float(data.get("rvec_z_rad")),
-        ],
-        dtype=np.float64,
-    ).reshape(3, 1)
-    tvec = np.asarray(
-        [
-            _to_float(data.get("tvec_x_mm")),
-            _to_float(data.get("tvec_y_mm")),
-            _to_float(data.get("tvec_z_mm")),
-        ],
-        dtype=np.float64,
-    ).reshape(3, 1)
-    if not np.all(np.isfinite(rvec)) or not np.all(np.isfinite(tvec)):
-        return None
-    return rvec, tvec
-
-
-def _points_from_frame_detail(detail: dict) -> tuple[np.ndarray, np.ndarray]:
-    corners = list(detail.get("pose_corners") or [])
-    if not corners:
-        corners = list(detail.get("correspondence_corners") or [])
-
-    object_points: list[np.ndarray] = []
-    image_points: list[np.ndarray] = []
-    for corner in corners:
-        if not isinstance(corner, dict):
-            continue
-        xyz = corner.get("xyz_mm")
-        uv = corner.get("uv_px")
-        if not isinstance(xyz, (list, tuple)) or not isinstance(uv, (list, tuple)):
-            continue
-        if len(xyz) < 3 or len(uv) < 2:
-            continue
-        xyz_arr = np.asarray([_to_float(v) for v in xyz[:3]], dtype=np.float64)
-        uv_arr = np.asarray([_to_float(v) for v in uv[:2]], dtype=np.float64)
-        if np.all(np.isfinite(xyz_arr)) and np.all(np.isfinite(uv_arr)):
-            object_points.append(xyz_arr.reshape(3))
-            image_points.append(uv_arr.reshape(2))
-
-    if not object_points:
-        return (
-            np.empty((0, 3), dtype=np.float64),
-            np.empty((0, 2), dtype=np.float64),
-        )
-    return (
-        np.asarray(object_points, dtype=np.float64).reshape(-1, 3),
-        np.asarray(image_points, dtype=np.float64).reshape(-1, 2),
-    )
-
-
-def _fmt_debug_float(value: float, digits: int = 3) -> str:
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return ""
-    if not np.isfinite(value):
-        return ""
-    return f"{value:.{digits}f}"
-
-
-def _reprojection_stats(
-    *,
-    K: np.ndarray,
-    dist: np.ndarray,
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-    object_points: np.ndarray,
-    image_points: np.ndarray,
-) -> dict[str, str]:
-    if len(object_points) == 0:
-        return {}
-    try:
-        import cv2
-
-        projected, _ = cv2.projectPoints(
-            object_points.reshape(-1, 3),
-            rvec.reshape(3, 1),
-            tvec.reshape(3, 1),
-            K,
-            dist.reshape(-1, 1),
-        )
-    except Exception:
-        return {}
-
-    residual = projected.reshape(-1, 2) - image_points.reshape(-1, 2)
-    err = np.linalg.norm(residual, axis=1)
-    return {
-        "mean_err": _fmt_debug_float(float(np.mean(err))),
-        "max_err": _fmt_debug_float(float(np.max(err))),
-        "pose_reproj_mean_px": _fmt_debug_float(float(np.mean(err))),
-        "pose_reproj_median_px": _fmt_debug_float(float(np.median(err))),
-        "pose_reproj_p95_px": _fmt_debug_float(float(np.percentile(err, 95))),
-        "pose_reproj_max_px": _fmt_debug_float(float(np.max(err))),
-        "pose_reproj_mean_du_px": _fmt_debug_float(float(np.mean(residual[:, 0]))),
-        "pose_reproj_mean_dv_px": _fmt_debug_float(float(np.mean(residual[:, 1]))),
-        "pose_reproj_std_du_px": _fmt_debug_float(float(np.std(residual[:, 0]))),
-        "pose_reproj_std_dv_px": _fmt_debug_float(float(np.std(residual[:, 1]))),
-    }
-
-
-def _ensure_columns(columns: list[str], extra_columns: tuple[str, ...]) -> list[str]:
-    out = list(columns)
-    for column in extra_columns:
-        if column not in out:
-            out.append(column)
-    return out
-
-
-def replay_depth_filter_on_run(path: Path, output_path: Path | None = None) -> Path:
-    _ensure_src_on_path()
-    from tracking.hydramarker.config import TrackerConfig
-    from tracking.pose_filters import PoseDepthKalmanFilter
-
-    path = Path(path)
-    if output_path is None:
-        output_path = path.with_name(f"{path.stem}_depth_filter_replay.jsonl")
-
-    records: list[dict] = []
-    details_by_frame: dict[int, dict] = {}
-    K: np.ndarray | None = None
-    dist: np.ndarray | None = None
-
-    with path.open("r", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"Invalid JSONL at line {line_no}: {exc}") from exc
-
-            if record.get("type") == "run_start":
-                K, dist = _camera_from_run_start(record)
-            elif record.get("type") == "frame_detail":
-                frame = _to_int(record.get("frame"), default=-1)
-                if frame >= 0:
-                    details_by_frame[frame] = record
-            records.append(record)
-
-    if K is None or dist is None:
-        raise RuntimeError("No camera intrinsics found in run_start record.")
-
-    cfg = TrackerConfig()
-    depth_filter = PoseDepthKalmanFilter(
-        observation_std_mm=float(cfg.pose_depth_filter_observation_std_mm),
-        process_std_mm=float(cfg.pose_depth_filter_process_std_mm),
-        initial_velocity_std_mm=float(cfg.pose_depth_filter_initial_velocity_std_mm),
-        reprojection_guard_px=float(cfg.pose_depth_filter_reprojection_guard_px),
-        K=K,
-        dist_coeffs=dist,
-        innovation_guard_enabled=bool(cfg.pose_depth_filter_innovation_guard_enabled),
-        innovation_guard_window=int(cfg.pose_depth_filter_innovation_window),
-        innovation_guard_bias_threshold_mm=float(
-            cfg.pose_depth_filter_innovation_bias_threshold_mm
-        ),
-        innovation_guard_min_same_sign=int(cfg.pose_depth_filter_innovation_min_same_sign),
-        innovation_cusum_slack_mm=float(cfg.pose_depth_filter_innovation_cusum_slack_mm),
-        innovation_cusum_threshold_mm=float(cfg.pose_depth_filter_innovation_cusum_threshold_mm),
-        negative_delta_guard_enabled=bool(
-            cfg.pose_depth_filter_negative_delta_guard_enabled
-        ),
-        negative_delta_guard_min_z_span_mm=float(
-            cfg.pose_depth_filter_negative_delta_guard_min_z_span_mm
-        ),
-        negative_delta_guard_max_negative_delta_mm=float(
-            cfg.pose_depth_filter_negative_delta_guard_max_negative_delta_mm
-        ),
-        negative_delta_guard_hold_previous_z=bool(
-            cfg.pose_depth_filter_negative_delta_guard_hold_previous_z
-        ),
-        negative_delta_guard_hold_requires_innovation_bias=bool(
-            cfg.pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias
-        ),
-        negative_delta_guard_hold_min_negative_delta_mm=float(
-            cfg.pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm
-        ),
-        negative_delta_guard_max_hold_correction_mm=float(
-            cfg.pose_depth_filter_negative_delta_guard_max_hold_correction_mm
-        ),
-        negative_delta_guard_velocity_damping=float(
-            cfg.pose_depth_filter_negative_delta_guard_velocity_damping
-        ),
-    )
-    min_points = max(1, int(cfg.pose_depth_filter_min_points))
-
-    applied_count = 0
-    filtered_count = 0
-    skipped_count = 0
-    previous_filtered_tvec: np.ndarray | None = None
-    lost_frames = 0
-    max_lost_frames = int(getattr(cfg, "max_lost_frames", 8))
-
-    for record in records:
-        record_type = record.get("type")
-        if record_type == "run_start":
-            columns = list(record.get("columns") or [])
-            record["columns"] = _ensure_columns(columns, DEPTH_FILTER_COLUMNS)
-            config = dict(record.get("config") or {})
-            config.update(
-                {
-                    "pose_depth_filter_enabled": True,
-                    "pose_depth_filter_observation_std_mm": float(
-                        cfg.pose_depth_filter_observation_std_mm
-                    ),
-                    "pose_depth_filter_process_std_mm": float(
-                        cfg.pose_depth_filter_process_std_mm
-                    ),
-                    "pose_depth_filter_initial_velocity_std_mm": float(
-                        cfg.pose_depth_filter_initial_velocity_std_mm
-                    ),
-                    "pose_depth_filter_reprojection_guard_px": float(
-                        cfg.pose_depth_filter_reprojection_guard_px
-                    ),
-                    "pose_depth_filter_min_points": int(cfg.pose_depth_filter_min_points),
-                    "pose_depth_filter_innovation_guard_enabled": bool(
-                        cfg.pose_depth_filter_innovation_guard_enabled
-                    ),
-                    "pose_depth_filter_innovation_window": int(
-                        cfg.pose_depth_filter_innovation_window
-                    ),
-                    "pose_depth_filter_innovation_bias_threshold_mm": float(
-                        cfg.pose_depth_filter_innovation_bias_threshold_mm
-                    ),
-                    "pose_depth_filter_innovation_min_same_sign": int(
-                        cfg.pose_depth_filter_innovation_min_same_sign
-                    ),
-                    "pose_depth_filter_innovation_cusum_slack_mm": float(
-                        cfg.pose_depth_filter_innovation_cusum_slack_mm
-                    ),
-                    "pose_depth_filter_innovation_cusum_threshold_mm": float(
-                        cfg.pose_depth_filter_innovation_cusum_threshold_mm
-                    ),
-                    "pose_depth_filter_negative_delta_guard_enabled": bool(
-                        cfg.pose_depth_filter_negative_delta_guard_enabled
-                    ),
-                    "pose_depth_filter_negative_delta_guard_min_z_span_mm": float(
-                        cfg.pose_depth_filter_negative_delta_guard_min_z_span_mm
-                    ),
-                    "pose_depth_filter_negative_delta_guard_max_negative_delta_mm": float(
-                        cfg.pose_depth_filter_negative_delta_guard_max_negative_delta_mm
-                    ),
-                    "pose_depth_filter_negative_delta_guard_hold_previous_z": bool(
-                        cfg.pose_depth_filter_negative_delta_guard_hold_previous_z
-                    ),
-                    "pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias": bool(
-                        cfg.pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias
-                    ),
-                    "pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm": float(
-                        cfg.pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm
-                    ),
-                    "pose_depth_filter_negative_delta_guard_max_hold_correction_mm": float(
-                        cfg.pose_depth_filter_negative_delta_guard_max_hold_correction_mm
-                    ),
-                    "pose_depth_filter_negative_delta_guard_velocity_damping": float(
-                        cfg.pose_depth_filter_negative_delta_guard_velocity_damping
-                    ),
-                    "offline_depth_filter_replay": True,
-                }
-            )
-            record["config"] = config
-            continue
-
-        if record_type != "frame":
-            continue
-
-        data = record.get("data") or {}
-        if _to_int(data.get("success"), default=0) == 0:
-            lost_frames += 1
-            previous_filtered_tvec = None
-            if lost_frames > max_lost_frames:
-                depth_filter.reset()
-            continue
-        lost_frames = 0
-
-        frame = _to_int(data.get("frame"), default=-1)
-        pose = _pose_from_frame_data(data)
-        detail = details_by_frame.get(frame, {})
-        object_points, image_points = _points_from_frame_detail(detail)
-        if pose is None or len(object_points) < min_points:
-            skipped_count += 1
-            continue
-
-        rvec, tvec = pose
-        filtered = depth_filter.update(
-            rvec=rvec,
-            tvec=tvec,
-            object_points=object_points,
-            image_points=image_points,
-        )
-        filtered_count += 1
-        applied_count += int(bool(filtered.applied))
-
-        out_tvec = filtered.tvec.reshape(3, 1)
-        data["tvec_z_mm"] = _fmt_debug_float(float(out_tvec[2, 0]))
-        data["depth_filter_applied"] = int(bool(filtered.applied))
-        data["depth_filter_delta_z_mm"] = _fmt_debug_float(float(filtered.delta_z_mm))
-        data["depth_filter_raw_z_mm"] = _fmt_debug_float(float(filtered.raw_z_mm))
-        data["depth_filter_z_mm"] = _fmt_debug_float(float(filtered.filtered_z_mm))
-        data["depth_filter_reproj_excess_px"] = _fmt_debug_float(
-            float(filtered.reprojection_excess_px)
-        )
-        data["depth_filter_guard_alpha"] = _fmt_debug_float(float(filtered.guard_alpha), digits=6)
-        data["depth_filter_innovation_z_mm"] = _fmt_debug_float(float(filtered.innovation_z_mm))
-        data["depth_filter_innovation_mean_z_mm"] = _fmt_debug_float(
-            float(filtered.innovation_mean_z_mm)
-        )
-        data["depth_filter_innovation_cusum_pos_mm"] = _fmt_debug_float(
-            float(filtered.innovation_cusum_pos_mm)
-        )
-        data["depth_filter_innovation_cusum_neg_mm"] = _fmt_debug_float(
-            float(filtered.innovation_cusum_neg_mm)
-        )
-        data["depth_filter_innovation_bias_detected"] = int(
-            bool(filtered.innovation_bias_detected)
-        )
-        data["depth_filter_innovation_bias_direction"] = int(
-            filtered.innovation_bias_direction
-        )
-        data["depth_filter_innovation_bias_limited"] = int(
-            bool(filtered.innovation_bias_limited)
-        )
-        data["depth_filter_object_z_span_mm"] = _fmt_debug_float(
-            float(filtered.object_z_span_mm)
-        )
-        data["depth_filter_negative_delta_guard_limited"] = int(
-            bool(filtered.negative_delta_guard_limited)
-        )
-        data.update(
-            _reprojection_stats(
-                K=K,
-                dist=dist,
-                rvec=filtered.rvec,
-                tvec=out_tvec,
-                object_points=object_points,
-                image_points=image_points,
-            )
-        )
-
-        if previous_filtered_tvec is None:
-            data["pose_translation_delta_mm"] = ""
-        else:
-            delta = float(np.linalg.norm(out_tvec.reshape(3) - previous_filtered_tvec.reshape(3)))
-            data["pose_translation_delta_mm"] = _fmt_debug_float(delta)
-        previous_filtered_tvec = out_tvec.copy()
-
-    for record in records:
-        if record.get("type") == "run_summary":
-            summary = dict(record.get("summary") or {})
-            summary.update(
-                {
-                    "offline_depth_filter_replay": True,
-                    "depth_filter_replayed_frames": filtered_count,
-                    "depth_filter_applied_frames": applied_count,
-                    "depth_filter_skipped_frames": skipped_count,
-                }
-            )
-            record["summary"] = summary
-
-    with output_path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    print(
-        "[depth_filter_replay] "
-        f"frames={filtered_count}, applied={applied_count}, skipped={skipped_count}"
-    )
-    print(f"[depth_filter_replay] wrote -> {output_path.resolve()}")
-    return output_path
-
-
 def _make_pose_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
     import cv2
 
@@ -726,6 +337,7 @@ def _board_tvec_from_result(result, T_B_C: np.ndarray) -> np.ndarray | None:
 
 
 def table_calibration_record(table_pose: BoardPoseCalibration, run_id: str) -> dict:
+    calib_camera, calib_checkerboard = _load_calib_modules()
     quality = calib_checkerboard.pose_quality_dict(table_pose)
     normal = np.asarray(table_pose.normal_camera, dtype=np.float64).reshape(3)
     return {
@@ -900,13 +512,13 @@ def _draw_table_axes_near_result(
     cv2.putText(vis, "+Y", y_end, cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3, cv2.LINE_AA)
 
 
-def load_live_tracker_module():
+def load_live_tracker_runner():
     _ensure_src_on_path()
     try:
-        from tracking.hydramarker.tests import test_tracker_realsense as live
+        from tracking.hydramarker.debug import live_tracker_runner as live
     except Exception as exc:
         raise RuntimeError(
-            "Could not import the RealSense tracker test module. "
+            "Could not import the RealSense live tracker runner. "
             "Run this from the tracking project environment."
         ) from exc
 
@@ -914,18 +526,8 @@ def load_live_tracker_module():
     live.tracker_log.set_run_log_dir(
         script_path.parents[1] / "tests" / "hydramarker_tracker_runs"
     )
-    print(f"[debug_tracker_translation] live module -> {Path(live.__file__).resolve()}")
+    print(f"[debug_tracker_translation] live runner -> {Path(live.__file__).resolve()}")
     return live
-
-
-def create_color_only_realsense_pipeline(live):
-    rs = live.rs
-    pipe = rs.pipeline()
-    cfg = rs.config()
-    cfg.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
-    profile = pipe.start(cfg)
-    print("[debug_tracker_translation] RealSense running (color=1920x1080@30, no IMU)")
-    return pipe, profile
 
 
 def _apply_live_debug_options(
@@ -963,8 +565,8 @@ def run_live_tracker_translation(
     no_temporal_persistence: bool = False,
     decode_only: bool = False,
 ) -> list[Path]:
-    live = load_live_tracker_module()
-    live.create_realsense_pipeline = lambda: create_color_only_realsense_pipeline(live)
+    live = load_live_tracker_runner()
+    _calib_camera, calib_checkerboard = _load_calib_modules()
     tracker_log = live.tracker_log
     table_ref: dict[str, BoardPoseCalibration | None] = {"pose": None}
     origin_ref: dict[str, np.ndarray | None] = {"tvec": None}
@@ -1607,22 +1209,6 @@ def plot_existing_run(path: Path | None = None) -> Path | None:
 
 def main() -> None:
     args = sys.argv[1:]
-    if args and args[0] in (
-        "--offline-depth-filter",
-        "--depth-filter-replay",
-        "depth-filter-replay",
-    ):
-        if len(args) < 2:
-            raise RuntimeError(
-                "Missing JSONL path.\n"
-                "Usage: debug_tracker_translation.py --offline-depth-filter <run.jsonl> [output.jsonl]"
-            )
-        input_path = Path(args[1])
-        output_path = Path(args[2]) if len(args) > 2 else None
-        replay_path = replay_depth_filter_on_run(input_path, output_path)
-        plot_existing_run(replay_path)
-        return
-
     if args and args[0] in ("--plot", "plot"):
         path = Path(args[1]) if len(args) > 1 else None
         plot_existing_run(path)
