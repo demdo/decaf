@@ -1,3 +1,9 @@
+"""Static Lie-IRLS pose replay for HydraMarker observations.
+
+This offline experiment evaluates robust Lie-algebra pose refinement on stored
+tracker frames using a static prior model.
+"""
+
 from __future__ import annotations
 
 import csv

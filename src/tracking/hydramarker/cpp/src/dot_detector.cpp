@@ -1,3 +1,4 @@
+// Implements dot decoding, temporal smoothing, and cached-cell recovery.
 #include "dot_detector.hpp"
 
 #include <algorithm>
@@ -32,24 +33,20 @@ void DotDetector::reset_smoothing()
     for (auto& kv : temporal_states_) {
         TemporalCellState& state = kv.second;
 
-        // EMA-Score auf den aktuellen has_dot-Zustand zuruecksetzen:
-        // hat die Zelle einen Dot, setzen wir den Score auf commit_threshold,
-        // sonst auf revoke_threshold. Damit startet der EMA neu ohne
-        // dass der naechste raw_score gegen einen weit entfernten
-        // eingefroren Wert ankämpfen muss.
+        // Reset the EMA score to the current committed bit state. Dot cells
+        // restart at commit_threshold; empty cells restart at revoke_threshold,
+        // so the next raw score does not fight a stale distant value.
         if (state.has_dot) {
             state.ema_score = config_.commit_threshold;
         } else {
             state.ema_score = config_.revoke_threshold;
         }
 
-        // Commit/Revoke-Counter zuruecksetzen damit sofort
-        // re-committed werden kann.
+        // Clear counters so the cell can be committed again immediately.
         state.commit_count = 0;
         state.revoke_count = 0;
 
-        // initialized und has_dot bleiben erhalten —
-        // der Warmup-State geht nicht verloren.
+        // Keep initialized and has_dot; warmup state remains valid.
     }
 }
 

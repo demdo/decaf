@@ -1,3 +1,10 @@
+"""Planarity analysis for reconstructed HydraMarker marker geometry.
+
+This script inspects reconstructed 3D points, estimates plane quality, and
+reports deviations that help judge whether a marker model is suitable for
+tracking.
+"""
+
 from __future__ import annotations
 
 import json

@@ -1,3 +1,9 @@
+"""Record RealSense observations for HydraMarker model construction.
+
+The live recorder runs ``HydraTracker`` against a RealSense stream and writes
+the corner, pose, and camera metadata needed by the SfM model-building pipeline.
+"""
+
 from __future__ import annotations
 
 import json

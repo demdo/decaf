@@ -1,11 +1,14 @@
-"""
-Debug-Version des CheckerboardDetector-Tests.
+"""Interactive checkerboard detector diagnostic.
 
-Visualisierung:
-    - GRÜN:    Finale Corners
-    - MAGENTA: Cells exakt aus C++ cell.corner_uv
-    - BLAU:    Recovery/Debug-Corners
-    - GELB:    Recovery-Corners, die final nicht übernommen werden
+This script opens a RealSense stream, runs the C++ checkerboard detector, and
+visualizes final corners, recovery/debug corners, and per-cell geometry. It is
+intended for detector tuning and flicker analysis, not for automated CI runs.
+
+Visualization:
+    - GREEN:   Final corners
+    - MAGENTA: Cells copied exactly from C++ cell.corner_uv
+    - BLUE:    Recovery/debug corners
+    - YELLOW:  Recovery corners that are not part of the final result
 
 Controls:
     t       Toggle visualization mode
@@ -15,15 +18,15 @@ Controls:
     ESC     Exit
 
 Flicker log:
-    Eine CSV-Datei pro Logging-Session unter hydramarker_saved_frames/.
-    Jede Zeile = ein Corner in einem Frame.
-    Fehlende Corners (flackern) sind als Lücken in (frame x (i,j)) sichtbar.
-    Analyse-Tipp (pandas):
+    One CSV file is written per logging session under hydramarker_saved_frames/.
+    Each row is one corner in one frame.
+    Missing flickering corners appear as gaps in the frame x (i, j) table.
+    Pandas analysis sketch:
         df = pd.read_csv("flicker_*.csv")
-        # Pivot: Zeilen=frame, Spalten=(i,j), Wert=present (0/1)
+        # Pivot: rows=frame, columns=(i,j), value=present (0/1)
         pivot = df.pivot_table(index="frame", columns=["i","j"],
                                values="present", fill_value=0)
-        # Flicker: frame N fehlt, N-1 und N+1 vorhanden
+        # Flicker: frame N is missing while N-1 and N+1 are present.
         flickering = ((pivot == 0) &
                       (pivot.shift(1) == 1) &
                       (pivot.shift(-1) == 1))

@@ -1,3 +1,9 @@
+"""Replay HydraMarker logs against an ideal cylindrical geometry model.
+
+This analysis tool replaces or compares observed geometry with an idealized
+cylinder to separate model-shape error from detector and pose-estimation error.
+"""
+
 from __future__ import annotations
 
 import csv

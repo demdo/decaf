@@ -1,3 +1,10 @@
+"""Parameter sweep for motion-aware IRLS pose replay.
+
+The module runs a grid of robust refinement settings over logged observations
+and summarizes how those settings affect reprojection error and trajectory
+stability.
+"""
+
 from __future__ import annotations
 
 import csv

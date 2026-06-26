@@ -1,3 +1,9 @@
+"""Adaptive per-degree-of-freedom IRLS prior replay for tracker logs.
+
+This research script replays stored HydraMarker observations with robust
+per-axis priors to study whether targeted regularization reduces pose drift.
+"""
+
 from __future__ import annotations
 
 import argparse

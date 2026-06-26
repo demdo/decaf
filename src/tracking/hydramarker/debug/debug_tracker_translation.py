@@ -1,3 +1,16 @@
+"""Live and offline translation diagnostics for HydraMarker tracker logs.
+
+The live mode reuses ``live_tracker_runner`` to start a normal ``HydraTracker``
+session, captures a ChArUco table pose once at startup, and augments the JSONL
+run log with table-frame metadata.  The plotting mode reads existing tracker
+logs and visualizes relative translation components, pose outages, timing
+profiles, and table-frame drift.
+
+This module is a diagnostic layer only.  It does not instantiate detector,
+decoder, filter, or pose-solver internals directly; live tracking is still
+routed through ``HydraTracker`` and ``tracker_log``.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -741,7 +754,6 @@ def run_live_tracker_translation(
         on_space_key=on_space_key,
         on_log_open=on_log_open,
         on_log_close=on_log_close,
-        draw_extra_overlay=draw_extra_overlay,
         stop_after_log_close=False,
         quit_on_q=False,
         final_cleanup=final_cleanup,

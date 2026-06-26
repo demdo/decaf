@@ -1,3 +1,9 @@
+"""Visualization helpers for HydraMarker reconstruction and diagnostics.
+
+This module renders reconstructed points, camera poses, residual summaries, and
+quality overlays used when inspecting model-building results.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

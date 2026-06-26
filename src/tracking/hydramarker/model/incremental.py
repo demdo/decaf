@@ -1,3 +1,9 @@
+"""Incremental reconstruction routines for HydraMarker model building.
+
+The module extends an initial reconstruction with additional observations,
+maintaining track state and preparing data for bundle adjustment.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

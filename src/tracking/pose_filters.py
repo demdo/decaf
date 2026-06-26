@@ -1,4 +1,10 @@
-# overlay/tracking/pose_filters.py
+"""Kalman filters used by overlay and visualization tools.
+
+This module contains the generic 3D point, plane, and corner filters that are
+still used outside the HydraMarker C++ tracker path.  The HydraMarker-specific
+camera-Z depth filter was removed from Python; live tracking now obtains depth
+filter behavior exclusively from the native tracker engine.
+"""
 
 from __future__ import annotations
 

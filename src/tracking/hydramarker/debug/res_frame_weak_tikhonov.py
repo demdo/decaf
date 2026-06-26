@@ -1,3 +1,9 @@
+"""Frame-wise weak Tikhonov replay experiment for HydraMarker poses.
+
+The script re-solves logged observations with weak regularization terms and
+compares the resulting trajectory against the tracker output.
+"""
+
 from __future__ import annotations
 
 import argparse

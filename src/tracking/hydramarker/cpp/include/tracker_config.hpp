@@ -66,8 +66,13 @@ struct TrackerConfig {
     int checker_min_tracking_decode_cell_span = 3;
     int checker_refresh_interval_frames = 1;
     int checker_tracking_recovery_stable_interval_frames = 9;
+    int checker_tracking_recovery_zero_gain_backoff_after = 3;
+    int checker_tracking_recovery_zero_gain_backoff_max_factor = 16;
     bool checker_local_completion_skip_enabled = true;
     int checker_local_completion_probe_interval_frames = 6;
+    int checker_local_completion_zero_gain_backoff_after = 3;
+    int checker_local_completion_zero_gain_backoff_max_factor = 16;
+    int checker_local_completion_stale_predicted_frames = 18;
     int checker_max_undecodeable_tracking_frames = 12;
     int checker_min_fresh_correspondences_for_stable_tracking = 8;
     int checker_max_low_fresh_correspondence_frames = 12;

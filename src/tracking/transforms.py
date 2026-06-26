@@ -1,3 +1,11 @@
+"""Rigid-transform helpers shared by tracking, calibration, and overlay code.
+
+The functions here provide small, explicit conversions between OpenCV
+``rvec``/``tvec`` pose representations and 4x4 homogeneous transforms.  They do
+not depend on HydraMarker runtime state and are safe to use from calibration,
+offline analysis, and overlay workflows.
+"""
+
 from __future__ import annotations
 
 import cv2

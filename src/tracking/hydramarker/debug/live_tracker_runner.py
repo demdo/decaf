@@ -1,3 +1,17 @@
+"""Shared RealSense live runner for HydraMarker tracking.
+
+The runner owns the camera loop, window drawing, keyboard controls, and JSONL
+logging hooks used by the manual test entry point and translation-debug tool.
+Tracking itself is delegated to ``HydraTracker``; no detector or pose subsystem
+is instantiated directly in this module.
+
+The loop starts in an idle video-only state and uses a compact overlay: green
+pose corners, a one-line status bar, and a small pose-status light. Press ``s``
+to start or stop tracking, ``p`` to toggle the reprojection overlay, ``SPACE``
+to open or close a run log, ``r`` to reset the tracker, and ``q`` or ``ESC`` to
+exit depending on the caller configuration.
+"""
+
 from __future__ import annotations
 
 import os
@@ -26,10 +40,6 @@ from tracking.hydramarker.config import TrackerConfig
 from tracking.hydramarker.tracker import HydraTracker
 
 
-# ============================================================
-# RealSense Live Runner / Diagnostics
-# ============================================================
-
 DISTORTION_MODE_ENV = "HYDRAMARKER_DISTORTION_MODE"
 APP_IDLE = "IDLE"
 APP_ACQUIRE = "ACQUIRE"
@@ -43,7 +53,6 @@ PROVISIONAL_MIN_CORNERS = 6
 PROVISIONAL_STALE_TIMEOUT_FRAMES = 30
 PROVISIONAL_TOTAL_TIMEOUT_FRAMES = 180
 TRACKING_STALE_TO_IDLE_FRAMES = 45
-
 
 
 def _first_npz_array(npz: Any, names: tuple[str, ...]) -> np.ndarray | None:
@@ -260,10 +269,7 @@ def draw_pose_corners(vis: np.ndarray, result) -> None:
     for p in result.corners:
         u = int(round(p.uv[0]))
         v = int(round(p.uv[1]))
-        cv2.circle(vis, (u, v), 5, (0, 255, 0), -1, cv2.LINE_AA)
-        cv2.putText(vis, f"{p.global_row},{p.global_col}",
-                    (u + 5, v - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.circle(vis, (u, v), 4, (0, 255, 0), -1, cv2.LINE_8)
 
 
 def draw_reprojection(vis: np.ndarray, result, K, dist) -> None:
@@ -332,6 +338,62 @@ def draw_status(vis: np.ndarray, result, frame_idx: int, tracker: HydraTracker) 
              (25, 185), color=(0, 255, 255), scale=0.46)
 
 
+def draw_compact_status(
+    vis: np.ndarray,
+    result,
+    frame_idx: int,
+    *,
+    show_reprojection: bool = False,
+) -> None:
+    pose_ok = tracker_log.has_fresh_pose(result)
+    timings = getattr(result, "timings_ms", {}) or {}
+    pose_source = getattr(getattr(result, "pose_source", None), "value", "none")
+    mode = getattr(getattr(result, "mode", None), "value", "")
+    text = (
+        f"{frame_idx} | {mode} | src={pose_source} | "
+        f"pts={result.num_points} | "
+        f"{timings.get('tracker_total_ms', 0.0):.1f} ms"
+    )
+    if show_reprojection:
+        text += " | reproj"
+
+    cv2.rectangle(vis, (8, 8), (620, 34), (0, 0, 0), thickness=-1)
+    cv2.putText(
+        vis,
+        text,
+        (14, 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (230, 230, 230),
+        1,
+        cv2.LINE_8,
+    )
+
+    w = vis.shape[1]
+    recording = tracker_log.is_active()
+    rec_text = "REC" if recording else "SPACE REC"
+    rec_color = (0, 0, 255) if recording else (110, 110, 110)
+    rec_x0 = w - 158
+    rec_x1 = w - 48
+    cv2.rectangle(vis, (rec_x0, 8), (rec_x1, 34), (0, 0, 0), thickness=-1)
+    cv2.circle(vis, (rec_x0 + 13, 21), 5, rec_color, -1, cv2.LINE_8)
+    cv2.putText(
+        vis,
+        rec_text,
+        (rec_x0 + 25, 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (230, 230, 230) if recording else (170, 170, 170),
+        1,
+        cv2.LINE_8,
+    )
+
+    center = (w - 24, 22)
+    color = (0, 220, 0) if pose_ok else (0, 0, 255)
+    cv2.circle(vis, center, 9, (0, 0, 0), -1, cv2.LINE_8)
+    cv2.circle(vis, center, 6, color, -1, cv2.LINE_8)
+
+
 def draw_app_state(
     vis: np.ndarray,
     app_state: str,
@@ -354,11 +416,25 @@ def draw_app_state(
     put_text(vis, f"app={app_state} | {detail}", (25, 215), color=color, scale=0.50)
 
 
-def draw_debug(vis, result, K, dist, frame_idx, tracker) -> np.ndarray:
-    draw_detection_corners(vis, result)
+def draw_debug(
+    vis: np.ndarray,
+    result,
+    K,
+    dist,
+    frame_idx: int,
+    tracker: HydraTracker,
+    *,
+    show_reprojection: bool = False,
+) -> np.ndarray:
     draw_pose_corners(vis, result)
-    draw_reprojection(vis, result, K, dist)
-    draw_status(vis, result, frame_idx, tracker)
+    if show_reprojection:
+        draw_reprojection(vis, result, K, dist)
+    draw_compact_status(
+        vis,
+        result,
+        frame_idx,
+        show_reprojection=show_reprojection,
+    )
     return vis
 
 
@@ -515,6 +591,7 @@ def run_live_tracker(
         provisional_start_frame = 0
         last_candidate_frame = 0
         stale_pose_frames = 0
+        show_reprojection = False
 
         def enter_idle(
             reason: str,
@@ -623,18 +700,14 @@ def run_live_tracker(
             last_message = result.message
 
             draw_t0 = time.perf_counter()
-            vis = draw_debug(frame.copy(), result, K_rgb, dist_rgb, frame_idx, tracker)
-            active_frames_for_display = (
-                max(0, frame_idx - acquire_start_frame + 1)
-                if app_state in (APP_ACQUIRE, APP_PROVISIONAL)
-                and acquire_start_frame > 0
-                else 0
-            )
-            draw_app_state(
-                vis,
-                app_state,
-                active_frames_for_display,
-                stale_pose_frames,
+            vis = draw_debug(
+                frame,
+                result,
+                K_rgb,
+                dist_rgb,
+                frame_idx,
+                tracker,
+                show_reprojection=show_reprojection,
             )
             if draw_extra_overlay is not None:
                 try:
@@ -669,6 +742,12 @@ def run_live_tracker(
                     start_acquire(manual=True)
                 else:
                     enter_idle("manual stop")
+            if key == ord("p"):
+                show_reprojection = not show_reprojection
+                print(
+                    f"{console_prefix} reprojection overlay "
+                    f"{'ON' if show_reprojection else 'OFF'}"
+                )
             if key == ord(" "):
                 if on_space_key is not None and on_space_key(tracker, result, frame_idx):
                     continue

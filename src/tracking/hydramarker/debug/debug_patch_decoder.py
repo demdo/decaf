@@ -1,3 +1,10 @@
+"""Patch-decoder diagnostics for stored HydraMarker observations.
+
+This script loads marker field data and extracted patch observations, then runs
+the native decoder path to inspect decoded IDs, ambiguities, and sampling
+quality without launching a live tracking session.
+"""
+
 import sys
 from pathlib import Path
 

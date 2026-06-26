@@ -1,3 +1,9 @@
+"""Bundle-adjustment utilities for HydraMarker model refinement.
+
+The functions optimize camera poses and marker-point geometry from recorded
+observations, producing a more consistent model for tracking and export.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

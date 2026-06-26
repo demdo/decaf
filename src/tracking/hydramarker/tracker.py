@@ -1,4 +1,15 @@
-"""Thin Python facade for the C++ HydraMarker tracker engine."""
+"""Python facade for the native HydraMarker tracker engine.
+
+The tracker implementation lives in the pybind11 extension built from
+``hydramarker/cpp``.  This module is intentionally small: it locates the native
+extension, converts ``TrackerConfig`` into the matching C++ configuration
+object, and exposes ``HydraTracker`` as the Python-facing runtime wrapper.
+
+Python code should treat this file as the only loader for tracker runtime
+objects.  Detector, decoder, persistence, filtering, pose estimation, and hold
+logic all execute inside C++; Python only passes configuration in and converts
+the native frame result into lightweight Python data containers.
+"""
 
 from __future__ import annotations
 

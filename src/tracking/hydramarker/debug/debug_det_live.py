@@ -1,3 +1,10 @@
+"""Live detector-only diagnostics for HydraMarker checkerboard tracking.
+
+This script runs the camera loop without the full tracker engine so detector
+state, recovery behavior, and visible checkerboard corners can be inspected in
+isolation during development.
+"""
+
 from __future__ import annotations
 
 import sys

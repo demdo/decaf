@@ -1,3 +1,12 @@
+"""Pose-estimation utilities shared by overlay and calibration workflows.
+
+The functions in this module wrap OpenCV PnP variants, IPPE candidate handling,
+reprojection diagnostics, and transform construction for non-HydraMarker tracker
+callers.  HydraMarker live tracking no longer calls this Python module; its pose
+estimation runs in the C++ tracker engine.  Overlay and calibration tools keep
+using these helpers for explicit analysis, calibration, and visualization tasks.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

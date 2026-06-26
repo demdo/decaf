@@ -1,3 +1,10 @@
+"""Alignment helpers for HydraMarker SfM model construction.
+
+The functions in this module align reconstructed marker observations with
+metric marker geometry so downstream bundle adjustment and export steps can work
+in a consistent coordinate frame.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

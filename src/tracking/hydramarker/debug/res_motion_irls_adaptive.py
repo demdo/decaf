@@ -1,3 +1,9 @@
+"""Adaptive IRLS motion-prior replay for HydraMarker pose observations.
+
+The script evaluates robust iterative pose refinement with motion-dependent
+weights against logged tracker frames.
+"""
+
 from __future__ import annotations
 
 import csv

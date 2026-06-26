@@ -1,3 +1,9 @@
+"""Analyze XY-controlled Z hysteresis in HydraMarker tracker logs.
+
+The script compares trajectory direction, board-frame movement, and Z drift to
+identify hysteresis patterns that appear during repeated motion passes.
+"""
+
 from __future__ import annotations
 
 import csv

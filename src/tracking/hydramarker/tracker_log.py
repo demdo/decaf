@@ -1,4 +1,14 @@
-"""Structured JSONL logging and frame diagnostics for live HydraMarker tracking."""
+"""Structured JSONL logging for live HydraMarker tracking.
+
+This module records the small Python-facing result surface produced by the C++
+tracker engine: pose state, visible/correspondence corners, status text, timing
+profiles, and debug counters.  It does not own detection, decoding, pose
+solving, persistence, filtering, or recovery decisions.
+
+The logger writes one JSONL run file per live session.  Optional detail records
+can include per-corner and alternative-pose diagnostics, but raw input frames are
+not stored here; the live runner passes only tracker results and timing data.
+"""
 
 from __future__ import annotations
 

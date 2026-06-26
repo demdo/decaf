@@ -1,3 +1,9 @@
+"""Parameter sweep for static IRLS pose replay experiments.
+
+The script runs multiple static robust-refinement settings over logged
+HydraMarker observations and writes aggregate comparison tables.
+"""
+
 from __future__ import annotations
 
 import csv

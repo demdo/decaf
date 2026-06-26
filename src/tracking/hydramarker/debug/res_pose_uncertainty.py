@@ -1,3 +1,9 @@
+"""Estimate pose uncertainty from logged HydraMarker observations.
+
+The module reuses per-frame correspondences and residuals to approximate pose
+uncertainty, then reports diagnostic metrics for tracker confidence analysis.
+"""
+
 from __future__ import annotations
 
 import csv

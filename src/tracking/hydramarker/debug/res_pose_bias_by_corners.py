@@ -1,3 +1,9 @@
+"""Analyze pose bias as a function of visible HydraMarker corners.
+
+This offline diagnostic groups logged poses by corner coverage and studies how
+specific feature subsets correlate with translation and rotation bias.
+"""
+
 from __future__ import annotations
 
 import csv

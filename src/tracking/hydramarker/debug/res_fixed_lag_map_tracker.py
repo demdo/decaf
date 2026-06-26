@@ -1,3 +1,10 @@
+"""Fixed-lag map-tracking replay for HydraMarker observations.
+
+The module replays logged corner observations through a fixed-lag optimization
+experiment to evaluate whether local temporal smoothing improves pose
+consistency.
+"""
+
 from __future__ import annotations
 
 import argparse

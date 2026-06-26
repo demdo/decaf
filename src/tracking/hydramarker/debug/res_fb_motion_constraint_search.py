@@ -1,3 +1,10 @@
+"""Search forward/backward motion constraints for offline pose replay.
+
+This research script evaluates candidate motion constraints against stored
+tracker logs to study how trajectory priors influence pose stability and Z
+drift.
+"""
+
 from __future__ import annotations
 
 import csv

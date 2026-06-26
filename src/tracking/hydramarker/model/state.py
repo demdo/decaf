@@ -1,3 +1,9 @@
+"""State containers for HydraMarker model reconstruction.
+
+The classes in this module hold camera poses, marker points, tracks, and
+intermediate reconstruction metadata shared across model-building stages.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

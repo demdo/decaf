@@ -1,3 +1,9 @@
+"""Tests and manual checks for HydraMarker checkerboard calibration helpers.
+
+The module exercises calibration capture, pose-quality calculations, and log
+records used by the checkerboard and ChArUco calibration workflow.
+"""
+
 from __future__ import annotations
 
 import argparse

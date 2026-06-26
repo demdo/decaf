@@ -1,3 +1,9 @@
+"""Command-line orchestration for the HydraMarker SfM model pipeline.
+
+The pipeline loads recorded observations, bootstraps a model, runs incremental
+and bundle-adjustment stages, and writes diagnostics and tracker-ready exports.
+"""
+
 from __future__ import annotations
 
 from contextlib import redirect_stdout

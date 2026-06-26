@@ -1,3 +1,10 @@
+"""Image-modification sandbox for HydraMarker detector experiments.
+
+This utility applies controlled image transformations to saved frames and runs
+detector components against them, helping isolate sensitivity to blur,
+contrast, exposure, and other preprocessing choices.
+"""
+
 from pathlib import Path
 import sys
 

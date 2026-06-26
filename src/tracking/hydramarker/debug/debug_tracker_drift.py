@@ -1,3 +1,10 @@
+"""Offline drift diagnostics for HydraMarker JSONL tracker runs.
+
+The module reads structured tracker logs, reconstructs pose/corner series, and
+plots drift, pose outages, feature coverage, and reprojection behavior for
+post-run analysis.
+"""
+
 from __future__ import annotations
 
 import argparse

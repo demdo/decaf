@@ -1,3 +1,10 @@
+"""Live dot-detector diagnostics for HydraMarker patches.
+
+The script combines checkerboard detection with dot and patch extraction views
+so thresholding, cell sampling, and dot classification behavior can be tuned
+without running the full pose tracker.
+"""
+
 import sys
 from pathlib import Path
 

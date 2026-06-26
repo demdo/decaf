@@ -1,3 +1,9 @@
+"""Replay residual jitter across HydraMarker tracker observations.
+
+This script reconstructs residual series from JSONL detail records to inspect
+frame-to-frame reprojection noise and its relationship to pose stability.
+"""
+
 from __future__ import annotations
 
 import argparse

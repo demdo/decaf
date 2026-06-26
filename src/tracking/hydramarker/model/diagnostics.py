@@ -1,3 +1,9 @@
+"""Diagnostics for HydraMarker model-building outputs.
+
+This module computes summary statistics, residual metrics, and consistency
+checks that make reconstruction quality easier to inspect after SfM processing.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

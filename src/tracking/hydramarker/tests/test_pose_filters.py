@@ -1,3 +1,10 @@
+"""C++ tracker facade tests for pose filtering and result conversion.
+
+The tests verify that Python code reaches the native depth-filter, fast-path
+pose transaction, tracker-engine result conversion, and plateau-prior bindings
+without depending on retired Python tracker implementations.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

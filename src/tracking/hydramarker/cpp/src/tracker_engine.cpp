@@ -1882,10 +1882,20 @@ CheckerboardDetectorConfig TrackerEngine::makeCheckerboardConfig(
         config.checker_refresh_interval_frames;
     checker_config.tracking_recovery_stable_interval_frames =
         config.checker_tracking_recovery_stable_interval_frames;
+    checker_config.tracking_recovery_zero_gain_backoff_after =
+        config.checker_tracking_recovery_zero_gain_backoff_after;
+    checker_config.tracking_recovery_zero_gain_backoff_max_factor =
+        config.checker_tracking_recovery_zero_gain_backoff_max_factor;
     checker_config.tracking_local_completion_skip_enabled =
         config.checker_local_completion_skip_enabled;
     checker_config.tracking_local_completion_probe_interval_frames =
         config.checker_local_completion_probe_interval_frames;
+    checker_config.tracking_local_completion_zero_gain_backoff_after =
+        config.checker_local_completion_zero_gain_backoff_after;
+    checker_config.tracking_local_completion_zero_gain_backoff_max_factor =
+        config.checker_local_completion_zero_gain_backoff_max_factor;
+    checker_config.tracking_local_completion_stale_predicted_frames =
+        config.checker_local_completion_stale_predicted_frames;
     checker_config.min_tracking_decode_cell_span =
         config.checker_min_tracking_decode_cell_span;
     checker_config.max_undecodeable_tracking_frames =

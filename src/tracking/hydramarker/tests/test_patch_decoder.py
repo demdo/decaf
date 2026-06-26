@@ -1,3 +1,9 @@
+"""Manual patch-decoder diagnostics for HydraMarker field decoding.
+
+The script loads marker field data, extracts image patches, and inspects decoder
+decisions for ambiguity, confidence, and field-position recovery.
+"""
+
 import sys
 from pathlib import Path
 from datetime import datetime

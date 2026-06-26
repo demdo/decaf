@@ -1,3 +1,10 @@
+"""Inspect checkerboard cell geometry for a selected HydraMarker frame.
+
+The script loads project paths, runs the native checkerboard detector, and
+prints or visualizes the per-cell layout needed to diagnose lattice indexing and
+local corner geometry.
+"""
+
 import sys
 from pathlib import Path
 

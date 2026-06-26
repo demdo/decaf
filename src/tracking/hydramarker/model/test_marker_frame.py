@@ -1,3 +1,9 @@
+"""Manual validation helper for reconstructed HydraMarker marker frames.
+
+The script loads exported model data and performs simple geometric checks that
+confirm the marker coordinate frame is oriented and scaled as expected.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

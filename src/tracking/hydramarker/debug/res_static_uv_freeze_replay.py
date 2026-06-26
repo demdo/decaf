@@ -1,3 +1,9 @@
+"""Static UV-freeze replay experiment for HydraMarker tracker logs.
+
+The module freezes selected image observations across frames to study how much
+pose drift is driven by UV jitter versus geometry or solver behavior.
+"""
+
 from __future__ import annotations
 
 import csv

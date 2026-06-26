@@ -1,3 +1,10 @@
+"""Analyze image-space corner jitter in HydraMarker tracker logs.
+
+The script reads JSONL detail records, aggregates corner UV motion over time,
+and reports or plots per-corner stability metrics for detector and tracking
+noise analysis.
+"""
+
 from __future__ import annotations
 
 import argparse

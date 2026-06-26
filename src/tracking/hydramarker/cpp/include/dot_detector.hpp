@@ -1,3 +1,5 @@
+// Decodes per-cell dot presence from checkerboard detections and owns the
+// optional temporal smoothing and short-gap cell-value cache.
 #pragma once
 
 #include <array>
@@ -87,15 +89,12 @@ public:
         const CheckerboardDetection& checkerboard
     );
 
-    // Vollstaendiger Reset: loescht alle temporalen Zustaende.
-    // Wird bei komplettem Track-Loss verwendet.
+    // Full reset: clears all temporal detector state after complete track loss.
     void reset();
 
-    // Partieller Reset: setzt EMA-Scores und Commit/Revoke-Counter zurueck,
-    // behaelt aber has_dot und initialized.
-    // Dadurch re-committed der Detector schnell im naechsten Frame,
-    // ohne den Warmup-State zu verlieren.
-    // Wird bei kurzzeitigem Track-Loss (RECOVERING-Modus) verwendet.
+    // Partial reset: clears EMA scores and commit/revoke counters while keeping
+    // the last committed bit state and initialized flags. This lets the detector
+    // recommit quickly in the next frame without losing warmup state.
     void reset_smoothing();
 
 private:

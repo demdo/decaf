@@ -84,6 +84,11 @@ struct CheckerboardDetectorConfig {
     // still allowing immediate recovery for corner loss, bad geometry, or weak
     // decode topology. 0 disables the slower stable cadence.
     int tracking_recovery_stable_interval_frames = 9;
+    // Stable maintenance recovery is backed off after repeated probes that do
+    // not add durable persistent corners. Hard recovery reasons such as corner
+    // loss, weak topology, or degraded geometry bypass this backoff.
+    int tracking_recovery_zero_gain_backoff_after = 3;
+    int tracking_recovery_zero_gain_backoff_max_factor = 16;
 
     // Skip local corner completion when the persistent LK state has no
     // actionable missed/pending corners. Predicted/weak-only states are
@@ -91,6 +96,17 @@ struct CheckerboardDetectorConfig {
     // without paying the corner-completion cost every frame.
     bool tracking_local_completion_skip_enabled = false;
     int tracking_local_completion_probe_interval_frames = 6;
+    // Soft local-completion probes are backed off after repeated attempts
+    // that do not add accepted corners. Pending work, bad decode topology,
+    // corner loss, and degraded geometry bypass this backoff.
+    int tracking_local_completion_zero_gain_backoff_after = 3;
+    int tracking_local_completion_zero_gain_backoff_max_factor = 16;
+    // Predicted corners that survive this many consecutive frames without a
+    // real observation are removed from the persistent state. This prevents
+    // stable rim corners from repeatedly creating local-completion work while
+    // still giving short occlusions several probe intervals to recover.
+    // 0 disables this additional cap and keeps the legacy dynamic limits.
+    int tracking_local_completion_stale_predicted_frames = 18;
 
     // Fraction of previously tracked corners that must be lost before an
     // immediate mid-interval recovery refresh is triggered.

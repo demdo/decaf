@@ -1,3 +1,10 @@
+"""Print the active RealSense color-stream distortion parameters.
+
+This utility opens the camera once, reports the RealSense intrinsics and
+distortion model, and exits. It is intended for quick environment checks before
+running calibration or live tracking tools.
+"""
+
 import pyrealsense2 as rs
 
 

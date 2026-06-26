@@ -1,3 +1,9 @@
+"""Robust PnP replay experiments for HydraMarker JSONL runs.
+
+The module re-solves logged 2D/3D correspondences with alternative robust PnP
+strategies and compares the resulting poses against the original tracker output.
+"""
+
 from __future__ import annotations
 
 import csv

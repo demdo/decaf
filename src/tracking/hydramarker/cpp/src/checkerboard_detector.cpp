@@ -7,6 +7,7 @@
 #include <limits>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -576,6 +577,108 @@ CheckerboardDetector::lastTimingsMs() const {
     return last_timings_ms_;
 }
 
+int CheckerboardDetector::stableRefreshBackoffFactor() const {
+    const int backoff_after =
+        config_.tracking_recovery_zero_gain_backoff_after;
+    const int max_factor =
+        std::max(1, config_.tracking_recovery_zero_gain_backoff_max_factor);
+    if (backoff_after <= 0 ||
+        stable_refresh_zero_gain_count_ < backoff_after) {
+        return 1;
+    }
+
+    int factor = 1;
+    const int steps =
+        stable_refresh_zero_gain_count_ - backoff_after + 1;
+    for (int step = 0; step < steps && factor < max_factor; ++step) {
+        factor = std::min(max_factor, factor * 2);
+    }
+    return std::max(1, factor);
+}
+
+void CheckerboardDetector::resetStableRefreshBackoff() {
+    stable_refresh_zero_gain_count_ = 0;
+}
+
+void CheckerboardDetector::recordStableRefreshOutcome(
+    bool stable_maintenance_refresh,
+    bool durable_gain,
+    bool transient_gain
+) {
+    if (durable_gain) {
+        addTimingMs("refresh_durable_gain_count", 1.0);
+    } else if (transient_gain) {
+        addTimingMs("refresh_transient_gain_count", 1.0);
+    }
+
+    if (!stable_maintenance_refresh) {
+        return;
+    }
+
+    if (durable_gain) {
+        stable_refresh_zero_gain_count_ = 0;
+    } else {
+        ++stable_refresh_zero_gain_count_;
+        addTimingMs("refresh_zero_durable_gain_count", 1.0);
+    }
+
+    addTimingMs(
+        "refresh_zero_gain_streak",
+        static_cast<double>(stable_refresh_zero_gain_count_));
+}
+
+int CheckerboardDetector::localCompletionSoftBackoffFactor() const {
+    const int backoff_after =
+        config_.tracking_local_completion_zero_gain_backoff_after;
+    const int max_factor =
+        std::max(1, config_.tracking_local_completion_zero_gain_backoff_max_factor);
+    if (backoff_after <= 0 ||
+        local_completion_soft_zero_gain_count_ < backoff_after) {
+        return 1;
+    }
+
+    int factor = 1;
+    const int steps =
+        local_completion_soft_zero_gain_count_ - backoff_after + 1;
+    for (int step = 0; step < steps && factor < max_factor; ++step) {
+        factor = std::min(max_factor, factor * 2);
+    }
+    return std::max(1, factor);
+}
+
+void CheckerboardDetector::resetLocalCompletionSoftBackoff() {
+    local_completion_soft_zero_gain_count_ = 0;
+}
+
+void CheckerboardDetector::recordLocalCompletionSoftOutcome(
+    bool soft_probe,
+    int durable_completed,
+    int transient_completed
+) {
+    if (!soft_probe) {
+        return;
+    }
+
+    if (durable_completed > 0) {
+        local_completion_soft_zero_gain_count_ = 0;
+        addTimingMs(
+            "tracking_local_completion_soft_durable_gain_count",
+            1.0);
+    } else {
+        if (transient_completed > 0) {
+            addTimingMs(
+                "tracking_local_completion_soft_transient_gain_count",
+                1.0);
+        }
+        ++local_completion_soft_zero_gain_count_;
+        addTimingMs("tracking_local_completion_zero_gain_count", 1.0);
+    }
+
+    addTimingMs(
+        "tracking_local_completion_zero_gain_streak",
+        static_cast<double>(local_completion_soft_zero_gain_count_));
+}
+
 void CheckerboardDetector::resetTracking() {
     last_gray_.release();
     last_gray_pyramid_.clear();
@@ -594,6 +697,8 @@ void CheckerboardDetector::resetTracking() {
     held_output_frames_ = 0;
     roi_align_fail_frames_ = 0;
     roi_recovery_fail_frames_ = 0;
+    stable_refresh_zero_gain_count_ = 0;
+    local_completion_soft_zero_gain_count_ = 0;
 }
 
 bool CheckerboardDetector::isTracking() const {
@@ -676,27 +781,152 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     std::max(24, tracked_corner_count / 2) &&
                 persistent_predicted_count <
                     std::max(24, tracked_corner_count / 2);
-            const bool recovery_state_weak =
+            const bool structural_recovery_state_weak =
                 !tracked->stable ||
                 !tracked_decodeable ||
                 !tracked_dense_enough ||
-                !persistent_state_not_critical ||
+                !persistent_state_not_critical;
+            const bool roi_recovery_failure_state =
                 roi_align_fail_frames_ > 0 ||
                 roi_recovery_fail_frames_ > 0;
+            const bool recovery_state_weak =
+                structural_recovery_state_weak ||
+                roi_recovery_failure_state;
             const int stable_refresh_interval =
                 config_.tracking_recovery_stable_interval_frames;
-            const bool stable_refresh_due =
+            if (corner_loss ||
+                geometry_degraded ||
+                structural_recovery_state_weak) {
+                resetStableRefreshBackoff();
+            }
+            const int stable_refresh_backoff_factor =
+                stableRefreshBackoffFactor();
+            const int stable_refresh_backoff_level = [&]() {
+                int level = 0;
+                for (int factor = stable_refresh_backoff_factor; factor > 1;
+                     factor /= 2) {
+                    ++level;
+                }
+                return level;
+            }();
+            const int stable_refresh_effective_interval =
+                stable_refresh_interval <= 0
+                    ? stable_refresh_interval
+                    : std::max(1, stable_refresh_interval) *
+                          stable_refresh_backoff_factor;
+            const bool stable_refresh_base_due =
                 stable_refresh_interval <= 0 ||
                 (frame_index_ % std::max(1, stable_refresh_interval) == 0);
+            const bool stable_refresh_due =
+                stable_refresh_effective_interval <= 0 ||
+                (frame_index_ %
+                     std::max(1, stable_refresh_effective_interval) ==
+                 0);
             const bool refresh_due =
                 refresh_cadence_due &&
-                (recovery_state_weak || stable_refresh_due);
+                (structural_recovery_state_weak || stable_refresh_due);
+            const bool stable_refresh_backoff_skipped =
+                refresh_cadence_due &&
+                !structural_recovery_state_weak &&
+                !corner_loss &&
+                !geometry_degraded &&
+                stable_refresh_base_due &&
+                !stable_refresh_due;
+            if (stable_refresh_backoff_skipped) {
+                addTimingMs("refresh_backoff_skip_count", 1.0);
+                addTimingMs(
+                    "refresh_backoff_factor",
+                    static_cast<double>(stable_refresh_backoff_factor));
+                addTimingMs(
+                    "refresh_backoff_level",
+                    static_cast<double>(stable_refresh_backoff_level));
+            }
             if (refresh_cadence_due && !refresh_due) {
                 addTimingMs("refresh_recovery_stable_deferred_count", 1.0);
             }
 
             const bool do_refresh = refresh_due || corner_loss || geometry_degraded;
+            const bool stable_maintenance_refresh =
+                refresh_due &&
+                !structural_recovery_state_weak &&
+                !corner_loss &&
+                !geometry_degraded;
             if (do_refresh) {
+                addTimingMs("refresh_trigger_count", 1.0);
+                if (stable_maintenance_refresh) {
+                    addTimingMs("refresh_stable_maintenance_count", 1.0);
+                }
+                if (stable_refresh_backoff_factor > 1) {
+                    addTimingMs(
+                        "refresh_backoff_factor",
+                        static_cast<double>(stable_refresh_backoff_factor));
+                    addTimingMs(
+                        "refresh_backoff_level",
+                        static_cast<double>(stable_refresh_backoff_level));
+                    addTimingMs(
+                        "refresh_backoff_zero_gain_streak",
+                        static_cast<double>(
+                            stable_refresh_zero_gain_count_));
+                }
+                if (refresh_due) {
+                    addTimingMs("refresh_trigger_due_count", 1.0);
+                }
+                if (refresh_cadence_due) {
+                    addTimingMs("refresh_trigger_cadence_due_count", 1.0);
+                }
+                if (stable_refresh_due) {
+                    addTimingMs("refresh_trigger_stable_interval_due_count", 1.0);
+                }
+                if (recovery_state_weak) {
+                    addTimingMs("refresh_trigger_weak_state_count", 1.0);
+                }
+                if (structural_recovery_state_weak) {
+                    addTimingMs(
+                        "refresh_trigger_structural_weak_state_count",
+                        1.0);
+                }
+                if (roi_recovery_failure_state) {
+                    addTimingMs(
+                        "refresh_trigger_roi_failure_state_count",
+                        1.0);
+                }
+                if (corner_loss) {
+                    addTimingMs("refresh_trigger_corner_loss_count", 1.0);
+                }
+                if (geometry_degraded) {
+                    addTimingMs("refresh_trigger_geometry_degraded_count", 1.0);
+                }
+                if (!tracked->stable) {
+                    addTimingMs("refresh_weak_unstable_tracking_count", 1.0);
+                }
+                if (!tracked_decodeable) {
+                    addTimingMs("refresh_weak_undecodeable_span_count", 1.0);
+                }
+                if (!tracked_dense_enough) {
+                    addTimingMs("refresh_weak_sparse_cells_count", 1.0);
+                }
+                if (!persistent_state_not_critical) {
+                    addTimingMs("refresh_weak_persistent_state_count", 1.0);
+                }
+                if (roi_align_fail_frames_ > 0) {
+                    addTimingMs("refresh_weak_roi_align_fail_state_count", 1.0);
+                }
+                if (roi_recovery_fail_frames_ > 0) {
+                    addTimingMs("refresh_weak_roi_recovery_fail_state_count", 1.0);
+                }
+                addTimingMs(
+                    "refresh_pre_tracked_corner_count",
+                    static_cast<double>(tracked_corner_count));
+                addTimingMs(
+                    "refresh_pre_tracked_cell_count",
+                    static_cast<double>(tracked_cell_count));
+                addTimingMs(
+                    "refresh_pre_persistent_missed_count",
+                    static_cast<double>(persistent_missed_count));
+                addTimingMs(
+                    "refresh_pre_persistent_predicted_count",
+                    static_cast<double>(persistent_predicted_count));
+
                 const int roi_fail_retry_after_frames =
                     config_.tracking_recovery_roi_fail_full_retry_frames;
                 const bool allow_roi_fail_count_retry =
@@ -742,6 +972,13 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 }
 
                 if (recovered && recovered->valid()) {
+                    addTimingMs("refresh_recovered_valid_count", 1.0);
+                    addTimingMs(
+                        "refresh_recovered_corner_count",
+                        static_cast<double>(recovered->corners.size()));
+                    addTimingMs(
+                        "refresh_recovered_cell_count",
+                        static_cast<double>(recovered->cells.size()));
                     roi_recovery_fail_frames_ = 0;
                     const auto align_t0 = cv::getTickCount();
                     auto aligned = alignDetectionGridToReference(*recovered, *tracked);
@@ -818,6 +1055,10 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                             degraded_frames_count_ = 0;
                             roi_align_fail_frames_ = 0;
                             roi_recovery_fail_frames_ = 0;
+                            recordStableRefreshOutcome(
+                                stable_maintenance_refresh,
+                                true,
+                                false);
                             return last_detection_;
                         }
 
@@ -843,6 +1084,10 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                             degraded_frames_count_ = 0;
                             roi_align_fail_frames_ = 0;
                             roi_recovery_fail_frames_ = 0;
+                            recordStableRefreshOutcome(
+                                stable_maintenance_refresh,
+                                true,
+                                false);
                             return last_detection_;
                         }
 
@@ -946,6 +1191,7 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     } else {
                         recovered = std::move(aligned);
                         roi_align_fail_frames_ = 0;
+                        addTimingMs("refresh_align_success_count", 1.0);
                     }
                 } else {
                     roi_align_fail_frames_ = 0;
@@ -972,26 +1218,76 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                             config_.refresh_gain_threshold;
 
                     if (gain_trigger || isBetterThanTracked(*recovered, *tracked)) {
+                        if (gain_trigger) {
+                            addTimingMs("refresh_gain_trigger_count", 1.0);
+                        } else {
+                            addTimingMs("refresh_better_than_tracked_count", 1.0);
+                        }
+                        const int before_output_count =
+                            static_cast<int>(tracked->corners.size());
                         // Recovery is clearly better — full reset to fresh detection.
                         const auto update_t0 = cv::getTickCount();
                         updateTrackingState(gray, *recovered);
                         addTimingMs("update_tracking_state_ms", elapsedMs(update_t0));
+                        addTimingMs("refresh_reset_to_recovery_count", 1.0);
+                        addTimingMs(
+                            "refresh_output_corner_delta",
+                            static_cast<double>(
+                                static_cast<int>(last_detection_.corners.size()) -
+                                before_output_count));
+                        recordStableRefreshOutcome(
+                            stable_maintenance_refresh,
+                            true,
+                            false);
                         undecodeable_tracking_frames_ = 0;
                         return last_detection_;
                     }
 
                     // Inject new corners from recovery directly into persistent
                     // state — no lattice refit, no Grid-ID loss.
+                    const int before_persistent_count =
+                        static_cast<int>(persistent_corners_.size());
+                    const int before_output_count =
+                        static_cast<int>(tracked->corners.size());
                     const auto update_t0 = cv::getTickCount();
                     updateTrackingState(gray, *tracked, &(*recovered));
                     addTimingMs("update_tracking_state_ms", elapsedMs(update_t0));
+                    const int persistent_delta =
+                        static_cast<int>(persistent_corners_.size()) -
+                        before_persistent_count;
+                    const int output_delta =
+                        static_cast<int>(last_detection_.corners.size()) -
+                        before_output_count;
+                    addTimingMs(
+                        "refresh_persistent_corner_delta",
+                        static_cast<double>(persistent_delta));
+                    addTimingMs(
+                        "refresh_output_corner_delta",
+                        static_cast<double>(output_delta));
+                    const bool durable_refresh_gain = persistent_delta > 0;
+                    const bool transient_refresh_gain =
+                        !durable_refresh_gain && output_delta > 0;
+                    if (persistent_delta > 0 || output_delta > 0) {
+                        addTimingMs("refresh_corner_gain_count", 1.0);
+                    } else {
+                        addTimingMs("refresh_no_corner_gain_count", 1.0);
+                    }
                     if (!last_detection_.valid()) {
                         const auto update_recovered_t0 = cv::getTickCount();
                         updateTrackingState(gray, *recovered);
                         addTimingMs("update_tracking_state_ms", elapsedMs(update_recovered_t0));
+                        addTimingMs("refresh_fallback_to_recovered_count", 1.0);
+                        recordStableRefreshOutcome(
+                            stable_maintenance_refresh,
+                            true,
+                            false);
                         undecodeable_tracking_frames_ = 0;
                         return last_detection_;
                     }
+                    recordStableRefreshOutcome(
+                        stable_maintenance_refresh,
+                        durable_refresh_gain,
+                        transient_refresh_gain);
                     if (hasDecodeableCellSpan(
                             last_detection_,
                             config_.min_tracking_decode_cell_span)) {
@@ -1008,6 +1304,11 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 }
 
                 // Recovery found nothing.
+                addTimingMs("refresh_no_valid_recovery_count", 1.0);
+                recordStableRefreshOutcome(
+                    stable_maintenance_refresh,
+                    false,
+                    false);
                 if (geometry_degraded) {
                     ++degraded_frames_count_;
                     if (degraded_frames_count_ >=
@@ -1081,15 +1382,63 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 persistent_weak_count > 0;
             const int local_completion_probe_interval =
                 config_.tracking_local_completion_probe_interval_frames;
-            const bool local_completion_probe_due =
+            if (local_completion_has_hard_work ||
+                structural_recovery_state_weak) {
+                resetLocalCompletionSoftBackoff();
+            }
+            const int local_completion_soft_backoff_factor =
+                localCompletionSoftBackoffFactor();
+            const int local_completion_soft_backoff_level = [&]() {
+                int level = 0;
+                for (int factor = local_completion_soft_backoff_factor;
+                     factor > 1;
+                     factor /= 2) {
+                    ++level;
+                }
+                return level;
+            }();
+            const int local_completion_effective_probe_interval =
+                local_completion_probe_interval <= 0
+                    ? local_completion_probe_interval
+                    : std::max(1, local_completion_probe_interval) *
+                          local_completion_soft_backoff_factor;
+            const bool local_completion_base_probe_due =
                 local_completion_probe_interval <= 1 ||
-                (frame_index_ % local_completion_probe_interval == 0);
+                (frame_index_ %
+                     std::max(1, local_completion_probe_interval) ==
+                 0);
+            const bool local_completion_probe_due =
+                local_completion_effective_probe_interval <= 1 ||
+                (frame_index_ %
+                     std::max(1, local_completion_effective_probe_interval) ==
+                 0);
+            const bool local_completion_soft_backoff_skipped =
+                config_.tracking_local_completion_skip_enabled &&
+                last_detection_.valid() &&
+                !local_completion_has_hard_work &&
+                local_completion_has_soft_state &&
+                local_completion_base_probe_due &&
+                !local_completion_probe_due;
+            if (local_completion_soft_backoff_skipped) {
+                addTimingMs(
+                    "tracking_local_completion_backoff_skip_count",
+                    1.0);
+                addTimingMs(
+                    "tracking_local_completion_backoff_factor",
+                    static_cast<double>(
+                        local_completion_soft_backoff_factor));
+                addTimingMs(
+                    "tracking_local_completion_backoff_level",
+                    static_cast<double>(
+                        local_completion_soft_backoff_level));
+            }
             const bool skip_local_completion =
                 config_.tracking_local_completion_skip_enabled &&
                 last_detection_.valid() &&
                 !local_completion_has_hard_work &&
                 (!local_completion_has_soft_state ||
                  !local_completion_probe_due);
+            bool local_completion_soft_probe = false;
             if (skip_local_completion) {
                 if (local_completion_has_soft_state) {
                     addTimingMs(
@@ -1105,22 +1454,41 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     !local_completion_has_hard_work &&
                     local_completion_probe_due) {
                     if (local_completion_has_soft_state) {
+                        local_completion_soft_probe = true;
                         addTimingMs(
                             "tracking_local_completion_soft_probe_count",
                             1.0);
+                        if (local_completion_soft_backoff_factor > 1) {
+                            addTimingMs(
+                                "tracking_local_completion_backoff_factor",
+                                static_cast<double>(
+                                    local_completion_soft_backoff_factor));
+                            addTimingMs(
+                                "tracking_local_completion_backoff_level",
+                                static_cast<double>(
+                                    local_completion_soft_backoff_level));
+                            addTimingMs(
+                                "tracking_local_completion_backoff_zero_gain_streak",
+                                static_cast<double>(
+                                    local_completion_soft_zero_gain_count_));
+                        }
                     } else {
                         addTimingMs(
                             "tracking_local_completion_idle_probe_count",
                             1.0);
                     }
                 }
-                const int locally_completed =
+                const LocalCompletionResult local_completion =
                     tryCompleteMissingCorners(gray, true);
-                if (locally_completed > 0) {
+                if (local_completion.added > 0) {
                     addTimingMs(
                         "tracking_local_completion_added_count",
-                        static_cast<double>(locally_completed));
+                        static_cast<double>(local_completion.added));
                 }
+                recordLocalCompletionSoftOutcome(
+                    local_completion_soft_probe,
+                    local_completion.durable_added,
+                    local_completion.transient_added);
             }
             if (!last_detection_.valid()) {
                 const auto recovery_t0 = cv::getTickCount();
@@ -2582,12 +2950,16 @@ void CheckerboardDetector::updateTrackingState(
         }
     }
 
-    // Evict corners that have been missed too long.
+    // Evict corners that have been missed too long or have remained only
+    // predicted for too many frames.
+    std::vector<std::pair<int, int>> stale_predicted_grids;
     persistent_corners_.erase(
         std::remove_if(
             persistent_corners_.begin(),
             persistent_corners_.end(),
-            [this, &measured_detection](const PersistentTrackedCorner& pc) {
+            [this, &measured_detection, &stale_predicted_grids](
+                const PersistentTrackedCorner& pc
+            ) {
                 const bool established = pc.observed_frames >= 8;
                 const bool very_established = pc.observed_frames >= 20;
                 const bool confirmed = pc.observed_frames >= 3;
@@ -2607,7 +2979,7 @@ void CheckerboardDetector::updateTrackingState(
                     }
                     return config_.max_missed_frames;
                 }();
-                const int predicted_limit = [&]() {
+                int predicted_limit = [&]() {
                     if (very_established) {
                         return std::max(
                             config_.max_missed_frames,
@@ -2623,12 +2995,57 @@ void CheckerboardDetector::updateTrackingState(
                     }
                     return config_.max_missed_frames;
                 }();
-                return pc.missed_frames > missed_limit ||
-                       pc.predicted_frames > predicted_limit;
+                const int stale_predicted_limit =
+                    config_.tracking_local_completion_stale_predicted_frames;
+                if (stale_predicted_limit > 0) {
+                    predicted_limit = std::min(
+                        predicted_limit,
+                        std::max(config_.max_missed_frames,
+                                 stale_predicted_limit));
+                }
+
+                const bool stale_predicted =
+                    pc.predicted_frames > predicted_limit;
+                if (stale_predicted) {
+                    stale_predicted_grids.emplace_back(
+                        pc.corner.i,
+                        pc.corner.j);
+                }
+                return pc.missed_frames > missed_limit || stale_predicted;
             }
         ),
         persistent_corners_.end()
     );
+    if (!stale_predicted_grids.empty()) {
+        addTimingMs(
+            "tracking_stale_predicted_evict_count",
+            static_cast<double>(stale_predicted_grids.size()));
+
+        const auto staleGrid = [&stale_predicted_grids](int i, int j) {
+            return std::any_of(
+                stale_predicted_grids.begin(),
+                stale_predicted_grids.end(),
+                [i, j](const auto& grid) {
+                    return grid.first == i && grid.second == j;
+                });
+        };
+        const auto pending_before = pending_completion_corners_.size();
+        pending_completion_corners_.erase(
+            std::remove_if(
+                pending_completion_corners_.begin(),
+                pending_completion_corners_.end(),
+                [&staleGrid](const PendingCompletionCorner& p) {
+                    return staleGrid(p.i, p.j);
+                }),
+            pending_completion_corners_.end());
+        const auto pending_removed =
+            pending_before - pending_completion_corners_.size();
+        if (pending_removed > 0) {
+            addTimingMs(
+                "tracking_stale_predicted_pending_evict_count",
+                static_cast<double>(pending_removed));
+        }
+    }
 
     // Inject new corners from recovery into persistent state.
     // This is the main mechanism for picking up corners that became newly
@@ -3200,10 +3617,12 @@ void CheckerboardDetector::injectRecoveryCorners(
     }
 }
 
-int CheckerboardDetector::tryCompleteMissingCorners(
+CheckerboardDetector::LocalCompletionResult
+CheckerboardDetector::tryCompleteMissingCorners(
     const cv::Mat& gray,
     bool tracking
 ) {
+    LocalCompletionResult result;
     const auto attempt_t0 = cv::getTickCount();
     struct ScopedLocalCompletionTimer {
         const CheckerboardDetector* self;
@@ -3217,19 +3636,19 @@ int CheckerboardDetector::tryCompleteMissingCorners(
 
     if (!tracking || gray.empty() || !tracking_active_ ||
         !last_detection_.valid()) {
-        return 0;
+        return result;
     }
 
     const float spacing = estimateMedianSpacing(last_detection_);
-    if (spacing < 4.0f) return 0;
+    if (spacing < 4.0f) return result;
 
     const cv::Rect roi = trackingRecoveryRoi(
         last_detection_, gray.size(), config_);
-    if (roi.empty()) return 0;
+    if (roi.empty()) return result;
 
     const cv::Rect image_rect(0, 0, gray.cols, gray.rows);
     const cv::Rect active_roi = roi & image_rect;
-    if (active_roi.width <= 0 || active_roi.height <= 0) return 0;
+    if (active_roi.width <= 0 || active_roi.height <= 0) return result;
 
     const cv::Mat source = gray(active_roi);
     const cv::Point2f offset(
@@ -3326,7 +3745,7 @@ int CheckerboardDetector::tryCompleteMissingCorners(
         if (pc.smoothed_visibility_score < 0.05f) continue;
         active.push_back({pc.corner.i, pc.corner.j, pc.corner.uv, idx});
     }
-    if (active.size() < 2) return 0;
+    if (active.size() < 2) return result;
 
     auto hasActiveGrid = [&](int i, int j) {
         for (const auto& c : active) {
@@ -3802,7 +4221,7 @@ int CheckerboardDetector::tryCompleteMissingCorners(
     addTimingMs(
         "tracking_local_completion_proposal_count",
         static_cast<double>(proposals.size()));
-    if (proposals.empty()) return 0;
+    if (proposals.empty()) return result;
 
     std::sort(
         proposals.begin(), proposals.end(),
@@ -3881,7 +4300,7 @@ int CheckerboardDetector::tryCompleteMissingCorners(
     addTimingMs(
         "tracking_local_completion_candidate_count",
         static_cast<double>(candidates.size()));
-    if (candidates.empty()) return 0;
+    if (candidates.empty()) return result;
 
     std::vector<char> used = corrected_candidate_used;
     const float search_r = std::max(5.0f, spacing * 0.55f);
@@ -4323,7 +4742,21 @@ int CheckerboardDetector::tryCompleteMissingCorners(
         if (strong_measured_single_frame && it->hits == 1) {
             ++fast_accepted;
         }
+        const bool durable_completion =
+            has_measured_hit &&
+            (strong_measured_single_frame ||
+             (it->support >= 3 &&
+              it->hits >= 2 &&
+              it->error <= spacing * 0.42f) ||
+             (it->support >= 2 &&
+              it->hits >= 3 &&
+              it->error <= spacing * 0.35f));
         ++added;
+        if (durable_completion) {
+            ++result.durable_added;
+        } else {
+            ++result.transient_added;
+        }
         it = pending_completion_corners_.erase(it);
     }
 
@@ -4342,6 +4775,16 @@ int CheckerboardDetector::tryCompleteMissingCorners(
             "tracking_local_completion_fast_accept_count",
             static_cast<double>(fast_accepted));
     }
+    if (result.durable_added > 0) {
+        addTimingMs(
+            "tracking_local_completion_durable_added_count",
+            static_cast<double>(result.durable_added));
+    }
+    if (result.transient_added > 0) {
+        addTimingMs(
+            "tracking_local_completion_transient_added_count",
+            static_cast<double>(result.transient_added));
+    }
 
     if (added > 0 || corrected > 0 || saddle_snap_count > 0) {
         auto completed = buildDetectionFromPersistent(tracking, false);
@@ -4351,7 +4794,8 @@ int CheckerboardDetector::tryCompleteMissingCorners(
         }
     }
 
-    return added;
+    result.added = added;
+    return result;
 }
 
 

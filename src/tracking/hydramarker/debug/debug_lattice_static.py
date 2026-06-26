@@ -1,3 +1,9 @@
+"""Static-image lattice inspection for HydraMarker checkerboard detections.
+
+The script loads one image, runs the checkerboard detector, and exposes lattice
+fit diagnostics that are easier to inspect outside the live camera loop.
+"""
+
 from __future__ import annotations
 
 import sys

@@ -1,3 +1,9 @@
+"""Render reconstructed HydraMarker model geometry onto camera images.
+
+The script projects marker-frame points or axes into image space to visually
+validate calibration, geometry export, and tracker alignment.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime

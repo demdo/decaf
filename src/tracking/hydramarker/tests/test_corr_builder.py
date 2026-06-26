@@ -1,3 +1,9 @@
+"""Manual correspondence-builder diagnostics for HydraMarker components.
+
+The script drives checkerboard, patch decoding, and correspondence construction
+steps so their intermediate outputs can be inspected during development.
+"""
+
 from pathlib import Path
 from datetime import datetime
 import sys

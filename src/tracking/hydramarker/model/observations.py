@@ -1,3 +1,9 @@
+"""Observation data structures and loaders for HydraMarker model building.
+
+This module defines the recorded image/marker observations that feed bootstrap,
+incremental reconstruction, diagnostics, and bundle-adjustment stages.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

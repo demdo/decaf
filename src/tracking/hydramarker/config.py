@@ -1,4 +1,15 @@
-"""Central configuration surface for the C++ HydraMarker tracker engine."""
+"""Runtime configuration for the C++ HydraMarker tracker engine.
+
+This module is intentionally the only Python-side configuration surface for the
+live HydraMarker tracker.  The values below are copied into the native
+``TrackerConfig`` object in ``tracker.py`` and then consumed by the staged C++
+pipeline in ``cpp/src/tracker_engine.cpp`` and the related detector, decoder,
+pose, filter, persistence, and logging helpers.
+
+Changing these values does not require rebuilding C++.  A new ``HydraTracker``
+instance copies the current Python dataclass values into the native runtime at
+startup.
+"""
 
 from __future__ import annotations
 
@@ -7,33 +18,41 @@ from dataclasses import dataclass
 
 @dataclass
 class TrackerConfig:
-    """Runtime thresholds copied into C++ TrackerConfig by tracker.py."""
+    """Grouped runtime thresholds for the native tracking pipeline."""
 
-    # Engine allgemein
-    # Landet direkt in cpp/include/tracker_config.hpp::TrackerConfig.
-    # TrackerEngine nutzt diese Werte in cpp/src/tracker_engine.cpp fuer
-    # globalen Laufmodus, Verlustzaehler und Reset-Verhalten.
+    # Engine
+    # Copied directly into cpp/include/tracker_config.hpp::TrackerConfig.
+    # TrackerEngine uses these values for global mode selection, lost-frame
+    # accounting, and reset behavior in cpp/src/tracker_engine.cpp.
     max_lost_frames: int = 8
     decode_only_mode: bool = False
 
     # Checkerboard
-    # Wird in TrackerEngine::makeCheckerboardConfig in
-    # CheckerboardDetectorConfig kopiert und steuert LK-Tracking, Refresh und
-    # Recovery des sichtbaren Schachbrettgitters.
+    # Copied by TrackerEngine::makeCheckerboardConfig into
+    # CheckerboardDetectorConfig. These values control LK tracking, refresh
+    # cadence, and recovery for the visible checkerboard lattice.
     checker_min_tracking_decode_cell_span: int = 3
     checker_refresh_interval_frames: int = 1
     checker_tracking_recovery_stable_interval_frames: int = 9
+    checker_tracking_recovery_zero_gain_backoff_after: int = 3
+    checker_tracking_recovery_zero_gain_backoff_max_factor: int = 16
     checker_local_completion_skip_enabled: bool = True
     checker_local_completion_probe_interval_frames: int = 6
+    checker_local_completion_zero_gain_backoff_after: int = 3
+    checker_local_completion_zero_gain_backoff_max_factor: int = 16
+    # Caps old LK predictions after roughly three soft-probe intervals so
+    # static rim corners stop triggering repeated local-completion work.
+    # Set to 0 to keep the legacy dynamic predicted-corner lifetime.
+    checker_local_completion_stale_predicted_frames: int = 18
     checker_max_undecodeable_tracking_frames: int = 12
     checker_min_fresh_correspondences_for_stable_tracking: int = 8
     checker_max_low_fresh_correspondence_frames: int = 12
 
     # Dot/Patch/Decode
-    # Dot-Werte landen in TrackerEngine::makeDotDetectorConfig, Decoder-Werte
-    # in makePatchDecoderConfig, Korrespondenzwerte in
-    # makeCorrespondenceBuilderConfig. Zusammen bilden sie die frische
-    # Patch-Decoding-Pipeline vor Pose/PnP.
+    # Dot values are copied by TrackerEngine::makeDotDetectorConfig, decoder
+    # values by makePatchDecoderConfig, and correspondence values by
+    # makeCorrespondenceBuilderConfig. Together they form the fresh
+    # patch-decoding stage before pose estimation.
     dot_canonical_size: int = 80
     dot_canonical_margin_px: float = 4.0
     dot_min_dot_contrast: float = 8.0
@@ -62,9 +81,10 @@ class TrackerConfig:
     corr_min_rotation_support_ratio: float = 0.55
 
     # Pose/PnP
-    # Wird in TrackerEngine::makeMapPoseTrackerConfig nach
-    # MapPoseTrackerConfig uebersetzt. MapPoseTracker und die Fast-Path-Pose
-    # verwenden diese Grenzen fuer RANSAC, direkte Prior-Loesung und Gates.
+    # Translated by TrackerEngine::makeMapPoseTrackerConfig into
+    # MapPoseTrackerConfig. MapPoseTracker and the fast-path pose estimator use
+    # these thresholds for RANSAC, direct-prior solving, and motion/reprojection
+    # gates.
     min_points: int = 6
     min_inliers: int = 5
     max_mean_reprojection_error_px: float = 4.0
@@ -83,9 +103,9 @@ class TrackerConfig:
     pnp_direct_max_max_reprojection_error_px: float = 3.0
 
     # Depth Filter
-    # Aktiviert und parametriert den C++ Z-Filter. Die Unterwerte werden in
-    # TrackerEngine::makePoseDepthFilterConfig nach PoseDepthFilterConfig
-    # kopiert und in TrackerEngine::applyDepthFilterToPose genutzt.
+    # Enables and parameterizes the native camera-Z filter. Values are copied by
+    # TrackerEngine::makePoseDepthFilterConfig into PoseDepthFilterConfig and
+    # applied in TrackerEngine::applyDepthFilterToPose.
     pose_depth_filter_enabled: bool = True
     pose_depth_filter_observation_std_mm: float = 16.0
     pose_depth_filter_process_std_mm: float = 0.05
@@ -108,9 +128,9 @@ class TrackerConfig:
     pose_depth_filter_negative_delta_guard_velocity_damping: float = 0.25
 
     # Plateau Prior
-    # Landet in TrackerEngine::makePlateauPosePriorConfig und wird nur von
-    # TrackerEngine::maybeApplyPlateauPrior verwendet, wenn der Depth Filter
-    # eine geometrisch verdaechtige negative Z-Korrektur sieht.
+    # Copied by TrackerEngine::makePlateauPosePriorConfig and used only by
+    # TrackerEngine::maybeApplyPlateauPrior when the depth filter reports a
+    # geometry-suspicious negative Z correction.
     pose_plateau_prior_enabled: bool = True
     pose_plateau_prior_trigger_negative_delta_mm: float = 0.0
     pose_plateau_prior_min_object_z_span_mm: float = 14.835
@@ -127,10 +147,10 @@ class TrackerConfig:
     pose_plateau_prior_lm_damping: float = 1.0e-5
 
     # Persistence/Fast Path
-    # Wird von PersistentMatcher, TrackerGeometry und TrackerEngine in
-    # cpp/src/tracker_persistence.cpp, tracker_geometry.cpp und
-    # tracker_engine.cpp genutzt. Fachliche Schalter bleiben erhalten; reine
-    # Backend-Auswahlschalter gibt es hier nicht mehr.
+    # Used by PersistentMatcher, TrackerGeometry, and TrackerEngine in
+    # cpp/src/tracker_persistence.cpp, tracker_geometry.cpp, and
+    # tracker_engine.cpp. Domain-level feature switches remain here; backend
+    # selection switches are intentionally absent.
     enable_fast_persistent_path: bool = True
     fast_persistent_min_points: int = 10
     fast_persistent_refresh_mean_error_px: float = 1.5
@@ -183,8 +203,9 @@ class TrackerConfig:
     decode_update_min_distinct_cols: int = 3
 
     # Recovery/Hold
-    # Diese Werte steuern Pose-Propagation, Fallback-Pose und Hold-Pfade in
-    # tracker_engine.cpp, wenn Decode oder frische Korrespondenzen fehlen.
+    # Controls pose propagation, fallback pose generation, and hold paths in
+    # tracker_engine.cpp when fresh decode results or correspondences are
+    # missing.
     enable_pose_propagation: bool = True
     pose_propagation_max_reproj_px: float = 2.0
     pose_propagation_border_px: float = 8.0
@@ -198,10 +219,9 @@ class TrackerConfig:
     fallback_pose_max_mean_reprojection_error_px: float = 1.8
     fallback_pose_max_max_reprojection_error_px: float = 4.0
 
-    # Logging-Ausgabe
-    # Beeinflusst die Cornerliste, die TrackerEngine an Python zurueckgibt.
-    # tracker_log.py schreibt diese Werte nur noch weg; es trifft selbst keine
-    # Tracking-Entscheidung mehr.
+    # Logging Output
+    # Controls the corner list that TrackerEngine returns to Python.
+    # tracker_log.py records these values but does not make tracking decisions.
     visual_corner_max_reprojection_error_px: float = 3.0
     visual_corner_min_count: int = 6
 

@@ -1,3 +1,9 @@
+"""Bootstrap routines for building an initial HydraMarker 3D model.
+
+The module creates the first marker-state estimate from recorded observations
+before incremental reconstruction and bundle adjustment refine the geometry.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

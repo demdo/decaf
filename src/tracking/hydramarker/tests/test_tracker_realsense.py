@@ -1,3 +1,11 @@
+"""Manual RealSense entry point for the shared HydraMarker live tracker.
+
+This file intentionally contains no tracking logic.  It exists so the legacy
+manual command can still be launched from the tests directory while the actual
+camera loop, ``HydraTracker`` setup, and logging behavior live in
+``hydramarker.debug.live_tracker_runner``.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

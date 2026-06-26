@@ -1,3 +1,9 @@
+"""Fit and visualize motion-dependent pose bias models from tracker logs.
+
+The module reads logged HydraMarker runs, extracts motion and residual features,
+and estimates how pose bias changes with movement direction and speed.
+"""
+
 from __future__ import annotations
 
 import csv

@@ -100,6 +100,8 @@ private:
     int held_output_frames_ = 0;
     int roi_align_fail_frames_ = 0;
     int roi_recovery_fail_frames_ = 0;
+    int stable_refresh_zero_gain_count_ = 0;
+    int local_completion_soft_zero_gain_count_ = 0;
 
     cv::Mat last_gray_;
     CheckerboardDetection last_detection_;
@@ -184,9 +186,15 @@ private:
         float spacing
     );
 
+    struct LocalCompletionResult {
+        int added = 0;
+        int durable_added = 0;
+        int transient_added = 0;
+    };
+
     // Searches for missing grid corners by interpolating expected positions
     // from known neighbours and looking for raw candidates nearby.
-    int tryCompleteMissingCorners(
+    LocalCompletionResult tryCompleteMissingCorners(
         const cv::Mat& gray,
         bool tracking
     );
@@ -239,6 +247,20 @@ private:
 
     mutable std::unordered_map<std::string, double> last_timings_ms_;
 
+    int stableRefreshBackoffFactor() const;
+    void resetStableRefreshBackoff();
+    void recordStableRefreshOutcome(
+        bool stable_maintenance_refresh,
+        bool durable_gain,
+        bool transient_gain
+    );
+    int localCompletionSoftBackoffFactor() const;
+    void resetLocalCompletionSoftBackoff();
+    void recordLocalCompletionSoftOutcome(
+        bool soft_probe,
+        int durable_completed,
+        int transient_completed
+    );
     void clearTimings() const;
 };
 

@@ -1,3 +1,9 @@
+"""Export reconstructed HydraMarker geometry into tracker-ready map files.
+
+The script converts model-building outputs into the JSON geometry format used
+by the runtime tracker and related visualization tools.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
