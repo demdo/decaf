@@ -632,22 +632,29 @@ class PoseEstimationMixin:
             image_points=image_points,
         )
 
-        pose.rvec = filtered.rvec.copy()
-        pose.tvec = filtered.tvec.copy()
-        pose.T_marker_camera = filtered.T_marker_camera.copy()
+        filtered_rvec = np.asarray(filtered.rvec, dtype=np.float64).reshape(3, 1)
+        filtered_tvec = np.asarray(filtered.tvec, dtype=np.float64).reshape(3, 1)
+        filtered_T = np.asarray(
+            filtered.T_marker_camera,
+            dtype=np.float64,
+        ).reshape(4, 4)
+
+        pose.rvec = filtered_rvec.copy()
+        pose.tvec = filtered_tvec.copy()
+        pose.T_marker_camera = filtered_T.copy()
         errors = self._reprojection_errors_for_pose(
             object_points,
             image_points,
-            filtered.rvec,
-            filtered.tvec,
+            filtered_rvec,
+            filtered_tvec,
         )
         if errors is not None and len(errors):
             pose.reprojection_mean_px = float(np.mean(errors))
             pose.reprojection_max_px = float(np.max(errors))
 
-        self.pose_tracker.rvec = filtered.rvec.copy()
-        self.pose_tracker.tvec = filtered.tvec.copy()
-        self.pose_tracker.T_marker_camera = filtered.T_marker_camera.copy()
+        self.pose_tracker.rvec = filtered_rvec.copy()
+        self.pose_tracker.tvec = filtered_tvec.copy()
+        self.pose_tracker.T_marker_camera = filtered_T.copy()
         return filtered
 
     @staticmethod
@@ -871,6 +878,11 @@ class PoseEstimationMixin:
         previous_depth_filter_state: Optional[tuple] = None,
         previous_last_rvec: Optional[np.ndarray] = None,
         previous_last_tvec: Optional[np.ndarray] = None,
+        precomputed_visual_corners: Optional[List[TrackerCorner]] = None,
+        precomputed_visual_is_final: bool = False,
+        precomputed_depth_filter: Optional[object] = None,
+        precomputed_depth_pose: Optional[MapPoseResult] = None,
+        precomputed_accept_state: Optional[object] = None,
     ) -> TrackerResult:
         """Run pose estimation, validate fallback poses, and update accepted state."""
         pose_timings: dict[str, float] = {}
@@ -1018,9 +1030,28 @@ class PoseEstimationMixin:
         stage_t0 = time.perf_counter()
         raw_pose = self._clone_map_pose_result(pose)
         mark_pose_timing("pose_clone_map_result_ms", stage_t0)
-        stage_t0 = time.perf_counter()
-        filtered_depth = self._apply_depth_filter_to_pose(pose, track_points)
-        mark_pose_timing("pose_depth_filter_pre_ms", stage_t0)
+
+        use_precomputed_depth = (
+            precomputed_depth_filter is not None
+            and precomputed_depth_pose is not None
+            and bool(getattr(precomputed_depth_pose, "success", False))
+            and precomputed_depth_pose.rvec is not None
+            and precomputed_depth_pose.tvec is not None
+            and precomputed_depth_pose.T_marker_camera is not None
+        )
+        if use_precomputed_depth:
+            pose = precomputed_depth_pose
+            filtered_depth = precomputed_depth_filter
+            self.pose_tracker.rvec = pose.rvec.copy()
+            self.pose_tracker.tvec = pose.tvec.copy()
+            self.pose_tracker.T_marker_camera = pose.T_marker_camera.copy()
+            pose_timings["pose_depth_filter_pre_ms"] = 0.0
+            pose_timings["pose_depth_filter_cpp_precomputed_count"] = 1.0
+        else:
+            stage_t0 = time.perf_counter()
+            filtered_depth = self._apply_depth_filter_to_pose(pose, track_points)
+            mark_pose_timing("pose_depth_filter_pre_ms", stage_t0)
+            pose_timings["pose_depth_filter_cpp_precomputed_count"] = 0.0
 
         plateau_prior_t0 = time.perf_counter()
         prior_pose, plateau_prior, plateau_triggered, plateau_applied = (
@@ -1052,11 +1083,25 @@ class PoseEstimationMixin:
             mark_pose_timing("pose_inlier_corners_prior_ms", stage_t0)
 
         stage_t0 = time.perf_counter()
-        visual_corners = self._visual_corners_from_pose(
-            inlier_corners,
-            pose.rvec,
-            pose.tvec,
+        use_precomputed_visual = (
+            precomputed_visual_corners is not None
+            and prior_pose is None
+            and (
+                bool(precomputed_visual_is_final)
+                or filtered_depth is None
+                or not bool(getattr(filtered_depth, "applied", False))
+            )
         )
+        if use_precomputed_visual:
+            visual_corners = list(precomputed_visual_corners)
+            pose_timings["pose_visual_corners_cpp_precomputed_count"] = 1.0
+        else:
+            visual_corners = self._visual_corners_from_pose(
+                inlier_corners,
+                pose.rvec,
+                pose.tvec,
+            )
+            pose_timings["pose_visual_corners_cpp_precomputed_count"] = 0.0
         mark_pose_timing("pose_visual_corners_ms", stage_t0)
         visual_note = ""
         if len(visual_corners) != len(inlier_corners):
@@ -1112,22 +1157,77 @@ class PoseEstimationMixin:
         )
 
         stage_t0 = time.perf_counter()
-        # Max-pts und Reprojektionsfehler nur fuer verlaessliche Posen aktualisieren.
-        if reliable_pose:
-            if pose.num_inliers > self._max_pts_seen:
-                self._max_pts_seen = pose.num_inliers
-            if pose.reprojection_mean_px >= 0.0:
-                self._last_good_reproj_px = pose.reprojection_mean_px
-            if pose.rvec is not None:
-                self._last_accepted_rvec = np.asarray(pose.rvec, dtype=np.float64).reshape(3, 1)
-            if pose.tvec is not None:
-                self._last_accepted_tvec = np.asarray(pose.tvec, dtype=np.float64).reshape(3, 1)
-            if pose.T_marker_camera is not None:
-                self._last_accepted_T_marker_camera = np.asarray(
-                    pose.T_marker_camera,
+        use_precomputed_accept = (
+            precomputed_accept_state is not None
+            and prior_pose is None
+            and bool(getattr(precomputed_accept_state, "evaluated", False))
+        )
+        if use_precomputed_accept:
+            reliable_pose = bool(
+                getattr(precomputed_accept_state, "reliable_pose", False)
+            )
+            if reliable_pose:
+                self._max_pts_seen = int(
+                    getattr(
+                        precomputed_accept_state,
+                        "max_pts_seen",
+                        self._max_pts_seen,
+                    )
+                )
+                last_good = float(
+                    getattr(
+                        precomputed_accept_state,
+                        "last_good_reproj_px",
+                        self._last_good_reproj_px,
+                    )
+                )
+                if last_good >= 0.0:
+                    self._last_good_reproj_px = last_good
+
+                rvec_state = np.asarray(
+                    getattr(precomputed_accept_state, "rvec", []),
                     dtype=np.float64,
-                ).copy()
-            self._last_accepted_pose_frame = self.frame_index
+                )
+                tvec_state = np.asarray(
+                    getattr(precomputed_accept_state, "tvec", []),
+                    dtype=np.float64,
+                )
+                T_state = np.asarray(
+                    getattr(precomputed_accept_state, "T_marker_camera", []),
+                    dtype=np.float64,
+                )
+                if rvec_state.size == 3:
+                    self._last_accepted_rvec = rvec_state.reshape(3, 1).copy()
+                if tvec_state.size == 3:
+                    self._last_accepted_tvec = tvec_state.reshape(3, 1).copy()
+                if T_state.size == 16:
+                    self._last_accepted_T_marker_camera = T_state.reshape(4, 4).copy()
+                self._last_accepted_pose_frame = int(
+                    getattr(
+                        precomputed_accept_state,
+                        "accepted_pose_frame",
+                        self.frame_index,
+                    )
+                )
+            pose_timings["pose_accept_state_cpp_precomputed_count"] = 1.0
+        else:
+            # Max-pts und Reprojektionsfehler nur fuer verlaessliche Posen aktualisieren.
+            if reliable_pose:
+                if pose.num_inliers > self._max_pts_seen:
+                    self._max_pts_seen = pose.num_inliers
+                if pose.reprojection_mean_px >= 0.0:
+                    self._last_good_reproj_px = pose.reprojection_mean_px
+                if pose.rvec is not None:
+                    self._last_accepted_rvec = np.asarray(pose.rvec, dtype=np.float64).reshape(3, 1)
+                if pose.tvec is not None:
+                    self._last_accepted_tvec = np.asarray(pose.tvec, dtype=np.float64).reshape(3, 1)
+                if pose.T_marker_camera is not None:
+                    self._last_accepted_T_marker_camera = np.asarray(
+                        pose.T_marker_camera,
+                        dtype=np.float64,
+                    ).copy()
+                self._last_accepted_pose_frame = self.frame_index
+            pose_timings["pose_accept_state_cpp_precomputed_count"] = 0.0
         mark_pose_timing("pose_accept_state_update_ms", stage_t0)
 
         confidence = self._confidence(

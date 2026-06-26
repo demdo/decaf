@@ -44,12 +44,31 @@ class PersistenceMixin:
             )
         )
 
+    def _cpp_fast_pose_transaction_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self.config,
+                "cpp_fast_pose_transaction_enabled",
+                True,
+            )
+        )
+
+    def _cpp_depth_filter_for_fast_pose(self):
+        if not bool(getattr(self.config, "pose_depth_filter_enabled", False)):
+            return None
+
+        depth_filter = getattr(self, "pose_depth_filter", None)
+        if type(depth_filter).__module__ != "hydramarker_cpp":
+            return None
+        return depth_filter
+
     def _cpp_persistent_matcher_config_signature(self) -> Tuple[object, ...]:
         names = (
             "min_points",
             "min_inliers",
             "persistence_min_points",
             "persistence_max_frames",
+            "fast_persistent_refresh_mean_error_px",
             "persistence_use_pose_projection",
             "persistence_projection_max_reproj_px",
             "persistence_projection_adaptive_match_enabled",
@@ -74,6 +93,42 @@ class PersistenceMixin:
             "pnp_direct_refine_method",
             "pnp_direct_max_mean_reprojection_error_px",
             "pnp_direct_max_max_reprojection_error_px",
+            "persistence_max_translation_jump_mm",
+            "persistence_max_rotation_jump_deg",
+            "fallback_pose_min_detection_matches",
+            "fallback_pose_max_median_corner_error_px",
+            "fallback_pose_max_p90_corner_error_px",
+            "fallback_pose_max_mean_reprojection_error_px",
+            "fallback_pose_max_max_reprojection_error_px",
+            "fast_persistent_dense_refine_enabled",
+            "fast_persistent_dense_min_points",
+            "fast_persistent_dense_match_max_px",
+            "fast_persistent_dense_min_second_best_margin_px",
+            "fast_persistent_dense_max_median_px",
+            "fast_persistent_dense_max_p90_px",
+            "fast_persistent_dense_rescue_enabled",
+            "fast_persistent_dense_rescue_min_green_ratio",
+            "fast_persistent_dense_rescue_min_seed_median_px",
+            "fast_persistent_dense_min_image_coverage",
+            "fast_persistent_dense_min_object_span_mm",
+            "fast_persistent_dense_min_distinct_rows",
+            "fast_persistent_dense_min_distinct_cols",
+            "fast_persistent_dense_pose_solver",
+            "fast_persistent_dense_robust_refine_method",
+            "fast_persistent_dense_robust_trim_enabled",
+            "fast_persistent_dense_robust_trim_quantile",
+            "fast_persistent_dense_robust_min_keep_ratio",
+            "fast_persistent_dense_robust_max_mean_px",
+            "fast_persistent_dense_robust_max_max_px",
+            "fast_persistent_dense_adaptive_refine_enabled",
+            "fast_persistent_dense_adaptive_min_match_ratio",
+            "fast_persistent_dense_adaptive_motion_px",
+            "fast_persistent_dense_adaptive_max_seed_mean_px",
+            "fast_persistent_dense_adaptive_max_seed_max_px",
+            "visual_corner_min_count",
+            "visual_corner_max_reprojection_error_px",
+            "decode_only_mode",
+            "enable_temporal_correspondence_persistence",
         )
         return tuple(getattr(self.config, name, None) for name in names)
 
@@ -185,6 +240,60 @@ class PersistenceMixin:
             )
             for corner in corners
         ]
+
+    @staticmethod
+    def _global_corner_identities_from_cpp(
+        identities,
+    ) -> List[GlobalCornerIdentity]:
+        return [
+            GlobalCornerIdentity(
+                global_row=int(identity.global_row),
+                global_col=int(identity.global_col),
+                xyz_mm=tuple(float(v) for v in identity.xyz_mm),
+                uv=tuple(float(v) for v in identity.uv),
+                votes=int(getattr(identity, "votes", 0)),
+            )
+            for identity in identities
+        ]
+
+    def _commit_cpp_persistent_refresh(self, fast_result) -> bool:
+        """Commit C++-computed fast-path persistence identities."""
+        if not bool(
+            getattr(fast_result, "persistence_refresh_available", False)
+        ):
+            return False
+
+        cpp_identities = list(
+            getattr(fast_result, "persistence_refresh_identities", [])
+        )
+        identities = self._global_corner_identities_from_cpp(cpp_identities)
+        if len(identities) < int(self.config.persistence_min_points):
+            return False
+
+        default_frame_index = int(getattr(self, "frame_index", -1))
+        frame_index = int(
+            getattr(
+                fast_result,
+                "persistence_refresh_frame",
+                default_frame_index,
+            )
+        )
+        if frame_index < 0:
+            return False
+
+        matcher = getattr(self, "_cpp_persistent_matcher", None)
+        if matcher is None:
+            return False
+
+        try:
+            matcher.replace_identities(cpp_identities, frame_index)
+        except Exception:
+            self._cpp_persistent_matcher_unavailable = True
+            return False
+
+        self._identity_store.replace(identities)
+        self._persistent_frame_index = frame_index
+        return True
 
     @staticmethod
     def _cpp_pose_vector_to_array(
@@ -301,6 +410,46 @@ class PersistenceMixin:
             float(getattr(result, "pose_ms", 0.0)),
             float(getattr(result, "total_ms", 0.0)),
         )
+
+    def _fast_pose_transaction_cpp(self, detection):
+        """Run the persistent fast-pose transaction in C++ when enabled."""
+        if not self._cpp_fast_pose_transaction_enabled():
+            return None
+
+        matcher = self._ensure_cpp_persistent_matcher()
+        if matcher is None:
+            return None
+
+        depth_filter = self._cpp_depth_filter_for_fast_pose()
+        prev_depth_filter_state = (
+            None if depth_filter is None else depth_filter.snapshot()
+        )
+        try:
+            result = matcher.estimate_fast_pose(
+                detection,
+                self.geometry,
+                int(self.frame_index),
+                self.K,
+                self.dist_coeffs,
+                None if self.pose_tracker.rvec is None else self.pose_tracker.rvec,
+                None if self.pose_tracker.tvec is None else self.pose_tracker.tvec,
+                float(self._last_good_reproj_px),
+                None if self._last_accepted_rvec is None else self._last_accepted_rvec,
+                None if self._last_accepted_tvec is None else self._last_accepted_tvec,
+                int(self.lost_frames),
+                depth_filter,
+                int(getattr(self, "_max_pts_seen", 0)),
+            )
+        except Exception:
+            if prev_depth_filter_state is not None:
+                depth_filter.restore(prev_depth_filter_state)
+            return None
+
+        self._last_persistent_match_stats = self._persistent_match_stats_from_cpp(
+            result.stats
+        )
+        self._last_persistent_match_backend = "cpp_fast_pose"
+        return result, prev_depth_filter_state
 
     def _persistent_detection_motion_px(self, current_uvs: np.ndarray) -> float:
         """Estimate robust image motion between consecutive checker detections."""
@@ -803,6 +952,289 @@ class FastPathMixin:
 
         return False, "clean_seed", metrics
 
+    def _finish_fast_pose_transaction_cpp(
+        self,
+        detection,
+        fast_transaction,
+        fast_timings: Dict[str, float],
+    ) -> Optional[TrackerResult]:
+        """Package the C++ fast-pose transaction through the normal Python result path."""
+        fast_result, cpp_depth_filter_prev_state = fast_transaction
+        points = self._pose_track_points_from_cpp(
+            getattr(fast_result, "points", [])
+        )
+        corners = self._tracker_corners_from_cpp(
+            getattr(fast_result, "corners", [])
+        )
+        visual_corners = self._tracker_corners_from_cpp(
+            getattr(fast_result, "visual_corners", [])
+        )
+        pose = self._map_pose_result_from_cpp(fast_result.pose)
+        seed_pose = self._map_pose_result_from_cpp(fast_result.seed_pose)
+        depth_filter_result = None
+        depth_filtered_pose = None
+        if bool(getattr(fast_result, "depth_filter_available", False)):
+            depth_filter_result = getattr(fast_result, "depth_filter_result", None)
+            depth_filtered_pose = self._map_pose_result_from_cpp(
+                fast_result.depth_filtered_pose
+            )
+            if (
+                depth_filtered_pose.rvec is None
+                or depth_filtered_pose.tvec is None
+                or depth_filtered_pose.T_marker_camera is None
+            ):
+                if cpp_depth_filter_prev_state is not None:
+                    self.pose_depth_filter.restore(cpp_depth_filter_prev_state)
+                depth_filter_result = None
+                depth_filtered_pose = None
+        stats = self._last_persistent_match_stats
+
+        fast_timings["fast_persistent_seed_cpp_count"] = 1.0
+        fast_timings["fast_persistent_transaction_cpp_count"] = 1.0
+        fast_timings["fast_persistent_seed_cpp_total_ms"] = float(
+            getattr(fast_result, "cpp_seed_total_ms", 0.0)
+        )
+        fast_timings["fast_persistent_seed_cpp_pose_ms"] = float(
+            getattr(fast_result, "seed_pnp_ms", 0.0)
+        )
+        fast_timings["fast_persistent_seed_cpp_match_ms"] = float(
+            getattr(fast_result, "persistent_match_ms", 0.0)
+        )
+        fast_timings["fast_persistent_transaction_cpp_total_ms"] = float(
+            getattr(fast_result, "total_ms", 0.0)
+        )
+        fast_timings["fast_persistent_match_ms"] = float(
+            getattr(fast_result, "persistent_match_ms", 0.0)
+        )
+        fast_timings["fast_persistent_seed_pnp_ms"] = float(
+            getattr(fast_result, "seed_pnp_ms", 0.0)
+        )
+        if bool(getattr(fast_result, "depth_filter_available", False)):
+            fast_timings["pose_depth_filter_cpp_ms"] = float(
+                getattr(fast_result, "depth_filter_ms", 0.0)
+            )
+            fast_timings["pose_depth_filter_cpp_count"] = 1.0
+        fast_timings["fast_persistent_points_count"] = float(len(points))
+        fast_timings["fast_persistent_corners_count"] = float(len(corners))
+        fast_timings["fast_persistent_match_cpp_count"] = 1.0
+        fast_timings["fast_persistent_match_motion_px"] = float(
+            getattr(stats, "adaptive_motion_px", 0.0)
+        )
+        fast_timings["fast_persistent_match_radius_px"] = float(
+            getattr(stats, "adaptive_max_dist_px", 0.0)
+        )
+        fast_timings["fast_persistent_min_points_count"] = float(
+            getattr(fast_result, "min_points", 0)
+        )
+
+        dense_metrics = getattr(fast_result, "dense_gate_metrics", None)
+        if dense_metrics is not None:
+            fast_timings["fast_dense_adaptive_required_count"] = (
+                1.0 if bool(getattr(fast_result, "dense_required", False)) else 0.0
+            )
+            fast_timings["fast_dense_adaptive_skipped_count"] = (
+                0.0 if bool(getattr(fast_result, "dense_required", False)) else 1.0
+            )
+            fast_timings["fast_dense_adaptive_match_ratio"] = float(
+                getattr(dense_metrics, "match_ratio", 0.0)
+            )
+            fast_timings["fast_dense_adaptive_motion_px"] = float(
+                getattr(dense_metrics, "motion_px", 0.0)
+            )
+            fast_timings["fast_dense_adaptive_ambiguous_count"] = float(
+                getattr(dense_metrics, "ambiguous_count", 0.0)
+            )
+            fast_timings["fast_dense_adaptive_seed_mean_px"] = float(
+                getattr(dense_metrics, "seed_mean_px", -1.0)
+            )
+            fast_timings["fast_dense_adaptive_seed_max_px"] = float(
+                getattr(dense_metrics, "seed_max_px", -1.0)
+            )
+
+        dense_total_ms = float(getattr(fast_result, "dense_match_ms", 0.0)) + float(
+            getattr(fast_result, "dense_pose_ms", 0.0)
+        )
+        fast_timings["fast_dense_total_ms"] = dense_total_ms
+        if bool(getattr(fast_result, "route_decode", False)):
+            fast_timings["fast_persistent_preflight_decode_route_count"] = 1.0
+        if str(getattr(fast_result, "dense_reason", "")).startswith(
+            "rescue_skipped_decode:"
+        ):
+            fast_timings["fast_dense_rescue_skipped_count"] = 1.0
+            fast_timings["fast_dense_route_decode_count"] = 1.0
+
+        self._set_fast_path_debug(
+            attempted=True,
+            success=bool(getattr(fast_result, "success", False)),
+            reason=str(getattr(fast_result, "reason", "")),
+            matches=len(points),
+        )
+
+        dense_reason = str(getattr(fast_result, "dense_reason", ""))
+        dense_attempted = bool(getattr(fast_result, "dense_attempted", False))
+        if dense_attempted or dense_reason:
+            dense_stats = self._dense_projection_match_stats_from_cpp(
+                fast_result.dense_stats
+            )
+            self._set_dense_refine_debug(
+                attempted=dense_attempted,
+                success=bool(getattr(fast_result, "dense_success", False)),
+                reason=dense_reason,
+                matches=int(getattr(fast_result, "dense_matches", 0)),
+                median_error_px=float(dense_stats.median_error_px),
+                p90_error_px=float(dense_stats.p90_error_px),
+                stats=dense_stats,
+            )
+
+        if not bool(getattr(fast_result, "success", False)):
+            return None
+
+        if pose.rvec is None or pose.tvec is None or pose.T_marker_camera is None:
+            if cpp_depth_filter_prev_state is not None:
+                self.pose_depth_filter.restore(cpp_depth_filter_prev_state)
+            self._set_fast_path_debug(
+                attempted=True,
+                reason="C++ fast pose missing pose vectors.",
+                matches=len(points),
+            )
+            return None
+
+        prev_pose_rvec = (
+            None
+            if self.pose_tracker.rvec is None
+            else self.pose_tracker.rvec.copy()
+        )
+        prev_pose_tvec = (
+            None
+            if self.pose_tracker.tvec is None
+            else self.pose_tracker.tvec.copy()
+        )
+        prev_pose_T = (
+            None
+            if self.pose_tracker.T_marker_camera is None
+            else self.pose_tracker.T_marker_camera.copy()
+        )
+        prev_depth_filter_state = (
+            self.pose_depth_filter.snapshot()
+            if cpp_depth_filter_prev_state is None
+            else cpp_depth_filter_prev_state
+        )
+        prev_last_rvec = (
+            None
+            if self._last_accepted_rvec is None
+            else self._last_accepted_rvec.copy()
+        )
+        prev_last_tvec = (
+            None
+            if self._last_accepted_tvec is None
+            else self._last_accepted_tvec.copy()
+        )
+
+        self.pose_tracker.rvec = pose.rvec.copy()
+        self.pose_tracker.tvec = pose.tvec.copy()
+        self.pose_tracker.T_marker_camera = pose.T_marker_camera.copy()
+
+        if bool(getattr(fast_result, "used_dense", False)):
+            success_message = (
+                "Fast pose estimated from dense projection correspondences "
+                f"(seed_matches={seed_pose.num_inliers}, "
+                f"dense_matches={len(points)}, "
+                f"seed_median={float(getattr(fast_result.dense_stats, 'median_error_px', -1.0)):.3f}px, "
+                f"seed_p90={float(getattr(fast_result.dense_stats, 'p90_error_px', -1.0)):.3f}px)."
+            )
+            precomputed_pnp_ms = float(getattr(fast_result, "dense_pose_ms", 0.0))
+        else:
+            success_message = (
+                "Fast pose estimated from persistent correspondences "
+                f"(matches={len(points)}, identities={stats.identities}, "
+                f"far={stats.rejected_far}, ambiguous={stats.rejected_ambiguous}, "
+                f"claimed={stats.rejected_claimed})."
+            )
+            precomputed_pnp_ms = float(getattr(fast_result, "seed_pnp_ms", 0.0))
+
+        package_t0 = time.perf_counter()
+        result = self._estimate_and_package_pose(
+            points,
+            corners,
+            success_message=success_message,
+            update_persistence=False,
+            pose_source=PoseSource.FAST_PERSISTENT,
+            detection=detection,
+            precomputed_pose=pose,
+            precomputed_pnp_ms=precomputed_pnp_ms,
+            previous_pose_rvec=prev_pose_rvec,
+            previous_pose_tvec=prev_pose_tvec,
+            previous_pose_T=prev_pose_T,
+            previous_depth_filter_state=prev_depth_filter_state,
+            previous_last_rvec=prev_last_rvec,
+            previous_last_tvec=prev_last_tvec,
+            precomputed_visual_corners=visual_corners,
+            precomputed_visual_is_final=bool(
+                getattr(fast_result, "depth_filter_available", False)
+            ),
+            precomputed_depth_filter=depth_filter_result,
+            precomputed_depth_pose=depth_filtered_pose,
+            precomputed_accept_state=getattr(fast_result, "accepted_state", None),
+        )
+        fast_timings["fast_persistent_estimate_package_ms"] = (
+            time.perf_counter() - package_t0
+        ) * 1000.0
+        result.timings_ms["persistent_match_ms"] = float(
+            getattr(fast_result, "persistent_match_ms", 0.0)
+        )
+        result.timings_ms["fast_dense_total_ms"] = dense_total_ms
+        result.timings_ms["fast_seed_pnp_ms"] = float(
+            getattr(fast_result, "seed_pnp_ms", 0.0)
+        )
+        if bool(getattr(fast_result, "dense_attempted", False)):
+            result.timings_ms["fast_dense_match_ms"] = float(
+                getattr(fast_result, "dense_match_ms", 0.0)
+            )
+        if bool(getattr(fast_result, "depth_filter_available", False)):
+            result.timings_ms["pose_depth_filter_cpp_ms"] = float(
+                getattr(fast_result, "depth_filter_ms", 0.0)
+            )
+
+        if not result.success:
+            if cpp_depth_filter_prev_state is not None:
+                self.pose_depth_filter.restore(cpp_depth_filter_prev_state)
+            self._set_fast_path_debug(
+                attempted=True,
+                reason=result.message,
+                matches=len(points),
+            )
+            return None
+
+        self._attach_fast_path_debug(result)
+        result.confidence *= 0.95
+        refresh_t0 = time.perf_counter()
+        cpp_refresh_committed = (
+            float(
+                result.timings_ms.get(
+                    "pose_visual_corners_cpp_precomputed_count",
+                    0.0,
+                )
+            )
+            > 0.5
+            and not bool(getattr(result, "pose_plateau_prior_applied", False))
+            and self._commit_cpp_persistent_refresh(fast_result)
+        )
+        if not cpp_refresh_committed:
+            self._refresh_persistent_correspondences_from_result(
+                result,
+                max_mean_error_px=self.config.fast_persistent_refresh_mean_error_px,
+            )
+        result.timings_ms["fast_refresh_persistence_cpp_count"] = (
+            1.0 if cpp_refresh_committed else 0.0
+        )
+        result.timings_ms["fast_refresh_persistence_cpp_ms"] = float(
+            getattr(fast_result, "persistence_refresh_ms", 0.0)
+        )
+        result.timings_ms["fast_refresh_persistence_ms"] = (
+            time.perf_counter() - refresh_t0
+        ) * 1000.0
+        return result
+
     def _try_fast_pose_from_persistent_correspondences(
         self,
         detection,
@@ -835,6 +1267,14 @@ class FastPathMixin:
                 reason="invalid_detection",
             )
             return None
+
+        fast_transaction = self._fast_pose_transaction_cpp(detection)
+        if fast_transaction is not None:
+            return self._finish_fast_pose_transaction_cpp(
+                detection,
+                fast_transaction,
+                fast_timings,
+            )
 
         seed_pose: Optional[MapPoseResult] = None
         seed_pnp_ms = 0.0
@@ -1388,14 +1828,22 @@ class FastPathMixin:
                 detection=detection,
             )
         else:
-            dense_result = self._estimate_and_package_pose(
+            dense_result = self._estimate_dense_pose_with_direct_prior_cpp(
                 points,
                 corners,
                 success_message=dense_message,
-                update_persistence=False,
                 pose_source=PoseSource.FAST_PERSISTENT,
                 detection=detection,
             )
+            if dense_result is None:
+                dense_result = self._estimate_and_package_pose(
+                    points,
+                    corners,
+                    success_message=dense_message,
+                    update_persistence=False,
+                    pose_source=PoseSource.FAST_PERSISTENT,
+                    detection=detection,
+                )
         dense_result.timings_ms["fast_dense_match_ms"] = match_ms
 
         if (

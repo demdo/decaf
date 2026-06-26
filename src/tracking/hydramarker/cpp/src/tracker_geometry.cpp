@@ -24,6 +24,33 @@ double pointDistance(const cv::Point2d& a, const cv::Point2d& b) {
     return std::sqrt(sqr(a.x - b.x) + sqr(a.y - b.y));
 }
 
+MapPoseTrackerConfig makeDenseMapPoseTrackerConfig(
+    const TrackerConfig& config
+) {
+    MapPoseTrackerConfig pose_config;
+    pose_config.min_points = config.min_points;
+    pose_config.min_inliers = config.min_inliers;
+    pose_config.ransac_reproj_px = config.pnp_ransac_reprojection_px;
+    pose_config.ransac_confidence = config.pnp_ransac_confidence;
+    pose_config.ransac_iterations = config.pnp_ransac_iterations;
+    pose_config.max_mean_reproj_px = config.max_mean_reprojection_error_px;
+    pose_config.max_max_reproj_px = config.max_max_reprojection_error_px;
+    pose_config.max_translation_jump_mm = config.max_translation_jump_mm;
+    pose_config.max_rotation_jump_deg = config.max_rotation_jump_deg;
+    pose_config.rotation_gate_scale_per_lost_frame =
+        config.rotation_gate_scale_per_lost_frame;
+    pose_config.rotation_gate_max_deg = config.rotation_gate_max_deg;
+    pose_config.use_pose_prior = config.use_pose_prior;
+    pose_config.refine_with_iterative = true;
+    pose_config.use_direct_prior_solver = config.pnp_direct_prior_enabled;
+    pose_config.direct_refine_method = config.pnp_direct_refine_method;
+    pose_config.direct_max_mean_reproj_px =
+        config.pnp_direct_max_mean_reprojection_error_px;
+    pose_config.direct_max_max_reproj_px =
+        config.pnp_direct_max_max_reprojection_error_px;
+    return pose_config;
+}
+
 } // namespace
 
 TrackerGeometry::TrackerGeometry(
@@ -35,6 +62,7 @@ TrackerGeometry::TrackerGeometry(
     : geometry_(geometry),
       K_(K),
       dist_coeffs_(makeDistCoeffsMat(dist_coeffs)),
+      dist_coeff_values_(dist_coeffs),
       config_(config)
 {
     cached_corners_.clear();
@@ -783,6 +811,26 @@ MapPoseResult TrackerGeometry::estimateDenseRobustPose(
         }
     }
     return result;
+}
+
+MapPoseResult TrackerGeometry::estimateDenseDirectPose(
+    const std::vector<PoseTrackPoint>& points,
+    const std::vector<double>& seed_rvec,
+    const std::vector<double>& seed_tvec,
+    int lost_frames
+) const
+{
+    MapPoseTracker pose_tracker(
+        K_,
+        dist_coeff_values_,
+        makeDenseMapPoseTrackerConfig(config_)
+    );
+
+    if (!seed_rvec.empty() && !seed_tvec.empty()) {
+        pose_tracker.setPose(seed_rvec, seed_tvec);
+    }
+
+    return pose_tracker.estimatePose(points, lost_frames);
 }
 
 cv::Mat TrackerGeometry::makeDistCoeffsMat(

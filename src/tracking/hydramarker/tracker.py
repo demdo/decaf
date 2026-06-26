@@ -23,9 +23,11 @@ from tracking.hydramarker.tracker_geometry import (
 from tracking.hydramarker.tracker_persistence import FastPathMixin, PersistenceMixin
 from tracking.hydramarker.tracker_pose import FallbackPoseMixin, PoseEstimationMixin
 from tracking.hydramarker.tracker_types import (
+    DetectedCorner,
     FastPathDebug,
     IdentityStore,
     PersistentMatchStats,
+    PoseSource,
     TrackerMode,
     TrackerResult,
 )
@@ -57,6 +59,8 @@ class HydraTracker(
     ) -> None:
         """Load marker assets and initialize all detector, decoder, and pose state."""
         self.config = config or TrackerConfig()
+        self._field_path = str(field_path)
+        self._marker_json_path = str(marker_json_path)
 
         self.K = np.asarray(K, dtype=np.float64).reshape(3, 3)
         self.dist_coeffs = (
@@ -75,7 +79,56 @@ class HydraTracker(
         self.patch_decoder = self._create_patch_decoder()
         self.correspondence_builder = self._create_correspondence_builder()
         self.pose_tracker = self._create_pose_tracker(K, dist_coeffs)
-        self.pose_depth_filter = PoseDepthKalmanFilter(
+        self.pose_depth_filter = self._create_pose_depth_filter()
+
+        self.mode = TrackerMode.LOST
+        self.frame_index = 0
+        self.lost_frames = 0
+
+        # Highest accepted point count seen so far for early drift detection.
+        self._max_pts_seen: int = 0
+
+        # Last accepted reprojection error used by pose propagation.
+        self._last_good_reproj_px: float = -1.0
+
+        # Last accepted pose used by motion gates and rotation-change checks.
+        self._last_accepted_rvec: Optional[np.ndarray] = None
+        self._last_accepted_tvec: Optional[np.ndarray] = None
+        self._last_accepted_T_marker_camera: Optional[np.ndarray] = None
+        self._last_accepted_pose_frame: int = -1
+
+        self._identity_store = IdentityStore()
+        self._persistent_frame_index: int = -1
+        self._undecodeable_detection_frames: int = 0
+        self._low_fresh_correspondence_frames: int = 0
+        self._pose_propagation_block_until_frame: int = -1
+        self._last_uncoded_bootstrap_reason: str = ""
+        self._last_persistent_match_stats = PersistentMatchStats()
+        self._last_fast_path_debug = FastPathDebug()
+        self._persistent_match_prev_detection_uv: Optional[np.ndarray] = None
+        self._persistent_match_prev_detection_frame: int = -1
+        self._persistent_match_last_motion_px: float = 0.0
+        self._cpp_persistent_matcher = None
+        self._cpp_persistent_matcher_unavailable: bool = False
+        self._cpp_persistent_matcher_config_state = None
+        self._cpp_tracker_geometry = None
+        self._cpp_tracker_geometry_unavailable: bool = False
+        self._cpp_tracker_engine = None
+        self._cpp_tracker_engine_unavailable: bool = False
+        self._last_persistent_match_backend: str = "none"
+
+    def _create_pose_depth_filter(self):
+        if bool(getattr(self.config, "cpp_pose_depth_filter_enabled", True)):
+            try:
+                return hm.create_pose_depth_filter(
+                    self.K,
+                    self.dist_coeffs,
+                    self.config,
+                )
+            except Exception:
+                pass
+
+        return PoseDepthKalmanFilter(
             observation_std_mm=self.config.pose_depth_filter_observation_std_mm,
             process_std_mm=self.config.pose_depth_filter_process_std_mm,
             initial_velocity_std_mm=self.config.pose_depth_filter_initial_velocity_std_mm,
@@ -120,40 +173,6 @@ class HydraTracker(
             ),
         )
 
-        self.mode = TrackerMode.LOST
-        self.frame_index = 0
-        self.lost_frames = 0
-
-        # Highest accepted point count seen so far for early drift detection.
-        self._max_pts_seen: int = 0
-
-        # Last accepted reprojection error used by pose propagation.
-        self._last_good_reproj_px: float = -1.0
-
-        # Last accepted pose used by motion gates and rotation-change checks.
-        self._last_accepted_rvec: Optional[np.ndarray] = None
-        self._last_accepted_tvec: Optional[np.ndarray] = None
-        self._last_accepted_T_marker_camera: Optional[np.ndarray] = None
-        self._last_accepted_pose_frame: int = -1
-
-        self._identity_store = IdentityStore()
-        self._persistent_frame_index: int = -1
-        self._undecodeable_detection_frames: int = 0
-        self._low_fresh_correspondence_frames: int = 0
-        self._pose_propagation_block_until_frame: int = -1
-        self._last_uncoded_bootstrap_reason: str = ""
-        self._last_persistent_match_stats = PersistentMatchStats()
-        self._last_fast_path_debug = FastPathDebug()
-        self._persistent_match_prev_detection_uv: Optional[np.ndarray] = None
-        self._persistent_match_prev_detection_frame: int = -1
-        self._persistent_match_last_motion_px: float = 0.0
-        self._cpp_persistent_matcher = None
-        self._cpp_persistent_matcher_unavailable: bool = False
-        self._cpp_persistent_matcher_config_state = None
-        self._cpp_tracker_geometry = None
-        self._cpp_tracker_geometry_unavailable: bool = False
-        self._last_persistent_match_backend: str = "none"
-
     @property
     def rvec(self) -> Optional[np.ndarray]:
         return self.pose_tracker.rvec
@@ -165,6 +184,353 @@ class HydraTracker(
     @property
     def T_marker_camera(self) -> Optional[np.ndarray]:
         return self.pose_tracker.T_marker_camera
+
+    def _cpp_tracker_engine_enabled(self) -> bool:
+        return bool(getattr(self.config, "cpp_tracker_engine_enabled", False))
+
+    def _ensure_cpp_tracker_engine(self):
+        if not self._cpp_tracker_engine_enabled():
+            return None
+        if bool(getattr(self, "_cpp_tracker_engine_unavailable", False)):
+            return None
+
+        engine = getattr(self, "_cpp_tracker_engine", None)
+        if engine is not None:
+            return engine
+
+        try:
+            engine = hm.create_tracker_engine(
+                self._field_path,
+                self._marker_json_path,
+                self.K,
+                self.dist_coeffs,
+                self.config,
+            )
+        except Exception:
+            self._cpp_tracker_engine_unavailable = True
+            self._cpp_tracker_engine = None
+            return None
+
+        self._cpp_tracker_engine = engine
+        return engine
+
+    @staticmethod
+    def _cpp_enum_name(value) -> str:
+        name = getattr(value, "name", None)
+        if name:
+            return str(name).upper()
+        text = str(value)
+        if "." in text:
+            text = text.rsplit(".", 1)[-1]
+        return text.upper()
+
+    def _mode_from_cpp(self, value) -> TrackerMode:
+        name = self._cpp_enum_name(value)
+        return TrackerMode.__members__.get(name, self.mode)
+
+    @staticmethod
+    def _pose_source_from_cpp(value) -> PoseSource:
+        name = HydraTracker._cpp_enum_name(value)
+        return PoseSource.__members__.get(name, PoseSource.NONE)
+
+    @staticmethod
+    def _cpp_vector_to_array(values, shape):
+        arr = np.asarray(values, dtype=np.float64)
+        expected = int(np.prod(shape))
+        if arr.size != expected:
+            return None
+        return arr.reshape(shape).copy()
+
+    @staticmethod
+    def _detected_corners_from_cpp(corners) -> list[DetectedCorner]:
+        if corners is None:
+            return []
+        return [
+            DetectedCorner(
+                local_row=int(corner.local_row),
+                local_col=int(corner.local_col),
+                uv=tuple(float(v) for v in corner.uv),
+            )
+            for corner in corners
+        ]
+
+    def _tracker_result_from_cpp_engine(self, cpp_result) -> TrackerResult:
+        mode = self._mode_from_cpp(getattr(cpp_result, "mode", None))
+        pose_source = self._pose_source_from_cpp(
+            getattr(cpp_result, "pose_source", None)
+        )
+        rvec = self._cpp_vector_to_array(
+            getattr(cpp_result, "rvec", []),
+            (3, 1),
+        )
+        tvec = self._cpp_vector_to_array(
+            getattr(cpp_result, "tvec", []),
+            (3, 1),
+        )
+        T_marker_camera = self._cpp_vector_to_array(
+            getattr(cpp_result, "T_marker_camera", []),
+            (4, 4),
+        )
+
+        fast_debug = FastPathDebug(
+            attempted=bool(getattr(cpp_result, "fast_attempted", False)),
+            success=bool(getattr(cpp_result, "fast_success", False)),
+            reason=str(getattr(cpp_result, "fast_reason", "")),
+            matches=int(getattr(cpp_result, "fast_matches", 0)),
+            identities=int(getattr(cpp_result, "persistent_count", 0)),
+            current_corners=int(
+                getattr(cpp_result, "detection_corner_count", 0)
+            ),
+            dense_refine_attempted=bool(
+                getattr(cpp_result, "fast_dense_attempted", False)
+            ),
+            dense_refine_success=bool(
+                getattr(cpp_result, "fast_dense_success", False)
+            ),
+            dense_refine_reason=str(
+                getattr(cpp_result, "fast_dense_reason", "")
+            ),
+            dense_refine_matches=int(
+                getattr(cpp_result, "fast_dense_matches", 0)
+            ),
+        )
+
+        timings = {
+            str(key): float(value)
+            for key, value in dict(
+                getattr(cpp_result, "timings_ms", {}) or {}
+            ).items()
+        }
+        timings["cpp_tracker_engine_count"] = 1.0
+        timings["cpp_tracker_engine_current_pose_accepted_count"] = (
+            1.0 if bool(getattr(cpp_result, "current_pose_accepted", False)) else 0.0
+        )
+        timings["cpp_tracker_engine_has_accepted_pose_count"] = (
+            1.0 if bool(getattr(cpp_result, "has_accepted_pose", False)) else 0.0
+        )
+
+        result = TrackerResult(
+            success=bool(getattr(cpp_result, "success", False)),
+            mode=mode,
+            message=str(getattr(cpp_result, "message", "")),
+            detection_valid=bool(
+                getattr(cpp_result, "detection_valid", False)
+            ),
+            detection_tracking=bool(
+                getattr(cpp_result, "detection_tracking", False)
+            ),
+            detection_stable=bool(
+                getattr(cpp_result, "detection_stable", False)
+            ),
+            detection_corners=self._detected_corners_from_cpp(
+                getattr(cpp_result, "detection_corners", [])
+            ),
+            corners=self._tracker_corners_from_cpp(
+                getattr(cpp_result, "corners", [])
+            ),
+            correspondence_corners=self._tracker_corners_from_cpp(
+                getattr(cpp_result, "correspondence_corners", [])
+            ),
+            rvec=rvec,
+            tvec=tvec,
+            T_marker_camera=T_marker_camera,
+            mean_reprojection_error_px=float(
+                getattr(cpp_result, "mean_reprojection_error_px", -1.0)
+            ),
+            max_reprojection_error_px=float(
+                getattr(cpp_result, "max_reprojection_error_px", -1.0)
+            ),
+            num_points=int(getattr(cpp_result, "num_points", 0)),
+            num_inliers=int(getattr(cpp_result, "num_inliers", 0)),
+            confidence=float(getattr(cpp_result, "confidence", 0.0)),
+            pose_source=pose_source,
+            pnp_method=str(getattr(cpp_result, "pnp_method", "")),
+            depth_filter_applied=bool(
+                getattr(cpp_result, "depth_filter_applied", False)
+            ),
+            depth_filter_delta_z_mm=float(
+                getattr(cpp_result, "depth_filter_delta_z_mm", 0.0)
+            ),
+            depth_filter_raw_z_mm=float(
+                getattr(cpp_result, "depth_filter_raw_z_mm", np.nan)
+            ),
+            depth_filter_z_mm=float(
+                getattr(cpp_result, "depth_filter_z_mm", np.nan)
+            ),
+            depth_filter_reproj_excess_px=float(
+                getattr(cpp_result, "depth_filter_reproj_excess_px", np.nan)
+            ),
+            depth_filter_guard_alpha=float(
+                getattr(cpp_result, "depth_filter_guard_alpha", 1.0)
+            ),
+            depth_filter_innovation_z_mm=float(
+                getattr(cpp_result, "depth_filter_innovation_z_mm", 0.0)
+            ),
+            depth_filter_innovation_mean_z_mm=float(
+                getattr(cpp_result, "depth_filter_innovation_mean_z_mm", 0.0)
+            ),
+            depth_filter_innovation_cusum_pos_mm=float(
+                getattr(cpp_result, "depth_filter_innovation_cusum_pos_mm", 0.0)
+            ),
+            depth_filter_innovation_cusum_neg_mm=float(
+                getattr(cpp_result, "depth_filter_innovation_cusum_neg_mm", 0.0)
+            ),
+            depth_filter_innovation_bias_detected=bool(
+                getattr(
+                    cpp_result,
+                    "depth_filter_innovation_bias_detected",
+                    False,
+                )
+            ),
+            depth_filter_innovation_bias_direction=int(
+                getattr(cpp_result, "depth_filter_innovation_bias_direction", 0)
+            ),
+            depth_filter_innovation_bias_limited=bool(
+                getattr(
+                    cpp_result,
+                    "depth_filter_innovation_bias_limited",
+                    False,
+                )
+            ),
+            depth_filter_object_z_span_mm=float(
+                getattr(cpp_result, "depth_filter_object_z_span_mm", np.nan)
+            ),
+            depth_filter_negative_delta_guard_limited=bool(
+                getattr(
+                    cpp_result,
+                    "depth_filter_negative_delta_guard_limited",
+                    False,
+                )
+            ),
+            pose_plateau_prior_triggered=bool(
+                getattr(cpp_result, "pose_plateau_prior_triggered", False)
+            ),
+            pose_plateau_prior_attempted=bool(
+                getattr(cpp_result, "pose_plateau_prior_attempted", False)
+            ),
+            pose_plateau_prior_applied=bool(
+                getattr(cpp_result, "pose_plateau_prior_applied", False)
+            ),
+            pose_plateau_prior_method=str(
+                getattr(cpp_result, "pose_plateau_prior_method", "")
+            ),
+            pose_plateau_prior_reason=str(
+                getattr(cpp_result, "pose_plateau_prior_reason", "")
+            ),
+            pose_plateau_prior_delta_z_mm=float(
+                getattr(cpp_result, "pose_plateau_prior_delta_z_mm", np.nan)
+            ),
+            pose_plateau_prior_reproj_excess_px=float(
+                getattr(
+                    cpp_result,
+                    "pose_plateau_prior_reproj_excess_px",
+                    np.nan,
+                )
+            ),
+            pose_plateau_prior_max_reproj_excess_px=float(
+                getattr(
+                    cpp_result,
+                    "pose_plateau_prior_max_reproj_excess_px",
+                    np.nan,
+                )
+            ),
+            pose_plateau_prior_iterations=int(
+                getattr(cpp_result, "pose_plateau_prior_iterations", 0)
+            ),
+            fast_path_debug=fast_debug,
+            timings_ms=timings,
+        )
+
+        self.mode = mode
+        self.frame_index = int(getattr(cpp_result, "frame_index", self.frame_index))
+        self.lost_frames = int(getattr(cpp_result, "lost_frames", self.lost_frames))
+        self._last_fast_path_debug = fast_debug
+
+        pose_state_rvec = self._cpp_vector_to_array(
+            getattr(cpp_result, "pose_tracker_rvec", []),
+            (3, 1),
+        )
+        pose_state_tvec = self._cpp_vector_to_array(
+            getattr(cpp_result, "pose_tracker_tvec", []),
+            (3, 1),
+        )
+        pose_state_T = self._cpp_vector_to_array(
+            getattr(cpp_result, "pose_tracker_T_marker_camera", []),
+            (4, 4),
+        )
+        if (
+            bool(getattr(cpp_result, "pose_tracker_has_pose", False))
+            and pose_state_rvec is not None
+            and pose_state_tvec is not None
+        ):
+            self.pose_tracker.rvec = pose_state_rvec.copy()
+            self.pose_tracker.tvec = pose_state_tvec.copy()
+            self.pose_tracker.T_marker_camera = (
+                None if pose_state_T is None else pose_state_T.copy()
+            )
+        else:
+            self.pose_tracker.reset()
+
+        self._max_pts_seen = int(
+            getattr(cpp_result, "max_pts_seen", self._max_pts_seen)
+        )
+        self._last_good_reproj_px = float(
+            getattr(cpp_result, "last_good_reproj_px", self._last_good_reproj_px)
+        )
+
+        accepted_rvec = self._cpp_vector_to_array(
+            getattr(cpp_result, "accepted_rvec", []),
+            (3, 1),
+        )
+        accepted_tvec = self._cpp_vector_to_array(
+            getattr(cpp_result, "accepted_tvec", []),
+            (3, 1),
+        )
+        accepted_T = self._cpp_vector_to_array(
+            getattr(cpp_result, "accepted_T_marker_camera", []),
+            (4, 4),
+        )
+        if (
+            bool(getattr(cpp_result, "has_accepted_pose", False))
+            and accepted_rvec is not None
+            and accepted_tvec is not None
+        ):
+            self._last_accepted_rvec = accepted_rvec.copy()
+            self._last_accepted_tvec = accepted_tvec.copy()
+            self._last_accepted_T_marker_camera = (
+                None if accepted_T is None else accepted_T.copy()
+            )
+            self._last_accepted_pose_frame = int(
+                getattr(cpp_result, "accepted_pose_frame", self.frame_index)
+            )
+        else:
+            self._last_accepted_rvec = None
+            self._last_accepted_tvec = None
+            self._last_accepted_T_marker_camera = None
+            self._last_accepted_pose_frame = -1
+        return result
+
+    def _process_frame_cpp_engine(
+        self,
+        frame: np.ndarray,
+        *,
+        run_detection: bool,
+    ) -> Optional[TrackerResult]:
+        engine = self._ensure_cpp_tracker_engine()
+        if engine is None:
+            return None
+
+        try:
+            cpp_result = engine.process_frame(
+                np.asarray(frame, dtype=np.uint8),
+                bool(run_detection),
+            )
+        except Exception:
+            self._cpp_tracker_engine_unavailable = True
+            self._cpp_tracker_engine = None
+            return None
+
+        return self._tracker_result_from_cpp_engine(cpp_result)
 
     def reset(self) -> None:
         """Reset all runtime state while keeping the loaded marker assets."""
@@ -198,6 +564,13 @@ class HydraTracker(
         self.dot_detector = self._create_dot_detector()
 
         self._clear_persistent_correspondences()
+        engine = getattr(self, "_cpp_tracker_engine", None)
+        if engine is not None:
+            try:
+                engine.reset()
+            except Exception:
+                self._cpp_tracker_engine_unavailable = True
+                self._cpp_tracker_engine = None
 
     def process_frame(
         self,
@@ -218,6 +591,13 @@ class HydraTracker(
             merged_timings.update(timings_ms)
             result.timings_ms = merged_timings
             return result
+
+        cpp_result = self._process_frame_cpp_engine(
+            frame,
+            run_detection=run_detection,
+        )
+        if cpp_result is not None:
+            return cpp_result
 
         self.frame_index += 1
 

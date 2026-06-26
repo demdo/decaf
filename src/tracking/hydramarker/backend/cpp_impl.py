@@ -68,12 +68,21 @@ PoseTrackPoint = _hm.PoseTrackPoint
 MapPoseResult = _hm.MapPoseResult
 MapPoseTrackerConfig = _hm.MapPoseTrackerConfig
 MapPoseTracker = _hm.MapPoseTracker
+PoseDepthFilterConfig = _hm.PoseDepthFilterConfig
+PoseDepthFilterResult = _hm.PoseDepthFilterResult
+PoseDepthKalmanFilter = _hm.PoseDepthKalmanFilter
+PlateauPosePriorConfig = _hm.PlateauPosePriorConfig
+PlateauPosePriorResult = _hm.PlateauPosePriorResult
+solve_plateau_pose_prior = _hm.solve_plateau_pose_prior
 GlobalCornerIdentity = _hm.GlobalCornerIdentity
 PersistentTrackerCorner = _hm.TrackerCorner
 TrackerCorner = _hm.TrackerCorner
 PersistentMatchStats = _hm.PersistentMatchStats
 PersistentMatchResult = _hm.PersistentMatchResult
 PersistentPoseSeedResult = _hm.PersistentPoseSeedResult
+FastDenseGateMetrics = _hm.FastDenseGateMetrics
+FastDenseProjectionStats = _hm.FastDenseProjectionStats
+FastPoseResult = _hm.FastPoseResult
 PersistentMatcher = _hm.PersistentMatcher
 DenseProjectionMatchStats = _hm.DenseProjectionMatchStats
 DenseProjectionMatchResult = _hm.DenseProjectionMatchResult
@@ -218,6 +227,76 @@ def create_map_pose_tracker(K, dist_coeffs=None, config=None):
         K_arr,
         dist_arr,
         map_pose_config_from_python(config),
+    )
+
+
+def pose_depth_filter_config_from_python(config=None):
+    """Copy Python depth-filter settings into the C++ depth-filter config."""
+    cpp_config = PoseDepthFilterConfig()
+    if config is None:
+        return cpp_config
+
+    mapping = {
+        "pose_depth_filter_observation_std_mm": "observation_std_mm",
+        "pose_depth_filter_process_std_mm": "process_std_mm",
+        "pose_depth_filter_initial_velocity_std_mm": "initial_velocity_std_mm",
+        "pose_depth_filter_reprojection_guard_px": "reprojection_guard_px",
+        "pose_depth_filter_innovation_guard_enabled": "innovation_guard_enabled",
+        "pose_depth_filter_innovation_window": "innovation_guard_window",
+        "pose_depth_filter_innovation_bias_threshold_mm": (
+            "innovation_guard_bias_threshold_mm"
+        ),
+        "pose_depth_filter_innovation_min_same_sign": (
+            "innovation_guard_min_same_sign"
+        ),
+        "pose_depth_filter_innovation_cusum_slack_mm": "innovation_cusum_slack_mm",
+        "pose_depth_filter_innovation_cusum_threshold_mm": (
+            "innovation_cusum_threshold_mm"
+        ),
+        "pose_depth_filter_negative_delta_guard_enabled": (
+            "negative_delta_guard_enabled"
+        ),
+        "pose_depth_filter_negative_delta_guard_min_z_span_mm": (
+            "negative_delta_guard_min_z_span_mm"
+        ),
+        "pose_depth_filter_negative_delta_guard_max_negative_delta_mm": (
+            "negative_delta_guard_max_negative_delta_mm"
+        ),
+        "pose_depth_filter_negative_delta_guard_hold_previous_z": (
+            "negative_delta_guard_hold_previous_z"
+        ),
+        "pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias": (
+            "negative_delta_guard_hold_requires_innovation_bias"
+        ),
+        "pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm": (
+            "negative_delta_guard_hold_min_negative_delta_mm"
+        ),
+        "pose_depth_filter_negative_delta_guard_max_hold_correction_mm": (
+            "negative_delta_guard_max_hold_correction_mm"
+        ),
+        "pose_depth_filter_negative_delta_guard_velocity_damping": (
+            "negative_delta_guard_velocity_damping"
+        ),
+    }
+    for py_name, cpp_name in mapping.items():
+        if hasattr(config, py_name):
+            setattr(cpp_config, cpp_name, getattr(config, py_name))
+
+    return cpp_config
+
+
+def create_pose_depth_filter(K, dist_coeffs=None, config=None):
+    """Create the isolated C++ camera-Z depth filter."""
+    K_arr = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    dist_arr = (
+        None
+        if dist_coeffs is None
+        else np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+    )
+    return PoseDepthKalmanFilter(
+        K_arr,
+        dist_arr,
+        pose_depth_filter_config_from_python(config),
     )
 
 

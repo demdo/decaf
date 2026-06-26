@@ -742,7 +742,14 @@ def run_live_tracker(
             draw_ms = (time.perf_counter() - draw_t0) * 1000.0
 
             # Run log - only while SPACE-started logging is active.
-            tracker_log.log_frame(frame_idx, result, wall_ms, tracker, draw_ms)
+            tracker_log.log_frame(
+                frame_idx,
+                result,
+                wall_ms,
+                tracker,
+                draw_ms,
+                frame=frame,
+            )
 
             cv2.imshow(window_name, vis)
 

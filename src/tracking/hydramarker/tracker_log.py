@@ -17,6 +17,9 @@ import numpy as np
 RUN_LOG_DIR = Path("hydramarker_tracker_runs")
 LOG_FRAME_DETAILS_ENV = "HYDRAMARKER_LOG_FRAME_DETAILS"
 LOG_POSE_CANDIDATES_ENV = "HYDRAMARKER_LOG_POSE_CANDIDATES"
+LOG_RAW_FRAMES_ENV = "HYDRAMARKER_LOG_RAW_FRAMES"
+LOG_RAW_FRAME_EVERY_ENV = "HYDRAMARKER_LOG_RAW_FRAME_EVERY"
+LOG_RAW_FRAME_MAX_ENV = "HYDRAMARKER_LOG_RAW_FRAME_MAX"
 POSE_CANDIDATE_WORST_COUNT = 8
 FEW_GREEN_THRESHOLD = 5
 
@@ -42,6 +45,7 @@ COLUMNS = [
     "checkerboard_detail_timings",
 
     # tracker result
+    "tracker_backend", "cpp_tracker_engine_count",
     "mode", "success", "pose_source", "pose_is_fresh", "pose_age_frames", "message",
     "failure_stage", "failure_reason",
 
@@ -201,6 +205,8 @@ _log_file = None
 _log_path: Optional[Path] = None
 _log_active = False
 _log_run_id = ""
+_raw_frame_dir: Optional[Path] = None
+_raw_frame_count = 0
 _camera_intrinsics_info: dict = {}
 
 # Session statistics
@@ -281,6 +287,27 @@ def log_pose_candidates_enabled() -> bool:
     """Return whether alternative pose candidate records should be written."""
     value = os.environ.get(LOG_POSE_CANDIDATES_ENV, "1").strip().lower()
     return value not in ("0", "false", "off", "no")
+
+
+def log_raw_frames_enabled() -> bool:
+    """Return whether raw input frames should be written next to the JSONL log."""
+    value = os.environ.get(LOG_RAW_FRAMES_ENV, "1").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _raw_frame_every() -> int:
+    return max(1, _env_int(LOG_RAW_FRAME_EVERY_ENV, 1))
+
+
+def _raw_frame_max() -> int:
+    return max(0, _env_int(LOG_RAW_FRAME_MAX_ENV, 0))
 
 
 def _safe_len(x) -> int:
@@ -1518,9 +1545,56 @@ def _write_json_record(record: dict) -> None:
     _log_file.flush()
 
 
+def _write_raw_frame_record(frame_idx: int, frame: Optional[np.ndarray]) -> None:
+    global _raw_frame_count
+
+    if (
+        frame is None
+        or _raw_frame_dir is None
+        or not log_raw_frames_enabled()
+    ):
+        return
+    if int(frame_idx) % _raw_frame_every() != 0:
+        return
+
+    max_frames = _raw_frame_max()
+    if max_frames > 0 and _raw_frame_count >= max_frames:
+        return
+
+    try:
+        image = np.asarray(frame)
+        if image.size == 0:
+            return
+
+        _raw_frame_dir.mkdir(parents=True, exist_ok=True)
+        path = _raw_frame_dir / f"frame_{int(frame_idx):06d}.npz"
+        np.savez_compressed(
+            path,
+            raw_image_bgr=image,
+            frame_index=np.asarray(int(frame_idx), dtype=np.int64),
+            run_id=np.asarray(_log_run_id),
+        )
+        _raw_frame_count += 1
+        _write_json_record({
+            "type": "raw_frame",
+            "run_id": _log_run_id,
+            "frame": int(frame_idx),
+            "path": str(path.resolve()),
+            "shape": list(image.shape),
+            "dtype": str(image.dtype),
+        })
+    except Exception as exc:
+        _write_event(
+            "RAW_FRAME_SAVE_FAILED",
+            frame_idx,
+            error=str(exc),
+        )
+
+
 def log_open(field_path: Path, marker_json_path: Path, tracker: HydraTracker) -> None:
     """Open a JSONL run log and write the initial run metadata record."""
     global _log_file, _log_path, _log_active, _log_run_id
+    global _raw_frame_dir, _raw_frame_count
 
     if _log_active:
         return
@@ -1530,6 +1604,14 @@ def log_open(field_path: Path, marker_json_path: Path, tracker: HydraTracker) ->
     RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
     _log_run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     _log_path = RUN_LOG_DIR / f"hydramarker_tracker_run_{_log_run_id}.jsonl"
+    _raw_frame_count = 0
+    _raw_frame_dir = (
+        RUN_LOG_DIR / f"hydramarker_tracker_run_{_log_run_id}_frames"
+        if log_raw_frames_enabled()
+        else None
+    )
+    if _raw_frame_dir is not None:
+        _raw_frame_dir.mkdir(parents=True, exist_ok=True)
     _log_file = open(_log_path, "w", encoding="utf-8")
     _log_active = True
 
@@ -1542,6 +1624,20 @@ def log_open(field_path: Path, marker_json_path: Path, tracker: HydraTracker) ->
         "camera_intrinsics": dict(_camera_intrinsics_info),
         "frame_detail_records": bool(log_frame_details_enabled()),
         "pose_candidate_records": bool(log_pose_candidates_enabled()),
+        "raw_frame_records": bool(_raw_frame_dir is not None),
+        "raw_frame_dir": (
+            None if _raw_frame_dir is None else str(_raw_frame_dir.resolve())
+        ),
+        "raw_frame_every": _raw_frame_every(),
+        "raw_frame_max": _raw_frame_max(),
+        "tracker_backend": {
+            "cpp_tracker_engine_enabled": bool(
+                getattr(tracker.config, "cpp_tracker_engine_enabled", False)
+            ),
+            "python_orchestration": not bool(
+                getattr(tracker.config, "cpp_tracker_engine_enabled", False)
+            ),
+        },
         "columns": COLUMNS,
         "config": {
             name: getattr(tracker.config, name)
@@ -1564,7 +1660,14 @@ def _write_event(kind: str, frame_idx: int, **fields) -> None:
     })
 
 
-def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, draw_ms: float) -> None:
+def log_frame(
+    frame_idx: int,
+    result,
+    wall_ms: float,
+    tracker: HydraTracker,
+    draw_ms: float,
+    frame: Optional[np.ndarray] = None,
+) -> None:
     """Append one frame of tracker diagnostics to the active run log."""
     global _total_frames, _pose_frames, _no_pose_frames
     global _current_outage, _longest_outage, _outage_lengths
@@ -1673,6 +1776,16 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
 
     fast = getattr(result, "fast_path_debug", None)
     timings = getattr(result, "timings_ms", {}) or {}
+    cpp_engine_count = timings.get("cpp_tracker_engine_count")
+    try:
+        cpp_engine_count_value = 0.0 if cpp_engine_count is None else float(cpp_engine_count)
+    except (TypeError, ValueError):
+        cpp_engine_count_value = 0.0
+    tracker_backend = (
+        "cpp_engine"
+        if cpp_engine_count_value > 0.0
+        else "python"
+    )
 
     dense_median = getattr(fast, "dense_refine_median_error_px", None)
     if dense_median is not None and float(dense_median) < 0.0:
@@ -1731,6 +1844,8 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
             if key.startswith("checkerboard_")
         },
 
+        "tracker_backend": tracker_backend,
+        "cpp_tracker_engine_count": _fmt_float(cpp_engine_count),
         "mode": result.mode.value,
         "success": int(has_pose),
         "pose_source": getattr(
@@ -1973,6 +2088,8 @@ def log_frame(frame_idx: int, result, wall_ms: float, tracker: HydraTracker, dra
         "other_fail_total": _failure_counter["OTHER"],
     }
 
+    _write_raw_frame_record(frame_idx, frame)
+
     _write_json_record({
         "type": "frame",
         "run_id": _log_run_id,
@@ -1991,6 +2108,7 @@ def log_close() -> None:
     """Write the run summary and close the active JSONL log."""
     global _current_outage, _longest_outage
     global _log_file, _log_path, _log_active, _log_run_id
+    global _raw_frame_dir, _raw_frame_count
 
     if not _log_active:
         return
@@ -2023,6 +2141,10 @@ def log_close() -> None:
         "mean_pose_outage_frames": round(mean_outage, 2),
         "outage_lengths": list(_outage_lengths),
         "pose_losses_by_cause": dict(_failure_counter.most_common()),
+        "raw_frame_count": int(_raw_frame_count),
+        "raw_frame_dir": (
+            None if _raw_frame_dir is None else str(_raw_frame_dir.resolve())
+        ),
     }
 
     _write_json_record({
@@ -2040,5 +2162,7 @@ def log_close() -> None:
     _log_path = None
     _log_active = False
     _log_run_id = ""
+    _raw_frame_dir = None
+    _raw_frame_count = 0
 
     print(f"[run_log] closed -> {closed_path.resolve() if closed_path else ''}")

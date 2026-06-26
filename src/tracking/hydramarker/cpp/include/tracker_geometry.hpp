@@ -79,6 +79,13 @@ public:
         const std::vector<double>& previous_tvec = {}
     ) const;
 
+    MapPoseResult estimateDenseDirectPose(
+        const std::vector<PoseTrackPoint>& points,
+        const std::vector<double>& seed_rvec = {},
+        const std::vector<double>& seed_tvec = {},
+        int lost_frames = 0
+    ) const;
+
 private:
     struct DensePoseCandidate {
         cv::Mat rvec;
@@ -101,6 +108,7 @@ private:
     MarkerGeometry geometry_;
     cv::Matx33d K_;
     cv::Mat dist_coeffs_;
+    std::vector<double> dist_coeff_values_;
     TrackerConfig config_;
     std::vector<ProjectedCorner> cached_corners_;
 

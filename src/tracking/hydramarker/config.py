@@ -37,6 +37,7 @@ class TrackerConfig:
     # Runtime camera-Z stabilizer. This is the live, zero-latency version of
     # the depth Kalman/guard replay experiments: x/y and rotation stay with the
     # normal frame solver; only tvec[2] is filtered.
+    cpp_pose_depth_filter_enabled: bool = True
     pose_depth_filter_enabled: bool = True
     pose_depth_filter_observation_std_mm: float = 16.0
     pose_depth_filter_process_std_mm: float = 0.05
@@ -131,16 +132,21 @@ class TrackerConfig:
     decode_only_mode: bool = False
 
     enable_fast_persistent_path: bool = True
+    # Experimental one-call C++ frame engine. Keep disabled until parity
+    # against the Python orchestration path is proven on saved runs.
+    cpp_tracker_engine_enabled: bool = False
     # Use the C++ implementation for cached-identity to detection-corner
     # matching. Python remains the fallback path for development and parity
     # checks.
     cpp_persistent_matcher_enabled: bool = True
+    cpp_fast_pose_transaction_enabled: bool = True
     # Solve the fast persistent seed pose in the same C++ call as matching.
     # Python still owns the gates, logging, dense refine decision, and final
     # result packaging.
     cpp_fast_persistent_seed_enabled: bool = True
     cpp_dense_projection_matcher_enabled: bool = True
     cpp_visual_corner_filter_enabled: bool = True
+    cpp_dense_direct_solver_enabled: bool = True
     cpp_dense_robust_solver_enabled: bool = True
     fast_persistent_min_points: int = 10
     fast_persistent_refresh_mean_error_px: float = 1.5

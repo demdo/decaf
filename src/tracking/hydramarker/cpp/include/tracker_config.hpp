@@ -27,12 +27,50 @@ struct TrackerConfig {
     double pnp_direct_max_mean_reprojection_error_px = 1.5;
     double pnp_direct_max_max_reprojection_error_px = 3.0;
 
+    bool pose_depth_filter_enabled = true;
+    double pose_depth_filter_observation_std_mm = 16.0;
+    double pose_depth_filter_process_std_mm = 0.05;
+    double pose_depth_filter_initial_velocity_std_mm = 0.1;
+    double pose_depth_filter_reprojection_guard_px = 1.0;
+    int pose_depth_filter_min_points = 6;
+    bool pose_depth_filter_innovation_guard_enabled = true;
+    int pose_depth_filter_innovation_window = 10;
+    double pose_depth_filter_innovation_bias_threshold_mm = 0.75;
+    int pose_depth_filter_innovation_min_same_sign = 8;
+    double pose_depth_filter_innovation_cusum_slack_mm = 0.2;
+    double pose_depth_filter_innovation_cusum_threshold_mm = 8.0;
+    bool pose_depth_filter_negative_delta_guard_enabled = true;
+    double pose_depth_filter_negative_delta_guard_min_z_span_mm = 14.835;
+    double pose_depth_filter_negative_delta_guard_max_negative_delta_mm = 0.0;
+    bool pose_depth_filter_negative_delta_guard_hold_previous_z = false;
+    bool pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias = true;
+    double pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm = 0.4;
+    double pose_depth_filter_negative_delta_guard_max_hold_correction_mm = 0.75;
+    double pose_depth_filter_negative_delta_guard_velocity_damping = 0.25;
+
+    bool pose_plateau_prior_enabled = true;
+    double pose_plateau_prior_trigger_negative_delta_mm = 0.0;
+    double pose_plateau_prior_min_object_z_span_mm = 14.835;
+    int pose_plateau_prior_min_points = 6;
+    double pose_plateau_prior_static_max_excess_px = 0.18;
+    double pose_plateau_prior_candidate_max_excess_px = 0.25;
+    double pose_plateau_prior_candidate_max_max_excess_px = 1.0;
+    double pose_plateau_prior_min_positive_z_correction_mm = 0.0;
+    double pose_plateau_prior_max_positive_z_correction_mm = 0.75;
+    double pose_plateau_prior_robust_c_px = 0.20;
+    int pose_plateau_prior_max_iterations = 6;
+    double pose_plateau_prior_max_step_translation_mm = 5.0;
+    double pose_plateau_prior_max_step_rotation_deg = 5.0;
+    double pose_plateau_prior_lm_damping = 1.0e-5;
+
     int checker_min_tracking_decode_cell_span = 3;
     int checker_refresh_interval_frames = 1;
     int checker_tracking_recovery_stable_interval_frames = 9;
     bool checker_local_completion_skip_enabled = true;
     int checker_local_completion_probe_interval_frames = 6;
     int checker_max_undecodeable_tracking_frames = 12;
+    int checker_min_fresh_correspondences_for_stable_tracking = 8;
+    int checker_max_low_fresh_correspondence_frames = 12;
 
     int dot_canonical_size = 80;
     double dot_canonical_margin_px = 4.0;
@@ -65,6 +103,19 @@ struct TrackerConfig {
     bool enable_fast_persistent_path = true;
     int fast_persistent_min_points = 10;
     double fast_persistent_refresh_mean_error_px = 1.5;
+    bool fast_persistent_dense_refine_enabled = true;
+    int fast_persistent_dense_min_points = 24;
+    double fast_persistent_dense_match_max_px = 3.0;
+    double fast_persistent_dense_min_second_best_margin_px = 2.0;
+    double fast_persistent_dense_max_median_px = 1.2;
+    double fast_persistent_dense_max_p90_px = 2.5;
+    bool fast_persistent_dense_rescue_enabled = false;
+    double fast_persistent_dense_rescue_min_green_ratio = 0.85;
+    double fast_persistent_dense_rescue_min_seed_median_px = 1.5;
+    double fast_persistent_dense_min_image_coverage = 0.35;
+    double fast_persistent_dense_min_object_span_mm = 12.0;
+    int fast_persistent_dense_min_distinct_rows = 2;
+    int fast_persistent_dense_min_distinct_cols = 2;
     std::string fast_persistent_dense_pose_solver = "direct_prior";
     std::string fast_persistent_dense_robust_refine_method = "auto";
     bool fast_persistent_dense_robust_trim_enabled = true;
@@ -72,6 +123,11 @@ struct TrackerConfig {
     double fast_persistent_dense_robust_min_keep_ratio = 0.75;
     double fast_persistent_dense_robust_max_mean_px = 1.2;
     double fast_persistent_dense_robust_max_max_px = 2.5;
+    bool fast_persistent_dense_adaptive_refine_enabled = true;
+    double fast_persistent_dense_adaptive_min_match_ratio = 0.85;
+    double fast_persistent_dense_adaptive_motion_px = 8.0;
+    double fast_persistent_dense_adaptive_max_seed_mean_px = 1.2;
+    double fast_persistent_dense_adaptive_max_seed_max_px = 2.8;
 
     bool enable_temporal_correspondence_persistence = true;
     int persistence_max_frames = 8;

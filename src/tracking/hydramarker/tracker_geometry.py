@@ -211,6 +211,7 @@ class GeometryMixin:
         return bool(
             getattr(self.config, "cpp_dense_projection_matcher_enabled", True)
             or getattr(self.config, "cpp_visual_corner_filter_enabled", True)
+            or getattr(self.config, "cpp_dense_direct_solver_enabled", True)
             or getattr(self.config, "cpp_dense_robust_solver_enabled", True)
         )
 
@@ -1149,6 +1150,87 @@ class DenseRefineMixin:
             pnp_method=method,
             timings_ms={"pnp_ms": (time.perf_counter() - pnp_t0) * 1000.0},
             **self._depth_filter_kwargs(filtered_depth),
+        )
+
+    def _estimate_dense_pose_with_direct_prior_cpp(
+        self,
+        track_points: List[PoseTrackPoint],
+        tracker_corners: List[TrackerCorner],
+        success_message: str,
+        pose_source: PoseSource,
+        detection=None,
+    ) -> Optional[TrackerResult]:
+        """Use C++ for dense direct-prior pose solve, then Python packaging."""
+        if not bool(getattr(self.config, "cpp_dense_direct_solver_enabled", True)):
+            return None
+
+        helper = self._ensure_cpp_tracker_geometry()
+        if helper is None:
+            return None
+
+        prev_pose_rvec = (
+            None
+            if self.pose_tracker.rvec is None
+            else self.pose_tracker.rvec.copy()
+        )
+        prev_pose_tvec = (
+            None
+            if self.pose_tracker.tvec is None
+            else self.pose_tracker.tvec.copy()
+        )
+        prev_pose_T = (
+            None
+            if self.pose_tracker.T_marker_camera is None
+            else self.pose_tracker.T_marker_camera.copy()
+        )
+        prev_depth_filter_state = self.pose_depth_filter.snapshot()
+        prev_last_rvec = (
+            None
+            if self._last_accepted_rvec is None
+            else self._last_accepted_rvec.copy()
+        )
+        prev_last_tvec = (
+            None
+            if self._last_accepted_tvec is None
+            else self._last_accepted_tvec.copy()
+        )
+
+        pnp_t0 = time.perf_counter()
+        try:
+            pose_cpp = helper.estimate_dense_direct_pose(
+                hm.pose_track_points_from_python(track_points),
+                prev_pose_rvec,
+                prev_pose_tvec,
+                int(self.lost_frames),
+            )
+        except Exception:
+            self._cpp_tracker_geometry_unavailable = True
+            return None
+
+        pnp_ms = (time.perf_counter() - pnp_t0) * 1000.0
+        pose = self._map_pose_result_from_cpp(pose_cpp)
+        if pose.success:
+            if pose.rvec is None or pose.tvec is None or pose.T_marker_camera is None:
+                return None
+            self.pose_tracker.rvec = pose.rvec.copy()
+            self.pose_tracker.tvec = pose.tvec.copy()
+            self.pose_tracker.T_marker_camera = pose.T_marker_camera.copy()
+
+        return self._estimate_and_package_pose(
+            track_points,
+            tracker_corners,
+            success_message=success_message,
+            update_persistence=False,
+            pose_source=pose_source,
+            detection=detection,
+            precomputed_pose=pose,
+            precomputed_pnp_ms=pnp_ms,
+            previous_pose_rvec=prev_pose_rvec,
+            previous_pose_tvec=prev_pose_tvec,
+            previous_pose_T=prev_pose_T,
+            previous_depth_filter_state=prev_depth_filter_state,
+            previous_last_rvec=prev_last_rvec,
+            previous_last_tvec=prev_last_tvec,
         )
 
     def _estimate_dense_pose_with_robust_solver_cpp(
