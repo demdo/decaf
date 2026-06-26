@@ -317,6 +317,13 @@ def _safe_len(x) -> int:
         return 0
 
 
+def _debug_counter(counters: dict[str, Any], name: str, default: float = 0.0) -> float:
+    try:
+        return float(counters.get(name, default))
+    except (AttributeError, TypeError, ValueError):
+        return float(default)
+
+
 def _fmt_float(x: Optional[float], digits: int = 3) -> str:
     if x is None or not np.isfinite(x):
         return ""
@@ -1631,12 +1638,8 @@ def log_open(field_path: Path, marker_json_path: Path, tracker: HydraTracker) ->
         "raw_frame_every": _raw_frame_every(),
         "raw_frame_max": _raw_frame_max(),
         "tracker_backend": {
-            "cpp_tracker_engine_enabled": bool(
-                getattr(tracker.config, "cpp_tracker_engine_enabled", False)
-            ),
-            "python_orchestration": not bool(
-                getattr(tracker.config, "cpp_tracker_engine_enabled", False)
-            ),
+            "engine": "cpp_tracker_engine",
+            "python_orchestration": False,
         },
         "columns": COLUMNS,
         "config": {
@@ -1774,35 +1777,31 @@ def log_frame(
         rot_delta = None
         trans_delta = None
 
-    fast = getattr(result, "fast_path_debug", None)
+    debug_counters = getattr(result, "debug_counters", {}) or {}
     timings = getattr(result, "timings_ms", {}) or {}
     cpp_engine_count = timings.get("cpp_tracker_engine_count")
     try:
         cpp_engine_count_value = 0.0 if cpp_engine_count is None else float(cpp_engine_count)
     except (TypeError, ValueError):
         cpp_engine_count_value = 0.0
-    tracker_backend = (
-        "cpp_engine"
-        if cpp_engine_count_value > 0.0
-        else "python"
-    )
+    tracker_backend = "cpp_engine" if cpp_engine_count_value > 0.0 else "unknown"
 
-    dense_median = getattr(fast, "dense_refine_median_error_px", None)
+    dense_median = _debug_counter(debug_counters, "fast_dense_median_px", -1.0)
     if dense_median is not None and float(dense_median) < 0.0:
         dense_median = None
-    dense_p90 = getattr(fast, "dense_refine_p90_error_px", None)
+    dense_p90 = _debug_counter(debug_counters, "fast_dense_p90_px", -1.0)
     if dense_p90 is not None and float(dense_p90) < 0.0:
         dense_p90 = None
-    dense_coverage = getattr(fast, "dense_refine_image_coverage", None)
+    dense_coverage = _debug_counter(debug_counters, "fast_dense_image_coverage", -1.0)
     if dense_coverage is not None and float(dense_coverage) < 0.0:
         dense_coverage = None
-    dense_span_u = getattr(fast, "dense_refine_image_span_u_px", None)
+    dense_span_u = _debug_counter(debug_counters, "fast_dense_image_span_u_px", -1.0)
     if dense_span_u is not None and float(dense_span_u) < 0.0:
         dense_span_u = None
-    dense_span_v = getattr(fast, "dense_refine_image_span_v_px", None)
+    dense_span_v = _debug_counter(debug_counters, "fast_dense_image_span_v_px", -1.0)
     if dense_span_v is not None and float(dense_span_v) < 0.0:
         dense_span_v = None
-    dense_object_span = getattr(fast, "dense_refine_object_span_mm", None)
+    dense_object_span = _debug_counter(debug_counters, "fast_dense_object_span_mm", -1.0)
     if dense_object_span is not None and float(dense_object_span) < 0.0:
         dense_object_span = None
 
@@ -1876,43 +1875,69 @@ def log_frame(
         "mean_err": f"{float(getattr(result, 'mean_reprojection_error_px', 0.0)):.3f}",
         "max_err": f"{float(getattr(result, 'max_reprojection_error_px', 0.0)):.3f}",
         "confidence": f"{float(getattr(result, 'confidence', 0.0)):.3f}",
-        "persistent_count": _safe_len(getattr(tracker, "_persistent_corners", [])),
+        "persistent_count": int(
+            _debug_counter(
+                debug_counters,
+                "persistent_count",
+                _safe_len(getattr(tracker, "_persistent_corners", [])),
+            )
+        ),
 
-        "fast_attempted": int(bool(getattr(fast, "attempted", False))),
-        "fast_success": int(bool(getattr(fast, "success", False))),
-        "fast_matches": int(getattr(fast, "matches", 0)),
-        "fast_reason": getattr(fast, "reason", ""),
-        "fast_identities": int(getattr(fast, "identities", 0)),
-        "fast_current_corners": int(getattr(fast, "current_corners", 0)),
-        "fast_dense_attempted": int(bool(getattr(fast, "dense_refine_attempted", False))),
-        "fast_dense_success": int(bool(getattr(fast, "dense_refine_success", False))),
-        "fast_dense_matches": int(getattr(fast, "dense_refine_matches", 0)),
-        "fast_dense_reason": getattr(fast, "dense_refine_reason", ""),
+        "fast_attempted": int(_debug_counter(debug_counters, "fast_attempted") > 0.0),
+        "fast_success": int(_debug_counter(debug_counters, "fast_success") > 0.0),
+        "fast_matches": int(_debug_counter(debug_counters, "fast_matches")),
+        "fast_reason": "",
+        "fast_identities": int(_debug_counter(debug_counters, "fast_identities")),
+        "fast_current_corners": int(
+            _debug_counter(debug_counters, "fast_current_corners")
+        ),
+        "fast_dense_attempted": int(
+            _debug_counter(debug_counters, "fast_dense_attempted") > 0.0
+        ),
+        "fast_dense_success": int(
+            _debug_counter(debug_counters, "fast_dense_success") > 0.0
+        ),
+        "fast_dense_matches": int(_debug_counter(debug_counters, "fast_dense_matches")),
+        "fast_dense_reason": "",
         "fast_dense_median_px": _fmt_float(dense_median),
         "fast_dense_p90_px": _fmt_float(dense_p90),
-        "fast_dense_projected": int(getattr(fast, "dense_refine_projected", 0)),
-        "fast_dense_detected": int(getattr(fast, "dense_refine_detected", 0)),
-        "fast_dense_rejected_no_projection": int(
-            getattr(fast, "dense_refine_rejected_no_projection", 0)
+        "fast_dense_projected": int(
+            _debug_counter(debug_counters, "fast_dense_projected")
         ),
-        "fast_dense_rejected_far": int(getattr(fast, "dense_refine_rejected_far", 0)),
+        "fast_dense_detected": int(
+            _debug_counter(debug_counters, "fast_dense_detected")
+        ),
+        "fast_dense_rejected_no_projection": int(
+            _debug_counter(debug_counters, "fast_dense_rejected_no_projection")
+        ),
+        "fast_dense_rejected_far": int(
+            _debug_counter(debug_counters, "fast_dense_rejected_far")
+        ),
         "fast_dense_rejected_ambiguous": int(
-            getattr(fast, "dense_refine_rejected_ambiguous", 0)
+            _debug_counter(debug_counters, "fast_dense_rejected_ambiguous")
         ),
         "fast_dense_rejected_non_mutual": int(
-            getattr(fast, "dense_refine_rejected_non_mutual", 0)
+            _debug_counter(debug_counters, "fast_dense_rejected_non_mutual")
         ),
         "fast_dense_image_coverage": _fmt_float(dense_coverage),
         "fast_dense_image_span_u_px": _fmt_float(dense_span_u),
         "fast_dense_image_span_v_px": _fmt_float(dense_span_v),
         "fast_dense_object_span_mm": _fmt_float(dense_object_span),
-        "fast_dense_distinct_rows": int(getattr(fast, "dense_refine_distinct_rows", 0)),
-        "fast_dense_distinct_cols": int(getattr(fast, "dense_refine_distinct_cols", 0)),
-        "fast_rejected_far": int(getattr(fast, "rejected_far", 0)),
-        "fast_rejected_ambiguous": int(getattr(fast, "rejected_ambiguous", 0)),
-        "fast_rejected_claimed": int(getattr(fast, "rejected_claimed", 0)),
+        "fast_dense_distinct_rows": int(
+            _debug_counter(debug_counters, "fast_dense_distinct_rows")
+        ),
+        "fast_dense_distinct_cols": int(
+            _debug_counter(debug_counters, "fast_dense_distinct_cols")
+        ),
+        "fast_rejected_far": int(_debug_counter(debug_counters, "fast_rejected_far")),
+        "fast_rejected_ambiguous": int(
+            _debug_counter(debug_counters, "fast_rejected_ambiguous")
+        ),
+        "fast_rejected_claimed": int(
+            _debug_counter(debug_counters, "fast_rejected_claimed")
+        ),
         "fast_rejected_no_projection": int(
-            getattr(fast, "rejected_no_projection", 0)
+            _debug_counter(debug_counters, "fast_rejected_no_projection")
         ),
 
         "green_ratio": f"{green_ratio:.3f}",

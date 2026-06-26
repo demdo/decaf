@@ -51,7 +51,7 @@ def _ensure_src_on_path() -> None:
 
 _ensure_src_on_path()
 
-from tracking.hydramarker.backend import cpp_impl as hydramarker_cpp
+from tracking.hydramarker import tracker as hydramarker_cpp
 
 
 # ============================================================

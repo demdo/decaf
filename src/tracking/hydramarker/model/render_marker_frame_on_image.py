@@ -10,8 +10,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from tracking.hydramarker.config import TrackerConfig
-from tracking.hydramarker.tracker import HydraTracker
-from tracking.hydramarker.tracker_types import TrackerResult
+from tracking.hydramarker.tracker import HydraTracker, TrackerResult
 
 
 INPUT_MODE = "realsense"  # "realsense" or "image"

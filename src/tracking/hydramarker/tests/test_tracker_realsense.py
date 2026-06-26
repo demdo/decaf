@@ -22,7 +22,7 @@ def _ensure_src_on_path() -> None:
 _ensure_src_on_path()
 
 from tracking.hydramarker import tracker_log
-from tracking.hydramarker.backend import cpp_impl as hydramarker_cpp
+from tracking.hydramarker import tracker as hydramarker_cpp
 from tracking.hydramarker.config import TrackerConfig
 from tracking.hydramarker.tracker import HydraTracker
 
@@ -340,7 +340,7 @@ def draw_status(vis: np.ndarray, result, frame_idx: int, tracker: HydraTracker) 
     detection_corners = getattr(result, "detection_corners", [])
     status_color = (0, 255, 0) if result.success else (0, 165, 255)
     failure_stage, failure_reason = tracker_log.classify_failure(result)
-    fast = getattr(result, "fast_path_debug", None)
+    debug_counters = getattr(result, "debug_counters", {}) or {}
 
     line1 = (
         f"frame={frame_idx} | {result.mode.value} | ok={result.success} | "
@@ -354,9 +354,9 @@ def draw_status(vis: np.ndarray, result, frame_idx: int, tracker: HydraTracker) 
         f"mean={result.mean_reprojection_error_px:.3f}px | "
         f"max={result.max_reprojection_error_px:.3f}px | "
         f"conf={result.confidence:.2f} | "
-        f"fast={int(bool(getattr(fast, 'attempted', False)))}/"
-        f"{int(bool(getattr(fast, 'success', False)))}:"
-        f"{int(getattr(fast, 'matches', 0))} | "
+        f"fast={int(float(debug_counters.get('fast_attempted', 0.0)) > 0.0)}/"
+        f"{int(float(debug_counters.get('fast_success', 0.0)) > 0.0)}:"
+        f"{int(float(debug_counters.get('fast_matches', 0.0)))} | "
         f"stage={failure_stage}"
     )
 
@@ -424,16 +424,16 @@ def log_console(frame_idx: int, result, tracker, *, force: bool = False) -> None
         return
 
     failure_stage, failure_reason = tracker_log.classify_failure(result)
-    fast = getattr(result, "fast_path_debug", None)
+    debug_counters = getattr(result, "debug_counters", {}) or {}
     print(
         "[test_tracker]",
         f"frame={frame_idx}",
         f"mode={result.mode.value}",
         f"success={result.success}",
         f"src={getattr(getattr(result, 'pose_source', None), 'value', 'none')}",
-        f"fast={int(bool(getattr(fast, 'attempted', False)))}/"
-        f"{int(bool(getattr(fast, 'success', False)))}:"
-        f"{int(getattr(fast, 'matches', 0))}",
+        f"fast={int(float(debug_counters.get('fast_attempted', 0.0)) > 0.0)}/"
+        f"{int(float(debug_counters.get('fast_success', 0.0)) > 0.0)}:"
+        f"{int(float(debug_counters.get('fast_matches', 0.0)))}",
         f"stage={failure_stage}",
         f"reason={failure_reason}",
         f"msg={result.message}",
@@ -467,10 +467,6 @@ def make_tracker(field_path, marker_json_path, K, dist) -> HydraTracker:
             decode_update_min_visual_corners=12,
             decode_update_min_distinct_rows=3,
             decode_update_min_distinct_cols=3,
-            # On the drill/cylinder, low pts is often caused by visibility,
-            # not LK drift. Do not reset dot state based on point count.
-            dot_early_reset_pts_ratio=0.0,
-            dot_early_reset_min_pts=6,
             pnp_ransac_iterations=500,
             pnp_ransac_reprojection_px=3.0,
             pnp_ransac_confidence=0.99,

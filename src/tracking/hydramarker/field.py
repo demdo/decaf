@@ -11,7 +11,7 @@ actual lookup is performed by the C++ backend through pybind11.
 
 import numpy as np
 
-from .backend.cpp_impl import (
+from .tracker import (
     MarkerFieldCpp,
     generate_planar_field,
 )

@@ -117,7 +117,7 @@ def test_depth_filter_holds_previous_z_when_negative_velocity_overshoots() -> No
 
 
 def test_cpp_depth_filter_matches_python_reference_sequence() -> None:
-    cpp = pytest.importorskip("tracking.hydramarker.backend.cpp_impl")
+    cpp = pytest.importorskip("tracking.hydramarker.tracker")
     from tracking.hydramarker.config import TrackerConfig
 
     K = np.asarray(
@@ -311,7 +311,7 @@ def test_cpp_depth_filter_matches_python_reference_sequence() -> None:
 
 
 def test_cpp_fast_pose_transaction_can_apply_depth_filter() -> None:
-    cpp = pytest.importorskip("tracking.hydramarker.backend.cpp_impl")
+    cpp = pytest.importorskip("tracking.hydramarker.tracker")
     from tracking.hydramarker.config import TrackerConfig
 
     geometry_path = (
@@ -474,8 +474,8 @@ def test_cpp_fast_pose_transaction_can_apply_depth_filter() -> None:
     )
 
 
-def test_cpp_tracker_engine_switch_routes_process_frame() -> None:
-    pytest.importorskip("tracking.hydramarker.backend.cpp_impl")
+def test_hydratracker_routes_process_frame_through_cpp_engine() -> None:
+    pytest.importorskip("tracking.hydramarker.tracker")
     from tracking.hydramarker.config import TrackerConfig
     from tracking.hydramarker.tracker import HydraTracker
 
@@ -491,24 +491,14 @@ def test_cpp_tracker_engine_switch_routes_process_frame() -> None:
     K = np.eye(3, dtype=np.float64)
     frame = np.zeros((64, 64, 3), dtype=np.uint8)
 
-    python_tracker = HydraTracker(
+    tracker = HydraTracker(
         str(field_path),
         str(geometry_path),
         K,
         None,
         TrackerConfig(),
     )
-    python_result = python_tracker.process_frame(frame, run_detection=False)
-    assert "cpp_tracker_engine_count" not in python_result.timings_ms
-
-    cpp_tracker = HydraTracker(
-        str(field_path),
-        str(geometry_path),
-        K,
-        None,
-        TrackerConfig(cpp_tracker_engine_enabled=True),
-    )
-    cpp_result = cpp_tracker.process_frame(frame, run_detection=False)
+    cpp_result = tracker.process_frame(frame, run_detection=False)
     assert cpp_result.timings_ms["cpp_tracker_engine_count"] == pytest.approx(1.0)
     assert cpp_result.timings_ms[
         "cpp_tracker_engine_current_pose_accepted_count"
@@ -516,16 +506,16 @@ def test_cpp_tracker_engine_switch_routes_process_frame() -> None:
     assert cpp_result.timings_ms[
         "cpp_tracker_engine_has_accepted_pose_count"
     ] == pytest.approx(0.0)
-    assert cpp_tracker.frame_index == 1
-    assert cpp_tracker._last_accepted_pose_frame == -1
-    assert cpp_tracker.pose_tracker.rvec is None
+    assert tracker.frame_index == 1
+    assert tracker._last_accepted_pose_frame == -1
+    assert tracker.pose_tracker.rvec is None
 
-    cpp_tracker.reset()
-    assert cpp_tracker.frame_index == 0
+    tracker.reset()
+    assert tracker.frame_index == 0
 
 
 def test_cpp_tracker_engine_result_carries_corner_lists() -> None:
-    cpp = pytest.importorskip("tracking.hydramarker.backend.cpp_impl")
+    cpp = pytest.importorskip("tracking.hydramarker.tracker")
     from tracking.hydramarker.config import TrackerConfig
     from tracking.hydramarker.tracker import HydraTracker
 
@@ -543,7 +533,7 @@ def test_cpp_tracker_engine_result_carries_corner_lists() -> None:
         str(geometry_path),
         np.eye(3, dtype=np.float64),
         None,
-        TrackerConfig(cpp_tracker_engine_enabled=True),
+        TrackerConfig(),
     )
 
     detected = cpp.DetectedCorner()
@@ -633,8 +623,7 @@ def test_plateau_pose_prior_accepts_static_pose_with_small_reprojection_excess()
 
 
 def test_cpp_plateau_pose_prior_matches_python_static_case() -> None:
-    pytest.importorskip("tracking.hydramarker.backend.cpp_impl")
-    from tracking.hydramarker.backend import cpp_impl as cpp
+    cpp = pytest.importorskip("tracking.hydramarker.tracker")
 
     object_points = np.asarray(
         [

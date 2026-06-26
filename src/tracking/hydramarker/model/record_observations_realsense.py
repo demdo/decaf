@@ -12,8 +12,7 @@ import pyrealsense2 as rs
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from tracking.hydramarker.config import TrackerConfig
-from tracking.hydramarker.tracker import HydraTracker
-from tracking.hydramarker.tracker_types import PoseSource
+from tracking.hydramarker.tracker import HydraTracker, PoseSource
 from tracking.hydramarker.model.observations import (
     FrameObservation,
     frame_from_tracker_result,
@@ -394,7 +393,6 @@ def make_sfm_tracker(
             max_rotation_jump_deg=360.0,
             rotation_gate_scale_per_lost_frame=0.0,
             rotation_gate_max_deg=360.0,
-            dot_early_reset_pts_ratio=0.0,
             pnp_ransac_iterations=500,
             pnp_ransac_reprojection_px=3.0,
             pnp_ransac_confidence=0.99,
@@ -406,13 +404,8 @@ def make_sfm_tracker(
             corr_min_rotation_support=2,
             corr_min_rotation_support_ratio=0.55,
             decode_only_mode=True,
-            # SfM wants dense, freshly decoded observations. The later live
-            # tracker may use the Fast Path, but the recorder must keep
-            # running Dot/Patch/Decode so newly visible corners can become
-            # global correspondences.
             enable_fast_persistent_path=False,
             enable_pose_propagation=False,
-            enable_uncoded_grid_bootstrap=False,
             enable_temporal_correspondence_persistence=False,
             persistence_use_pose_projection=True,
             persistence_projection_max_reproj_px=12.0,
