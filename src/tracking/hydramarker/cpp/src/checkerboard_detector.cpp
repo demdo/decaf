@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -27,6 +28,20 @@ static float dist2(const cv::Point2f& a, const cv::Point2f& b) {
 
 static float distf(const cv::Point2f& a, const cv::Point2f& b) {
     return std::sqrt(dist2(a, b));
+}
+
+static double percentileNearest(std::vector<float> values, double q) {
+    if (values.empty()) return 0.0;
+    q = std::max(0.0, std::min(1.0, q));
+    std::sort(values.begin(), values.end());
+    const size_t rank = std::max<size_t>(
+        1,
+        static_cast<size_t>(std::ceil(
+            q * static_cast<double>(values.size()))));
+    const size_t idx = std::min(
+        values.size() - 1,
+        rank - 1);
+    return static_cast<double>(values[idx]);
 }
 
 static float cross2(const cv::Point2f& a, const cv::Point2f& b) {
@@ -2518,6 +2533,116 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
         validation.visible_points    = std::move(culled_points);
         validation.visible_predicted = std::move(culled_predicted);
         addTimingMs("tracking_cull_ms", elapsedMs(cull_t0));
+    }
+
+    // Snap LK-tracked points to current-frame subpixel corners before the
+    // tracked detection is rebuilt and handed to PnP.
+    {
+        const auto subpix_t0 = cv::getTickCount();
+        const bool subpix_enabled =
+            config_.saddle_subpix_win_size != 0 &&
+            config_.saddle_subpix_max_iters > 0 &&
+            config_.saddle_subpix_epsilon > 0.0;
+
+        last_timings_ms_["tracking_subpix_enabled_count"] =
+            subpix_enabled ? 1.0 : 0.0;
+        last_timings_ms_["tracking_subpix_count"] = 0.0;
+        last_timings_ms_["tracking_subpix_mean_shift_px"] = 0.0;
+        last_timings_ms_["tracking_subpix_p95_shift_px"] = 0.0;
+        last_timings_ms_["tracking_subpix_max_shift_px"] = 0.0;
+
+        if (subpix_enabled && !validation.visible_points.empty()) {
+            const int configured_win =
+                config_.saddle_subpix_win_size > 0
+                    ? config_.saddle_subpix_win_size
+                    : config_.saddle_radius - 1;
+            const int win = std::max(3, configured_win);
+            const float border = static_cast<float>(win + 1);
+
+            std::vector<int> refine_indices;
+            std::vector<cv::Point2f> refined;
+            refine_indices.reserve(validation.visible_points.size());
+            refined.reserve(validation.visible_points.size());
+
+            for (size_t k = 0; k < validation.visible_points.size(); ++k) {
+                const bool predicted =
+                    k < validation.visible_predicted.size()
+                        ? validation.visible_predicted[k]
+                        : false;
+                if (predicted) continue;
+
+                const cv::Point2f& uv = validation.visible_points[k];
+                if (!std::isfinite(uv.x) || !std::isfinite(uv.y)) continue;
+                if (uv.x < border || uv.y < border ||
+                    uv.x >= static_cast<float>(gray.cols) - border ||
+                    uv.y >= static_cast<float>(gray.rows) - border) {
+                    continue;
+                }
+
+                refine_indices.push_back(static_cast<int>(k));
+                refined.push_back(uv);
+            }
+
+            if (!refined.empty()) {
+                const std::vector<cv::Point2f> before = refined;
+                bool refined_ok = true;
+                try {
+                    cv::cornerSubPix(
+                        gray,
+                        refined,
+                        cv::Size(win, win),
+                        cv::Size(-1, -1),
+                        cv::TermCriteria(
+                            cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
+                            config_.saddle_subpix_max_iters,
+                            config_.saddle_subpix_epsilon));
+                } catch (const cv::Exception&) {
+                    refined_ok = false;
+                }
+
+                std::vector<float> shifts;
+                shifts.reserve(refined.size());
+                double shift_sum = 0.0;
+                double shift_max = 0.0;
+
+                if (refined_ok) {
+                    for (size_t r = 0; r < refined.size(); ++r) {
+                        const cv::Point2f& uv = refined[r];
+                        if (!std::isfinite(uv.x) ||
+                            !std::isfinite(uv.y)) {
+                            continue;
+                        }
+                        if (uv.x < 0.0f || uv.y < 0.0f ||
+                            uv.x >= static_cast<float>(gray.cols) ||
+                            uv.y >= static_cast<float>(gray.rows)) {
+                            continue;
+                        }
+
+                        const float shift = distf(uv, before[r]);
+                        shifts.push_back(shift);
+                        shift_sum += static_cast<double>(shift);
+                        shift_max = std::max(
+                            shift_max,
+                            static_cast<double>(shift));
+                        validation.visible_points[
+                            static_cast<size_t>(refine_indices[r])] = uv;
+                    }
+
+                    if (!shifts.empty()) {
+                        last_timings_ms_["tracking_subpix_count"] =
+                            static_cast<double>(shifts.size());
+                        last_timings_ms_["tracking_subpix_mean_shift_px"] =
+                            shift_sum / static_cast<double>(shifts.size());
+                        last_timings_ms_["tracking_subpix_p95_shift_px"] =
+                            percentileNearest(shifts, 0.95);
+                        last_timings_ms_["tracking_subpix_max_shift_px"] =
+                            shift_max;
+                    }
+                }
+            }
+        }
+
+        addTimingMs("tracking_subpix_ms", elapsedMs(subpix_t0));
     }
 
     const auto build_t0 = cv::getTickCount();
