@@ -77,38 +77,6 @@ struct TrackerFrameResult {
     std::vector<TrackerCorner> correspondence_corners;
     int persistent_count = 0;
 
-    bool depth_filter_available = false;
-    bool depth_filter_applied = false;
-    double depth_filter_delta_z_mm = 0.0;
-    double depth_filter_raw_z_mm = std::numeric_limits<double>::quiet_NaN();
-    double depth_filter_z_mm = std::numeric_limits<double>::quiet_NaN();
-    double depth_filter_reproj_excess_px =
-        std::numeric_limits<double>::quiet_NaN();
-    double depth_filter_guard_alpha = 1.0;
-    double depth_filter_innovation_z_mm = 0.0;
-    double depth_filter_innovation_mean_z_mm = 0.0;
-    double depth_filter_innovation_cusum_pos_mm = 0.0;
-    double depth_filter_innovation_cusum_neg_mm = 0.0;
-    bool depth_filter_innovation_bias_detected = false;
-    int depth_filter_innovation_bias_direction = 0;
-    bool depth_filter_innovation_bias_limited = false;
-    double depth_filter_object_z_span_mm =
-        std::numeric_limits<double>::quiet_NaN();
-    bool depth_filter_negative_delta_guard_limited = false;
-
-    bool pose_plateau_prior_triggered = false;
-    bool pose_plateau_prior_attempted = false;
-    bool pose_plateau_prior_applied = false;
-    std::string pose_plateau_prior_method;
-    std::string pose_plateau_prior_reason;
-    double pose_plateau_prior_delta_z_mm =
-        std::numeric_limits<double>::quiet_NaN();
-    double pose_plateau_prior_reproj_excess_px =
-        std::numeric_limits<double>::quiet_NaN();
-    double pose_plateau_prior_max_reproj_excess_px =
-        std::numeric_limits<double>::quiet_NaN();
-    int pose_plateau_prior_iterations = 0;
-
     bool fast_attempted = false;
     bool fast_success = false;
     bool fast_route_decode = false;

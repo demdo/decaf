@@ -34,7 +34,7 @@ COLUMNS = [
     # frame / timing
     "frame", "wall_ms",
     "tracker_total_ms", "checkerboard_ms", "fast_persistent_ms",
-    "persistent_match_ms", "pnp_ms", "pnp_method", "pose_plateau_prior_ms", "pose_propagation_ms",
+    "persistent_match_ms", "pnp_ms", "pnp_method", "pose_propagation_ms",
     "decode_pose_ms", "hold_pose_ms", "emergency_hold_ms", "draw_ms",
     "checkerboard_to_gray_ms", "checkerboard_track_total_ms",
     "checkerboard_lk_ms", "checkerboard_tracking_validate_ms",
@@ -103,30 +103,20 @@ COLUMNS = [
     "camera_yaw_deg",
     "pose_rotation_delta_deg",
     "pose_translation_delta_mm",
-    "depth_filter_applied",
-    "depth_filter_delta_z_mm",
-    "depth_filter_raw_z_mm",
-    "depth_filter_z_mm",
-    "depth_filter_reproj_excess_px",
-    "depth_filter_guard_alpha",
-    "depth_filter_innovation_z_mm",
-    "depth_filter_innovation_mean_z_mm",
-    "depth_filter_innovation_cusum_pos_mm",
-    "depth_filter_innovation_cusum_neg_mm",
-    "depth_filter_innovation_bias_detected",
-    "depth_filter_innovation_bias_direction",
-    "depth_filter_innovation_bias_limited",
-    "depth_filter_object_z_span_mm",
-    "depth_filter_negative_delta_guard_limited",
-    "pose_plateau_prior_triggered",
-    "pose_plateau_prior_attempted",
-    "pose_plateau_prior_applied",
-    "pose_plateau_prior_method",
-    "pose_plateau_prior_reason",
-    "pose_plateau_prior_delta_z_mm",
-    "pose_plateau_prior_reproj_excess_px",
-    "pose_plateau_prior_max_reproj_excess_px",
-    "pose_plateau_prior_iterations",
+    "raw_tvec_x_mm",
+    "raw_tvec_y_mm",
+    "raw_tvec_z_mm",
+    "raw_rvec_x_rad",
+    "raw_rvec_y_rad",
+    "raw_rvec_z_rad",
+    "raw_board_pose_available",
+    "raw_board_tvec_x_mm",
+    "raw_board_tvec_y_mm",
+    "raw_board_tvec_z_mm",
+    "raw_board_delta_x_mm",
+    "raw_board_delta_y_mm",
+    "raw_board_delta_z_mm",
+    "raw_pose_source",
 
     # board-relative pose diagnostics, filled by debug_tracker_translation
     "board_pose_available",
@@ -1728,6 +1718,22 @@ def log_frame(
         dense_object_span = None
 
     timing_profile = _timing_profile_dict(timings, wall_ms=wall_ms, draw_ms=draw_ms)
+    raw_tvec = None
+    raw_board_tvec = None
+    raw_board_delta = None
+    raw_pose_source = ""
+    if (
+        has_pose
+        and tvec_x_mm is not None
+        and tvec_y_mm is not None
+        and tvec_z_mm is not None
+        and np.isfinite(tvec_z_mm)
+    ):
+        raw_tvec = np.asarray([tvec_x_mm, tvec_y_mm, tvec_z_mm], dtype=np.float64)
+        raw_board_tvec = board_tvec_from_pose(getattr(result, "rvec", None), raw_tvec)
+        if raw_board_tvec is not None and _debug_board_origin_tvec is not None:
+            raw_board_delta = raw_board_tvec - _debug_board_origin_tvec
+        raw_pose_source = "pose"
 
     row = {
         "frame": frame_idx,
@@ -1738,7 +1744,6 @@ def log_frame(
         "persistent_match_ms": _fmt_float(timings.get("persistent_match_ms")),
         "pnp_ms": _fmt_float(timings.get("pnp_ms")),
         "pnp_method": getattr(result, "pnp_method", ""),
-        "pose_plateau_prior_ms": _fmt_float(timings.get("pose_plateau_prior_ms")),
         "pose_propagation_ms": _fmt_float(timings.get("pose_propagation_ms")),
         "decode_pose_ms": _fmt_float(timings.get("decode_pose_ms")),
         "hold_pose_ms": _fmt_float(timings.get("hold_pose_ms")),
@@ -1885,64 +1890,20 @@ def log_frame(
         "camera_yaw_deg": _fmt_float(camera_yaw_deg),
         "pose_rotation_delta_deg": _fmt_float(rot_delta),
         "pose_translation_delta_mm": _fmt_float(trans_delta),
-        "depth_filter_applied": int(bool(getattr(result, "depth_filter_applied", False))),
-        "depth_filter_delta_z_mm": _fmt_float(getattr(result, "depth_filter_delta_z_mm", None)),
-        "depth_filter_raw_z_mm": _fmt_float(getattr(result, "depth_filter_raw_z_mm", None)),
-        "depth_filter_z_mm": _fmt_float(getattr(result, "depth_filter_z_mm", None)),
-        "depth_filter_reproj_excess_px": _fmt_float(
-            getattr(result, "depth_filter_reproj_excess_px", None)
-        ),
-        "depth_filter_guard_alpha": _fmt_float(getattr(result, "depth_filter_guard_alpha", None)),
-        "depth_filter_innovation_z_mm": _fmt_float(
-            getattr(result, "depth_filter_innovation_z_mm", None)
-        ),
-        "depth_filter_innovation_mean_z_mm": _fmt_float(
-            getattr(result, "depth_filter_innovation_mean_z_mm", None)
-        ),
-        "depth_filter_innovation_cusum_pos_mm": _fmt_float(
-            getattr(result, "depth_filter_innovation_cusum_pos_mm", None)
-        ),
-        "depth_filter_innovation_cusum_neg_mm": _fmt_float(
-            getattr(result, "depth_filter_innovation_cusum_neg_mm", None)
-        ),
-        "depth_filter_innovation_bias_detected": int(
-            bool(getattr(result, "depth_filter_innovation_bias_detected", False))
-        ),
-        "depth_filter_innovation_bias_direction": int(
-            getattr(result, "depth_filter_innovation_bias_direction", 0) or 0
-        ),
-        "depth_filter_innovation_bias_limited": int(
-            bool(getattr(result, "depth_filter_innovation_bias_limited", False))
-        ),
-        "depth_filter_object_z_span_mm": _fmt_float(
-            getattr(result, "depth_filter_object_z_span_mm", None)
-        ),
-        "depth_filter_negative_delta_guard_limited": int(
-            bool(getattr(result, "depth_filter_negative_delta_guard_limited", False))
-        ),
-        "pose_plateau_prior_triggered": int(
-            bool(getattr(result, "pose_plateau_prior_triggered", False))
-        ),
-        "pose_plateau_prior_attempted": int(
-            bool(getattr(result, "pose_plateau_prior_attempted", False))
-        ),
-        "pose_plateau_prior_applied": int(
-            bool(getattr(result, "pose_plateau_prior_applied", False))
-        ),
-        "pose_plateau_prior_method": getattr(result, "pose_plateau_prior_method", ""),
-        "pose_plateau_prior_reason": getattr(result, "pose_plateau_prior_reason", ""),
-        "pose_plateau_prior_delta_z_mm": _fmt_float(
-            getattr(result, "pose_plateau_prior_delta_z_mm", None)
-        ),
-        "pose_plateau_prior_reproj_excess_px": _fmt_float(
-            getattr(result, "pose_plateau_prior_reproj_excess_px", None)
-        ),
-        "pose_plateau_prior_max_reproj_excess_px": _fmt_float(
-            getattr(result, "pose_plateau_prior_max_reproj_excess_px", None)
-        ),
-        "pose_plateau_prior_iterations": int(
-            getattr(result, "pose_plateau_prior_iterations", 0) or 0
-        ),
+        "raw_tvec_x_mm": _fmt_float(None if raw_tvec is None else raw_tvec[0]),
+        "raw_tvec_y_mm": _fmt_float(None if raw_tvec is None else raw_tvec[1]),
+        "raw_tvec_z_mm": _fmt_float(None if raw_tvec is None else raw_tvec[2]),
+        "raw_rvec_x_rad": _fmt_float(rvec_x_rad, digits=8) if raw_tvec is not None else "",
+        "raw_rvec_y_rad": _fmt_float(rvec_y_rad, digits=8) if raw_tvec is not None else "",
+        "raw_rvec_z_rad": _fmt_float(rvec_z_rad, digits=8) if raw_tvec is not None else "",
+        "raw_board_pose_available": int(raw_board_tvec is not None),
+        "raw_board_tvec_x_mm": _fmt_float(None if raw_board_tvec is None else raw_board_tvec[0]),
+        "raw_board_tvec_y_mm": _fmt_float(None if raw_board_tvec is None else raw_board_tvec[1]),
+        "raw_board_tvec_z_mm": _fmt_float(None if raw_board_tvec is None else raw_board_tvec[2]),
+        "raw_board_delta_x_mm": _fmt_float(None if raw_board_delta is None else raw_board_delta[0]),
+        "raw_board_delta_y_mm": _fmt_float(None if raw_board_delta is None else raw_board_delta[1]),
+        "raw_board_delta_z_mm": _fmt_float(None if raw_board_delta is None else raw_board_delta[2]),
+        "raw_pose_source": raw_pose_source,
 
         "board_pose_available": int(board_pose["available"]),
         "board_tvec_x_mm": _fmt_float(board_pose["x"]),

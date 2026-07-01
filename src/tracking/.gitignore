@@ -1,0 +1,15 @@
+# Local HydraMarker artifacts
+hydramarker/debug/
+hydramarker/data/
+hydramarker/tests/
+
+# Generated calibration outputs stay local; calibration scripts remain tracked.
+hydramarker/calib/camera_calibration*.npz
+hydramarker/calib/hydramarker_camera_calibration_*.npz
+hydramarker/calib/hydramarker_camera_calibration_*_model_comparison.csv
+hydramarker/calib/hydramarker_camera_calibration_*_diagnostics/
+
+# Same local-only folders if they are created at the repository root.
+debug/
+data/
+tests/

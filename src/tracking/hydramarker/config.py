@@ -4,7 +4,7 @@ This module is intentionally the only Python-side configuration surface for the
 live HydraMarker tracker.  The values below are copied into the native
 ``TrackerConfig`` object in ``tracker.py`` and then consumed by the staged C++
 pipeline in ``cpp/src/tracker_engine.cpp`` and the related detector, decoder,
-pose, filter, persistence, and logging helpers.
+pose, persistence, and logging helpers.
 
 Changing these values does not require rebuilding C++.  A new ``HydraTracker``
 instance copies the current Python dataclass values into the native runtime at
@@ -101,50 +101,6 @@ class TrackerConfig:
     pnp_direct_refine_method: str = "lm"
     pnp_direct_max_mean_reprojection_error_px: float = 1.5
     pnp_direct_max_max_reprojection_error_px: float = 3.0
-
-    # Depth Filter
-    # Enables and parameterizes the native camera-Z filter. Values are copied by
-    # TrackerEngine::makePoseDepthFilterConfig into PoseDepthFilterConfig and
-    # applied in TrackerEngine::applyDepthFilterToPose.
-    pose_depth_filter_enabled: bool = True
-    pose_depth_filter_observation_std_mm: float = 16.0
-    pose_depth_filter_process_std_mm: float = 0.05
-    pose_depth_filter_initial_velocity_std_mm: float = 0.1
-    pose_depth_filter_reprojection_guard_px: float = 1.0
-    pose_depth_filter_min_points: int = 6
-    pose_depth_filter_innovation_guard_enabled: bool = True
-    pose_depth_filter_innovation_window: int = 10
-    pose_depth_filter_innovation_bias_threshold_mm: float = 0.75
-    pose_depth_filter_innovation_min_same_sign: int = 8
-    pose_depth_filter_innovation_cusum_slack_mm: float = 0.2
-    pose_depth_filter_innovation_cusum_threshold_mm: float = 8.0
-    pose_depth_filter_negative_delta_guard_enabled: bool = True
-    pose_depth_filter_negative_delta_guard_min_z_span_mm: float = 14.835
-    pose_depth_filter_negative_delta_guard_max_negative_delta_mm: float = 0.0
-    pose_depth_filter_negative_delta_guard_hold_previous_z: bool = False
-    pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias: bool = True
-    pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm: float = 0.4
-    pose_depth_filter_negative_delta_guard_max_hold_correction_mm: float = 0.75
-    pose_depth_filter_negative_delta_guard_velocity_damping: float = 0.25
-
-    # Plateau Prior
-    # Copied by TrackerEngine::makePlateauPosePriorConfig and used only by
-    # TrackerEngine::maybeApplyPlateauPrior when the depth filter reports a
-    # geometry-suspicious negative Z correction.
-    pose_plateau_prior_enabled: bool = True
-    pose_plateau_prior_trigger_negative_delta_mm: float = 0.0
-    pose_plateau_prior_min_object_z_span_mm: float = 14.835
-    pose_plateau_prior_min_points: int = 6
-    pose_plateau_prior_static_max_excess_px: float = 0.18
-    pose_plateau_prior_candidate_max_excess_px: float = 0.25
-    pose_plateau_prior_candidate_max_max_excess_px: float = 1.00
-    pose_plateau_prior_min_positive_z_correction_mm: float = 0.0
-    pose_plateau_prior_max_positive_z_correction_mm: float = 0.75
-    pose_plateau_prior_robust_c_px: float = 0.20
-    pose_plateau_prior_max_iterations: int = 6
-    pose_plateau_prior_max_step_translation_mm: float = 5.0
-    pose_plateau_prior_max_step_rotation_deg: float = 5.0
-    pose_plateau_prior_lm_damping: float = 1.0e-5
 
     # Persistence/Fast Path
     # Used by PersistentMatcher, TrackerGeometry, and TrackerEngine in

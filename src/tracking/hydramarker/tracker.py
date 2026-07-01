@@ -6,9 +6,9 @@ extension, converts ``TrackerConfig`` into the matching C++ configuration
 object, and exposes ``HydraTracker`` as the Python-facing runtime wrapper.
 
 Python code should treat this file as the only loader for tracker runtime
-objects.  Detector, decoder, persistence, filtering, pose estimation, and hold
-logic all execute inside C++; Python only passes configuration in and converts
-the native frame result into lightweight Python data containers.
+objects. Detector, decoder, persistence, pose estimation, and hold logic all
+execute inside C++; Python only passes configuration in and converts the native
+frame result into lightweight Python data containers.
 """
 
 from __future__ import annotations
@@ -91,73 +91,6 @@ def create_tracker_engine(
         K_arr,
         dist_arr,
         tracker_config_from_python(config),
-    )
-
-
-def pose_depth_filter_config_from_python(config=None):
-    cpp_config = hydramarker_cpp.PoseDepthFilterConfig()
-    if config is None:
-        return cpp_config
-
-    mapping = {
-        "pose_depth_filter_observation_std_mm": "observation_std_mm",
-        "pose_depth_filter_process_std_mm": "process_std_mm",
-        "pose_depth_filter_initial_velocity_std_mm": "initial_velocity_std_mm",
-        "pose_depth_filter_reprojection_guard_px": "reprojection_guard_px",
-        "pose_depth_filter_innovation_guard_enabled": "innovation_guard_enabled",
-        "pose_depth_filter_innovation_window": "innovation_guard_window",
-        "pose_depth_filter_innovation_bias_threshold_mm": (
-            "innovation_guard_bias_threshold_mm"
-        ),
-        "pose_depth_filter_innovation_min_same_sign": (
-            "innovation_guard_min_same_sign"
-        ),
-        "pose_depth_filter_innovation_cusum_slack_mm": "innovation_cusum_slack_mm",
-        "pose_depth_filter_innovation_cusum_threshold_mm": (
-            "innovation_cusum_threshold_mm"
-        ),
-        "pose_depth_filter_negative_delta_guard_enabled": (
-            "negative_delta_guard_enabled"
-        ),
-        "pose_depth_filter_negative_delta_guard_min_z_span_mm": (
-            "negative_delta_guard_min_z_span_mm"
-        ),
-        "pose_depth_filter_negative_delta_guard_max_negative_delta_mm": (
-            "negative_delta_guard_max_negative_delta_mm"
-        ),
-        "pose_depth_filter_negative_delta_guard_hold_previous_z": (
-            "negative_delta_guard_hold_previous_z"
-        ),
-        "pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias": (
-            "negative_delta_guard_hold_requires_innovation_bias"
-        ),
-        "pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm": (
-            "negative_delta_guard_hold_min_negative_delta_mm"
-        ),
-        "pose_depth_filter_negative_delta_guard_max_hold_correction_mm": (
-            "negative_delta_guard_max_hold_correction_mm"
-        ),
-        "pose_depth_filter_negative_delta_guard_velocity_damping": (
-            "negative_delta_guard_velocity_damping"
-        ),
-    }
-    for py_name, cpp_name in mapping.items():
-        if hasattr(config, py_name):
-            setattr(cpp_config, cpp_name, getattr(config, py_name))
-    return cpp_config
-
-
-def create_pose_depth_filter(K, dist_coeffs=None, config=None):
-    K_arr = np.asarray(K, dtype=np.float64).reshape(3, 3)
-    dist_arr = (
-        None
-        if dist_coeffs is None
-        else np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
-    )
-    return hydramarker_cpp.PoseDepthKalmanFilter(
-        K_arr,
-        dist_arr,
-        pose_depth_filter_config_from_python(config),
     )
 
 

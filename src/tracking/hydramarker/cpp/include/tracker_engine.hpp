@@ -15,11 +15,9 @@
 #include "patch_decoder.hpp"
 #include "patch_extractor.hpp"
 #include "tracker_config.hpp"
-#include "tracker_depth_filter.hpp"
 #include "tracker_geometry.hpp"
 #include "tracker_persistence.hpp"
 #include "tracker_pose.hpp"
-#include "tracker_pose_prior.hpp"
 #include "tracker_types.hpp"
 
 namespace hydramarker {
@@ -59,7 +57,6 @@ private:
     PatchDecoder patch_decoder_;
     CorrespondenceBuilder correspondence_builder_;
     MapPoseTracker pose_tracker_;
-    PoseDepthKalmanFilter pose_depth_filter_;
     TrackerGeometry tracker_geometry_;
     PersistentMatcher persistent_matcher_;
 
@@ -85,12 +82,6 @@ private:
         const TrackerConfig& config
     );
     static MapPoseTrackerConfig makeMapPoseTrackerConfig(
-        const TrackerConfig& config
-    );
-    static PoseDepthFilterConfig makePoseDepthFilterConfig(
-        const TrackerConfig& config
-    );
-    static PlateauPosePriorConfig makePlateauPosePriorConfig(
         const TrackerConfig& config
     );
     static double confidence(int num_inliers, double mean_error_px, const TrackerConfig& config);
@@ -141,40 +132,6 @@ private:
         const std::vector<double>& tvec,
         double& mean_error_px,
         double& max_error_px
-    ) const;
-
-    std::optional<PoseDepthFilterResult> applyDepthFilterToPose(
-        MapPoseResult& pose,
-        const std::vector<PoseTrackPoint>& fallback_points
-    );
-
-    bool plateauPriorTriggered(
-        const std::optional<PoseDepthFilterResult>& filtered
-    ) const;
-
-    std::optional<MapPoseResult> maybeApplyPlateauPrior(
-        const MapPoseResult& raw_pose,
-        MapPoseResult& pose,
-        const std::vector<PoseTrackPoint>& fallback_points,
-        const std::optional<PoseDepthFilterResult>& filtered,
-        const std::vector<double>& previous_rvec,
-        const std::vector<double>& previous_tvec,
-        PlateauPosePriorResult& prior,
-        bool& triggered,
-        bool& applied
-    );
-
-    void attachDepthFilterResult(
-        TrackerFrameResult& result,
-        const std::optional<PoseDepthFilterResult>& filtered
-    ) const;
-
-    void attachPlateauPriorResult(
-        TrackerFrameResult& result,
-        const PlateauPosePriorResult& prior,
-        bool triggered,
-        bool attempted,
-        bool applied
     ) const;
 
     bool acceptPoseState(

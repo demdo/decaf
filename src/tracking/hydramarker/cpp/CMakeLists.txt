@@ -47,8 +47,6 @@ set(HYDRAMARKER_SOURCES
     src/tracking_validator.cpp
     src/geometry_utils.cpp
     src/tracker_pose.cpp
-    src/tracker_depth_filter.cpp
-    src/tracker_pose_prior.cpp
     src/tracker_persistence.cpp
     src/tracker_geometry.cpp
     src/tracker_engine.cpp

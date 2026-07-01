@@ -10,7 +10,6 @@
 #include "checkerboard_types.hpp"
 #include "marker_geometry.hpp"
 #include "tracker_config.hpp"
-#include "tracker_depth_filter.hpp"
 #include "tracker_pose.hpp"
 
 namespace hydramarker {
@@ -138,22 +137,18 @@ struct FastPoseResult {
 
     MapPoseResult seed_pose;
     MapPoseResult pose;
-    MapPoseResult depth_filtered_pose;
-    PoseDepthFilterResult depth_filter_result;
 
     double persistent_match_ms = 0.0;
     double seed_pnp_ms = 0.0;
     double cpp_seed_total_ms = 0.0;
     double dense_match_ms = 0.0;
     double dense_pose_ms = 0.0;
-    double depth_filter_ms = 0.0;
     double persistence_refresh_ms = 0.0;
     double total_ms = 0.0;
 
     int min_points = 0;
     int min_dense_points = 0;
     int dense_matches = 0;
-    bool depth_filter_available = false;
     FastAcceptedState accepted_state;
 
     bool persistence_refresh_available = false;
@@ -212,7 +207,6 @@ public:
         const std::vector<double>& previous_rvec = {},
         const std::vector<double>& previous_tvec = {},
         int lost_frames = 0,
-        PoseDepthKalmanFilter* depth_filter = nullptr,
         int max_pts_seen = 0
     );
 

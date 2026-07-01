@@ -46,7 +46,6 @@ TrackerEngine::TrackerEngine(
       patch_decoder_(makePatchDecoderConfig(config)),
       correspondence_builder_(makeCorrespondenceBuilderConfig(config)),
       pose_tracker_(K, dist_coeffs, makeMapPoseTrackerConfig(config)),
-      pose_depth_filter_(K, dist_coeffs, makePoseDepthFilterConfig(config)),
       tracker_geometry_(geometry_, K, dist_coeffs, config),
       persistent_matcher_(config)
 {
@@ -75,7 +74,6 @@ void TrackerEngine::reset()
     checkerboard_detector_.resetTracking();
     dot_detector_.reset();
     pose_tracker_.reset();
-    pose_depth_filter_.reset();
     persistent_matcher_.reset();
 }
 
@@ -375,52 +373,14 @@ TrackerFrameResult TrackerEngine::processFrame(
 
     low_fresh_correspondence_frames_ = 0;
 
-    const std::vector<double> previous_rvec = pose_tracker_.rvec();
-    const std::vector<double> previous_tvec = pose_tracker_.tvec();
-    const PoseDepthFilterSnapshot depth_snapshot =
-        pose_depth_filter_.snapshot();
-
     const std::int64_t pose_t0 = cv::getTickCount();
     MapPoseResult pose = pose_tracker_.estimatePose(pose_points, lost_frames_);
     result.timings_ms["pnp_ms"] = elapsedMs(pose_t0);
 
-    std::optional<PoseDepthFilterResult> filtered_depth;
-    PlateauPosePriorResult plateau_prior;
-    bool plateau_triggered = false;
-    bool plateau_applied = false;
     std::vector<TrackerCorner> visual_corners;
     if (pose.success) {
-        MapPoseResult raw_pose = pose;
-        const std::int64_t depth_t0 = cv::getTickCount();
-        filtered_depth = applyDepthFilterToPose(pose, pose_points);
-        result.timings_ms["pose_depth_filter_pre_ms"] = elapsedMs(depth_t0);
-
-        const std::int64_t plateau_t0 = cv::getTickCount();
-        std::optional<MapPoseResult> prior_pose = maybeApplyPlateauPrior(
-            raw_pose,
-            pose,
-            pose_points,
-            filtered_depth,
-            previous_rvec,
-            previous_tvec,
-            plateau_prior,
-            plateau_triggered,
-            plateau_applied
-        );
-        result.timings_ms["pose_plateau_prior_ms"] = elapsedMs(plateau_t0);
-        if (prior_pose.has_value()) {
-            pose_depth_filter_.restore(depth_snapshot);
-            pose = *prior_pose;
-            pose_tracker_.setPose(pose.rvec, pose.tvec);
-            const std::int64_t prior_depth_t0 = cv::getTickCount();
-            filtered_depth = applyDepthFilterToPose(pose, pose_points);
-            result.timings_ms["pose_depth_filter_prior_ms"] =
-                elapsedMs(prior_depth_t0);
-        }
+        pose_tracker_.setPose(pose.rvec, pose.tvec);
         visual_corners = visualCornersForPose(pose);
-    } else {
-        result.timings_ms["pose_depth_filter_pre_ms"] = 0.0;
-        result.timings_ms["pose_plateau_prior_ms"] = 0.0;
     }
     packagePoseResult(
         result,
@@ -429,14 +389,6 @@ TrackerFrameResult TrackerEngine::processFrame(
         pose.message,
         visual_corners,
         correspondence_corners
-    );
-    attachDepthFilterResult(result, filtered_depth);
-    attachPlateauPriorResult(
-        result,
-        plateau_prior,
-        plateau_triggered,
-        plateau_triggered,
-        plateau_applied
     );
 
     if (pose.success) {
@@ -701,224 +653,6 @@ bool TrackerEngine::reprojectionMeanMax(
     }
     mean_error_px = sum / static_cast<double>(projected.size());
     return true;
-}
-
-std::optional<PoseDepthFilterResult> TrackerEngine::applyDepthFilterToPose(
-    MapPoseResult& pose,
-    const std::vector<PoseTrackPoint>& fallback_points
-)
-{
-    if (!config_.pose_depth_filter_enabled) {
-        return std::nullopt;
-    }
-    if (!pose.success || pose.rvec.size() != 3 || pose.tvec.size() != 3) {
-        return std::nullopt;
-    }
-
-    const std::vector<PoseTrackPoint>& filter_points =
-        pose.points.empty() ? fallback_points : pose.points;
-    if (
-        static_cast<int>(filter_points.size()) <
-        std::max(1, config_.pose_depth_filter_min_points)
-    ) {
-        return std::nullopt;
-    }
-
-    std::vector<cv::Point3d> object_points;
-    std::vector<cv::Point2d> image_points;
-    pointsToCv(filter_points, object_points, image_points);
-
-    PoseDepthFilterResult filtered = pose_depth_filter_.update(
-        pose.rvec,
-        pose.tvec,
-        object_points,
-        image_points
-    );
-
-    pose.rvec = filtered.rvec;
-    pose.tvec = filtered.tvec;
-    pose.T_marker_camera = filtered.T_marker_camera;
-
-    double mean_error_px = -1.0;
-    double max_error_px = -1.0;
-    if (
-        reprojectionMeanMax(
-            object_points,
-            image_points,
-            pose.rvec,
-            pose.tvec,
-            mean_error_px,
-            max_error_px
-        )
-    ) {
-        pose.reprojection_mean_px = mean_error_px;
-        pose.reprojection_max_px = max_error_px;
-    }
-
-    pose_tracker_.setPose(pose.rvec, pose.tvec);
-    return filtered;
-}
-
-bool TrackerEngine::plateauPriorTriggered(
-    const std::optional<PoseDepthFilterResult>& filtered
-) const
-{
-    if (!filtered.has_value()) {
-        return false;
-    }
-    if (!config_.pose_plateau_prior_enabled) {
-        return false;
-    }
-    if (
-        filtered->delta_z_mm >=
-        config_.pose_plateau_prior_trigger_negative_delta_mm
-    ) {
-        return false;
-    }
-    if (!std::isfinite(filtered->object_z_span_mm)) {
-        return false;
-    }
-    return filtered->object_z_span_mm >=
-        config_.pose_plateau_prior_min_object_z_span_mm;
-}
-
-std::optional<MapPoseResult> TrackerEngine::maybeApplyPlateauPrior(
-    const MapPoseResult& raw_pose,
-    MapPoseResult& pose,
-    const std::vector<PoseTrackPoint>& fallback_points,
-    const std::optional<PoseDepthFilterResult>& filtered,
-    const std::vector<double>& previous_rvec,
-    const std::vector<double>& previous_tvec,
-    PlateauPosePriorResult& prior,
-    bool& triggered,
-    bool& applied
-)
-{
-    triggered = plateauPriorTriggered(filtered);
-    applied = false;
-    prior = PlateauPosePriorResult();
-
-    if (!triggered) {
-        return std::nullopt;
-    }
-
-    if (previous_rvec.size() != 3 || previous_tvec.size() != 3) {
-        prior.method = "none";
-        prior.reason = "missing_previous_pose";
-        return std::nullopt;
-    }
-    if (
-        !raw_pose.success ||
-        raw_pose.rvec.size() != 3 ||
-        raw_pose.tvec.size() != 3
-    ) {
-        prior.method = "none";
-        prior.reason = "missing_raw_pose";
-        return std::nullopt;
-    }
-
-    const std::vector<PoseTrackPoint>& points =
-        raw_pose.points.empty() ? fallback_points : raw_pose.points;
-    if (
-        static_cast<int>(points.size()) <
-        std::max(1, config_.pose_plateau_prior_min_points)
-    ) {
-        prior.method = "none";
-        prior.reason = "too_few_points";
-        return std::nullopt;
-    }
-
-    std::vector<cv::Point3d> object_points;
-    std::vector<cv::Point2d> image_points;
-    pointsToCv(points, object_points, image_points);
-
-    prior = solvePlateauPosePrior(
-        object_points,
-        image_points,
-        K_,
-        dist_coeffs_,
-        raw_pose.rvec,
-        raw_pose.tvec,
-        previous_rvec,
-        previous_tvec,
-        makePlateauPosePriorConfig(config_)
-    );
-
-    if (
-        !prior.success ||
-        prior.rvec.size() != 3 ||
-        prior.tvec.size() != 3
-    ) {
-        return std::nullopt;
-    }
-
-    MapPoseResult prior_pose = raw_pose;
-    prior_pose.rvec = prior.rvec;
-    prior_pose.tvec = prior.tvec;
-    prior_pose.T_marker_camera = prior.T_marker_camera;
-    prior_pose.reprojection_mean_px = prior.reprojection_mean_px;
-    prior_pose.reprojection_max_px = prior.reprojection_max_px;
-    prior_pose.method =
-        raw_pose.method + "+plateau_prior_" + prior.method;
-    prior_pose.message = "Pose refined by triggered plateau prior.";
-    pose = prior_pose;
-    applied = true;
-    return prior_pose;
-}
-
-void TrackerEngine::attachDepthFilterResult(
-    TrackerFrameResult& result,
-    const std::optional<PoseDepthFilterResult>& filtered
-) const
-{
-    result.depth_filter_available = filtered.has_value();
-    if (!filtered.has_value()) {
-        return;
-    }
-
-    result.depth_filter_applied = filtered->applied;
-    result.depth_filter_delta_z_mm = filtered->delta_z_mm;
-    result.depth_filter_raw_z_mm = filtered->raw_z_mm;
-    result.depth_filter_z_mm = filtered->filtered_z_mm;
-    result.depth_filter_reproj_excess_px = filtered->reprojection_excess_px;
-    result.depth_filter_guard_alpha = filtered->guard_alpha;
-    result.depth_filter_innovation_z_mm = filtered->innovation_z_mm;
-    result.depth_filter_innovation_mean_z_mm =
-        filtered->innovation_mean_z_mm;
-    result.depth_filter_innovation_cusum_pos_mm =
-        filtered->innovation_cusum_pos_mm;
-    result.depth_filter_innovation_cusum_neg_mm =
-        filtered->innovation_cusum_neg_mm;
-    result.depth_filter_innovation_bias_detected =
-        filtered->innovation_bias_detected;
-    result.depth_filter_innovation_bias_direction =
-        filtered->innovation_bias_direction;
-    result.depth_filter_innovation_bias_limited =
-        filtered->innovation_bias_limited;
-    result.depth_filter_object_z_span_mm = filtered->object_z_span_mm;
-    result.depth_filter_negative_delta_guard_limited =
-        filtered->negative_delta_guard_limited;
-}
-
-void TrackerEngine::attachPlateauPriorResult(
-    TrackerFrameResult& result,
-    const PlateauPosePriorResult& prior,
-    bool triggered,
-    bool attempted,
-    bool applied
-) const
-{
-    result.pose_plateau_prior_triggered = triggered;
-    result.pose_plateau_prior_attempted = attempted;
-    result.pose_plateau_prior_applied = applied && prior.success;
-    result.pose_plateau_prior_method = prior.method;
-    result.pose_plateau_prior_reason = prior.reason;
-    result.pose_plateau_prior_delta_z_mm = prior.delta_z_mm;
-    result.pose_plateau_prior_reproj_excess_px =
-        prior.reprojection_excess_px;
-    result.pose_plateau_prior_max_reproj_excess_px =
-        prior.max_reprojection_excess_px;
-    result.pose_plateau_prior_iterations = prior.iterations;
 }
 
 bool TrackerEngine::acceptPoseState(
@@ -1359,8 +1093,6 @@ bool TrackerEngine::tryPersistentFallbackPose(
     const bool had_pose = pose_tracker_.hasPose();
     const std::vector<double> previous_rvec = pose_tracker_.rvec();
     const std::vector<double> previous_tvec = pose_tracker_.tvec();
-    const PoseDepthFilterSnapshot depth_snapshot =
-        pose_depth_filter_.snapshot();
 
     PersistentPoseSeedResult seed = persistent_matcher_.estimatePose(
         detection,
@@ -1397,38 +1129,7 @@ bool TrackerEngine::tryPersistentFallbackPose(
     }
 
     MapPoseResult pose = seed.pose;
-    MapPoseResult raw_pose = seed.pose;
-    const std::int64_t depth_t0 = cv::getTickCount();
-    std::optional<PoseDepthFilterResult> filtered_depth =
-        applyDepthFilterToPose(pose, seed.points);
-    result.timings_ms["pose_depth_filter_pre_ms"] = elapsedMs(depth_t0);
-
-    PlateauPosePriorResult plateau_prior;
-    bool plateau_triggered = false;
-    bool plateau_applied = false;
-    const std::int64_t plateau_t0 = cv::getTickCount();
-    std::optional<MapPoseResult> prior_pose = maybeApplyPlateauPrior(
-        raw_pose,
-        pose,
-        seed.points,
-        filtered_depth,
-        previous_rvec,
-        previous_tvec,
-        plateau_prior,
-        plateau_triggered,
-        plateau_applied
-    );
-    result.timings_ms["pose_plateau_prior_ms"] = elapsedMs(plateau_t0);
-    if (prior_pose.has_value()) {
-        pose_depth_filter_.restore(depth_snapshot);
-        pose = *prior_pose;
-        pose_tracker_.setPose(pose.rvec, pose.tvec);
-        const std::int64_t prior_depth_t0 = cv::getTickCount();
-        filtered_depth = applyDepthFilterToPose(pose, seed.points);
-        result.timings_ms["pose_depth_filter_prior_ms"] =
-            elapsedMs(prior_depth_t0);
-    }
-
+    pose_tracker_.setPose(pose.rvec, pose.tvec);
     std::vector<TrackerCorner> visual_corners = visualCornersForPose(pose);
     packagePoseResult(
         result,
@@ -1437,14 +1138,6 @@ bool TrackerEngine::tryPersistentFallbackPose(
         "Pose estimated from persistent correspondences after: " + reason + ".",
         visual_corners,
         seed.corners
-    );
-    attachDepthFilterResult(result, filtered_depth);
-    attachPlateauPriorResult(
-        result,
-        plateau_prior,
-        plateau_triggered,
-        plateau_triggered,
-        plateau_applied
     );
     result.confidence *= 0.85;
     result.current_pose_accepted =
@@ -1662,7 +1355,6 @@ void TrackerEngine::onTrackingFailure()
     if (lost_frames_ > config_.max_lost_frames) {
         mode_ = TrackerMode::Lost;
         pose_tracker_.reset();
-        pose_depth_filter_.reset();
         dot_detector_.reset();
         persistent_matcher_.clearIdentities();
         return;
@@ -1710,13 +1402,6 @@ bool TrackerEngine::tryFastPersistentPose(
         return false;
     }
 
-    const std::vector<double> previous_rvec = pose_tracker_.rvec();
-    const std::vector<double> previous_tvec = pose_tracker_.tvec();
-    const PoseDepthFilterSnapshot depth_snapshot =
-        pose_depth_filter_.snapshot();
-    PoseDepthKalmanFilter* depth_filter_ptr =
-        config_.pose_depth_filter_enabled ? &pose_depth_filter_ : nullptr;
-
     const std::int64_t fast_t0 = cv::getTickCount();
     FastPoseResult fast = persistent_matcher_.estimateFastPose(
         detection,
@@ -1730,7 +1415,6 @@ bool TrackerEngine::tryFastPersistentPose(
         last_accepted_rvec_,
         last_accepted_tvec_,
         lost_frames_,
-        depth_filter_ptr,
         max_pts_seen_
     );
     result.timings_ms["fast_persistent_ms"] = elapsedMs(fast_t0);
@@ -1754,10 +1438,7 @@ bool TrackerEngine::tryFastPersistentPose(
         return false;
     }
 
-    MapPoseResult raw_pose = fast.pose;
-    MapPoseResult pose = fast.depth_filter_available
-        ? fast.depth_filtered_pose
-        : fast.pose;
+    MapPoseResult pose = fast.pose;
     if (
         !pose.success ||
         pose.rvec.size() != 3 ||
@@ -1766,43 +1447,7 @@ bool TrackerEngine::tryFastPersistentPose(
         return false;
     }
 
-    std::optional<PoseDepthFilterResult> filtered_depth;
-    if (fast.depth_filter_available) {
-        filtered_depth = fast.depth_filter_result;
-        result.timings_ms["pose_depth_filter_pre_ms"] = fast.depth_filter_ms;
-        result.timings_ms["pose_depth_filter_cpp_precomputed_count"] = 1.0;
-    } else {
-        result.timings_ms["pose_depth_filter_pre_ms"] = 0.0;
-        result.timings_ms["pose_depth_filter_cpp_precomputed_count"] = 0.0;
-    }
-
-    PlateauPosePriorResult plateau_prior;
-    bool plateau_triggered = false;
-    bool plateau_applied = false;
     std::vector<TrackerCorner> visual_corners = fast.visual_corners;
-    const std::int64_t plateau_t0 = cv::getTickCount();
-    std::optional<MapPoseResult> prior_pose = maybeApplyPlateauPrior(
-        raw_pose,
-        pose,
-        fast.points,
-        filtered_depth,
-        previous_rvec,
-        previous_tvec,
-        plateau_prior,
-        plateau_triggered,
-        plateau_applied
-    );
-    result.timings_ms["pose_plateau_prior_ms"] = elapsedMs(plateau_t0);
-    if (prior_pose.has_value()) {
-        pose_depth_filter_.restore(depth_snapshot);
-        pose = *prior_pose;
-        pose_tracker_.setPose(pose.rvec, pose.tvec);
-        const std::int64_t prior_depth_t0 = cv::getTickCount();
-        filtered_depth = applyDepthFilterToPose(pose, fast.points);
-        result.timings_ms["pose_depth_filter_prior_ms"] =
-            elapsedMs(prior_depth_t0);
-        visual_corners = visualCornersForPose(pose);
-    }
 
     pose_tracker_.setPose(pose.rvec, pose.tvec);
     packagePoseResult(
@@ -1813,29 +1458,10 @@ bool TrackerEngine::tryFastPersistentPose(
         visual_corners,
         fast.corners
     );
-    attachDepthFilterResult(result, filtered_depth);
-    attachPlateauPriorResult(
-        result,
-        plateau_prior,
-        plateau_triggered,
-        plateau_triggered,
-        plateau_applied
-    );
 
     result.current_pose_accepted =
         acceptPoseState(pose, static_cast<int>(visual_corners.size()));
-    if (prior_pose.has_value()) {
-        if (
-            pose.reprojection_mean_px >= 0.0 &&
-            pose.reprojection_mean_px <=
-                config_.fast_persistent_refresh_mean_error_px
-        ) {
-            refreshPersistentIdentities(visual_corners, frame_index_);
-            result.timings_ms["fast_refresh_persistence_cpp_count"] = 1.0;
-        } else {
-            result.timings_ms["fast_refresh_persistence_cpp_count"] = 0.0;
-        }
-    } else if (fast.persistence_refresh_available) {
+    if (fast.persistence_refresh_available) {
         persistent_matcher_.replaceIdentities(
             fast.persistence_refresh_identities,
             fast.persistence_refresh_frame
@@ -1982,75 +1608,6 @@ MapPoseTrackerConfig TrackerEngine::makeMapPoseTrackerConfig(
     pose_config.direct_max_max_reproj_px =
         config.pnp_direct_max_max_reprojection_error_px;
     return pose_config;
-}
-
-PoseDepthFilterConfig TrackerEngine::makePoseDepthFilterConfig(
-    const TrackerConfig& config
-)
-{
-    PoseDepthFilterConfig depth_config;
-    depth_config.observation_std_mm =
-        config.pose_depth_filter_observation_std_mm;
-    depth_config.process_std_mm =
-        config.pose_depth_filter_process_std_mm;
-    depth_config.initial_velocity_std_mm =
-        config.pose_depth_filter_initial_velocity_std_mm;
-    depth_config.reprojection_guard_px =
-        config.pose_depth_filter_reprojection_guard_px;
-    depth_config.innovation_guard_enabled =
-        config.pose_depth_filter_innovation_guard_enabled;
-    depth_config.innovation_guard_window =
-        config.pose_depth_filter_innovation_window;
-    depth_config.innovation_guard_bias_threshold_mm =
-        config.pose_depth_filter_innovation_bias_threshold_mm;
-    depth_config.innovation_guard_min_same_sign =
-        config.pose_depth_filter_innovation_min_same_sign;
-    depth_config.innovation_cusum_slack_mm =
-        config.pose_depth_filter_innovation_cusum_slack_mm;
-    depth_config.innovation_cusum_threshold_mm =
-        config.pose_depth_filter_innovation_cusum_threshold_mm;
-    depth_config.negative_delta_guard_enabled =
-        config.pose_depth_filter_negative_delta_guard_enabled;
-    depth_config.negative_delta_guard_min_z_span_mm =
-        config.pose_depth_filter_negative_delta_guard_min_z_span_mm;
-    depth_config.negative_delta_guard_max_negative_delta_mm =
-        config.pose_depth_filter_negative_delta_guard_max_negative_delta_mm;
-    depth_config.negative_delta_guard_hold_previous_z =
-        config.pose_depth_filter_negative_delta_guard_hold_previous_z;
-    depth_config.negative_delta_guard_hold_requires_innovation_bias =
-        config.pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias;
-    depth_config.negative_delta_guard_hold_min_negative_delta_mm =
-        config.pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm;
-    depth_config.negative_delta_guard_max_hold_correction_mm =
-        config.pose_depth_filter_negative_delta_guard_max_hold_correction_mm;
-    depth_config.negative_delta_guard_velocity_damping =
-        config.pose_depth_filter_negative_delta_guard_velocity_damping;
-    return depth_config;
-}
-
-PlateauPosePriorConfig TrackerEngine::makePlateauPosePriorConfig(
-    const TrackerConfig& config
-)
-{
-    PlateauPosePriorConfig prior_config;
-    prior_config.static_max_excess_px =
-        config.pose_plateau_prior_static_max_excess_px;
-    prior_config.candidate_max_excess_px =
-        config.pose_plateau_prior_candidate_max_excess_px;
-    prior_config.candidate_max_max_excess_px =
-        config.pose_plateau_prior_candidate_max_max_excess_px;
-    prior_config.min_positive_z_correction_mm =
-        config.pose_plateau_prior_min_positive_z_correction_mm;
-    prior_config.max_positive_z_correction_mm =
-        config.pose_plateau_prior_max_positive_z_correction_mm;
-    prior_config.robust_c_px = config.pose_plateau_prior_robust_c_px;
-    prior_config.max_iterations = config.pose_plateau_prior_max_iterations;
-    prior_config.max_step_translation_mm =
-        config.pose_plateau_prior_max_step_translation_mm;
-    prior_config.max_step_rotation_deg =
-        config.pose_plateau_prior_max_step_rotation_deg;
-    prior_config.lm_damping = config.pose_plateau_prior_lm_damping;
-    return prior_config;
 }
 
 double TrackerEngine::confidence(

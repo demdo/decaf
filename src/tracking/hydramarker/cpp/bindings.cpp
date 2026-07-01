@@ -30,12 +30,10 @@
 #include "patch_extractor.hpp"
 #include "patch_decoder.hpp"
 #include "tracker_config.hpp"
-#include "tracker_depth_filter.hpp"
 #include "tracker_engine.hpp"
 #include "tracker_geometry.hpp"
 #include "tracker_persistence.hpp"
 #include "tracker_pose.hpp"
-#include "tracker_pose_prior.hpp"
 #include "tracker_types.hpp"
 
 namespace py = pybind11;
@@ -299,223 +297,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::return_value_policy::copy
         );
 
-    py::class_<PoseDepthFilterConfig>(m, "PoseDepthFilterConfig")
-        .def(py::init<>())
-        .def_readwrite("observation_std_mm", &PoseDepthFilterConfig::observation_std_mm)
-        .def_readwrite("process_std_mm", &PoseDepthFilterConfig::process_std_mm)
-        .def_readwrite("initial_velocity_std_mm", &PoseDepthFilterConfig::initial_velocity_std_mm)
-        .def_readwrite("reprojection_guard_px", &PoseDepthFilterConfig::reprojection_guard_px)
-        .def_readwrite("innovation_guard_enabled", &PoseDepthFilterConfig::innovation_guard_enabled)
-        .def_readwrite("innovation_guard_window", &PoseDepthFilterConfig::innovation_guard_window)
-        .def_readwrite("innovation_guard_bias_threshold_mm", &PoseDepthFilterConfig::innovation_guard_bias_threshold_mm)
-        .def_readwrite("innovation_guard_min_same_sign", &PoseDepthFilterConfig::innovation_guard_min_same_sign)
-        .def_readwrite("innovation_cusum_slack_mm", &PoseDepthFilterConfig::innovation_cusum_slack_mm)
-        .def_readwrite("innovation_cusum_threshold_mm", &PoseDepthFilterConfig::innovation_cusum_threshold_mm)
-        .def_readwrite("negative_delta_guard_enabled", &PoseDepthFilterConfig::negative_delta_guard_enabled)
-        .def_readwrite("negative_delta_guard_min_z_span_mm", &PoseDepthFilterConfig::negative_delta_guard_min_z_span_mm)
-        .def_readwrite("negative_delta_guard_max_negative_delta_mm", &PoseDepthFilterConfig::negative_delta_guard_max_negative_delta_mm)
-        .def_readwrite("negative_delta_guard_hold_previous_z", &PoseDepthFilterConfig::negative_delta_guard_hold_previous_z)
-        .def_readwrite("negative_delta_guard_hold_requires_innovation_bias", &PoseDepthFilterConfig::negative_delta_guard_hold_requires_innovation_bias)
-        .def_readwrite("negative_delta_guard_hold_min_negative_delta_mm", &PoseDepthFilterConfig::negative_delta_guard_hold_min_negative_delta_mm)
-        .def_readwrite("negative_delta_guard_max_hold_correction_mm", &PoseDepthFilterConfig::negative_delta_guard_max_hold_correction_mm)
-        .def_readwrite("negative_delta_guard_velocity_damping", &PoseDepthFilterConfig::negative_delta_guard_velocity_damping);
-
-    py::class_<PoseDepthFilterResult>(m, "PoseDepthFilterResult")
-        .def(py::init<>())
-        .def_readwrite("rvec", &PoseDepthFilterResult::rvec)
-        .def_readwrite("tvec", &PoseDepthFilterResult::tvec)
-        .def_readwrite("T_marker_camera", &PoseDepthFilterResult::T_marker_camera)
-        .def_readwrite("raw_z_mm", &PoseDepthFilterResult::raw_z_mm)
-        .def_readwrite("filtered_z_mm", &PoseDepthFilterResult::filtered_z_mm)
-        .def_readwrite("delta_z_mm", &PoseDepthFilterResult::delta_z_mm)
-        .def_readwrite("raw_reprojection_rms_px", &PoseDepthFilterResult::raw_reprojection_rms_px)
-        .def_readwrite("filtered_reprojection_rms_px", &PoseDepthFilterResult::filtered_reprojection_rms_px)
-        .def_readwrite("reprojection_excess_px", &PoseDepthFilterResult::reprojection_excess_px)
-        .def_readwrite("guard_alpha", &PoseDepthFilterResult::guard_alpha)
-        .def_readwrite("applied", &PoseDepthFilterResult::applied)
-        .def_readwrite("innovation_z_mm", &PoseDepthFilterResult::innovation_z_mm)
-        .def_readwrite("innovation_mean_z_mm", &PoseDepthFilterResult::innovation_mean_z_mm)
-        .def_readwrite("innovation_cusum_pos_mm", &PoseDepthFilterResult::innovation_cusum_pos_mm)
-        .def_readwrite("innovation_cusum_neg_mm", &PoseDepthFilterResult::innovation_cusum_neg_mm)
-        .def_readwrite("innovation_bias_detected", &PoseDepthFilterResult::innovation_bias_detected)
-        .def_readwrite("innovation_bias_direction", &PoseDepthFilterResult::innovation_bias_direction)
-        .def_readwrite("innovation_bias_limited", &PoseDepthFilterResult::innovation_bias_limited)
-        .def_readwrite("object_z_span_mm", &PoseDepthFilterResult::object_z_span_mm)
-        .def_readwrite("negative_delta_guard_limited", &PoseDepthFilterResult::negative_delta_guard_limited);
-
-    py::class_<PoseDepthKalmanFilter>(m, "PoseDepthKalmanFilter")
-        .def(
-            py::init([](
-                py::array_t<double, py::array::c_style | py::array::forcecast> K,
-                py::object dist_coeffs,
-                const PoseDepthFilterConfig& config
-            ) {
-                return std::make_unique<PoseDepthKalmanFilter>(
-                    numpyToMatx33d(K),
-                    optionalNumpyToVectorDouble(dist_coeffs),
-                    config
-                );
-            }),
-            py::arg("K"),
-            py::arg("dist_coeffs") = py::none(),
-            py::arg("config") = PoseDepthFilterConfig()
-        )
-        .def("reset", &PoseDepthKalmanFilter::reset)
-        .def(
-            "snapshot",
-            [](const PoseDepthKalmanFilter& self) {
-                PoseDepthFilterSnapshot state = self.snapshot();
-                py::object x = py::none();
-                py::object P = py::none();
-                if (state.has_state) {
-                    x = py::cast(std::vector<double>{
-                        state.x[0],
-                        state.x[1]
-                    });
-                    P = py::cast(std::vector<double>{
-                        state.P[0],
-                        state.P[1],
-                        state.P[2],
-                        state.P[3]
-                    });
-                }
-                return py::make_tuple(
-                    x,
-                    P,
-                    state.innovation_history,
-                    state.innovation_cusum_pos,
-                    state.innovation_cusum_neg
-                );
-            }
-        )
-        .def(
-            "restore",
-            [](PoseDepthKalmanFilter& self, py::object state_obj) {
-                py::tuple tuple = py::cast<py::tuple>(state_obj);
-                if (py::len(tuple) < 2) {
-                    throw std::runtime_error("Depth filter state tuple is too short");
-                }
-
-                PoseDepthFilterSnapshot state;
-                if (!tuple[0].is_none() && !tuple[1].is_none()) {
-                    std::vector<double> x =
-                        optionalNumpyToVectorDouble(
-                            py::reinterpret_borrow<py::object>(tuple[0])
-                        );
-                    std::vector<double> P =
-                        optionalNumpyToVectorDouble(
-                            py::reinterpret_borrow<py::object>(tuple[1])
-                        );
-                    if (x.size() != 2 || P.size() != 4) {
-                        throw std::runtime_error("Invalid depth filter state shape");
-                    }
-                    state.has_state = true;
-                    state.x = {x[0], x[1]};
-                    state.P = {P[0], P[1], P[2], P[3]};
-                }
-
-                if (py::len(tuple) >= 3 && !tuple[2].is_none()) {
-                    for (py::handle item : py::cast<py::iterable>(tuple[2])) {
-                        state.innovation_history.push_back(
-                            py::cast<double>(item)
-                        );
-                    }
-                }
-                if (py::len(tuple) >= 5) {
-                    state.innovation_cusum_pos = py::cast<double>(tuple[3]);
-                    state.innovation_cusum_neg = py::cast<double>(tuple[4]);
-                }
-
-                self.restore(state);
-            },
-            py::arg("state")
-        )
-        .def(
-            "update",
-            [](
-                PoseDepthKalmanFilter& self,
-                py::object rvec,
-                py::object tvec,
-                py::array_t<double, py::array::c_style | py::array::forcecast> object_points,
-                py::array_t<double, py::array::c_style | py::array::forcecast> image_points
-            ) {
-                return self.update(
-                    optionalNumpyToVectorDouble(rvec),
-                    optionalNumpyToVectorDouble(tvec),
-                    numpyToPoint3dVector(object_points),
-                    numpyToPoint2dVector(image_points)
-                );
-            },
-            py::arg("rvec"),
-            py::arg("tvec"),
-            py::arg("object_points"),
-            py::arg("image_points")
-        );
-
-    py::class_<PlateauPosePriorConfig>(m, "PlateauPosePriorConfig")
-        .def(py::init<>())
-        .def_readwrite("static_max_excess_px", &PlateauPosePriorConfig::static_max_excess_px)
-        .def_readwrite("candidate_max_excess_px", &PlateauPosePriorConfig::candidate_max_excess_px)
-        .def_readwrite("candidate_max_max_excess_px", &PlateauPosePriorConfig::candidate_max_max_excess_px)
-        .def_readwrite("min_positive_z_correction_mm", &PlateauPosePriorConfig::min_positive_z_correction_mm)
-        .def_readwrite("max_positive_z_correction_mm", &PlateauPosePriorConfig::max_positive_z_correction_mm)
-        .def_readwrite("robust_c_px", &PlateauPosePriorConfig::robust_c_px)
-        .def_readwrite("max_iterations", &PlateauPosePriorConfig::max_iterations)
-        .def_readwrite("max_step_translation_mm", &PlateauPosePriorConfig::max_step_translation_mm)
-        .def_readwrite("max_step_rotation_deg", &PlateauPosePriorConfig::max_step_rotation_deg)
-        .def_readwrite("lm_damping", &PlateauPosePriorConfig::lm_damping);
-
-    py::class_<PlateauPosePriorResult>(m, "PlateauPosePriorResult")
-        .def(py::init<>())
-        .def_readwrite("success", &PlateauPosePriorResult::success)
-        .def_readwrite("method", &PlateauPosePriorResult::method)
-        .def_readwrite("reason", &PlateauPosePriorResult::reason)
-        .def_readwrite("rvec", &PlateauPosePriorResult::rvec)
-        .def_readwrite("tvec", &PlateauPosePriorResult::tvec)
-        .def_readwrite("T_marker_camera", &PlateauPosePriorResult::T_marker_camera)
-        .def_readwrite("reprojection_mean_px", &PlateauPosePriorResult::reprojection_mean_px)
-        .def_readwrite("reprojection_max_px", &PlateauPosePriorResult::reprojection_max_px)
-        .def_readwrite("reprojection_excess_px", &PlateauPosePriorResult::reprojection_excess_px)
-        .def_readwrite("max_reprojection_excess_px", &PlateauPosePriorResult::max_reprojection_excess_px)
-        .def_readwrite("delta_z_mm", &PlateauPosePriorResult::delta_z_mm)
-        .def_readwrite("iterations", &PlateauPosePriorResult::iterations);
-
-    m.def(
-        "solve_plateau_pose_prior",
-        [](
-            py::array_t<double, py::array::c_style | py::array::forcecast> object_points,
-            py::array_t<double, py::array::c_style | py::array::forcecast> image_points,
-            py::array_t<double, py::array::c_style | py::array::forcecast> K,
-            py::object dist_coeffs,
-            py::object raw_rvec,
-            py::object raw_tvec,
-            py::object seed_rvec,
-            py::object seed_tvec,
-            const PlateauPosePriorConfig& config
-        ) {
-            return solvePlateauPosePrior(
-                numpyToPoint3dVector(object_points),
-                numpyToPoint2dVector(image_points),
-                numpyToMatx33d(K),
-                optionalNumpyToVectorDouble(dist_coeffs),
-                optionalNumpyToVectorDouble(raw_rvec),
-                optionalNumpyToVectorDouble(raw_tvec),
-                optionalNumpyToVectorDouble(seed_rvec),
-                optionalNumpyToVectorDouble(seed_tvec),
-                config
-            );
-        },
-        py::arg("object_points"),
-        py::arg("image_points"),
-        py::arg("K"),
-        py::arg("dist_coeffs") = py::none(),
-        py::arg("raw_rvec") = py::none(),
-        py::arg("raw_tvec") = py::none(),
-        py::arg("seed_rvec") = py::none(),
-        py::arg("seed_tvec") = py::none(),
-        py::arg("config") = PlateauPosePriorConfig()
-    );
-
     py::class_<GlobalCornerIdentity>(m, "GlobalCornerIdentity")
         .def(py::init<>())
         .def_readwrite("global_row", &GlobalCornerIdentity::global_row)
@@ -633,20 +414,16 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("dense_gate_metrics", &FastPoseResult::dense_gate_metrics)
         .def_readwrite("seed_pose", &FastPoseResult::seed_pose)
         .def_readwrite("pose", &FastPoseResult::pose)
-        .def_readwrite("depth_filtered_pose", &FastPoseResult::depth_filtered_pose)
-        .def_readwrite("depth_filter_result", &FastPoseResult::depth_filter_result)
         .def_readwrite("persistent_match_ms", &FastPoseResult::persistent_match_ms)
         .def_readwrite("seed_pnp_ms", &FastPoseResult::seed_pnp_ms)
         .def_readwrite("cpp_seed_total_ms", &FastPoseResult::cpp_seed_total_ms)
         .def_readwrite("dense_match_ms", &FastPoseResult::dense_match_ms)
         .def_readwrite("dense_pose_ms", &FastPoseResult::dense_pose_ms)
-        .def_readwrite("depth_filter_ms", &FastPoseResult::depth_filter_ms)
         .def_readwrite("persistence_refresh_ms", &FastPoseResult::persistence_refresh_ms)
         .def_readwrite("total_ms", &FastPoseResult::total_ms)
         .def_readwrite("min_points", &FastPoseResult::min_points)
         .def_readwrite("min_dense_points", &FastPoseResult::min_dense_points)
         .def_readwrite("dense_matches", &FastPoseResult::dense_matches)
-        .def_readwrite("depth_filter_available", &FastPoseResult::depth_filter_available)
         .def_readwrite("accepted_state", &FastPoseResult::accepted_state)
         .def_readwrite("persistence_refresh_available", &FastPoseResult::persistence_refresh_available)
         .def_readwrite("persistence_refresh_frame", &FastPoseResult::persistence_refresh_frame)
@@ -834,40 +611,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("pnp_direct_refine_method", &TrackerConfig::pnp_direct_refine_method)
         .def_readwrite("pnp_direct_max_mean_reprojection_error_px", &TrackerConfig::pnp_direct_max_mean_reprojection_error_px)
         .def_readwrite("pnp_direct_max_max_reprojection_error_px", &TrackerConfig::pnp_direct_max_max_reprojection_error_px)
-        .def_readwrite("pose_depth_filter_enabled", &TrackerConfig::pose_depth_filter_enabled)
-        .def_readwrite("pose_depth_filter_observation_std_mm", &TrackerConfig::pose_depth_filter_observation_std_mm)
-        .def_readwrite("pose_depth_filter_process_std_mm", &TrackerConfig::pose_depth_filter_process_std_mm)
-        .def_readwrite("pose_depth_filter_initial_velocity_std_mm", &TrackerConfig::pose_depth_filter_initial_velocity_std_mm)
-        .def_readwrite("pose_depth_filter_reprojection_guard_px", &TrackerConfig::pose_depth_filter_reprojection_guard_px)
-        .def_readwrite("pose_depth_filter_min_points", &TrackerConfig::pose_depth_filter_min_points)
-        .def_readwrite("pose_depth_filter_innovation_guard_enabled", &TrackerConfig::pose_depth_filter_innovation_guard_enabled)
-        .def_readwrite("pose_depth_filter_innovation_window", &TrackerConfig::pose_depth_filter_innovation_window)
-        .def_readwrite("pose_depth_filter_innovation_bias_threshold_mm", &TrackerConfig::pose_depth_filter_innovation_bias_threshold_mm)
-        .def_readwrite("pose_depth_filter_innovation_min_same_sign", &TrackerConfig::pose_depth_filter_innovation_min_same_sign)
-        .def_readwrite("pose_depth_filter_innovation_cusum_slack_mm", &TrackerConfig::pose_depth_filter_innovation_cusum_slack_mm)
-        .def_readwrite("pose_depth_filter_innovation_cusum_threshold_mm", &TrackerConfig::pose_depth_filter_innovation_cusum_threshold_mm)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_enabled", &TrackerConfig::pose_depth_filter_negative_delta_guard_enabled)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_min_z_span_mm", &TrackerConfig::pose_depth_filter_negative_delta_guard_min_z_span_mm)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_max_negative_delta_mm", &TrackerConfig::pose_depth_filter_negative_delta_guard_max_negative_delta_mm)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_hold_previous_z", &TrackerConfig::pose_depth_filter_negative_delta_guard_hold_previous_z)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias", &TrackerConfig::pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm", &TrackerConfig::pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_max_hold_correction_mm", &TrackerConfig::pose_depth_filter_negative_delta_guard_max_hold_correction_mm)
-        .def_readwrite("pose_depth_filter_negative_delta_guard_velocity_damping", &TrackerConfig::pose_depth_filter_negative_delta_guard_velocity_damping)
-        .def_readwrite("pose_plateau_prior_enabled", &TrackerConfig::pose_plateau_prior_enabled)
-        .def_readwrite("pose_plateau_prior_trigger_negative_delta_mm", &TrackerConfig::pose_plateau_prior_trigger_negative_delta_mm)
-        .def_readwrite("pose_plateau_prior_min_object_z_span_mm", &TrackerConfig::pose_plateau_prior_min_object_z_span_mm)
-        .def_readwrite("pose_plateau_prior_min_points", &TrackerConfig::pose_plateau_prior_min_points)
-        .def_readwrite("pose_plateau_prior_static_max_excess_px", &TrackerConfig::pose_plateau_prior_static_max_excess_px)
-        .def_readwrite("pose_plateau_prior_candidate_max_excess_px", &TrackerConfig::pose_plateau_prior_candidate_max_excess_px)
-        .def_readwrite("pose_plateau_prior_candidate_max_max_excess_px", &TrackerConfig::pose_plateau_prior_candidate_max_max_excess_px)
-        .def_readwrite("pose_plateau_prior_min_positive_z_correction_mm", &TrackerConfig::pose_plateau_prior_min_positive_z_correction_mm)
-        .def_readwrite("pose_plateau_prior_max_positive_z_correction_mm", &TrackerConfig::pose_plateau_prior_max_positive_z_correction_mm)
-        .def_readwrite("pose_plateau_prior_robust_c_px", &TrackerConfig::pose_plateau_prior_robust_c_px)
-        .def_readwrite("pose_plateau_prior_max_iterations", &TrackerConfig::pose_plateau_prior_max_iterations)
-        .def_readwrite("pose_plateau_prior_max_step_translation_mm", &TrackerConfig::pose_plateau_prior_max_step_translation_mm)
-        .def_readwrite("pose_plateau_prior_max_step_rotation_deg", &TrackerConfig::pose_plateau_prior_max_step_rotation_deg)
-        .def_readwrite("pose_plateau_prior_lm_damping", &TrackerConfig::pose_plateau_prior_lm_damping)
         .def_readwrite("checker_min_tracking_decode_cell_span", &TrackerConfig::checker_min_tracking_decode_cell_span)
         .def_readwrite("checker_refresh_interval_frames", &TrackerConfig::checker_refresh_interval_frames)
         .def_readwrite("checker_tracking_recovery_stable_interval_frames", &TrackerConfig::checker_tracking_recovery_stable_interval_frames)
@@ -1057,18 +800,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 py::object previous_rvec,
                 py::object previous_tvec,
                 int lost_frames,
-                py::object depth_filter,
                 int max_pts_seen
             ) {
-                PoseDepthKalmanFilter* depth_filter_ptr = nullptr;
-                if (!depth_filter.is_none()) {
-                    try {
-                        depth_filter_ptr =
-                            depth_filter.cast<PoseDepthKalmanFilter*>();
-                    } catch (const py::cast_error&) {
-                        depth_filter_ptr = nullptr;
-                    }
-                }
                 return self.estimateFastPose(
                     detection,
                     geometry,
@@ -1081,7 +814,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                     optionalNumpyToVectorDouble(previous_rvec),
                     optionalNumpyToVectorDouble(previous_tvec),
                     lost_frames,
-                    depth_filter_ptr,
                     max_pts_seen
                 );
             },
@@ -1096,7 +828,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("previous_rvec") = py::none(),
             py::arg("previous_tvec") = py::none(),
             py::arg("lost_frames") = 0,
-            py::arg("depth_filter") = py::none(),
             py::arg("max_pts_seen") = 0
         )
         .def_property_readonly(
@@ -1154,31 +885,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("corners", &TrackerFrameResult::corners)
         .def_readwrite("correspondence_corners", &TrackerFrameResult::correspondence_corners)
         .def_readwrite("persistent_count", &TrackerFrameResult::persistent_count)
-        .def_readwrite("depth_filter_available", &TrackerFrameResult::depth_filter_available)
-        .def_readwrite("depth_filter_applied", &TrackerFrameResult::depth_filter_applied)
-        .def_readwrite("depth_filter_delta_z_mm", &TrackerFrameResult::depth_filter_delta_z_mm)
-        .def_readwrite("depth_filter_raw_z_mm", &TrackerFrameResult::depth_filter_raw_z_mm)
-        .def_readwrite("depth_filter_z_mm", &TrackerFrameResult::depth_filter_z_mm)
-        .def_readwrite("depth_filter_reproj_excess_px", &TrackerFrameResult::depth_filter_reproj_excess_px)
-        .def_readwrite("depth_filter_guard_alpha", &TrackerFrameResult::depth_filter_guard_alpha)
-        .def_readwrite("depth_filter_innovation_z_mm", &TrackerFrameResult::depth_filter_innovation_z_mm)
-        .def_readwrite("depth_filter_innovation_mean_z_mm", &TrackerFrameResult::depth_filter_innovation_mean_z_mm)
-        .def_readwrite("depth_filter_innovation_cusum_pos_mm", &TrackerFrameResult::depth_filter_innovation_cusum_pos_mm)
-        .def_readwrite("depth_filter_innovation_cusum_neg_mm", &TrackerFrameResult::depth_filter_innovation_cusum_neg_mm)
-        .def_readwrite("depth_filter_innovation_bias_detected", &TrackerFrameResult::depth_filter_innovation_bias_detected)
-        .def_readwrite("depth_filter_innovation_bias_direction", &TrackerFrameResult::depth_filter_innovation_bias_direction)
-        .def_readwrite("depth_filter_innovation_bias_limited", &TrackerFrameResult::depth_filter_innovation_bias_limited)
-        .def_readwrite("depth_filter_object_z_span_mm", &TrackerFrameResult::depth_filter_object_z_span_mm)
-        .def_readwrite("depth_filter_negative_delta_guard_limited", &TrackerFrameResult::depth_filter_negative_delta_guard_limited)
-        .def_readwrite("pose_plateau_prior_triggered", &TrackerFrameResult::pose_plateau_prior_triggered)
-        .def_readwrite("pose_plateau_prior_attempted", &TrackerFrameResult::pose_plateau_prior_attempted)
-        .def_readwrite("pose_plateau_prior_applied", &TrackerFrameResult::pose_plateau_prior_applied)
-        .def_readwrite("pose_plateau_prior_method", &TrackerFrameResult::pose_plateau_prior_method)
-        .def_readwrite("pose_plateau_prior_reason", &TrackerFrameResult::pose_plateau_prior_reason)
-        .def_readwrite("pose_plateau_prior_delta_z_mm", &TrackerFrameResult::pose_plateau_prior_delta_z_mm)
-        .def_readwrite("pose_plateau_prior_reproj_excess_px", &TrackerFrameResult::pose_plateau_prior_reproj_excess_px)
-        .def_readwrite("pose_plateau_prior_max_reproj_excess_px", &TrackerFrameResult::pose_plateau_prior_max_reproj_excess_px)
-        .def_readwrite("pose_plateau_prior_iterations", &TrackerFrameResult::pose_plateau_prior_iterations)
         .def_readwrite("fast_attempted", &TrackerFrameResult::fast_attempted)
         .def_readwrite("fast_success", &TrackerFrameResult::fast_success)
         .def_readwrite("fast_route_decode", &TrackerFrameResult::fast_route_decode)

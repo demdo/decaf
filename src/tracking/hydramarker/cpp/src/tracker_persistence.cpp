@@ -759,7 +759,6 @@ FastPoseResult PersistentMatcher::estimateFastPose(
     const std::vector<double>& previous_rvec,
     const std::vector<double>& previous_tvec,
     int lost_frames,
-    PoseDepthKalmanFilter* depth_filter,
     int max_pts_seen
 )
 {
@@ -859,9 +858,7 @@ FastPoseResult PersistentMatcher::estimateFastPose(
     result.dense_gate_reason = dense_decision.second;
 
     auto finalPoseForPackaging = [&]() -> const MapPoseResult& {
-        return result.depth_filter_available
-            ? result.depth_filtered_pose
-            : result.pose;
+        return result.pose;
     };
 
     auto fillVisualCorners = [&]() {
@@ -938,72 +935,11 @@ FastPoseResult PersistentMatcher::estimateFastPose(
         result.persistence_refresh_ms = elapsedMs(refresh_t0);
     };
 
-    auto applyDepthFilter = [&](const MapPoseResult& accepted_pose) {
-        result.depth_filter_available = false;
-        result.depth_filter_ms = 0.0;
-        result.depth_filtered_pose = MapPoseResult();
-        result.depth_filter_result = PoseDepthFilterResult();
-
-        if (depth_filter == nullptr) {
-            return;
-        }
-        if (
-            !accepted_pose.success ||
-            accepted_pose.rvec.size() != 3 ||
-            accepted_pose.tvec.size() != 3
-        ) {
-            return;
-        }
-
-        const std::vector<PoseTrackPoint>& filter_points =
-            accepted_pose.points.empty() ? result.points : accepted_pose.points;
-        if (filter_points.empty()) {
-            return;
-        }
-
-        std::vector<cv::Point3d> object_points;
-        std::vector<cv::Point2d> image_points;
-        pointsToCv(filter_points, object_points, image_points);
-
-        const std::int64_t depth_t0 = cv::getTickCount();
-        result.depth_filter_result = depth_filter->update(
-            accepted_pose.rvec,
-            accepted_pose.tvec,
-            object_points,
-            image_points
-        );
-        result.depth_filter_ms = elapsedMs(depth_t0);
-        result.depth_filter_available = true;
-
-        result.depth_filtered_pose = accepted_pose;
-        result.depth_filtered_pose.rvec = result.depth_filter_result.rvec;
-        result.depth_filtered_pose.tvec = result.depth_filter_result.tvec;
-        result.depth_filtered_pose.T_marker_camera =
-            result.depth_filter_result.T_marker_camera;
-
-        double mean_error_px = -1.0;
-        double max_error_px = -1.0;
-        if (reprojectionMeanMax(
-                object_points,
-                image_points,
-                K,
-                dist_coeffs,
-                result.depth_filtered_pose.rvec,
-                result.depth_filtered_pose.tvec,
-                mean_error_px,
-                max_error_px
-            )) {
-            result.depth_filtered_pose.reprojection_mean_px = mean_error_px;
-            result.depth_filtered_pose.reprojection_max_px = max_error_px;
-        }
-    };
-
     auto acceptSeed = [&]() {
         result.success = true;
         result.used_dense = false;
         result.reason = "ok";
         result.pose = result.seed_pose;
-        applyDepthFilter(result.pose);
         fillVisualCorners();
         fillAcceptedState();
         fillPersistenceRefresh();
@@ -1251,7 +1187,6 @@ FastPoseResult PersistentMatcher::estimateFastPose(
     result.pose = dense_pose;
     result.points = std::move(dense_points);
     result.corners = std::move(dense_match.corners);
-    applyDepthFilter(result.pose);
     fillVisualCorners();
     fillAcceptedState();
     fillPersistenceRefresh();

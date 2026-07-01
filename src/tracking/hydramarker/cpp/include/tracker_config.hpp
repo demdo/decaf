@@ -27,42 +27,6 @@ struct TrackerConfig {
     double pnp_direct_max_mean_reprojection_error_px = 1.5;
     double pnp_direct_max_max_reprojection_error_px = 3.0;
 
-    bool pose_depth_filter_enabled = true;
-    double pose_depth_filter_observation_std_mm = 16.0;
-    double pose_depth_filter_process_std_mm = 0.05;
-    double pose_depth_filter_initial_velocity_std_mm = 0.1;
-    double pose_depth_filter_reprojection_guard_px = 1.0;
-    int pose_depth_filter_min_points = 6;
-    bool pose_depth_filter_innovation_guard_enabled = true;
-    int pose_depth_filter_innovation_window = 10;
-    double pose_depth_filter_innovation_bias_threshold_mm = 0.75;
-    int pose_depth_filter_innovation_min_same_sign = 8;
-    double pose_depth_filter_innovation_cusum_slack_mm = 0.2;
-    double pose_depth_filter_innovation_cusum_threshold_mm = 8.0;
-    bool pose_depth_filter_negative_delta_guard_enabled = true;
-    double pose_depth_filter_negative_delta_guard_min_z_span_mm = 14.835;
-    double pose_depth_filter_negative_delta_guard_max_negative_delta_mm = 0.0;
-    bool pose_depth_filter_negative_delta_guard_hold_previous_z = false;
-    bool pose_depth_filter_negative_delta_guard_hold_requires_innovation_bias = true;
-    double pose_depth_filter_negative_delta_guard_hold_min_negative_delta_mm = 0.4;
-    double pose_depth_filter_negative_delta_guard_max_hold_correction_mm = 0.75;
-    double pose_depth_filter_negative_delta_guard_velocity_damping = 0.25;
-
-    bool pose_plateau_prior_enabled = true;
-    double pose_plateau_prior_trigger_negative_delta_mm = 0.0;
-    double pose_plateau_prior_min_object_z_span_mm = 14.835;
-    int pose_plateau_prior_min_points = 6;
-    double pose_plateau_prior_static_max_excess_px = 0.18;
-    double pose_plateau_prior_candidate_max_excess_px = 0.25;
-    double pose_plateau_prior_candidate_max_max_excess_px = 1.0;
-    double pose_plateau_prior_min_positive_z_correction_mm = 0.0;
-    double pose_plateau_prior_max_positive_z_correction_mm = 0.75;
-    double pose_plateau_prior_robust_c_px = 0.20;
-    int pose_plateau_prior_max_iterations = 6;
-    double pose_plateau_prior_max_step_translation_mm = 5.0;
-    double pose_plateau_prior_max_step_rotation_deg = 5.0;
-    double pose_plateau_prior_lm_damping = 1.0e-5;
-
     int checker_min_tracking_decode_cell_span = 3;
     int checker_refresh_interval_frames = 1;
     int checker_tracking_recovery_stable_interval_frames = 9;
