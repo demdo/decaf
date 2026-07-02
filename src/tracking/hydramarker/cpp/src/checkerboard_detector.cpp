@@ -711,6 +711,7 @@ void CheckerboardDetector::resetTracking() {
     persistent_corners_.clear();
     pending_completion_corners_.clear();
     lk_corner_displacements_.clear();
+    lk_corner_kalman_.clear();
     tracking_active_       = false;
     frame_index_           = 0;
     degraded_frames_count_ = 0;
@@ -2470,6 +2471,101 @@ CheckerboardDetector::buildVisibleTrackedDetection(
 // trackFromPreviousFrame
 // ============================================================
 
+void CheckerboardDetector::initializeCornerKalman(
+    CornerKalmanState& state,
+    const cv::Point2f& uv,
+    int frame_index
+) {
+    state.u.x = cv::Vec3d(static_cast<double>(uv.x), 0.0, 0.0);
+    state.v.x = cv::Vec3d(static_cast<double>(uv.y), 0.0, 0.0);
+    state.u.P = cv::Matx33d::eye() * 100.0;
+    state.v.P = cv::Matx33d::eye() * 100.0;
+    state.last_frame = frame_index;
+    state.initialized = true;
+}
+
+void CheckerboardDetector::predictCornerKalmanAxis(
+    CheckerboardDetector::CornerKalmanAxisState& axis,
+    double dt,
+    double process_noise_px
+) {
+    const cv::Matx33d A(
+        1.0, dt, 0.5 * dt * dt,
+        0.0, 1.0, dt,
+        0.0, 0.0, 1.0);
+
+    axis.x = A * axis.x;
+    axis.P = A * axis.P * A.t();
+
+    const double sigma = std::max(1e-6, process_noise_px);
+    const double q = sigma * sigma;
+    const cv::Vec3d g(dt * dt * dt / 6.0, 0.5 * dt * dt, dt);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            axis.P(r, c) += q * g[r] * g[c];
+        }
+    }
+}
+
+void CheckerboardDetector::predictCornerKalman(
+    CornerKalmanState& state,
+    double dt,
+    double process_noise_px
+) {
+    const double clamped_dt = std::max(1.0, std::min(5.0, dt));
+    predictCornerKalmanAxis(state.u, clamped_dt, process_noise_px);
+    predictCornerKalmanAxis(state.v, clamped_dt, process_noise_px);
+}
+
+cv::Point2f
+CheckerboardDetector::cornerKalmanPosition(const CornerKalmanState& state) {
+    return cv::Point2f(
+        static_cast<float>(state.u.x[0]),
+        static_cast<float>(state.v.x[0]));
+}
+
+double CheckerboardDetector::updateCornerKalmanAxis(
+    CheckerboardDetector::CornerKalmanAxisState& axis,
+    double measurement,
+    double measurement_noise_px
+) {
+    const double sigma = std::max(1e-6, measurement_noise_px);
+    const double r_var = sigma * sigma;
+    const double innovation = measurement - axis.x[0];
+    const double s = axis.P(0, 0) + r_var;
+    if (!(s > 1e-12) || !std::isfinite(s)) {
+        axis.x[0] = measurement;
+        axis.P = cv::Matx33d::eye() * 100.0;
+        return innovation;
+    }
+
+    const cv::Vec3d k(axis.P(0, 0) / s,
+                      axis.P(1, 0) / s,
+                      axis.P(2, 0) / s);
+    axis.x += k * innovation;
+
+    cv::Matx33d updated = axis.P;
+    for (int rr = 0; rr < 3; ++rr) {
+        for (int cc = 0; cc < 3; ++cc) {
+            updated(rr, cc) = axis.P(rr, cc) - k[rr] * axis.P(0, cc);
+        }
+    }
+    axis.P = updated;
+    return innovation;
+}
+
+cv::Point2f CheckerboardDetector::updateCornerKalman(
+    CornerKalmanState& state,
+    const cv::Point2f& measurement,
+    double measurement_noise_px
+) {
+    updateCornerKalmanAxis(state.u, static_cast<double>(measurement.x),
+                           measurement_noise_px);
+    updateCornerKalmanAxis(state.v, static_cast<double>(measurement.y),
+                           measurement_noise_px);
+    return cornerKalmanPosition(state);
+}
+
 std::optional<CheckerboardDetection>
 CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
     if (!tracking_active_ ||
@@ -2493,6 +2589,16 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
     last_timings_ms_["lk_initial_flow_mean_residual_px"] = 0.0;
     last_timings_ms_["lk_initial_flow_p95_residual_px"] = 0.0;
     last_timings_ms_["lk_initial_flow_max_residual_px"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_enabled_count"] =
+        config_.lk_corner_kalman_enabled ? 1.0 : 0.0;
+    last_timings_ms_["lk_corner_kalman_update_count"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_reset_count"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_mean_innovation_px"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_p95_innovation_px"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_max_innovation_px"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_mean_correction_px"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_p95_correction_px"] = 0.0;
+    last_timings_ms_["lk_corner_kalman_max_correction_px"] = 0.0;
 
     std::vector<cv::Point2f> initial_curr_points;
     std::vector<char> initial_flow_used;
@@ -2507,13 +2613,38 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
             config_.lk_initial_flow_max_prediction_px);
         for (size_t k = 0; k < last_detection_.corners.size(); ++k) {
             const auto& c = last_detection_.corners[k];
-            const auto it =
-                lk_corner_displacements_.find(gridKey(c.i, c.j));
-            if (it == lk_corner_displacements_.end()) {
-                continue;
+            const std::int64_t key = gridKey(c.i, c.j);
+            cv::Point2f d(0.0f, 0.0f);
+            bool has_prediction = false;
+
+            if (config_.lk_corner_kalman_enabled) {
+                const auto kit = lk_corner_kalman_.find(key);
+                if (kit != lk_corner_kalman_.end() &&
+                    kit->second.initialized &&
+                    kit->second.last_frame >= 0) {
+                    const int gap = frame_index_ - kit->second.last_frame;
+                    if (gap > 0 &&
+                        gap <= config_.lk_corner_kalman_max_gap_frames) {
+                        CornerKalmanState predicted = kit->second;
+                        predictCornerKalman(
+                            predicted,
+                            static_cast<double>(gap),
+                            config_.lk_corner_kalman_process_noise_px);
+                        d = cornerKalmanPosition(predicted) - prev_points[k];
+                        has_prediction = true;
+                    }
+                }
             }
 
-            const cv::Point2f d = it->second;
+            if (!has_prediction) {
+                const auto it = lk_corner_displacements_.find(key);
+                if (it == lk_corner_displacements_.end()) {
+                    continue;
+                }
+                d = it->second;
+                has_prediction = true;
+            }
+
             if (!std::isfinite(d.x) || !std::isfinite(d.y)) {
                 continue;
             }
@@ -2744,6 +2875,133 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
         addTimingMs("tracking_subpix_ms", elapsedMs(subpix_t0));
     }
 
+    // Paper-style per-corner Kalman update in image coordinates.  The LK +
+    // subpixel result is the measurement; the filtered uv is what PnP sees.
+    if (config_.lk_corner_kalman_enabled &&
+        !validation.visible_points.empty()) {
+        const auto kf_t0 = cv::getTickCount();
+        const double process_noise =
+            std::max(1e-6f, config_.lk_corner_kalman_process_noise_px);
+        const double measurement_noise =
+            std::max(1e-6f, config_.lk_corner_kalman_measurement_noise_px);
+        const float max_update_innovation =
+            std::max(0.0f, config_.lk_corner_kalman_max_update_innovation_px);
+
+        std::vector<float> innovations;
+        std::vector<float> corrections;
+        innovations.reserve(validation.visible_points.size());
+        corrections.reserve(validation.visible_points.size());
+        int reset_count = 0;
+
+        for (size_t k = 0; k < validation.visible_points.size(); ++k) {
+            const bool predicted =
+                k < validation.visible_predicted.size()
+                    ? validation.visible_predicted[k]
+                    : false;
+            if (predicted) {
+                continue;
+            }
+
+            if (k >= validation.visible_indices.size()) {
+                continue;
+            }
+            const int old_idx = validation.visible_indices[k];
+            if (old_idx < 0 ||
+                old_idx >= static_cast<int>(last_detection_.corners.size())) {
+                continue;
+            }
+
+            const cv::Point2f measurement = validation.visible_points[k];
+            if (!std::isfinite(measurement.x) ||
+                !std::isfinite(measurement.y)) {
+                continue;
+            }
+
+            const auto& old_corner = last_detection_.corners[old_idx];
+            CornerKalmanState& state =
+                lk_corner_kalman_[gridKey(old_corner.i, old_corner.j)];
+
+            bool reset_state =
+                !state.initialized ||
+                state.last_frame < 0 ||
+                frame_index_ <= state.last_frame;
+            int gap = frame_index_ - state.last_frame;
+            if (!reset_state &&
+                gap > config_.lk_corner_kalman_max_gap_frames) {
+                reset_state = true;
+            }
+
+            if (reset_state) {
+                initializeCornerKalman(state, measurement, frame_index_);
+                ++reset_count;
+                continue;
+            }
+
+            predictCornerKalman(
+                state,
+                static_cast<double>(std::max(1, gap)),
+                process_noise);
+            const cv::Point2f predicted_uv = cornerKalmanPosition(state);
+            const float innovation = distf(measurement, predicted_uv);
+
+            if (!std::isfinite(innovation) ||
+                (max_update_innovation > 0.0f &&
+                 innovation > max_update_innovation)) {
+                initializeCornerKalman(state, measurement, frame_index_);
+                ++reset_count;
+                continue;
+            }
+
+            const cv::Point2f filtered =
+                updateCornerKalman(state, measurement, measurement_noise);
+            state.last_frame = frame_index_;
+            validation.visible_points[k] = filtered;
+
+            const float correction = distf(filtered, measurement);
+            if (std::isfinite(innovation)) {
+                innovations.push_back(innovation);
+            }
+            if (std::isfinite(correction)) {
+                corrections.push_back(correction);
+            }
+        }
+
+        last_timings_ms_["lk_corner_kalman_reset_count"] =
+            static_cast<double>(reset_count);
+        last_timings_ms_["lk_corner_kalman_update_count"] =
+            static_cast<double>(corrections.size());
+
+        if (!innovations.empty()) {
+            double sum = 0.0;
+            double max_v = 0.0;
+            for (const float v : innovations) {
+                sum += static_cast<double>(v);
+                max_v = std::max(max_v, static_cast<double>(v));
+            }
+            last_timings_ms_["lk_corner_kalman_mean_innovation_px"] =
+                sum / static_cast<double>(innovations.size());
+            last_timings_ms_["lk_corner_kalman_p95_innovation_px"] =
+                percentileNearest(innovations, 0.95);
+            last_timings_ms_["lk_corner_kalman_max_innovation_px"] = max_v;
+        }
+
+        if (!corrections.empty()) {
+            double sum = 0.0;
+            double max_v = 0.0;
+            for (const float v : corrections) {
+                sum += static_cast<double>(v);
+                max_v = std::max(max_v, static_cast<double>(v));
+            }
+            last_timings_ms_["lk_corner_kalman_mean_correction_px"] =
+                sum / static_cast<double>(corrections.size());
+            last_timings_ms_["lk_corner_kalman_p95_correction_px"] =
+                percentileNearest(corrections, 0.95);
+            last_timings_ms_["lk_corner_kalman_max_correction_px"] = max_v;
+        }
+
+        addTimingMs("tracking_corner_kalman_ms", elapsedMs(kf_t0));
+    }
+
     const auto build_t0 = cv::getTickCount();
     auto detection = buildVisibleTrackedDetection(last_detection_, validation);
     addTimingMs("build_visible_tracked_ms", elapsedMs(build_t0));
@@ -2795,6 +3053,7 @@ void CheckerboardDetector::updateTrackingState(
         persistent_corners_.clear();
         pending_completion_corners_.clear();
         lk_corner_displacements_.clear();
+        lk_corner_kalman_.clear();
         last_gray_pyramid_.clear();
         pending_current_gray_pyramid_.clear();
         last_gray_pyramid_frame_index_ = -1;
@@ -2809,6 +3068,7 @@ void CheckerboardDetector::updateTrackingState(
         persistent_corners_.clear();
         pending_completion_corners_.clear();
         lk_corner_displacements_.clear();
+        lk_corner_kalman_.clear();
         persistent_corners_.reserve(measured_detection.corners.size());
 
         for (const auto& c : measured_detection.corners) {
@@ -2820,6 +3080,15 @@ void CheckerboardDetector::updateTrackingState(
             pc.predicted_frames = c.predicted ? 1 : 0;
             pc.low_visibility_frames = 0;
             persistent_corners_.push_back(pc);
+            if (config_.lk_corner_kalman_enabled &&
+                !c.predicted &&
+                std::isfinite(c.uv.x) &&
+                std::isfinite(c.uv.y)) {
+                initializeCornerKalman(
+                    lk_corner_kalman_[gridKey(c.i, c.j)],
+                    c.uv,
+                    frame_index_);
+            }
         }
 
         last_detection_  = measured_detection;

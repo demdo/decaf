@@ -111,6 +111,20 @@ private:
     std::vector<PendingCompletionCorner> pending_completion_corners_;
     std::unordered_map<std::int64_t, cv::Point2f> lk_corner_displacements_;
 
+    struct CornerKalmanAxisState {
+        cv::Vec3d x = cv::Vec3d(0.0, 0.0, 0.0);
+        cv::Matx33d P = cv::Matx33d::eye() * 100.0;
+    };
+
+    struct CornerKalmanState {
+        CornerKalmanAxisState u;
+        CornerKalmanAxisState v;
+        int last_frame = -1;
+        bool initialized = false;
+    };
+
+    std::unordered_map<std::int64_t, CornerKalmanState> lk_corner_kalman_;
+
     CornerDetector corner_detector_;
     CornerRefiner corner_refiner_;
     LatticeModel lattice_model_;
@@ -169,6 +183,28 @@ private:
 
     std::optional<CheckerboardDetection>
     trackFromPreviousFrame(const cv::Mat& gray);
+
+    static void initializeCornerKalman(
+        CornerKalmanState& state,
+        const cv::Point2f& uv,
+        int frame_index);
+    static void predictCornerKalman(
+        CornerKalmanState& state,
+        double dt,
+        double process_noise_px);
+    static cv::Point2f cornerKalmanPosition(const CornerKalmanState& state);
+    static cv::Point2f updateCornerKalman(
+        CornerKalmanState& state,
+        const cv::Point2f& measurement,
+        double measurement_noise_px);
+    static void predictCornerKalmanAxis(
+        CornerKalmanAxisState& axis,
+        double dt,
+        double process_noise_px);
+    static double updateCornerKalmanAxis(
+        CornerKalmanAxisState& axis,
+        double measurement,
+        double measurement_noise_px);
 
     // recovery_detection: if provided and tracking is active, new corners
     // from recovery that are not yet in persistent_corners_ are injected

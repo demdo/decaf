@@ -159,6 +159,16 @@ struct CheckerboardDetectorConfig {
     bool lk_use_initial_flow_prediction = true;
     float lk_initial_flow_max_prediction_px = 18.0f;
 
+    // Paper-style per-corner Kalman filter in image space.  Each stable grid
+    // corner is filtered independently with a constant-acceleration model
+    // after LK/subpixel refinement and before the tracked detection is passed
+    // to pose estimation.
+    bool lk_corner_kalman_enabled = true;
+    float lk_corner_kalman_process_noise_px = 0.35f;
+    float lk_corner_kalman_measurement_noise_px = 0.75f;
+    float lk_corner_kalman_max_update_innovation_px = 12.0f;
+    int lk_corner_kalman_max_gap_frames = 5;
+
     // Forward-backward LK consistency threshold.
     float max_lk_forward_backward_error_px = 3.5f;
 
