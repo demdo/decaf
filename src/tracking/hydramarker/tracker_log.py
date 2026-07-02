@@ -38,6 +38,14 @@ COLUMNS = [
     "decode_pose_ms", "hold_pose_ms", "emergency_hold_ms", "draw_ms",
     "checkerboard_to_gray_ms", "checkerboard_track_total_ms",
     "checkerboard_lk_ms", "checkerboard_tracking_validate_ms",
+    "checkerboard_lk_initial_flow_enabled_count",
+    "checkerboard_lk_initial_flow_count",
+    "checkerboard_lk_initial_flow_mean_prediction_px",
+    "checkerboard_lk_initial_flow_p95_prediction_px",
+    "checkerboard_lk_initial_flow_max_prediction_px",
+    "checkerboard_lk_initial_flow_mean_residual_px",
+    "checkerboard_lk_initial_flow_p95_residual_px",
+    "checkerboard_lk_initial_flow_max_residual_px",
     "checkerboard_tracking_subpix_ms",
     "checkerboard_tracking_subpix_count",
     "checkerboard_tracking_subpix_enabled_count",
@@ -67,6 +75,15 @@ COLUMNS = [
     "pose_corners", "num_points", "num_inliers",
     "mean_err", "max_err", "confidence",
     "persistent_count",
+    "det_predicted_corners",
+    "det_observed_frames_mean", "det_observed_frames_max",
+    "det_visibility_mean", "det_visibility_min",
+    "pose_predicted_corners",
+    "pose_observed_frames_mean", "pose_observed_frames_max",
+    "pose_visibility_mean", "pose_visibility_min",
+    "corr_predicted_corners",
+    "corr_observed_frames_mean", "corr_observed_frames_max",
+    "corr_visibility_mean", "corr_visibility_min",
 
     # fast persistent path diagnostics
     "fast_attempted", "fast_success", "fast_matches", "fast_reason",
@@ -557,6 +574,44 @@ def _corner_distribution_stats(corners) -> dict[str, Optional[float] | int]:
         "v_span": float(np.ptp(uv_arr[:, 1])),
         "centroid_u": float(np.mean(uv_arr[:, 0])),
         "centroid_v": float(np.mean(uv_arr[:, 1])),
+    }
+
+
+def _corner_state_stats(corners) -> dict[str, Optional[float] | int]:
+    corner_list = list(corners or [])
+    if not corner_list:
+        return {
+            "predicted_count": 0,
+            "observed_mean": None,
+            "observed_max": None,
+            "visibility_mean": None,
+            "visibility_min": None,
+        }
+
+    predicted_count = 0
+    observed: list[float] = []
+    visibility: list[float] = []
+    for corner in corner_list:
+        try:
+            if bool(getattr(corner, "predicted", False)):
+                predicted_count += 1
+        except Exception:
+            pass
+        try:
+            observed.append(float(getattr(corner, "observed_frames")))
+        except Exception:
+            pass
+        try:
+            visibility.append(float(getattr(corner, "visibility_score")))
+        except Exception:
+            pass
+
+    return {
+        "predicted_count": int(predicted_count),
+        "observed_mean": float(np.mean(observed)) if observed else None,
+        "observed_max": float(np.max(observed)) if observed else None,
+        "visibility_mean": float(np.mean(visibility)) if visibility else None,
+        "visibility_min": float(np.min(visibility)) if visibility else None,
     }
 
 
@@ -1237,12 +1292,29 @@ def _pose_candidate_record(
 
 def _compact_corner_record(corner) -> dict:
     record = {}
-    for attr in ("local_row", "local_col", "global_row", "global_col", "votes"):
+    for attr in (
+        "local_row",
+        "local_col",
+        "global_row",
+        "global_col",
+        "votes",
+        "observed_frames",
+    ):
         if hasattr(corner, attr):
             try:
                 record[attr] = int(getattr(corner, attr))
             except Exception:
                 pass
+    if hasattr(corner, "predicted"):
+        try:
+            record["predicted"] = int(bool(getattr(corner, "predicted")))
+        except Exception:
+            pass
+    if hasattr(corner, "visibility_score"):
+        try:
+            record["visibility_score"] = float(getattr(corner, "visibility_score"))
+        except Exception:
+            pass
     if hasattr(corner, "xyz_mm"):
         try:
             record["xyz_mm"] = [float(v) for v in corner.xyz_mm]
@@ -1678,6 +1750,9 @@ def log_frame(
     pose_reproj = _pose_reprojection_debug(result, tracker) if has_pose else _pose_reprojection_debug(None, tracker)
     pose_distribution = _corner_distribution_stats(getattr(result, "corners", []) or [])
     corr_distribution = _corner_distribution_stats(getattr(result, "correspondence_corners", []) or [])
+    det_state = _corner_state_stats(getattr(result, "detection_corners", []) or [])
+    pose_state = _corner_state_stats(getattr(result, "corners", []) or [])
+    corr_state = _corner_state_stats(getattr(result, "correspondence_corners", []) or [])
     candidate_sets = (
         _pose_candidate_sets(result, tracker)
         if has_pose and log_pose_candidates_enabled()
@@ -1758,6 +1833,14 @@ def log_frame(
         "checkerboard_to_gray_ms": _fmt_float(timings.get("checkerboard_to_gray_ms")),
         "checkerboard_track_total_ms": _fmt_float(timings.get("checkerboard_track_total_ms")),
         "checkerboard_lk_ms": _fmt_float(timings.get("checkerboard_lk_ms")),
+        "checkerboard_lk_initial_flow_enabled_count": int(float(timings.get("checkerboard_lk_initial_flow_enabled_count", 0.0) or 0.0)),
+        "checkerboard_lk_initial_flow_count": int(float(timings.get("checkerboard_lk_initial_flow_count", 0.0) or 0.0)),
+        "checkerboard_lk_initial_flow_mean_prediction_px": _fmt_float(timings.get("checkerboard_lk_initial_flow_mean_prediction_px")),
+        "checkerboard_lk_initial_flow_p95_prediction_px": _fmt_float(timings.get("checkerboard_lk_initial_flow_p95_prediction_px")),
+        "checkerboard_lk_initial_flow_max_prediction_px": _fmt_float(timings.get("checkerboard_lk_initial_flow_max_prediction_px")),
+        "checkerboard_lk_initial_flow_mean_residual_px": _fmt_float(timings.get("checkerboard_lk_initial_flow_mean_residual_px")),
+        "checkerboard_lk_initial_flow_p95_residual_px": _fmt_float(timings.get("checkerboard_lk_initial_flow_p95_residual_px")),
+        "checkerboard_lk_initial_flow_max_residual_px": _fmt_float(timings.get("checkerboard_lk_initial_flow_max_residual_px")),
         "checkerboard_tracking_validate_ms": _fmt_float(timings.get("checkerboard_tracking_validate_ms")),
         "checkerboard_tracking_subpix_ms": _fmt_float(timings.get("checkerboard_tracking_subpix_ms")),
         "checkerboard_tracking_subpix_count": int(float(timings.get("checkerboard_tracking_subpix_count", 0.0) or 0.0)),
@@ -1821,6 +1904,21 @@ def log_frame(
                 _safe_len(getattr(tracker, "_persistent_corners", [])),
             )
         ),
+        "det_predicted_corners": int(det_state["predicted_count"]),
+        "det_observed_frames_mean": _fmt_float(det_state["observed_mean"]),
+        "det_observed_frames_max": _fmt_float(det_state["observed_max"]),
+        "det_visibility_mean": _fmt_float(det_state["visibility_mean"]),
+        "det_visibility_min": _fmt_float(det_state["visibility_min"]),
+        "pose_predicted_corners": int(pose_state["predicted_count"]),
+        "pose_observed_frames_mean": _fmt_float(pose_state["observed_mean"]),
+        "pose_observed_frames_max": _fmt_float(pose_state["observed_max"]),
+        "pose_visibility_mean": _fmt_float(pose_state["visibility_mean"]),
+        "pose_visibility_min": _fmt_float(pose_state["visibility_min"]),
+        "corr_predicted_corners": int(corr_state["predicted_count"]),
+        "corr_observed_frames_mean": _fmt_float(corr_state["observed_mean"]),
+        "corr_observed_frames_max": _fmt_float(corr_state["observed_max"]),
+        "corr_visibility_mean": _fmt_float(corr_state["visibility_mean"]),
+        "corr_visibility_min": _fmt_float(corr_state["visibility_min"]),
 
         "fast_attempted": int(_debug_counter(debug_counters, "fast_attempted") > 0.0),
         "fast_success": int(_debug_counter(debug_counters, "fast_success") > 0.0),

@@ -30,6 +30,12 @@ static float distf(const cv::Point2f& a, const cv::Point2f& b) {
     return std::sqrt(dist2(a, b));
 }
 
+static std::int64_t gridKey(int i, int j) {
+    return (static_cast<std::int64_t>(
+                static_cast<std::uint32_t>(i)) << 32) |
+           static_cast<std::uint32_t>(j);
+}
+
 static double percentileNearest(std::vector<float> values, double q) {
     if (values.empty()) return 0.0;
     q = std::max(0.0, std::min(1.0, q));
@@ -704,6 +710,7 @@ void CheckerboardDetector::resetTracking() {
     last_detection_ = CheckerboardDetection{};
     persistent_corners_.clear();
     pending_completion_corners_.clear();
+    lk_corner_displacements_.clear();
     tracking_active_       = false;
     frame_index_           = 0;
     degraded_frames_count_ = 0;
@@ -2477,19 +2484,111 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
         prev_points.push_back(c.uv);
     addTimingMs("track_prepare_points_ms", elapsedMs(prepare_t0));
 
+    last_timings_ms_["lk_initial_flow_enabled_count"] =
+        config_.lk_use_initial_flow_prediction ? 1.0 : 0.0;
+    last_timings_ms_["lk_initial_flow_count"] = 0.0;
+    last_timings_ms_["lk_initial_flow_mean_prediction_px"] = 0.0;
+    last_timings_ms_["lk_initial_flow_p95_prediction_px"] = 0.0;
+    last_timings_ms_["lk_initial_flow_max_prediction_px"] = 0.0;
+    last_timings_ms_["lk_initial_flow_mean_residual_px"] = 0.0;
+    last_timings_ms_["lk_initial_flow_p95_residual_px"] = 0.0;
+    last_timings_ms_["lk_initial_flow_max_residual_px"] = 0.0;
+
+    std::vector<cv::Point2f> initial_curr_points;
+    std::vector<char> initial_flow_used;
+    std::vector<float> prediction_shifts;
+    if (config_.lk_use_initial_flow_prediction) {
+        initial_curr_points = prev_points;
+        initial_flow_used.assign(prev_points.size(), 0);
+        prediction_shifts.reserve(prev_points.size());
+
+        const float max_pred = std::max(
+            0.0f,
+            config_.lk_initial_flow_max_prediction_px);
+        for (size_t k = 0; k < last_detection_.corners.size(); ++k) {
+            const auto& c = last_detection_.corners[k];
+            const auto it =
+                lk_corner_displacements_.find(gridKey(c.i, c.j));
+            if (it == lk_corner_displacements_.end()) {
+                continue;
+            }
+
+            const cv::Point2f d = it->second;
+            if (!std::isfinite(d.x) || !std::isfinite(d.y)) {
+                continue;
+            }
+            const float shift = std::sqrt(d.x * d.x + d.y * d.y);
+            if (shift <= 1e-4f || shift > max_pred) {
+                continue;
+            }
+
+            initial_curr_points[k] = prev_points[k] + d;
+            initial_flow_used[k] = 1;
+            prediction_shifts.push_back(shift);
+        }
+
+        if (!prediction_shifts.empty()) {
+            double sum = 0.0;
+            double max_shift = 0.0;
+            for (const float v : prediction_shifts) {
+                sum += static_cast<double>(v);
+                max_shift = std::max(max_shift, static_cast<double>(v));
+            }
+            last_timings_ms_["lk_initial_flow_count"] =
+                static_cast<double>(prediction_shifts.size());
+            last_timings_ms_["lk_initial_flow_mean_prediction_px"] =
+                sum / static_cast<double>(prediction_shifts.size());
+            last_timings_ms_["lk_initial_flow_p95_prediction_px"] =
+                percentileNearest(prediction_shifts, 0.95);
+            last_timings_ms_["lk_initial_flow_max_prediction_px"] =
+                max_shift;
+        }
+    }
+    const std::vector<cv::Point2f>* initial_curr_points_ptr =
+        prediction_shifts.empty() ? nullptr : &initial_curr_points;
+
     pending_current_gray_pyramid_.clear();
     pending_current_gray_pyramid_frame_index_ = -1;
     const bool reuse_prev_pyramid = !last_gray_pyramid_.empty();
 
     const auto lk_t0 = cv::getTickCount();
     LKTrackingResult lk = lk_tracker_.track(
-        last_gray_, gray, prev_points,
+        last_gray_, gray, prev_points, initial_curr_points_ptr,
         config_.lk_win_size, config_.lk_max_level,
         config_.lk_max_iters, config_.lk_epsilon,
         config_.max_lk_error,
         reuse_prev_pyramid ? &last_gray_pyramid_ : nullptr,
         &pending_current_gray_pyramid_);
     addTimingMs("lk_ms", elapsedMs(lk_t0));
+
+    if (lk.valid && initial_curr_points_ptr != nullptr) {
+        std::vector<float> residuals;
+        residuals.reserve(prediction_shifts.size());
+        double residual_sum = 0.0;
+        double residual_max = 0.0;
+        for (size_t k = 0; k < lk.curr_points.size() &&
+                           k < initial_curr_points.size() &&
+                           k < initial_flow_used.size(); ++k) {
+            if (!initial_flow_used[k] || !lk.status[k]) {
+                continue;
+            }
+            const float residual =
+                distf(lk.curr_points[k], initial_curr_points[k]);
+            residuals.push_back(residual);
+            residual_sum += static_cast<double>(residual);
+            residual_max = std::max(
+                residual_max,
+                static_cast<double>(residual));
+        }
+        if (!residuals.empty()) {
+            last_timings_ms_["lk_initial_flow_mean_residual_px"] =
+                residual_sum / static_cast<double>(residuals.size());
+            last_timings_ms_["lk_initial_flow_p95_residual_px"] =
+                percentileNearest(residuals, 0.95);
+            last_timings_ms_["lk_initial_flow_max_residual_px"] =
+                residual_max;
+        }
+    }
     if (reuse_prev_pyramid) {
         addTimingMs("lk_prev_pyramid_reused_count", 1.0);
     }
@@ -2649,6 +2748,22 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
     auto detection = buildVisibleTrackedDetection(last_detection_, validation);
     addTimingMs("build_visible_tracked_ms", elapsedMs(build_t0));
     if (!detection || !detection->valid()) return std::nullopt;
+
+    lk_corner_displacements_.clear();
+    for (size_t k = 0; k < validation.visible_indices.size() &&
+                       k < validation.visible_points.size(); ++k) {
+        const int old_idx = validation.visible_indices[k];
+        if (old_idx < 0 ||
+            old_idx >= static_cast<int>(last_detection_.corners.size())) {
+            continue;
+        }
+        const auto& c = last_detection_.corners[old_idx];
+        const cv::Point2f d = validation.visible_points[k] - c.uv;
+        if (std::isfinite(d.x) && std::isfinite(d.y)) {
+            lk_corner_displacements_[gridKey(c.i, c.j)] = d;
+        }
+    }
+
     return detection;
 }
 
@@ -2679,6 +2794,7 @@ void CheckerboardDetector::updateTrackingState(
         last_detection_ = CheckerboardDetection{};
         persistent_corners_.clear();
         pending_completion_corners_.clear();
+        lk_corner_displacements_.clear();
         last_gray_pyramid_.clear();
         pending_current_gray_pyramid_.clear();
         last_gray_pyramid_frame_index_ = -1;
@@ -2692,6 +2808,7 @@ void CheckerboardDetector::updateTrackingState(
         !measured_detection.tracking) {
         persistent_corners_.clear();
         pending_completion_corners_.clear();
+        lk_corner_displacements_.clear();
         persistent_corners_.reserve(measured_detection.corners.size());
 
         for (const auto& c : measured_detection.corners) {

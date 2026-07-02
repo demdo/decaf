@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "marker_field.hpp"
 #include "marker_geometry.hpp"
@@ -167,6 +168,27 @@ std::vector<cv::Point2d> numpyToPoint2dVector(
     return points;
 }
 
+std::vector<cv::Point2f> numpyToPoint2fVector(
+    py::array_t<double, py::array::c_style | py::array::forcecast> arr
+) {
+    py::buffer_info info = arr.request();
+    if (info.size % 2 != 0) {
+        throw std::runtime_error("points size must be divisible by 2");
+    }
+
+    const double* data = static_cast<const double*>(info.ptr);
+    std::vector<cv::Point2f> points;
+    const size_t size = static_cast<size_t>(info.size);
+    points.reserve(size / 2);
+    for (size_t i = 0; i < size; i += 2) {
+        points.emplace_back(
+            static_cast<float>(data[i]),
+            static_cast<float>(data[i + 1])
+        );
+    }
+    return points;
+}
+
 } // namespace
 
 PYBIND11_MODULE(hydramarker_cpp, m) {
@@ -198,6 +220,100 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         py::arg("max_ms") = 60000.0,
         py::arg("max_trial") = 100000,
         py::arg("is_print") = false
+    );
+
+    m.def(
+        "refine_saddle_points",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> img,
+           py::array_t<double, py::array::c_style | py::array::forcecast> points,
+           int radius,
+           int iterations,
+           float max_angle_bias_deg,
+           float correlation_drop,
+           float merge_radius_px,
+           int quadrant_half_r,
+           float quadrant_min_contrast,
+           float quadrant_max_diagonal_diff,
+           int subpix_win_size,
+           int subpix_max_iters,
+           double subpix_epsilon) -> py::array_t<double>
+        {
+            cv::Mat mat = numpyToMat(img);
+            cv::Mat gray;
+
+            if (mat.channels() == 1) {
+                gray = mat;
+            } else if (mat.channels() == 3) {
+                cv::cvtColor(mat, gray, cv::COLOR_BGR2GRAY);
+            } else if (mat.channels() == 4) {
+                cv::cvtColor(mat, gray, cv::COLOR_BGRA2GRAY);
+            } else {
+                throw std::runtime_error("Image must have 1, 3, or 4 channels");
+            }
+
+            std::vector<cv::Point2f> candidates = numpyToPoint2fVector(points);
+
+            cv::Mat gray_f;
+            gray.convertTo(gray_f, CV_32F);
+
+            cv::Mat grad_x;
+            cv::Mat grad_y;
+            cv::Sobel(gray_f, grad_x, CV_32F, 1, 0, 3);
+            cv::Sobel(gray_f, grad_y, CV_32F, 0, 1, 3);
+
+            CornerRefinementConfig config;
+            config.radius = radius;
+            config.iterations = iterations;
+            config.max_angle_bias_deg = max_angle_bias_deg;
+            config.correlation_drop = correlation_drop;
+            config.merge_radius_px = merge_radius_px;
+            config.quadrant_half_r = quadrant_half_r;
+            config.quadrant_min_contrast = quadrant_min_contrast;
+            config.quadrant_max_diagonal_diff = quadrant_max_diagonal_diff;
+            config.subpix_win_size = subpix_win_size;
+            config.subpix_max_iters = subpix_max_iters;
+            config.subpix_epsilon = subpix_epsilon;
+
+            CornerRefiner refiner;
+            std::vector<RefinedCorner> refined = refiner.refine(
+                gray,
+                candidates,
+                grad_x,
+                grad_y,
+                config
+            );
+
+            py::array_t<double> out({
+                static_cast<py::ssize_t>(refined.size()),
+                static_cast<py::ssize_t>(5)
+            });
+            py::buffer_info info = out.request();
+            double* data = static_cast<double*>(info.ptr);
+
+            for (size_t i = 0; i < refined.size(); ++i) {
+                const size_t j = i * 5;
+                data[j + 0] = static_cast<double>(refined[i].uv.x);
+                data[j + 1] = static_cast<double>(refined[i].uv.y);
+                data[j + 2] = static_cast<double>(refined[i].correlation);
+                data[j + 3] = static_cast<double>(refined[i].angle_bias_deg);
+                data[j + 4] = refined[i].valid ? 1.0 : 0.0;
+            }
+
+            return out;
+        },
+        py::arg("img"),
+        py::arg("points"),
+        py::arg("radius") = 5,
+        py::arg("iterations") = 2,
+        py::arg("max_angle_bias_deg") = 20.0f,
+        py::arg("correlation_drop") = 0.2f,
+        py::arg("merge_radius_px") = 2.0f,
+        py::arg("quadrant_half_r") = 3,
+        py::arg("quadrant_min_contrast") = 12.0f,
+        py::arg("quadrant_max_diagonal_diff") = 60.0f,
+        py::arg("subpix_win_size") = -1,
+        py::arg("subpix_max_iters") = 20,
+        py::arg("subpix_epsilon") = 0.05
     );
 
     py::enum_<TrackerMode>(m, "TrackerMode")
@@ -313,13 +429,19 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("global_col", &TrackerCorner::global_col)
         .def_readwrite("xyz_mm", &TrackerCorner::xyz_mm)
         .def_readwrite("uv", &TrackerCorner::uv)
-        .def_readwrite("votes", &TrackerCorner::votes);
+        .def_readwrite("votes", &TrackerCorner::votes)
+        .def_readwrite("visibility_score", &TrackerCorner::visibility_score)
+        .def_readwrite("observed_frames", &TrackerCorner::observed_frames)
+        .def_readwrite("predicted", &TrackerCorner::predicted);
 
     py::class_<FrameDetectedCorner>(m, "DetectedCorner")
         .def(py::init<>())
         .def_readwrite("local_row", &FrameDetectedCorner::local_row)
         .def_readwrite("local_col", &FrameDetectedCorner::local_col)
-        .def_readwrite("uv", &FrameDetectedCorner::uv);
+        .def_readwrite("uv", &FrameDetectedCorner::uv)
+        .def_readwrite("visibility_score", &FrameDetectedCorner::visibility_score)
+        .def_readwrite("observed_frames", &FrameDetectedCorner::observed_frames)
+        .def_readwrite("predicted", &FrameDetectedCorner::predicted);
 
     py::class_<PersistentMatchStats>(m, "PersistentMatchStats")
         .def(py::init<>())
@@ -1054,6 +1176,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("lk_max_iters", &CheckerboardDetectorConfig::lk_max_iters)
         .def_readwrite("lk_epsilon", &CheckerboardDetectorConfig::lk_epsilon)
         .def_readwrite("max_lk_error", &CheckerboardDetectorConfig::max_lk_error)
+        .def_readwrite("lk_use_initial_flow_prediction", &CheckerboardDetectorConfig::lk_use_initial_flow_prediction)
+        .def_readwrite("lk_initial_flow_max_prediction_px", &CheckerboardDetectorConfig::lk_initial_flow_max_prediction_px)
         .def_readwrite("max_lk_forward_backward_error_px", &CheckerboardDetectorConfig::max_lk_forward_backward_error_px)
         .def_readwrite("stable_motion_threshold_px", &CheckerboardDetectorConfig::stable_motion_threshold_px)
         .def_readwrite("det_width", &CheckerboardDetectorConfig::det_width)
@@ -1332,7 +1456,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readonly("local_col", &Correspondence2D3D::local_col)
         .def_readonly("global_row", &Correspondence2D3D::global_row)
         .def_readonly("global_col", &Correspondence2D3D::global_col)
-        .def_readonly("votes", &Correspondence2D3D::votes);
+        .def_readonly("votes", &Correspondence2D3D::votes)
+        .def_readonly("visibility_score", &Correspondence2D3D::visibility_score)
+        .def_readonly("observed_frames", &Correspondence2D3D::observed_frames)
+        .def_readonly("predicted", &Correspondence2D3D::predicted);
 
     py::class_<CorrespondenceBuilderConfig>(m, "CorrespondenceBuilderConfig")
         .def(py::init<>())

@@ -30,6 +30,9 @@ struct FrameDetectedCorner {
     int local_row = -1;
     int local_col = -1;
     std::array<double, 2> uv = {0.0, 0.0};
+    double visibility_score = 1.0;
+    int observed_frames = 0;
+    bool predicted = false;
 };
 
 struct TrackerFrameResult {

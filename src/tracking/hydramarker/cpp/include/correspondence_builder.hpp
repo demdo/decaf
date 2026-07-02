@@ -21,6 +21,9 @@ struct Correspondence2D3D {
     int global_col = -1;
 
     int votes = 0;
+    float visibility_score = 1.0f;
+    int observed_frames = 0;
+    bool predicted = false;
 };
 
 struct CorrespondenceBuilderConfig {

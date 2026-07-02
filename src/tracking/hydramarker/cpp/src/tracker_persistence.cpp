@@ -660,6 +660,9 @@ PersistentMatchResult PersistentMatcher::match(
         corner.xyz_mm = cached.xyz_mm;
         corner.uv = uv;
         corner.votes = votes;
+        corner.visibility_score = matched.visibility_score;
+        corner.observed_frames = matched.observed_frames;
+        corner.predicted = matched.predicted;
         result.corners.push_back(corner);
 
         used_globals.insert(global_key);
@@ -1337,6 +1340,9 @@ PersistentMatcher::detectedCornersFromDetection(
             static_cast<double>(corner.uv.x),
             static_cast<double>(corner.uv.y)
         );
+        out.visibility_score = static_cast<double>(corner.visibility_score);
+        out.observed_frames = corner.observed_frames;
+        out.predicted = corner.predicted;
         corners.push_back(out);
     }
 

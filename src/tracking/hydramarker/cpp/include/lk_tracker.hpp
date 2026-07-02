@@ -30,6 +30,7 @@ public:
         const cv::Mat& prev_gray,
         const cv::Mat& curr_gray,
         const std::vector<cv::Point2f>& prev_points,
+        const std::vector<cv::Point2f>* initial_curr_points,
         int win_size,
         int max_level,
         int max_iters,

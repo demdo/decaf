@@ -218,6 +218,9 @@ DenseProjectionMatchResult TrackerGeometry::strictProjectedMatch(
             static_cast<double>(detected.uv.y)
         };
         corner.votes = 0;
+        corner.visibility_score = static_cast<double>(detected.visibility_score);
+        corner.observed_frames = detected.observed_frames;
+        corner.predicted = detected.predicted;
         result.corners.push_back(corner);
 
         accepted_distances.push_back(best_dist);
@@ -378,6 +381,9 @@ DenseProjectionMatchResult TrackerGeometry::greedyProjectedMatch(
             static_cast<double>(detected.uv.y)
         };
         corner.votes = 0;
+        corner.visibility_score = static_cast<double>(detected.visibility_score);
+        corner.observed_frames = detected.observed_frames;
+        corner.predicted = detected.predicted;
         result.corners.push_back(corner);
         distances.push_back(std::sqrt(best_dist_sq));
     }

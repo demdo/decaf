@@ -30,6 +30,9 @@ struct TrackerCorner {
     std::array<double, 3> xyz_mm = {0.0, 0.0, 0.0};
     std::array<double, 2> uv = {0.0, 0.0};
     int votes = 0;
+    double visibility_score = 1.0;
+    int observed_frames = 0;
+    bool predicted = false;
 };
 
 struct PersistentMatchStats {
@@ -215,6 +218,9 @@ private:
         int local_row = -1;
         int local_col = -1;
         cv::Point2d uv;
+        double visibility_score = 1.0;
+        int observed_frames = 0;
+        bool predicted = false;
     };
 
     struct CornerMatch {

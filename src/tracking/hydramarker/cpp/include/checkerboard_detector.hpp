@@ -109,6 +109,7 @@ private:
 
     std::vector<PersistentTrackedCorner> persistent_corners_;
     std::vector<PendingCompletionCorner> pending_completion_corners_;
+    std::unordered_map<std::int64_t, cv::Point2f> lk_corner_displacements_;
 
     CornerDetector corner_detector_;
     CornerRefiner corner_refiner_;

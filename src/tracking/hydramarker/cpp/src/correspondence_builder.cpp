@@ -404,6 +404,9 @@ CorrespondenceBuildResult CorrespondenceBuilder::build(
         corr.global_col = global_col;
 
         corr.votes = best_votes;
+        corr.visibility_score = local_corner->visibility_score;
+        corr.observed_frames = local_corner->observed_frames;
+        corr.predicted = local_corner->predicted;
 
         result.correspondences.push_back(corr);
         result.assignments_accepted += best_votes;

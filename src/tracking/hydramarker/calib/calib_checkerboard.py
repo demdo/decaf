@@ -1020,7 +1020,14 @@ def estimate_charuco_table_frame_pose(
     frame_index: int,
     min_charuco_corners: int = CHARUCO_TABLE_MIN_CORNERS,
 ) -> tuple[CharucoTableFramePose | None, calib_camera.CharucoDetection]:
-    det = calib_camera.detect_charuco(frame_bgr, board, aruco_dict, detector_params)
+    det = calib_camera.detect_charuco(
+        frame_bgr,
+        board,
+        aruco_dict,
+        detector_params,
+        camera_matrix=K,
+        dist_coeffs=dist,
+    )
     if det.charuco_ids is None or det.charuco_corners is None:
         return None, det
     if det.num_charuco < int(min_charuco_corners):

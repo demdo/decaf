@@ -159,6 +159,9 @@ class DetectedCorner:
     local_row: int
     local_col: int
     uv: Tuple[float, float]
+    visibility_score: float = 1.0
+    observed_frames: int = 0
+    predicted: bool = False
 
 
 @dataclass
@@ -172,6 +175,9 @@ class TrackerCorner:
     xyz_mm: Tuple[float, float, float]
     uv: Tuple[float, float]
     votes: int = 0
+    visibility_score: float = 1.0
+    observed_frames: int = 0
+    predicted: bool = False
 
 
 @dataclass
@@ -347,6 +353,9 @@ class HydraTracker:
                 local_row=int(corner.local_row),
                 local_col=int(corner.local_col),
                 uv=tuple(float(v) for v in corner.uv),
+                visibility_score=float(getattr(corner, "visibility_score", 1.0)),
+                observed_frames=int(getattr(corner, "observed_frames", 0)),
+                predicted=bool(getattr(corner, "predicted", False)),
             )
             for corner in corners
         ]
@@ -364,6 +373,9 @@ class HydraTracker:
                 xyz_mm=tuple(float(v) for v in corner.xyz_mm),
                 uv=tuple(float(v) for v in corner.uv),
                 votes=int(getattr(corner, "votes", 0)),
+                visibility_score=float(getattr(corner, "visibility_score", 1.0)),
+                observed_frames=int(getattr(corner, "observed_frames", 0)),
+                predicted=bool(getattr(corner, "predicted", False)),
             )
             for corner in corners
         ]

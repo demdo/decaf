@@ -465,6 +465,9 @@ TrackerCorner TrackerEngine::trackerCornerFromCorrespondence(
         static_cast<double>(corr.uv.y)
     };
     corner.votes = corr.votes;
+    corner.visibility_score = static_cast<double>(corr.visibility_score);
+    corner.observed_frames = corr.observed_frames;
+    corner.predicted = corr.predicted;
     return corner;
 }
 
@@ -507,6 +510,9 @@ FrameDetectedCorner TrackerEngine::detectedCornerFromGridCorner(
         static_cast<double>(corner.uv.x),
         static_cast<double>(corner.uv.y)
     };
+    out.visibility_score = static_cast<double>(corner.visibility_score);
+    out.observed_frames = corner.observed_frames;
+    out.predicted = corner.predicted;
     return out;
 }
 
@@ -555,7 +561,22 @@ void TrackerEngine::packagePoseResult(
     );
     result.pnp_method = pose.method;
     result.visual_corner_count = static_cast<int>(visual_corners.size());
-    result.corners = visual_corners;
+
+    std::vector<TrackerCorner> packaged_visual_corners = visual_corners;
+    for (TrackerCorner& visual_corner : packaged_visual_corners) {
+        for (const TrackerCorner& corr_corner : correspondence_corners) {
+            if (visual_corner.global_row != corr_corner.global_row ||
+                visual_corner.global_col != corr_corner.global_col) {
+                continue;
+            }
+            visual_corner.visibility_score = corr_corner.visibility_score;
+            visual_corner.observed_frames = corr_corner.observed_frames;
+            visual_corner.predicted = corr_corner.predicted;
+            break;
+        }
+    }
+
+    result.corners = packaged_visual_corners;
     result.correspondence_corners = correspondence_corners;
 }
 

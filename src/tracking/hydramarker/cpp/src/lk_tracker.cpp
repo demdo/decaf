@@ -24,6 +24,7 @@ LKTrackingResult LKTracker::track(
     const cv::Mat& prev_gray,
     const cv::Mat& curr_gray,
     const std::vector<cv::Point2f>& prev_points,
+    const std::vector<cv::Point2f>* initial_curr_points,
     int win_size,
     int max_level,
     int max_iters,
@@ -70,6 +71,13 @@ LKTrackingResult LKTracker::track(
         true
     );
 
+    int flags = 0;
+    if (initial_curr_points != nullptr &&
+        initial_curr_points->size() == prev_points.size()) {
+        curr_points = *initial_curr_points;
+        flags |= cv::OPTFLOW_USE_INITIAL_FLOW;
+    }
+
     // Forward LK: previous frame -> current frame.
     cv::calcOpticalFlowPyrLK(
         prev_pyramid,
@@ -80,7 +88,8 @@ LKTrackingResult LKTracker::track(
         error,
         lk_window,
         max_level,
-        criteria
+        criteria,
+        flags
     );
 
     if (

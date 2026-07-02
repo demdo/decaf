@@ -153,6 +153,12 @@ struct CheckerboardDetectorConfig {
     double lk_epsilon = 0.01;
     float max_lk_error = 35.0f;
 
+    // Start LK at prev_uv + last measured per-corner displacement instead of
+    // at prev_uv. This reduces residual motion for smooth frame-to-frame
+    // slides while falling back to normal LK for corners without history.
+    bool lk_use_initial_flow_prediction = true;
+    float lk_initial_flow_max_prediction_px = 18.0f;
+
     // Forward-backward LK consistency threshold.
     float max_lk_forward_backward_error_px = 3.5f;
 
