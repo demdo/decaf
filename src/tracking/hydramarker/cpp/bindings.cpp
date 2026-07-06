@@ -316,6 +316,240 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         py::arg("subpix_epsilon") = 0.05
     );
 
+    // Debug helper: load a marker geometry JSON and report the parsed
+    // surface model (used to verify the surface_model.fitted pipeline).
+    m.def(
+        "load_marker_geometry_surface_debug",
+        [](const std::string& path) -> py::dict {
+            const MarkerGeometry geometry = MarkerGeometry::loadFromJson(path);
+            const SurfaceModel& sm = geometry.surfaceModel();
+            py::dict out;
+            out["type"] =
+                sm.type == SurfaceModel::Type::Cylinder ? "cylinder"
+                : sm.type == SurfaceModel::Type::Plane ? "plane"
+                : "none";
+            out["point"] = std::vector<double>{
+                sm.point[0], sm.point[1], sm.point[2]};
+            out["dir"] = std::vector<double>{
+                sm.dir[0], sm.dir[1], sm.dir[2]};
+            out["radius_mm"] = sm.radius_mm;
+            out["band"] = std::vector<double>{
+                sm.band_a_min, sm.band_a_max, sm.band_b_min, sm.band_b_max};
+            out["fit_rms_mm"] = sm.fit_rms_mm;
+            return out;
+        },
+        py::arg("path")
+    );
+
+    // Offline entry point for the tracked-corner measurement operator.
+    // Drives CornerRefiner::refineTrackedCorners with an explicit model
+    // context so the model_warp path can be validated frame by frame from
+    // recorded data without a live tracking lock.
+    m.def(
+        "refine_tracked_corners",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> gray_np,
+           std::vector<double> points_flat,          // 2N (u, v)
+           std::vector<int> predicted,               // N
+           const std::string& method,
+           // camera
+           std::vector<double> K_flat,               // 9 row-major
+           std::vector<double> dist,
+           // current pose (marker -> camera)
+           std::vector<double> R_flat,               // 9 row-major
+           std::vector<double> t_vec,                // 3
+           // surface model
+           const std::string& surface_type,          // "plane" / "cylinder"
+           std::vector<double> surf_point,           // 3
+           std::vector<double> surf_dir,             // 3
+           std::vector<double> surf_radial_ref,      // 3
+           double surf_radius_mm,
+           std::vector<double> band,                 // a_min, a_max, b_min, b_max
+           std::vector<double> basis_u,              // 3 (plane)
+           std::vector<double> basis_v,              // 3 (plane)
+           // anchors
+           std::vector<double> anchors_flat,         // 3N
+           std::vector<int> anchor_valid,            // N
+           // reference view
+           py::array_t<uint8_t, py::array::c_style | py::array::forcecast> ref_np,
+           std::vector<double> R_ref_flat,           // 9 row-major
+           std::vector<double> t_ref_vec,            // 3
+           // model-warp tuning
+           int half_window,
+           int max_iters,
+           double min_zncc,
+           double max_shift_px,
+           double max_incidence_deg,
+           double min_valid_frac,
+           // subpix baseline tuning (live defaults)
+           int subpix_win_size,
+           int subpix_max_iters,
+           double subpix_epsilon,
+           int saddle_radius) -> py::dict
+        {
+            const size_t n = points_flat.size() / 2;
+            if (predicted.size() != n ||
+                anchor_valid.size() != n ||
+                anchors_flat.size() != 3 * n ||
+                K_flat.size() != 9 ||
+                R_flat.size() != 9 ||
+                R_ref_flat.size() != 9 ||
+                t_vec.size() != 3 ||
+                t_ref_vec.size() != 3) {
+                throw std::runtime_error(
+                    "refine_tracked_corners: inconsistent array sizes.");
+            }
+
+            cv::Mat gray = numpyToMat(gray_np);
+            cv::Mat ref = numpyToMat(ref_np);
+            if (gray.channels() != 1 || ref.channels() != 1) {
+                throw std::runtime_error(
+                    "refine_tracked_corners: images must be single-channel.");
+            }
+
+            std::vector<cv::Point2f> points(n);
+            std::vector<bool> pred(n);
+            for (size_t i = 0; i < n; ++i) {
+                points[i] = cv::Point2f(
+                    static_cast<float>(points_flat[2 * i]),
+                    static_cast<float>(points_flat[2 * i + 1]));
+                pred[i] = predicted[i] != 0;
+            }
+
+            CornerModelContext ctx;
+            ctx.K = cv::Matx33d(
+                K_flat[0], K_flat[1], K_flat[2],
+                K_flat[3], K_flat[4], K_flat[5],
+                K_flat[6], K_flat[7], K_flat[8]);
+            ctx.dist = dist;
+            ctx.R = cv::Matx33d(
+                R_flat[0], R_flat[1], R_flat[2],
+                R_flat[3], R_flat[4], R_flat[5],
+                R_flat[6], R_flat[7], R_flat[8]);
+            ctx.t = cv::Vec3d(t_vec[0], t_vec[1], t_vec[2]);
+            ctx.R_ref = cv::Matx33d(
+                R_ref_flat[0], R_ref_flat[1], R_ref_flat[2],
+                R_ref_flat[3], R_ref_flat[4], R_ref_flat[5],
+                R_ref_flat[6], R_ref_flat[7], R_ref_flat[8]);
+            ctx.t_ref = cv::Vec3d(t_ref_vec[0], t_ref_vec[1], t_ref_vec[2]);
+            ctx.ref_gray = ref;
+
+            SurfaceModel sm;
+            if (surface_type == "cylinder") {
+                sm.type = SurfaceModel::Type::Cylinder;
+            } else if (surface_type == "plane") {
+                sm.type = SurfaceModel::Type::Plane;
+            }
+            if (surf_point.size() == 3) {
+                sm.point = cv::Vec3d(surf_point[0], surf_point[1],
+                                     surf_point[2]);
+            }
+            if (surf_dir.size() == 3) {
+                const cv::Vec3d d(surf_dir[0], surf_dir[1], surf_dir[2]);
+                sm.dir = d / cv::norm(d);
+            }
+            if (surf_radial_ref.size() == 3) {
+                const cv::Vec3d e(surf_radial_ref[0], surf_radial_ref[1],
+                                  surf_radial_ref[2]);
+                sm.radial_ref = e / cv::norm(e);
+            }
+            sm.radius_mm = surf_radius_mm;
+            if (band.size() == 4) {
+                sm.band_a_min = band[0];
+                sm.band_a_max = band[1];
+                sm.band_b_min = band[2];
+                sm.band_b_max = band[3];
+            }
+            if (basis_u.size() == 3) {
+                sm.basis_u = cv::Vec3d(basis_u[0], basis_u[1], basis_u[2]);
+            }
+            if (basis_v.size() == 3) {
+                sm.basis_v = cv::Vec3d(basis_v[0], basis_v[1], basis_v[2]);
+            }
+            ctx.surface = sm;
+
+            ctx.anchor_xyz_mm.resize(n);
+            ctx.anchor_valid.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                ctx.anchor_xyz_mm[i] = cv::Vec3d(
+                    anchors_flat[3 * i],
+                    anchors_flat[3 * i + 1],
+                    anchors_flat[3 * i + 2]);
+                ctx.anchor_valid[i] =
+                    static_cast<uint8_t>(anchor_valid[i] != 0);
+            }
+
+            CornerRefinementConfig config;
+            config.radius = saddle_radius;
+            config.subpix_win_size = subpix_win_size;
+            config.subpix_max_iters = subpix_max_iters;
+            config.subpix_epsilon = subpix_epsilon;
+            config.tracked_refine_method = method;
+            config.model_warp_half_window = half_window;
+            config.model_warp_max_iters = max_iters;
+            config.model_warp_min_zncc = min_zncc;
+            config.model_warp_max_shift_px = max_shift_px;
+            config.model_warp_max_incidence_deg = max_incidence_deg;
+            config.model_warp_min_valid_frac = min_valid_frac;
+
+            CornerRefiner refiner;
+            const TrackedRefineStats stats = refiner.refineTrackedCorners(
+                gray, points, pred, config, &ctx);
+
+            py::array_t<double> out_points({
+                static_cast<py::ssize_t>(n),
+                static_cast<py::ssize_t>(2)});
+            {
+                py::buffer_info info = out_points.request();
+                double* data = static_cast<double*>(info.ptr);
+                for (size_t i = 0; i < n; ++i) {
+                    data[2 * i] = static_cast<double>(points[i].x);
+                    data[2 * i + 1] = static_cast<double>(points[i].y);
+                }
+            }
+
+            py::dict result;
+            result["points"] = out_points;
+            result["model_warp_ok"] = stats.model_warp_ok;
+            result["model_warp_zncc"] = stats.model_warp_zncc;
+            result["model_warp_count"] = stats.model_warp_count;
+            result["model_warp_mean_zncc"] = stats.model_warp_mean_zncc;
+            result["subpix_count"] = stats.refined_count;
+            result["subpix_mean_shift_px"] = stats.mean_shift_px;
+            return result;
+        },
+        py::arg("gray"),
+        py::arg("points"),
+        py::arg("predicted"),
+        py::arg("method"),
+        py::arg("K"),
+        py::arg("dist"),
+        py::arg("R"),
+        py::arg("t"),
+        py::arg("surface_type"),
+        py::arg("surf_point"),
+        py::arg("surf_dir"),
+        py::arg("surf_radial_ref"),
+        py::arg("surf_radius_mm"),
+        py::arg("band"),
+        py::arg("basis_u"),
+        py::arg("basis_v"),
+        py::arg("anchors"),
+        py::arg("anchor_valid"),
+        py::arg("ref_gray"),
+        py::arg("R_ref"),
+        py::arg("t_ref"),
+        py::arg("half_window") = 12,
+        py::arg("max_iters") = 12,
+        py::arg("min_zncc") = 0.6,
+        py::arg("max_shift_px") = 4.0,
+        py::arg("max_incidence_deg") = 72.0,
+        py::arg("min_valid_frac") = 0.55,
+        py::arg("subpix_win_size") = -1,
+        py::arg("subpix_max_iters") = 20,
+        py::arg("subpix_epsilon") = 0.05,
+        py::arg("saddle_radius") = 5
+    );
+
     py::enum_<TrackerMode>(m, "TrackerMode")
         .value("LOST", TrackerMode::Lost)
         .value("DETECTING", TrackerMode::Detecting)
@@ -433,6 +667,15 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("visibility_score", &TrackerCorner::visibility_score)
         .def_readwrite("observed_frames", &TrackerCorner::observed_frames)
         .def_readwrite("predicted", &TrackerCorner::predicted);
+
+    py::class_<TrackedRefineSample>(m, "TrackedRefineSample")
+        .def(py::init<>())
+        .def_readwrite("uv_lk", &TrackedRefineSample::uv_lk)
+        .def_readwrite("uv_subpix", &TrackedRefineSample::uv_subpix)
+        .def_readwrite("uv_meas", &TrackedRefineSample::uv_meas)
+        .def_readwrite("model_warp_ok", &TrackedRefineSample::model_warp_ok)
+        .def_readwrite("zncc", &TrackedRefineSample::zncc)
+        .def_readwrite("predicted", &TrackedRefineSample::predicted);
 
     py::class_<FrameDetectedCorner>(m, "DetectedCorner")
         .def(py::init<>())
@@ -731,6 +974,22 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("use_pose_prior", &TrackerConfig::use_pose_prior)
         .def_readwrite("pnp_direct_prior_enabled", &TrackerConfig::pnp_direct_prior_enabled)
         .def_readwrite("pnp_direct_refine_method", &TrackerConfig::pnp_direct_refine_method)
+        .def_readwrite("checker_tracked_refine_method", &TrackerConfig::checker_tracked_refine_method)
+        .def_readwrite("pose_exclude_predicted_corners", &TrackerConfig::pose_exclude_predicted_corners)
+        .def_readwrite("pose_min_observed_frames", &TrackerConfig::pose_min_observed_frames)
+        .def_readwrite("pose_warmup_min_accepted_frames", &TrackerConfig::pose_warmup_min_accepted_frames)
+        .def_readwrite("pose_warmup_stable_window", &TrackerConfig::pose_warmup_stable_window)
+        .def_readwrite("pose_warmup_max_young_corners", &TrackerConfig::pose_warmup_max_young_corners)
+        .def_readwrite("pose_kf_enabled", &TrackerConfig::pose_kf_enabled)
+        .def_readwrite("pose_kf_sigma_px", &TrackerConfig::pose_kf_sigma_px)
+        .def_readwrite("pose_kf_q_translation_mm", &TrackerConfig::pose_kf_q_translation_mm)
+        .def_readwrite("pose_kf_q_rotation_deg", &TrackerConfig::pose_kf_q_rotation_deg)
+        .def_readwrite("pose_kf_gate_mahalanobis", &TrackerConfig::pose_kf_gate_mahalanobis)
+        .def_readwrite("pose_kf_reset_rotation_deg", &TrackerConfig::pose_kf_reset_rotation_deg)
+        .def_readwrite("model_warp_reenroll_on_loss", &TrackerConfig::model_warp_reenroll_on_loss)
+        .def_readwrite("model_warp_reenroll_angle_deg", &TrackerConfig::model_warp_reenroll_angle_deg)
+        .def_readwrite("model_warp_enroll_max_motion_mm", &TrackerConfig::model_warp_enroll_max_motion_mm)
+        .def_readwrite("model_warp_enroll_max_rotation_deg", &TrackerConfig::model_warp_enroll_max_rotation_deg)
         .def_readwrite("pnp_direct_max_mean_reprojection_error_px", &TrackerConfig::pnp_direct_max_mean_reprojection_error_px)
         .def_readwrite("pnp_direct_max_max_reprojection_error_px", &TrackerConfig::pnp_direct_max_max_reprojection_error_px)
         .def_readwrite("checker_min_tracking_decode_cell_span", &TrackerConfig::checker_min_tracking_decode_cell_span)
@@ -985,6 +1244,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("pose_tracker_tvec", &TrackerFrameResult::pose_tracker_tvec)
         .def_readwrite("pose_tracker_T_marker_camera", &TrackerFrameResult::pose_tracker_T_marker_camera)
         .def_readwrite("current_pose_accepted", &TrackerFrameResult::current_pose_accepted)
+        .def_readwrite("pose_converged", &TrackerFrameResult::pose_converged)
         .def_readwrite("has_accepted_pose", &TrackerFrameResult::has_accepted_pose)
         .def_readwrite("accepted_pose_frame", &TrackerFrameResult::accepted_pose_frame)
         .def_readwrite("accepted_visual_corner_count", &TrackerFrameResult::accepted_visual_corner_count)
@@ -1006,6 +1266,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("visual_corner_count", &TrackerFrameResult::visual_corner_count)
         .def_readwrite("corners", &TrackerFrameResult::corners)
         .def_readwrite("correspondence_corners", &TrackerFrameResult::correspondence_corners)
+        .def_readwrite("tracked_refine_samples", &TrackerFrameResult::tracked_refine_samples)
         .def_readwrite("persistent_count", &TrackerFrameResult::persistent_count)
         .def_readwrite("fast_attempted", &TrackerFrameResult::fast_attempted)
         .def_readwrite("fast_success", &TrackerFrameResult::fast_success)
@@ -1229,6 +1490,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("saddle_subpix_win_size", &CheckerboardDetectorConfig::saddle_subpix_win_size)
         .def_readwrite("saddle_subpix_max_iters", &CheckerboardDetectorConfig::saddle_subpix_max_iters)
         .def_readwrite("saddle_subpix_epsilon", &CheckerboardDetectorConfig::saddle_subpix_epsilon)
+        .def_readwrite("tracked_refine_method", &CheckerboardDetectorConfig::tracked_refine_method)
         .def_readwrite("recovery_correction_weight", &CheckerboardDetectorConfig::recovery_correction_weight)
         .def_readwrite("recovery_correction_max_dist_rel", &CheckerboardDetectorConfig::recovery_correction_max_dist_rel);
 

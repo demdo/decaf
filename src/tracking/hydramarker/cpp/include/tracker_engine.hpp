@@ -73,6 +73,61 @@ private:
     std::vector<double> last_accepted_tvec_;
     std::vector<double> last_accepted_T_marker_camera_;
 
+    // ---- model-warp corner measurement (live wiring) ----
+    // Reference view enrolled on the first stable accepted pose plus the
+    // pose corners of the last accepted frame (anchor source).  The input
+    // frame of the current processFrame call is kept as a cheap header copy
+    // so enrollment inside finalizeFrameResult can access it.
+    bool model_ref_enrolled_ = false;
+    cv::Mat model_ref_gray_;            // CV_32F at enrollment
+    cv::Matx33d model_ref_R_ = cv::Matx33d::eye();
+    cv::Vec3d model_ref_t_{0.0, 0.0, 0.0};
+    std::vector<cv::Point2f> model_prev_uv_;
+    std::vector<cv::Vec3d> model_prev_xyz_;
+    cv::Mat current_frame_;
+    // Pixel->ray lookup table, built once on first use (perf).
+    cv::Mat model_ray_lut_;
+    // Last two accepted poses for constant-velocity pose prediction.
+    std::vector<double> model_curr_rvec_;
+    std::vector<double> model_curr_tvec_;
+    std::vector<double> model_prev_rvec_;
+    std::vector<double> model_prev_tvec_;
+    // Re-enrollment policy state: total enrollments this tracking session
+    // and the current viewing-angle offset to the reference view.
+    int model_enroll_count_ = 0;
+    double model_ref_view_angle_deg_ = 0.0;
+
+    // ---- pose warmup status ----
+    // Right after (re)acquisition the corner set is still saturating and the
+    // pose wanders along the weak observability mode; pose_converged_
+    // latches once the set has been quiet for the configured window.
+    int warmup_accepted_frames_ = 0;
+    int warmup_quiet_streak_ = 0;
+    bool pose_converged_ = false;
+
+    // ---- anisotropic pose Kalman filter (output-only) ----
+    // Constant-velocity model over (rvec, tvec); per-frame measurement
+    // covariance sigma_px^2 (J^T J)^-1 keeps observable directions
+    // measurement-dominated while the weak observability mode is smoothed.
+    // Filters ONLY the reported pose; the internal chain (anchors,
+    // persistence, prediction) keeps the raw pose so no feedback loop forms.
+    bool pose_kf_initialized_ = false;
+    cv::Mat pose_kf_x_;   // 12x1: rvec, tvec, and their per-frame velocities
+    cv::Mat pose_kf_P_;   // 12x12 covariance
+
+    TrackerFrameResult processFrameInternal(
+        const cv::Mat& frame,
+        bool run_detection
+    );
+    void updateCornerModelInput();
+    void updateModelWarpStateAfterFrame(const TrackerFrameResult& result);
+    void updatePoseWarmupState(TrackerFrameResult& result);
+    void resetPoseWarmup();
+    bool posePointUsable(bool predicted, int observed_frames) const;
+    void applyPoseKalman(TrackerFrameResult& result);
+    void resetPoseKalman();
+    bool poseMotionQuiet() const;
+
     static CheckerboardDetectorConfig makeCheckerboardConfig(
         const TrackerConfig& config
     );

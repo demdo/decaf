@@ -1388,8 +1388,28 @@ def _pose_corner_detail_records(result, tracker: HydraTracker) -> list[dict]:
     return records
 
 
+def _tracked_refine_records(result) -> list[dict]:
+    """Per-corner operator comparison of a model_warp frame: the incoming LK
+    position, the subpix baseline and the final (warp or fallback)
+    measurement — lets one run be evaluated with BOTH measurement methods."""
+    records = []
+    for sample in list(getattr(result, "tracked_refine_samples", []) or []):
+        try:
+            records.append({
+                "uv_lk": [round(float(v), 4) for v in sample.uv_lk],
+                "uv_subpix": [round(float(v), 4) for v in sample.uv_subpix],
+                "uv_meas": [round(float(v), 4) for v in sample.uv_meas],
+                "warp_ok": int(bool(sample.model_warp_ok)),
+                "zncc": round(float(sample.zncc), 4),
+                "predicted": int(bool(sample.predicted)),
+            })
+        except Exception:
+            continue
+    return records
+
+
 def _frame_detail_record(frame_idx: int, result, tracker: HydraTracker) -> dict:
-    return {
+    record = {
         "type": "frame_detail",
         "run_id": _log_run_id,
         "frame": int(frame_idx),
@@ -1406,6 +1426,10 @@ def _frame_detail_record(frame_idx: int, result, tracker: HydraTracker) -> dict:
             for corner in list(getattr(result, "correspondence_corners", []) or [])
         ],
     }
+    tracked_refine = _tracked_refine_records(result)
+    if tracked_refine:
+        record["tracked_refine"] = tracked_refine
+    return record
 
 
 def _extract_detection_uv(result) -> np.ndarray:

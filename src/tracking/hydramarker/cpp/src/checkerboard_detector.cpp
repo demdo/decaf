@@ -700,6 +700,12 @@ void CheckerboardDetector::recordLocalCompletionSoftOutcome(
         static_cast<double>(local_completion_soft_zero_gain_count_));
 }
 
+void CheckerboardDetector::setCornerModelInput(
+    const CornerModelFrameInput& input
+) {
+    corner_model_input_ = input;
+}
+
 void CheckerboardDetector::resetTracking() {
     last_gray_.release();
     last_gray_pyramid_.clear();
@@ -737,6 +743,7 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
     const cv::Mat& image
 ) {
     clearTimings();
+    last_tracked_refine_samples_.clear();
     recovery_region_cache_.reset();
     const auto to_gray_t0 = cv::getTickCount();
     const cv::Mat gray = toGray8(image);
@@ -2765,110 +2772,134 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
         addTimingMs("tracking_cull_ms", elapsedMs(cull_t0));
     }
 
-    // Snap LK-tracked points to current-frame subpixel corners before the
-    // tracked detection is rebuilt and handed to PnP.
+    // Snap LK-tracked points to current-frame corner measurements before the
+    // tracked detection is rebuilt and handed to PnP.  The measurement
+    // operator (cornerSubPix or model-warp) lives in CornerRefiner.
     {
         const auto subpix_t0 = cv::getTickCount();
-        const bool subpix_enabled =
-            config_.saddle_subpix_win_size != 0 &&
-            config_.saddle_subpix_max_iters > 0 &&
-            config_.saddle_subpix_epsilon > 0.0;
 
-        last_timings_ms_["tracking_subpix_enabled_count"] =
-            subpix_enabled ? 1.0 : 0.0;
-        last_timings_ms_["tracking_subpix_count"] = 0.0;
-        last_timings_ms_["tracking_subpix_mean_shift_px"] = 0.0;
-        last_timings_ms_["tracking_subpix_p95_shift_px"] = 0.0;
-        last_timings_ms_["tracking_subpix_max_shift_px"] = 0.0;
+        CornerRefinementConfig refine_config;
+        refine_config.radius           = config_.saddle_radius;
+        refine_config.subpix_win_size  = config_.saddle_subpix_win_size;
+        refine_config.subpix_max_iters = config_.saddle_subpix_max_iters;
+        refine_config.subpix_epsilon   = config_.saddle_subpix_epsilon;
+        refine_config.tracked_refine_method = config_.tracked_refine_method;
 
-        if (subpix_enabled && !validation.visible_points.empty()) {
-            const int configured_win =
-                config_.saddle_subpix_win_size > 0
-                    ? config_.saddle_subpix_win_size
-                    : config_.saddle_radius - 1;
-            const int win = std::max(3, configured_win);
-            const float border = static_cast<float>(win + 1);
+        // Resolve per-point 3D anchors from the engine-provided model input:
+        // each tracked point is matched against the previous accepted
+        // frame's pose corners by its previous-frame position.  Points
+        // without a match keep the subpix measurement (per-point fallback).
+        CornerModelContext model_ctx;
+        const CornerModelContext* model_ctx_ptr = nullptr;
 
-            std::vector<int> refine_indices;
-            std::vector<cv::Point2f> refined;
-            refine_indices.reserve(validation.visible_points.size());
-            refined.reserve(validation.visible_points.size());
+        if (config_.tracked_refine_method == "model_warp" &&
+            corner_model_input_.enabled &&
+            !corner_model_input_.prev_uv.empty() &&
+            corner_model_input_.prev_uv.size() ==
+                corner_model_input_.prev_xyz_mm.size()) {
+            constexpr float kAnchorMatchTolPx = 1.5f;
+            constexpr float kAnchorMatchTol2 =
+                kAnchorMatchTolPx * kAnchorMatchTolPx;
 
-            for (size_t k = 0; k < validation.visible_points.size(); ++k) {
-                const bool predicted =
-                    k < validation.visible_predicted.size()
-                        ? validation.visible_predicted[k]
-                        : false;
-                if (predicted) continue;
+            const size_t n = validation.visible_points.size();
+            model_ctx.K = corner_model_input_.K;
+            model_ctx.dist = corner_model_input_.dist;
+            model_ctx.R = corner_model_input_.R;
+            model_ctx.t = corner_model_input_.t;
+            model_ctx.surface = corner_model_input_.surface;
+            model_ctx.ref_gray = corner_model_input_.ref_gray;
+            model_ctx.R_ref = corner_model_input_.R_ref;
+            model_ctx.t_ref = corner_model_input_.t_ref;
+            model_ctx.ray_lut = corner_model_input_.ray_lut;
+            model_ctx.anchor_xyz_mm.assign(n, cv::Vec3d(0.0, 0.0, 0.0));
+            model_ctx.anchor_valid.assign(n, 0);
 
-                const cv::Point2f& uv = validation.visible_points[k];
-                if (!std::isfinite(uv.x) || !std::isfinite(uv.y)) continue;
-                if (uv.x < border || uv.y < border ||
-                    uv.x >= static_cast<float>(gray.cols) - border ||
-                    uv.y >= static_cast<float>(gray.rows) - border) {
+            int anchored = 0;
+            for (size_t k = 0; k < n; ++k) {
+                if (k >= validation.visible_indices.size()) continue;
+                const int old_idx = validation.visible_indices[k];
+                if (old_idx < 0 ||
+                    old_idx >=
+                        static_cast<int>(last_detection_.corners.size())) {
                     continue;
                 }
+                const cv::Point2f& prev_uv =
+                    last_detection_.corners[old_idx].uv;
 
-                refine_indices.push_back(static_cast<int>(k));
-                refined.push_back(uv);
+                float best_d2 = kAnchorMatchTol2;
+                int best_j = -1;
+                for (size_t j = 0; j < corner_model_input_.prev_uv.size();
+                     ++j) {
+                    const cv::Point2f d =
+                        corner_model_input_.prev_uv[j] - prev_uv;
+                    const float d2 = d.x * d.x + d.y * d.y;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        best_j = static_cast<int>(j);
+                    }
+                }
+                if (best_j >= 0) {
+                    model_ctx.anchor_xyz_mm[k] =
+                        corner_model_input_.prev_xyz_mm[best_j];
+                    model_ctx.anchor_valid[k] = 1;
+                    ++anchored;
+                }
             }
 
-            if (!refined.empty()) {
-                const std::vector<cv::Point2f> before = refined;
-                bool refined_ok = true;
-                try {
-                    cv::cornerSubPix(
-                        gray,
-                        refined,
-                        cv::Size(win, win),
-                        cv::Size(-1, -1),
-                        cv::TermCriteria(
-                            cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
-                            config_.saddle_subpix_max_iters,
-                            config_.saddle_subpix_epsilon));
-                } catch (const cv::Exception&) {
-                    refined_ok = false;
-                }
+            last_timings_ms_["tracking_modelwarp_anchor_count"] =
+                static_cast<double>(anchored);
+            if (anchored > 0) {
+                model_ctx_ptr = &model_ctx;
+            }
+        }
 
-                std::vector<float> shifts;
-                shifts.reserve(refined.size());
-                double shift_sum = 0.0;
-                double shift_max = 0.0;
+        const TrackedRefineStats subpix_stats =
+            corner_refiner_.refineTrackedCorners(
+                gray,
+                validation.visible_points,
+                validation.visible_predicted,
+                refine_config,
+                model_ctx_ptr);
 
-                if (refined_ok) {
-                    for (size_t r = 0; r < refined.size(); ++r) {
-                        const cv::Point2f& uv = refined[r];
-                        if (!std::isfinite(uv.x) ||
-                            !std::isfinite(uv.y)) {
-                            continue;
-                        }
-                        if (uv.x < 0.0f || uv.y < 0.0f ||
-                            uv.x >= static_cast<float>(gray.cols) ||
-                            uv.y >= static_cast<float>(gray.rows)) {
-                            continue;
-                        }
+        last_timings_ms_["tracking_subpix_enabled_count"] =
+            subpix_stats.enabled ? 1.0 : 0.0;
+        last_timings_ms_["tracking_subpix_count"] =
+            static_cast<double>(subpix_stats.refined_count);
+        last_timings_ms_["tracking_subpix_mean_shift_px"] =
+            subpix_stats.mean_shift_px;
+        last_timings_ms_["tracking_subpix_p95_shift_px"] =
+            subpix_stats.p95_shift_px;
+        last_timings_ms_["tracking_subpix_max_shift_px"] =
+            subpix_stats.max_shift_px;
+        last_timings_ms_["tracking_modelwarp_count"] =
+            static_cast<double>(subpix_stats.model_warp_count);
+        last_timings_ms_["tracking_modelwarp_mean_zncc"] =
+            subpix_stats.model_warp_mean_zncc;
 
-                        const float shift = distf(uv, before[r]);
-                        shifts.push_back(shift);
-                        shift_sum += static_cast<double>(shift);
-                        shift_max = std::max(
-                            shift_max,
-                            static_cast<double>(shift));
-                        validation.visible_points[
-                            static_cast<size_t>(refine_indices[r])] = uv;
-                    }
-
-                    if (!shifts.empty()) {
-                        last_timings_ms_["tracking_subpix_count"] =
-                            static_cast<double>(shifts.size());
-                        last_timings_ms_["tracking_subpix_mean_shift_px"] =
-                            shift_sum / static_cast<double>(shifts.size());
-                        last_timings_ms_["tracking_subpix_p95_shift_px"] =
-                            percentileNearest(shifts, 0.95);
-                        last_timings_ms_["tracking_subpix_max_shift_px"] =
-                            shift_max;
-                    }
-                }
+        // Operator-comparison samples (model_warp runs only): subpix
+        // baseline + final measurement per tracked point, for run logging.
+        const size_t n_pts = validation.visible_points.size();
+        if (subpix_stats.input_uv.size() == n_pts &&
+            subpix_stats.subpix_uv.size() == n_pts) {
+            last_tracked_refine_samples_.reserve(n_pts);
+            for (size_t k = 0; k < n_pts; ++k) {
+                TrackedRefineSample sample;
+                sample.uv_lk = {
+                    static_cast<double>(subpix_stats.input_uv[k].x),
+                    static_cast<double>(subpix_stats.input_uv[k].y)};
+                sample.uv_subpix = {
+                    static_cast<double>(subpix_stats.subpix_uv[k].x),
+                    static_cast<double>(subpix_stats.subpix_uv[k].y)};
+                sample.uv_meas = {
+                    static_cast<double>(validation.visible_points[k].x),
+                    static_cast<double>(validation.visible_points[k].y)};
+                sample.model_warp_ok =
+                    k < subpix_stats.model_warp_ok.size() &&
+                    subpix_stats.model_warp_ok[k] != 0;
+                sample.zncc = k < subpix_stats.model_warp_zncc.size()
+                    ? subpix_stats.model_warp_zncc[k] : 0.0f;
+                sample.predicted = validation.visible_predicted[k];
+                last_tracked_refine_samples_.push_back(sample);
             }
         }
 

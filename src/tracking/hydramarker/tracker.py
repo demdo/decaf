@@ -196,6 +196,11 @@ class TrackerResult:
     corners: List[TrackerCorner] = field(default_factory=list)
     correspondence_corners: List[TrackerCorner] = field(default_factory=list)
 
+    # Per-corner operator comparison (LK / subpix baseline / final warp
+    # measurement) of this frame; C++ TrackedRefineSample objects, only
+    # populated while model_warp is the active refine method.
+    tracked_refine_samples: List = field(default_factory=list)
+
     rvec: Optional[np.ndarray] = None
     tvec: Optional[np.ndarray] = None
     T_marker_camera: Optional[np.ndarray] = None
@@ -524,6 +529,9 @@ class HydraTracker:
             ),
             correspondence_corners=self._tracker_corners_from_cpp(
                 getattr(cpp_result, "correspondence_corners", [])
+            ),
+            tracked_refine_samples=list(
+                getattr(cpp_result, "tracked_refine_samples", []) or []
             ),
             rvec=rvec,
             tvec=tvec,

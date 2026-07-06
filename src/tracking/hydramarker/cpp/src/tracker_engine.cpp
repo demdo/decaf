@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace hydramarker {
 
@@ -71,6 +72,18 @@ void TrackerEngine::reset()
     last_accepted_rvec_.clear();
     last_accepted_tvec_.clear();
     last_accepted_T_marker_camera_.clear();
+    model_ref_enrolled_ = false;
+    model_ref_gray_ = cv::Mat();
+    model_prev_uv_.clear();
+    model_prev_xyz_.clear();
+    model_curr_rvec_.clear();
+    model_curr_tvec_.clear();
+    model_prev_rvec_.clear();
+    model_prev_tvec_.clear();
+    model_enroll_count_ = 0;
+    model_ref_view_angle_deg_ = 0.0;
+    resetPoseWarmup();
+    resetPoseKalman();
     checkerboard_detector_.resetTracking();
     dot_detector_.reset();
     pose_tracker_.reset();
@@ -78,6 +91,42 @@ void TrackerEngine::reset()
 }
 
 TrackerFrameResult TrackerEngine::processFrame(
+    const cv::Mat& frame,
+    bool run_detection
+)
+{
+    // Model-warp wiring wraps the actual frame processing: the per-frame
+    // context must be on the detector before detect() runs, and the anchor
+    // source / reference enrollment update after the pose was accepted.
+    current_frame_ = frame;
+    updateCornerModelInput();
+
+    TrackerFrameResult result = processFrameInternal(frame, run_detection);
+
+    result.tracked_refine_samples =
+        checkerboard_detector_.lastTrackedRefineSamples();
+    updatePoseWarmupState(result);
+    updateModelWarpStateAfterFrame(result);
+    // Output filter LAST: the model-warp anchors above must see the raw
+    // pose, otherwise the filtered pose feeds back into tracking.
+    applyPoseKalman(result);
+    if (config_.checker_tracked_refine_method == "model_warp") {
+        result.timings_ms["modelwarp_surface_valid"] =
+            geometry_.surfaceModel().valid() ? 1.0 : 0.0;
+        result.timings_ms["modelwarp_ref_enrolled"] =
+            model_ref_enrolled_ ? 1.0 : 0.0;
+        result.timings_ms["modelwarp_prev_corner_count"] =
+            static_cast<double>(model_prev_uv_.size());
+        result.timings_ms["modelwarp_enroll_count"] =
+            static_cast<double>(model_enroll_count_);
+        result.timings_ms["modelwarp_ref_view_angle_deg"] =
+            model_ref_view_angle_deg_;
+    }
+    current_frame_ = cv::Mat();
+    return result;
+}
+
+TrackerFrameResult TrackerEngine::processFrameInternal(
     const cv::Mat& frame,
     bool run_detection
 )
@@ -309,9 +358,21 @@ TrackerFrameResult TrackerEngine::processFrame(
     std::vector<TrackerCorner> correspondence_corners;
     pose_points.reserve(correspondences.correspondences.size());
     correspondence_corners.reserve(correspondences.correspondences.size());
+    // Pose-set stabilisation: predicted corners feed the previous pose back
+    // into PnP and freshly appeared corners jump the pose along the weak
+    // mode, so both are kept out of the POSE input (they still decode and
+    // track). Relax automatically if filtering would starve the solver.
+    std::vector<PoseTrackPoint> filtered_points;
+    filtered_points.reserve(correspondences.correspondences.size());
     for (const Correspondence2D3D& corr : correspondences.correspondences) {
         pose_points.push_back(posePointFromCorrespondence(corr));
         correspondence_corners.push_back(trackerCornerFromCorrespondence(corr));
+        if (posePointUsable(corr.predicted, corr.observed_frames)) {
+            filtered_points.push_back(pose_points.back());
+        }
+    }
+    if (static_cast<int>(filtered_points.size()) >= config_.min_points) {
+        pose_points = std::move(filtered_points);
     }
 
     if (static_cast<int>(pose_points.size()) < config_.min_points) {
@@ -381,6 +442,30 @@ TrackerFrameResult TrackerEngine::processFrame(
     if (pose.success) {
         pose_tracker_.setPose(pose.rvec, pose.tvec);
         visual_corners = visualCornersForPose(pose);
+        // Corners withheld from the pose solve (predicted / young) must not
+        // vanish from the visual set, or the persistence refresh would evict
+        // them and the fast path could never match them again. Validate them
+        // against the pose like every other visual corner and merge.
+        std::set<std::pair<int, int>> in_visual;
+        for (const TrackerCorner& c : visual_corners) {
+            in_visual.insert({c.global_row, c.global_col});
+        }
+        std::vector<TrackerCorner> withheld;
+        for (const TrackerCorner& c : correspondence_corners) {
+            if (in_visual.find({c.global_row, c.global_col}) ==
+                in_visual.end()) {
+                withheld.push_back(c);
+            }
+        }
+        const std::vector<TrackerCorner> validated =
+            tracker_geometry_.visualCornersFromPose(
+                withheld,
+                pose.rvec,
+                pose.tvec,
+                config_.visual_corner_max_reprojection_error_px
+            );
+        visual_corners.insert(
+            visual_corners.end(), validated.begin(), validated.end());
     }
     packagePoseResult(
         result,
@@ -757,6 +842,435 @@ void TrackerEngine::finalizeFrameResult(
 {
     attachRuntimeState(result);
     result.timings_ms["tracker_total_ms"] = elapsedMs(frame_t0);
+}
+
+void TrackerEngine::updateCornerModelInput()
+{
+    if (config_.checker_tracked_refine_method != "model_warp") {
+        return;
+    }
+
+    CornerModelFrameInput input;
+    const SurfaceModel& surface = geometry_.surfaceModel();
+
+    if (surface.valid() &&
+        model_ref_enrolled_ &&
+        !model_prev_uv_.empty() &&
+        model_curr_rvec_.size() == 3 &&
+        model_curr_tvec_.size() == 3) {
+        // One-time pixel->ray lookup table (needs the frame size, hence
+        // lazy construction on the first enabled frame).
+        if (model_ray_lut_.empty() && !current_frame_.empty()) {
+            const int w = current_frame_.cols;
+            const int h = current_frame_.rows;
+            std::vector<cv::Point2d> pix;
+            pix.reserve(static_cast<size_t>(w) * h);
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    pix.emplace_back(x, y);
+                }
+            }
+            std::vector<cv::Point2d> und;
+            cv::Mat dist_mat;
+            if (!dist_coeffs_.empty()) {
+                dist_mat = cv::Mat(dist_coeffs_, true).reshape(1, 1);
+            }
+            cv::undistortPoints(pix, und, cv::Mat(K_), dist_mat);
+            model_ray_lut_.create(h, w, CV_32FC2);
+            size_t idx = 0;
+            for (int y = 0; y < h; ++y) {
+                cv::Vec2f* row = model_ray_lut_.ptr<cv::Vec2f>(y);
+                for (int x = 0; x < w; ++x, ++idx) {
+                    row[x] = cv::Vec2f(
+                        static_cast<float>(und[idx].x),
+                        static_cast<float>(und[idx].y));
+                }
+            }
+        }
+
+        input.enabled = true;
+        input.K = K_;
+        input.dist = dist_coeffs_;
+        input.ray_lut = model_ray_lut_;
+
+        // Constant-velocity pose prediction from the last two accepted
+        // poses; reduces the anchor lag during fast motion.  Falls back to
+        // the last pose when no history exists or the step looks abnormal.
+        cv::Mat R_last;
+        cv::Rodrigues(cv::Mat(model_curr_rvec_, true), R_last);
+        cv::Vec3d t_last(model_curr_tvec_[0], model_curr_tvec_[1],
+                         model_curr_tvec_[2]);
+        cv::Matx33d R_pred(R_last.ptr<double>());
+        cv::Vec3d t_pred = t_last;
+
+        if (model_prev_rvec_.size() == 3 && model_prev_tvec_.size() == 3) {
+            const cv::Vec3d t_prev(model_prev_tvec_[0], model_prev_tvec_[1],
+                                   model_prev_tvec_[2]);
+            const cv::Vec3d dt = t_last - t_prev;
+            cv::Mat R_prev;
+            cv::Rodrigues(cv::Mat(model_prev_rvec_, true), R_prev);
+            const cv::Mat R_delta = R_last * R_prev.t();
+            cv::Mat rvec_delta;
+            cv::Rodrigues(R_delta, rvec_delta);
+            const double rot_step = cv::norm(rvec_delta);
+
+            if (cv::norm(dt) < 40.0 && rot_step < 10.0 * CV_PI / 180.0) {
+                t_pred = t_last + dt;
+                const cv::Mat R_p = R_delta * R_last;
+                R_pred = cv::Matx33d(R_p.ptr<double>());
+            }
+        }
+
+        input.R = R_pred;
+        input.t = t_pred;
+        input.surface = surface;
+        input.ref_gray = model_ref_gray_;
+        input.R_ref = model_ref_R_;
+        input.t_ref = model_ref_t_;
+        input.prev_uv = model_prev_uv_;
+        input.prev_xyz_mm = model_prev_xyz_;
+    }
+
+    checkerboard_detector_.setCornerModelInput(input);
+}
+
+bool TrackerEngine::posePointUsable(bool predicted, int observed_frames) const
+{
+    if (config_.pose_exclude_predicted_corners && predicted) {
+        return false;
+    }
+    if (config_.pose_min_observed_frames > 0 &&
+        observed_frames < config_.pose_min_observed_frames) {
+        return false;
+    }
+    return true;
+}
+
+void TrackerEngine::resetPoseWarmup()
+{
+    warmup_accepted_frames_ = 0;
+    warmup_quiet_streak_ = 0;
+    pose_converged_ = false;
+}
+
+void TrackerEngine::resetPoseKalman()
+{
+    pose_kf_initialized_ = false;
+    pose_kf_x_ = cv::Mat();
+    pose_kf_P_ = cv::Mat();
+}
+
+void TrackerEngine::applyPoseKalman(TrackerFrameResult& result)
+{
+    if (!config_.pose_kf_enabled) {
+        return;
+    }
+    if (!result.current_pose_accepted ||
+        result.rvec.size() != 3 ||
+        result.tvec.size() != 3) {
+        // No fresh measurement this frame (hold / rejection): coast the
+        // state so velocities stay time-consistent, output stays untouched.
+        if (pose_kf_initialized_) {
+            for (int i = 0; i < 6; ++i) {
+                pose_kf_x_.at<double>(i) += pose_kf_x_.at<double>(i + 6);
+            }
+        }
+        return;
+    }
+
+    // Measured pose-set corners; their Jacobian at the measured pose gives
+    // the per-frame information matrix (huge along observable directions,
+    // near-singular along the weak mode).
+    std::vector<cv::Point3d> object_points;
+    object_points.reserve(result.corners.size());
+    for (const TrackerCorner& c : result.corners) {
+        if (posePointUsable(c.predicted, c.observed_frames)) {
+            object_points.emplace_back(c.xyz_mm[0], c.xyz_mm[1], c.xyz_mm[2]);
+        }
+    }
+    if (static_cast<int>(object_points.size()) < config_.min_points) {
+        return;
+    }
+
+    cv::Mat z(6, 1, CV_64F);
+    for (int i = 0; i < 3; ++i) {
+        z.at<double>(i) = result.rvec[static_cast<size_t>(i)];
+        z.at<double>(i + 3) = result.tvec[static_cast<size_t>(i)];
+    }
+
+    // Large real jumps (accepted by the engine's own gates, e.g. after
+    // recovery) restart the filter instead of being dragged in slowly.
+    if (pose_kf_initialized_) {
+        double dr = 0.0;
+        double dt = 0.0;
+        for (int i = 0; i < 3; ++i) {
+            const double er = z.at<double>(i) - pose_kf_x_.at<double>(i);
+            const double et = z.at<double>(i + 3) - pose_kf_x_.at<double>(i + 3);
+            dr += er * er;
+            dt += et * et;
+        }
+        const double reset_rot_rad =
+            config_.pose_kf_reset_rotation_deg * CV_PI / 180.0;
+        if (std::sqrt(dr) > reset_rot_rad ||
+            std::sqrt(dt) > config_.max_translation_jump_mm) {
+            pose_kf_initialized_ = false;
+        }
+    }
+
+    if (!pose_kf_initialized_) {
+        pose_kf_x_ = cv::Mat::zeros(12, 1, CV_64F);
+        z.copyTo(pose_kf_x_.rowRange(0, 6));
+        pose_kf_P_ = cv::Mat::zeros(12, 12, CV_64F);
+        const double r2 = std::pow(2.0 * CV_PI / 180.0, 2.0);
+        const double vr2 = std::pow(0.5 * CV_PI / 180.0, 2.0);
+        for (int i = 0; i < 3; ++i) {
+            pose_kf_P_.at<double>(i, i) = r2;
+            pose_kf_P_.at<double>(i + 3, i + 3) = 25.0;       // (5 mm)^2
+            pose_kf_P_.at<double>(i + 6, i + 6) = vr2;
+            pose_kf_P_.at<double>(i + 9, i + 9) = 4.0;        // (2 mm/f)^2
+        }
+        pose_kf_initialized_ = true;
+        result.timings_ms["pose_kf_applied"] = 0.0;
+        return;  // first frame: output = measurement
+    }
+
+    // Constant-velocity predict; process noise on the acceleration.
+    cv::Mat F = cv::Mat::eye(12, 12, CV_64F);
+    for (int i = 0; i < 6; ++i) {
+        F.at<double>(i, i + 6) = 1.0;
+    }
+    const double q_r =
+        std::pow(config_.pose_kf_q_rotation_deg * CV_PI / 180.0, 2.0);
+    const double q_t = std::pow(config_.pose_kf_q_translation_mm, 2.0);
+    cv::Mat Q = cv::Mat::zeros(12, 12, CV_64F);
+    for (int i = 0; i < 6; ++i) {
+        const double q = (i < 3) ? q_r : q_t;
+        Q.at<double>(i, i) = 0.25 * q;
+        Q.at<double>(i, i + 6) = 0.5 * q;
+        Q.at<double>(i + 6, i) = 0.5 * q;
+        Q.at<double>(i + 6, i + 6) = q;
+    }
+    pose_kf_x_ = F * pose_kf_x_;
+    pose_kf_P_ = F * pose_kf_P_ * F.t() + Q;
+
+    // Measurement covariance sigma^2 (J^T J)^-1 from the pose Jacobian.
+    cv::Mat rvec_m = z.rowRange(0, 3).clone();
+    cv::Mat tvec_m = z.rowRange(3, 6).clone();
+    cv::Mat dist_mat;
+    if (!dist_coeffs_.empty()) {
+        dist_mat = cv::Mat(dist_coeffs_, true);
+    }
+    std::vector<cv::Point2d> projected;
+    cv::Mat J;
+    cv::projectPoints(object_points, rvec_m, tvec_m, K_, dist_mat,
+                      projected, J);
+    const cv::Mat Jp = J.colRange(0, 6);  // columns: drvec(3), dtvec(3)
+    const cv::Mat info = Jp.t() * Jp;
+    const double sigma2 = std::pow(config_.pose_kf_sigma_px, 2.0);
+    cv::Mat Sigma;
+    cv::invert(info, Sigma, cv::DECOMP_SVD);
+    Sigma *= sigma2;
+
+    cv::Mat Hm = cv::Mat::zeros(6, 12, CV_64F);  // H = [I6 | 0]
+    for (int i = 0; i < 6; ++i) {
+        Hm.at<double>(i, i) = 1.0;
+    }
+
+    cv::Mat innov = z - Hm * pose_kf_x_;
+    cv::Mat S = Hm * pose_kf_P_ * Hm.t() + Sigma;
+    cv::Mat S_inv;
+    cv::invert(S, S_inv, cv::DECOMP_SVD);
+    const double m2 = cv::Mat(innov.t() * S_inv * innov).at<double>(0);
+    if (m2 > config_.pose_kf_gate_mahalanobis &&
+        config_.pose_kf_gate_mahalanobis > 0.0) {
+        // Spike: deweight the measurement instead of dropping it, so a
+        // genuine fast motion still pulls the state over a few frames.
+        Sigma *= m2 / config_.pose_kf_gate_mahalanobis;
+        S = Hm * pose_kf_P_ * Hm.t() + Sigma;
+        cv::invert(S, S_inv, cv::DECOMP_SVD);
+        result.timings_ms["pose_kf_gated"] = 1.0;
+    }
+    const cv::Mat Kg = pose_kf_P_ * Hm.t() * S_inv;
+    pose_kf_x_ = pose_kf_x_ + Kg * innov;
+    pose_kf_P_ = (cv::Mat::eye(12, 12, CV_64F) - Kg * Hm) * pose_kf_P_;
+
+    // Write the filtered pose into the OUTPUT fields only.
+    for (int i = 0; i < 3; ++i) {
+        result.rvec[static_cast<size_t>(i)] = pose_kf_x_.at<double>(i);
+        result.tvec[static_cast<size_t>(i)] = pose_kf_x_.at<double>(i + 3);
+    }
+    cv::Mat R;
+    cv::Rodrigues(pose_kf_x_.rowRange(0, 3), R);
+    if (result.T_marker_camera.size() == 16) {
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                result.T_marker_camera[static_cast<size_t>(r * 4 + c)] =
+                    R.at<double>(r, c);
+            }
+            result.T_marker_camera[static_cast<size_t>(r * 4 + 3)] =
+                pose_kf_x_.at<double>(r + 3);
+        }
+    }
+    result.timings_ms["pose_kf_applied"] = 1.0;
+    result.timings_ms["pose_kf_mahalanobis"] = m2;
+}
+
+void TrackerEngine::updatePoseWarmupState(TrackerFrameResult& result)
+{
+    if (config_.pose_warmup_min_accepted_frames <= 0) {
+        pose_converged_ = true;
+    } else if (!pose_converged_ && result.current_pose_accepted) {
+        ++warmup_accepted_frames_;
+
+        // "Young" corners are measured corners that only recently appeared;
+        // while they keep showing up, the pose set is still saturating and
+        // the pose can wander along the weak observability mode.
+        const int young_threshold = std::max(3, config_.pose_min_observed_frames);
+        int young = 0;
+        for (const TrackerCorner& c : result.correspondence_corners) {
+            if (!c.predicted && c.observed_frames < young_threshold) {
+                ++young;
+            }
+        }
+        if (young <= config_.pose_warmup_max_young_corners) {
+            ++warmup_quiet_streak_;
+        } else {
+            warmup_quiet_streak_ = 0;
+        }
+
+        if (warmup_accepted_frames_ >= config_.pose_warmup_min_accepted_frames &&
+            warmup_quiet_streak_ >= config_.pose_warmup_stable_window) {
+            pose_converged_ = true;  // latched until tracking is lost
+        }
+    }
+
+    result.pose_converged = pose_converged_;
+    result.timings_ms["pose_converged"] = pose_converged_ ? 1.0 : 0.0;
+}
+
+void TrackerEngine::updateModelWarpStateAfterFrame(
+    const TrackerFrameResult& result
+)
+{
+    if (config_.checker_tracked_refine_method != "model_warp") {
+        return;
+    }
+
+    if (!result.current_pose_accepted ||
+        result.rvec.size() != 3 ||
+        result.tvec.size() != 3) {
+        return;
+    }
+
+    // Anchor source for the next frame: pose corners of this (now last
+    // accepted) frame — their uv in this frame plus the marker coordinate.
+    model_prev_uv_.clear();
+    model_prev_xyz_.clear();
+    model_prev_uv_.reserve(result.corners.size());
+    model_prev_xyz_.reserve(result.corners.size());
+    for (const TrackerCorner& c : result.corners) {
+        if (c.predicted) {
+            continue;
+        }
+        model_prev_uv_.emplace_back(
+            static_cast<float>(c.uv[0]),
+            static_cast<float>(c.uv[1]));
+        model_prev_xyz_.emplace_back(
+            c.xyz_mm[0], c.xyz_mm[1], c.xyz_mm[2]);
+    }
+
+    // Pose history for the constant-velocity prediction.
+    model_prev_rvec_ = model_curr_rvec_;
+    model_prev_tvec_ = model_curr_tvec_;
+    model_curr_rvec_ = result.rvec;
+    model_curr_tvec_ = result.tvec;
+
+    // Re-enrollment trigger: drop the reference once the viewing direction
+    // (camera centre seen from the marker) moved beyond the threshold —
+    // the warp bias grows with the angle offset to the enrollment view.
+    // The enrollment block below then re-enrolls at the next quiet,
+    // high-quality frame; corners fall back to subpix in between.
+    model_ref_view_angle_deg_ = 0.0;
+    if (model_ref_enrolled_) {
+        cv::Mat R_now_m;
+        cv::Rodrigues(cv::Mat(result.rvec, true), R_now_m);
+        const cv::Matx33d R_now(R_now_m.ptr<double>());
+        const cv::Vec3d t_now(result.tvec[0], result.tvec[1],
+                              result.tvec[2]);
+        const cv::Vec3d c_now = -(R_now.t() * t_now);
+        const cv::Vec3d c_ref = -(model_ref_R_.t() * model_ref_t_);
+        const double n_now = cv::norm(c_now);
+        const double n_ref = cv::norm(c_ref);
+        if (n_now > 1e-6 && n_ref > 1e-6) {
+            double cosang = c_now.dot(c_ref) / (n_now * n_ref);
+            cosang = std::max(-1.0, std::min(1.0, cosang));
+            model_ref_view_angle_deg_ =
+                std::acos(cosang) * 180.0 / CV_PI;
+        }
+        if (config_.model_warp_reenroll_angle_deg > 0.0 &&
+            model_ref_view_angle_deg_ >
+                config_.model_warp_reenroll_angle_deg) {
+            model_ref_enrolled_ = false;
+        }
+    }
+
+    // Reference enrollment on a stable accepted pose AFTER pose warmup
+    // (poses during set saturation wander along the weak mode, and a
+    // reference enrolled from such a pose bakes that error in) and while
+    // the tool is QUIET (a blurred reference degrades every later
+    // measurement). Runs again whenever the re-enrollment policy dropped
+    // the reference; short tracking losses keep it, a full loss drops it.
+    if (!model_ref_enrolled_ &&
+        pose_converged_ &&
+        poseMotionQuiet() &&
+        geometry_.surfaceModel().valid() &&
+        !current_frame_.empty() &&
+        result.num_inliers >= 15 &&
+        result.mean_reprojection_error_px >= 0.0 &&
+        result.mean_reprojection_error_px <= 1.5) {
+        cv::Mat gray;
+        if (current_frame_.channels() == 3) {
+            cv::cvtColor(current_frame_, gray, cv::COLOR_BGR2GRAY);
+        } else if (current_frame_.channels() == 4) {
+            cv::cvtColor(current_frame_, gray, cv::COLOR_BGRA2GRAY);
+        } else {
+            gray = current_frame_;
+        }
+        // Stored as CV_32F so the refiner never converts the reference
+        // again (it is sampled every frame).
+        gray.convertTo(model_ref_gray_, CV_32F);
+
+        cv::Mat R;
+        cv::Rodrigues(cv::Mat(result.rvec, true), R);
+        model_ref_R_ = cv::Matx33d(R.ptr<double>());
+        model_ref_t_ = cv::Vec3d(
+            result.tvec[0], result.tvec[1], result.tvec[2]);
+        model_ref_enrolled_ = true;
+        ++model_enroll_count_;
+    }
+}
+
+bool TrackerEngine::poseMotionQuiet() const
+{
+    if (model_prev_rvec_.size() != 3 || model_prev_tvec_.size() != 3 ||
+        model_curr_rvec_.size() != 3 || model_curr_tvec_.size() != 3) {
+        return true;  // no pose history yet — nothing to compare against
+    }
+    double dt2 = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        const double d = model_curr_tvec_[static_cast<size_t>(i)] -
+                         model_prev_tvec_[static_cast<size_t>(i)];
+        dt2 += d * d;
+    }
+    if (std::sqrt(dt2) > config_.model_warp_enroll_max_motion_mm) {
+        return false;
+    }
+    cv::Mat R_prev, R_curr, r_delta;
+    cv::Rodrigues(cv::Mat(model_prev_rvec_, true), R_prev);
+    cv::Rodrigues(cv::Mat(model_curr_rvec_, true), R_curr);
+    cv::Rodrigues(R_curr * R_prev.t(), r_delta);
+    const double rot_deg = cv::norm(r_delta) * 180.0 / CV_PI;
+    return rot_deg <= config_.model_warp_enroll_max_rotation_deg;
 }
 
 void TrackerEngine::noteLowFreshCorrespondenceFailure(int fresh_count)
@@ -1378,6 +1892,16 @@ void TrackerEngine::onTrackingFailure()
         pose_tracker_.reset();
         dot_detector_.reset();
         persistent_matcher_.clearIdentities();
+        // Full loss: the corner set will be rebuilt from scratch, so the
+        // pose has to warm up again before it counts as converged.
+        resetPoseWarmup();
+        resetPoseKalman();
+        // Re-acquisition may happen in a different tool orientation; a
+        // reference from before the loss is then stale. Drop it — a fresh
+        // one is enrolled after the pose has re-converged.
+        if (config_.model_warp_reenroll_on_loss) {
+            model_ref_enrolled_ = false;
+        }
         return;
     }
 
@@ -1547,6 +2071,8 @@ CheckerboardDetectorConfig TrackerEngine::makeCheckerboardConfig(
         config.checker_min_tracking_decode_cell_span;
     checker_config.max_undecodeable_tracking_frames =
         config.checker_max_undecodeable_tracking_frames;
+    checker_config.tracked_refine_method =
+        config.checker_tracked_refine_method;
     return checker_config;
 }
 

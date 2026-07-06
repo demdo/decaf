@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -42,6 +43,19 @@ struct GridCell {
     std::array<cv::Point2f, 4> corner_uv;
 
     cv::Point2f center_uv;
+};
+
+// One LK-tracked corner measured by BOTH operators in the same frame.
+// Only recorded while model_warp is the active refine method: uv_subpix is
+// the baseline the warp measurement overwrote, so a model_warp run also
+// carries the full subpix measurement for offline comparison.
+struct TrackedRefineSample {
+    std::array<double, 2> uv_lk = {0.0, 0.0};      // incoming LK position
+    std::array<double, 2> uv_subpix = {0.0, 0.0};  // subpix baseline
+    std::array<double, 2> uv_meas = {0.0, 0.0};    // final measurement
+    bool model_warp_ok = false;   // uv_meas from warp (else subpix fallback)
+    float zncc = 0.0f;
+    bool predicted = false;       // carried by motion model, not measured
 };
 
 struct CheckerboardDetection {
@@ -230,6 +244,14 @@ struct CheckerboardDetectorConfig {
     int    saddle_subpix_win_size  = -1;
     int    saddle_subpix_max_iters = 20;
     double saddle_subpix_epsilon   = 0.05;
+
+    // Measurement operator applied to LK-tracked corners before the tracked
+    // detection is handed to pose estimation:
+    //   "subpix"     - cv::cornerSubPix snap (default, established behaviour)
+    //   "model_warp" - forward-model template registration for markers with a
+    //                  known surface model (not implemented yet; currently
+    //                  falls back to "subpix" with a one-time warning)
+    std::string tracked_refine_method = "subpix";
 
     // Quadrant intensity symmetry filter — used ONLY during recovery
     // (detectRecovery) to distinguish true checkerboard corners from

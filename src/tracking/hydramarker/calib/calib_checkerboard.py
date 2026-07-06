@@ -827,12 +827,9 @@ def detect_checkerboard_corners(
         flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
         ok, corners = cv2.findChessboardCorners(gray, pattern, flags)
         if ok:
-            criteria = (
-                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
-                80,
-                1e-4,
-            )
-            corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+            # Adaptive window (~1/4 corner spacing) + border guard, shared with
+            # the camera-calibration pipeline; the SB path above refines itself.
+            corners = calib_camera._refine_charuco_subpix(gray, corners)
 
     if not ok or corners is None:
         return None
@@ -849,6 +846,10 @@ def start_realsense_color_stream(*, width: int, height: int, fps: int):
     config = rs.config()
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
     profile = pipeline.start(config)
+    calib_camera.disable_realsense_ir_projector(
+        profile,
+        log_prefix="[calib_checkerboard]",
+    )
     for _ in range(15):
         pipeline.wait_for_frames()
     return pipeline, profile

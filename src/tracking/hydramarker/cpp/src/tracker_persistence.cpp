@@ -585,6 +585,8 @@ PersistentMatchResult PersistentMatcher::match(
 
     result.points.reserve(identities_.size());
     result.corners.reserve(identities_.size());
+    std::vector<PoseTrackPoint> held_points;
+    std::vector<TrackerCorner> held_corners;
 
     std::set<GlobalKey> used_globals;
     std::vector<bool> used_current_indices(current_corners.size(), false);
@@ -650,7 +652,6 @@ PersistentMatchResult PersistentMatcher::match(
         point.xyz_mm = cached.xyz_mm;
         point.uv = uv;
         point.votes = votes;
-        result.points.push_back(point);
 
         TrackerCorner corner;
         corner.local_row = matched.local_row;
@@ -663,11 +664,49 @@ PersistentMatchResult PersistentMatcher::match(
         corner.visibility_score = matched.visibility_score;
         corner.observed_frames = matched.observed_frames;
         corner.predicted = matched.predicted;
-        result.corners.push_back(corner);
+
+        // Pose-set stabilisation: predicted corners feed the previous pose
+        // back into PnP and freshly appeared corners jump the pose along
+        // the weak mode. They are held back from the POSE input; their
+        // corners are appended after the pose-parallel prefix below so
+        // inlier indices stay valid and persistence still sees them.
+        const bool pose_usable =
+            !(config_.pose_exclude_predicted_corners && matched.predicted) &&
+            (config_.pose_min_observed_frames <= 0 ||
+             matched.observed_frames >= config_.pose_min_observed_frames);
+        if (pose_usable) {
+            result.points.push_back(point);
+            result.corners.push_back(corner);
+        } else {
+            held_points.push_back(point);
+            held_corners.push_back(corner);
+        }
 
         used_globals.insert(global_key);
         used_current_indices[static_cast<size_t>(match.index)] = true;
         ++stats.accepted;
+    }
+
+    // Relax the stabilisation filter if it would starve the pose solver:
+    // a slightly wobblier pose beats no pose.
+    const int min_needed = std::max({
+        config_.min_points,
+        config_.persistence_min_points,
+        config_.fast_persistent_min_points
+    });
+    if (static_cast<int>(result.points.size()) < min_needed &&
+        !held_points.empty()) {
+        for (size_t i = 0; i < held_points.size(); ++i) {
+            result.points.push_back(held_points[i]);
+            result.corners.push_back(held_corners[i]);
+        }
+        held_points.clear();
+        held_corners.clear();
+    }
+    // Non-pose corners keep participating in everything downstream that
+    // consumes result.corners (visual corners, persistence refresh).
+    for (const TrackerCorner& corner : held_corners) {
+        result.corners.push_back(corner);
     }
 
     result.message = result.valid()
@@ -866,10 +905,17 @@ FastPoseResult PersistentMatcher::estimateFastPose(
 
     auto fillVisualCorners = [&]() {
         const MapPoseResult& final_pose = finalPoseForPackaging();
-        const std::vector<TrackerCorner> inlier_corners =
+        std::vector<TrackerCorner> candidate_corners =
             inlierCornersFromPose(final_pose, result.corners);
+        // Corners beyond the pose-parallel prefix were withheld from the
+        // pose solve (predicted / young). They still have to pass the same
+        // reprojection gate and stay in the visual set, otherwise the
+        // persistence refresh would evict them for good.
+        for (size_t i = result.points.size(); i < result.corners.size(); ++i) {
+            candidate_corners.push_back(result.corners[i]);
+        }
         result.visual_corners = geometry_helper.visualCornersFromPose(
-            inlier_corners,
+            candidate_corners,
             final_pose.rvec,
             final_pose.tvec,
             config_.visual_corner_max_reprojection_error_px

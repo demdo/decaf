@@ -41,6 +41,62 @@ struct TrackerConfig {
     int checker_min_fresh_correspondences_for_stable_tracking = 8;
     int checker_max_low_fresh_correspondence_frames = 12;
 
+    // Measurement operator for LK-tracked corners in the checkerboard
+    // detector ("subpix" = cv::cornerSubPix snap, "model_warp" =
+    // forward-model template registration once implemented).
+    std::string checker_tracked_refine_method = "subpix";
+
+    // Pose-set stabilisation. On the cylinder marker the pose is nearly
+    // blind along one direction (~1 mm z per 0.1 px), so two effects that
+    // are harmless elsewhere dominate the z error: (a) predicted corners
+    // feed the PREVIOUS pose back into PnP, (b) freshly appeared corners
+    // entering the pose set cause weak-mode jumps. Both filters apply to
+    // the POSE input only; detection/decoding/persistence keep every
+    // corner. If filtering would leave fewer than the minimum usable
+    // points, it relaxes automatically rather than losing the pose.
+    bool pose_exclude_predicted_corners = true;
+    int pose_min_observed_frames = 5;   // 0 disables the entry hysteresis
+
+    // Pose warmup reporting: after (re)acquisition the pose wanders along
+    // the weak mode while the corner set saturates (measured: z std 0.64 mm
+    // static). pose_converged latches once the set has been quiet; it is
+    // a STATUS for downstream consumers, poses are still produced.
+    int pose_warmup_min_accepted_frames = 20;  // 0 disables (always converged)
+    int pose_warmup_stable_window = 15;
+    int pose_warmup_max_young_corners = 2;
+
+    // Anisotropic pose Kalman filter (OUTPUT-only; the internal tracking
+    // chain keeps the raw pose so no feedback loop forms). Constant-velocity
+    // model; measurement covariance sigma^2*(J^T J)^-1 per frame, so
+    // observable directions follow the measurement instantly while the weak
+    // observability mode is smoothed. Mahalanobis-deweighted spikes.
+    bool pose_kf_enabled = true;
+    double pose_kf_sigma_px = 0.12;
+    double pose_kf_q_translation_mm = 0.15;   // accel noise per frame
+    double pose_kf_q_rotation_deg = 0.05;     // accel noise per frame
+    double pose_kf_gate_mahalanobis = 30.0;
+    double pose_kf_reset_rotation_deg = 10.0; // innovation beyond -> reset
+
+    // Model-warp reference re-enrollment. The warp bias grows with the
+    // viewing-angle offset to the enrollment view, and after a full
+    // tracking loss the old reference can belong to a different tool
+    // orientation entirely. Re-enroll (a) after a full tracking loss,
+    // (b) once the viewing direction moved beyond the angle threshold.
+    // Deliberately RARE: chained re-enrollment sums the same bias (no
+    // slope fix), so the threshold sits far above normal in-run angle
+    // changes (<5 deg on step runs) — this guards against stale-reference
+    // catastrophes, nothing else. While no reference is enrolled the
+    // corners fall back to subpix automatically.
+    // Threshold sized against real data: +-85 mm step runs reach ~15 deg
+    // viewing-angle offset (lateral orbit + a few deg of real yaw), a
+    // deliberate fb<->rl reorientation is ~90 deg.
+    bool model_warp_reenroll_on_loss = true;
+    double model_warp_reenroll_angle_deg = 20.0;   // 0 disables
+    // (Re-)enroll only while the tool is quiet — motion blur in the
+    // reference would bake into every later measurement.
+    double model_warp_enroll_max_motion_mm = 1.0;      // per frame
+    double model_warp_enroll_max_rotation_deg = 0.25;  // per frame
+
     int dot_canonical_size = 80;
     double dot_canonical_margin_px = 4.0;
     double dot_min_dot_contrast = 8.0;

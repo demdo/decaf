@@ -82,6 +82,11 @@ public:
 
     std::optional<CheckerboardDetection> detect(const cv::Mat& image);
 
+    // Per-frame model context for the "model_warp" tracked-corner
+    // measurement.  Set by the tracker engine before detect(); an input
+    // with enabled = false switches the operator off for the frame.
+    void setCornerModelInput(const CornerModelFrameInput& input);
+
     CheckerboardRecoveryDebug debugRecoveryStages(const cv::Mat& image) const;
 
     void resetTracking();
@@ -90,8 +95,15 @@ public:
     void addTimingMs(const std::string& name, double elapsed_ms) const;
     static double elapsedMs(std::int64_t start_tick);
 
+    // Per-corner operator comparison of the last detect() call (empty
+    // unless model_warp was active; see TrackedRefineSample).
+    const std::vector<TrackedRefineSample>& lastTrackedRefineSamples() const {
+        return last_tracked_refine_samples_;
+    }
+
 private:
     CheckerboardDetectorConfig config_;
+    std::vector<TrackedRefineSample> last_tracked_refine_samples_;
 
     int frame_index_ = 0;
     int degraded_frames_count_ = 0;
@@ -124,6 +136,8 @@ private:
     };
 
     std::unordered_map<std::int64_t, CornerKalmanState> lk_corner_kalman_;
+
+    CornerModelFrameInput corner_model_input_;
 
     CornerDetector corner_detector_;
     CornerRefiner corner_refiner_;

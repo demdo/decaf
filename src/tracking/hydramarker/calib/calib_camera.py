@@ -45,6 +45,12 @@ SELECTION_GRID_COLS = 7
 SELECTION_GRID_ROWS = 5
 COVERAGE_EDGE_FRACTION = 0.12
 MIN_COVERAGE_CELLS = 28
+# A cell counting as "covered" with a single corner allowed captures whose
+# lower image half held almost no data (2026-07-05 session: bottom row
+# [4,17,16,21,...] corners) — the distortion there is then extrapolated and
+# the model choice becomes a per-session lottery. Require a real minimum of
+# corners in every grid cell instead.
+MIN_CELL_CORNERS = 40
 MIN_EDGE_CORNERS = 36
 MIN_QUADRANT_CORNERS = 72
 MIN_CORNER_RADIUS_NORM = 0.75
@@ -54,6 +60,19 @@ MIN_VIEW_CENTER_CELLS = 9
 MIN_CENTER_VIEWS = 30
 MIN_VIEW_QUADRANT_VIEWS = 8
 CENTER_VIEW_HALF_WIDTH_NORM = 0.25
+# Strongly tilted views decorrelate focal length, principal point and the
+# radial/tangential coefficients — without them several distortion models fit
+# the data equally well but disagree in pose space (measured: ~0.9 mm/100 mm
+# z-slope spread between standard5 and no_k3 on the same views).
+STRONG_TILT_DEG = 35.0  # Rojtberg & Kuijper (ISMAR'18): ~45 deg optimally
+# constrains focal length (0 deg = focal undetermined, 90 deg = principal
+# point undetermined); we stay slightly below 45 for reliable board detection.
+MIN_STRONG_TILT_VIEWS = 12
+# Rolling-shutter guard: the D435i colour sensor reads out line by line, so a
+# board that moves during capture stretches vertically and biases fy (observed:
+# fx-fy split of ~7.5px and doubled RMS in a continuously swept capture).
+# Candidates are therefore only stored while the board is (nearly) still.
+MAX_CAPTURE_MOTION_PX = 1.5
 
 REALSENSE_WIDTH = 1920
 REALSENSE_HEIGHT = 1080
@@ -108,10 +127,21 @@ def _image_size(img: np.ndarray) -> Tuple[int, int]:
 
 def _make_detector_params() -> Any:
     if hasattr(cv2.aruco, "DetectorParameters"):
-        return cv2.aruco.DetectorParameters()
-    if hasattr(cv2.aruco, "DetectorParameters_create"):
-        return cv2.aruco.DetectorParameters_create()
-    raise RuntimeError("No compatible ArUco DetectorParameters API found.")
+        params = cv2.aruco.DetectorParameters()
+    elif hasattr(cv2.aruco, "DetectorParameters_create"):
+        params = cv2.aruco.DetectorParameters_create()
+    else:
+        raise RuntimeError("No compatible ArUco DetectorParameters API found.")
+
+    # Subpixel-refined marker corners give the ChArUco interpolation better seeds.
+    refine_subpix = getattr(cv2.aruco, "CORNER_REFINE_SUBPIX", None)
+    if refine_subpix is not None:
+        try:
+            params.cornerRefinementMethod = refine_subpix
+        except AttributeError:
+            pass
+
+    return params
 
 
 def _detect_aruco_markers(
@@ -136,8 +166,52 @@ def _detect_aruco_markers(
 
 
 _SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-_SUBPIX_WIN = (5, 5)
+_SUBPIX_MIN_HALF_WIN = 5
+_SUBPIX_MAX_HALF_WIN = 15
 _SUBPIX_ZERO = (-1, -1)
+
+
+def _subpix_half_window(points: np.ndarray) -> int:
+    """Half window ~ a quarter of the median corner spacing, so the refinement
+    sees a meaningful patch of the X-junction at any board distance while never
+    reaching the neighbouring corners."""
+    if points.shape[0] < 2:
+        return _SUBPIX_MIN_HALF_WIN
+    diff = points[None, :, :] - points[:, None, :]
+    dist = np.sqrt(np.sum(diff * diff, axis=-1))
+    np.fill_diagonal(dist, np.inf)
+    spacing = float(np.median(np.min(dist, axis=1)))
+    if not np.isfinite(spacing):
+        return _SUBPIX_MIN_HALF_WIN
+    return int(np.clip(round(spacing * 0.25), _SUBPIX_MIN_HALF_WIN, _SUBPIX_MAX_HALF_WIN))
+
+
+def _filter_corners_inside_image(
+    gray: np.ndarray,
+    cc: Optional[np.ndarray],
+    ci: Optional[np.ndarray],
+    margin_px: float = 2.0,
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Drop interpolated ChArUco corners that lie outside the image.
+
+    With CharucoParameters.minMarkers=1 the detector extrapolates corners of a
+    board that partially leaves the FOV; those points are pure extrapolation
+    (never measured) and crash cornerSubPix."""
+    if cc is None or ci is None:
+        return cc, ci
+
+    h, w = gray.shape[:2]
+    pts = cc.reshape(-1, 2)
+    keep = (
+        (pts[:, 0] >= margin_px)
+        & (pts[:, 0] <= float(w - 1) - margin_px)
+        & (pts[:, 1] >= margin_px)
+        & (pts[:, 1] <= float(h - 1) - margin_px)
+    )
+    if np.all(keep):
+        return cc, ci
+
+    return cc.reshape(-1, 1, 2)[keep], ci.reshape(-1, 1)[keep]
 
 
 def _refine_charuco_subpix(
@@ -146,9 +220,29 @@ def _refine_charuco_subpix(
 ) -> np.ndarray:
     if cc is None or cc.size == 0:
         return cc
-    pts = cc.reshape(-1, 1, 2).astype(np.float32)
-    refined = cv2.cornerSubPix(gray, pts, _SUBPIX_WIN, _SUBPIX_ZERO, _SUBPIX_CRITERIA)
-    return refined.reshape(cc.shape).astype(cc.dtype)
+
+    h, w = gray.shape[:2]
+    pts_all = cc.reshape(-1, 2).astype(np.float64)
+    half = _subpix_half_window(pts_all)
+
+    # Only refine corners whose search window fits inside the image; the rest
+    # (extreme edge corners) are kept at their interpolated position.
+    margin = float(half + 2)
+    safe = (
+        (pts_all[:, 0] >= margin)
+        & (pts_all[:, 0] <= float(w - 1) - margin)
+        & (pts_all[:, 1] >= margin)
+        & (pts_all[:, 1] <= float(h - 1) - margin)
+    )
+    if not np.any(safe):
+        return cc
+
+    pts = pts_all[safe].reshape(-1, 1, 2).astype(np.float32)
+    refined = cv2.cornerSubPix(gray, pts, (half, half), _SUBPIX_ZERO, _SUBPIX_CRITERIA)
+
+    out = pts_all.copy()
+    out[safe] = refined.reshape(-1, 2).astype(np.float64)
+    return out.reshape(cc.shape).astype(cc.dtype)
 
 
 def _interpolate_charuco_compat(
@@ -191,14 +285,24 @@ def _interpolate_charuco_compat(
         n = 0 if ret is None else int(ret)
         if n <= 0 or cc is None or ci is None:
             return 0, None, None
+        cc, ci = _filter_corners_inside_image(gray, cc, ci)
+        if cc is None or ci is None or len(ci) == 0:
+            return 0, None, None
         cc = _refine_charuco_subpix(gray, cc)
-        return n, cc, ci
+        return int(len(ci)), cc, ci
 
     if hasattr(cv2.aruco, "CharucoDetector"):
         if hasattr(cv2.aruco, "CharucoParameters"):
             charuco_params = cv2.aruco.CharucoParameters()
             charuco_params.cameraMatrix = K
             charuco_params.distCoeffs = dist
+            try:
+                # Keep corners that only have a single decoded marker next to
+                # them (board leaving the FOV) — those edge observations are
+                # the most valuable ones for k1/k2.
+                charuco_params.minMarkers = 1
+            except AttributeError:
+                pass
             detector = cv2.aruco.CharucoDetector(
                 board,
                 charucoParams=charuco_params,
@@ -212,6 +316,10 @@ def _interpolate_charuco_compat(
             markerIds=aruco_ids,
         )
 
+        if cc is None or ci is None or len(ci) == 0:
+            return 0, None, None
+
+        cc, ci = _filter_corners_inside_image(gray, cc, ci)
         if cc is None or ci is None or len(ci) == 0:
             return 0, None, None
 
@@ -282,6 +390,49 @@ def _charuco_id_set(det: CharucoDetection) -> set[int]:
     return {int(x) for x in det.charuco_ids.reshape(-1)}
 
 
+def _charuco_corner_map(det: CharucoDetection) -> dict[int, np.ndarray]:
+    if det.charuco_ids is None or det.charuco_corners is None:
+        return {}
+    ids = det.charuco_ids.reshape(-1).astype(int)
+    pts = det.charuco_corners.reshape(-1, 2).astype(np.float64)
+    return {int(i): p for i, p in zip(ids, pts)}
+
+
+def _median_corner_motion_px(
+    prev_map: dict[int, np.ndarray],
+    cur_map: dict[int, np.ndarray],
+) -> float:
+    common = cur_map.keys() & prev_map.keys()
+    if len(common) < 4:
+        return float("nan")
+    return float(np.median([np.linalg.norm(cur_map[i] - prev_map[i]) for i in common]))
+
+
+def _charuco_tilt_deg(det: CharucoDetection) -> float:
+    """Approximate board tilt vs. the image plane from the affine part of the
+    object->image mapping (weak perspective: singular-value ratio = cos(tilt))."""
+    if det.charuco_ids is None or det.charuco_corners is None or det.num_charuco < 4:
+        return float("nan")
+
+    ids = det.charuco_ids.reshape(-1).astype(int)
+    cols = ids % (SQUARES_X - 1)
+    rows = ids // (SQUARES_X - 1)
+    obj = np.c_[cols, rows].astype(np.float64) * SQUARE_LEN_M
+    img = det.charuco_corners.reshape(-1, 2).astype(np.float64)
+
+    obj_c = obj - obj.mean(axis=0)
+    img_c = img - img.mean(axis=0)
+    if np.linalg.matrix_rank(obj_c) < 2:
+        return float("nan")
+
+    A, *_ = np.linalg.lstsq(obj_c, img_c, rcond=None)
+    s = np.linalg.svd(A, compute_uv=False)
+    if s[0] <= 1e-9:
+        return float("nan")
+    ratio = float(np.clip(s[1] / s[0], 0.0, 1.0))
+    return float(np.degrees(np.arccos(ratio)))
+
+
 def _candidate_metrics(image: np.ndarray, det: CharucoDetection) -> Dict[str, float]:
     gray = _ensure_gray(image)
     h, w = gray.shape[:2]
@@ -300,10 +451,13 @@ def _candidate_metrics(image: np.ndarray, det: CharucoDetection) -> Dict[str, fl
         "edge_margin_norm": 0.0,
         "radius_norm": float("nan"),
         "corner_radius_norm_max": float("nan"),
+        "tilt_deg": float("nan"),
     }
 
     if det.charuco_corners is None or det.num_charuco <= 0:
         return metrics
+
+    metrics["tilt_deg"] = _charuco_tilt_deg(det)
 
     pts = det.charuco_corners.reshape(-1, 2).astype(np.float64)
     min_uv = np.min(pts, axis=0)
@@ -360,6 +514,8 @@ def _candidate_score(metrics: Dict[str, float]) -> float:
     edge_score = 1.0 - float(
         np.clip(edge_margin_norm / max(COVERAGE_EDGE_FRACTION, 1e-6), 0.0, 1.0)
     )
+    tilt_deg = float(np.nan_to_num(metrics.get("tilt_deg", 0.0), nan=0.0))
+    tilt_score = float(np.clip(tilt_deg / 45.0, 0.0, 1.0))
 
     return (
         0.35 * corner_score
@@ -367,6 +523,7 @@ def _candidate_score(metrics: Dict[str, float]) -> float:
         + 0.22 * sharpness_score
         + 0.15 * radius_score
         + 0.10 * edge_score
+        + 0.15 * tilt_score
     )
 
 
@@ -454,6 +611,11 @@ def _candidate_size_bin(metrics: Dict[str, float]) -> int:
     return int(np.searchsorted([0.025, 0.06, 0.12, 0.22], area, side="right"))
 
 
+def _candidate_tilt_bin(metrics: Dict[str, float]) -> int:
+    tilt = float(np.nan_to_num(metrics.get("tilt_deg", 0.0), nan=0.0))
+    return int(np.clip(tilt // 15.0, 0, 3))
+
+
 def _candidate_feature(metrics: Dict[str, float]) -> np.ndarray:
     return np.asarray(
         [
@@ -487,6 +649,26 @@ def _corner_grid_cells(
     cols = np.clip(np.floor(points[:, 0] / max(width, 1) * grid_cols), 0, grid_cols - 1)
     rows = np.clip(np.floor(points[:, 1] / max(height, 1) * grid_rows), 0, grid_rows - 1)
     return {(int(c), int(r)) for c, r in zip(cols, rows)}
+
+
+def _corner_grid_cell_counts(
+    points: np.ndarray,
+    image_size: tuple[int, int],
+    *,
+    grid_cols: int,
+    grid_rows: int,
+) -> np.ndarray:
+    counts = np.zeros((grid_rows, grid_cols), dtype=np.int32)
+    if points.size:
+        width, height = image_size
+        cols = np.clip(
+            np.floor(points[:, 0] / max(width, 1) * grid_cols), 0, grid_cols - 1
+        ).astype(int)
+        rows = np.clip(
+            np.floor(points[:, 1] / max(height, 1) * grid_rows), 0, grid_rows - 1
+        ).astype(int)
+        np.add.at(counts, (rows, cols), 1)
+    return counts
 
 
 def compute_corner_coverage(
@@ -580,9 +762,13 @@ def compute_view_center_coverage(
     quadrant_counts = np.zeros((2, 2), dtype=np.int32)
     centers: list[tuple[float, float]] = []
     center_count = 0
+    strong_tilt_count = 0
 
     for cand in candidates:
         metrics = cand.metrics
+        tilt = float(np.nan_to_num(metrics.get("tilt_deg", 0.0), nan=0.0))
+        if tilt >= STRONG_TILT_DEG:
+            strong_tilt_count += 1
         u = float(np.nan_to_num(metrics.get("centroid_u_norm", np.nan), nan=np.nan))
         v = float(np.nan_to_num(metrics.get("centroid_v_norm", np.nan), nan=np.nan))
         if not (np.isfinite(u) and np.isfinite(v)):
@@ -641,6 +827,8 @@ def compute_view_center_coverage(
         "coverage_fraction": float(covered_cells / max(total_cells, 1)),
         "total_views": int(centers_arr.shape[0]),
         "center_count": int(center_count),
+        "strong_tilt_views": int(strong_tilt_count),
+        "strong_tilt_min_deg": float(STRONG_TILT_DEG),
         "center_half_width_norm": float(center_half_width_norm),
         "centroids_uv_norm": centers_arr,
         "dx_norm_p05_p50_p95": [float(dx_p05), float(dx_p50), float(dx_p95)],
@@ -663,6 +851,7 @@ def coverage_failures(
     coverage: Dict[str, Any],
     *,
     min_coverage_cells: int = MIN_COVERAGE_CELLS,
+    min_cell_corners: int = MIN_CELL_CORNERS,
     min_edge_corners: int = MIN_EDGE_CORNERS,
     min_quadrant_corners: int = MIN_QUADRANT_CORNERS,
     min_corner_radius_norm: float = MIN_CORNER_RADIUS_NORM,
@@ -673,6 +862,19 @@ def coverage_failures(
             f"grid {coverage.get('covered_cells', 0)}/{coverage.get('total_cells', 0)} "
             f"(need {min_coverage_cells})"
         )
+
+    grid_counts = np.asarray(coverage.get("grid_counts", []))
+    if grid_counts.ndim == 2 and grid_counts.size and int(min_cell_corners) > 0:
+        thin = grid_counts < int(min_cell_corners)
+        if np.any(thin):
+            worst_row, worst_col = np.unravel_index(
+                int(np.argmin(grid_counts)), grid_counts.shape
+            )
+            failures.append(
+                f"{int(np.count_nonzero(thin))} cells < {int(min_cell_corners)} corners "
+                f"(worst r{worst_row + 1}c{worst_col + 1}="
+                f"{int(grid_counts[worst_row, worst_col])})"
+            )
 
     edge_counts = coverage.get("edge_counts", {})
     for edge in ("left", "right", "top", "bottom"):
@@ -699,6 +901,7 @@ def view_center_coverage_failures(
     min_view_center_cells: int = MIN_VIEW_CENTER_CELLS,
     min_center_views: int = MIN_CENTER_VIEWS,
     min_view_quadrant_views: int = MIN_VIEW_QUADRANT_VIEWS,
+    min_strong_tilt_views: int = MIN_STRONG_TILT_VIEWS,
 ) -> list[str]:
     failures: list[str] = []
     if not coverage:
@@ -714,6 +917,12 @@ def view_center_coverage_failures(
         failures.append(
             f"center views {coverage.get('center_count', 0)} "
             f"(need {min_center_views})"
+        )
+
+    if int(coverage.get("strong_tilt_views", 0)) < int(min_strong_tilt_views):
+        failures.append(
+            f"tilted views (>= {STRONG_TILT_DEG:.0f} deg) "
+            f"{coverage.get('strong_tilt_views', 0)}/{min_strong_tilt_views}"
         )
 
     quadrant_counts = np.asarray(coverage.get("quadrant_counts", np.zeros((2, 2))), dtype=int)
@@ -761,6 +970,7 @@ def select_calibration_candidates(
     grid_cols: int = SELECTION_GRID_COLS,
     grid_rows: int = SELECTION_GRID_ROWS,
     edge_fraction: float = COVERAGE_EDGE_FRACTION,
+    min_cell_corners: int = MIN_CELL_CORNERS,
     min_edge_corners: int = MIN_EDGE_CORNERS,
     min_quadrant_corners: int = MIN_QUADRANT_CORNERS,
     view_grid_cols: int = VIEW_CENTER_GRID_COLS,
@@ -795,10 +1005,13 @@ def select_calibration_candidates(
     selected: list[CalibrationCandidate] = []
     selected_features: list[np.ndarray] = []
     selected_cells: set[tuple[int, int]] = set()
+    selected_cell_counts = np.zeros((grid_rows, grid_cols), dtype=np.int32)
     selected_view_cells: set[tuple[int, int]] = set()
     selected_center_views = 0
     selected_radius_bins: set[int] = set()
     selected_size_bins: set[int] = set()
+    selected_tilt_bins: set[int] = set()
+    selected_strong_tilt_views = 0
     selected_edge_counts = {"left": 0, "right": 0, "top": 0, "bottom": 0}
     selected_quadrant_counts = np.zeros((2, 2), dtype=np.int32)
     selected_view_quadrant_counts = np.zeros((2, 2), dtype=np.int32)
@@ -840,6 +1053,20 @@ def select_calibration_candidates(
 
             new_cells = candidate_cells - selected_cells
             diversity_bonus += 0.45 * min(1.0, len(new_cells) / 3.0)
+
+            # feed cells still below the per-cell corner minimum, so the final
+            # 80-view selection cannot starve a region the operator did cover
+            if pts.size and int(min_cell_corners) > 0:
+                cand_cell_counts = _corner_grid_cell_counts(
+                    pts,
+                    image_size,
+                    grid_cols=grid_cols,
+                    grid_rows=grid_rows,
+                )
+                hungry = selected_cell_counts < int(min_cell_corners)
+                hungry_hits = int(cand_cell_counts[hungry].sum())
+                if hungry_hits > 0:
+                    diversity_bonus += 0.60 * min(1.0, hungry_hits / 30.0)
 
             if len(selected_view_cells) < min_view_center_cells and view_cell not in selected_view_cells:
                 diversity_bonus += 0.95
@@ -892,6 +1119,13 @@ def select_calibration_candidates(
             if size_bin not in selected_size_bins:
                 diversity_bonus += 0.18
 
+            tilt_bin = _candidate_tilt_bin(metrics)
+            tilt_deg = float(np.nan_to_num(metrics.get("tilt_deg", 0.0), nan=0.0))
+            if tilt_bin not in selected_tilt_bins:
+                diversity_bonus += 0.18
+            if selected_strong_tilt_views < MIN_STRONG_TILT_VIEWS and tilt_deg >= STRONG_TILT_DEG:
+                diversity_bonus += 0.85
+
             new_ids = ids - covered_ids
             diversity_bonus += 0.20 * min(1.0, len(new_ids) / 10.0)
 
@@ -933,6 +1167,12 @@ def select_calibration_candidates(
                 grid_rows=grid_rows,
             )
         )
+        selected_cell_counts += _corner_grid_cell_counts(
+            pts,
+            image_size,
+            grid_cols=grid_cols,
+            grid_rows=grid_rows,
+        )
         if pts.size:
             selected_edge_counts["left"] += int(np.count_nonzero(pts[:, 0] <= edge_fraction * width))
             selected_edge_counts["right"] += int(np.count_nonzero(pts[:, 0] >= (1.0 - edge_fraction) * width))
@@ -944,7 +1184,360 @@ def select_calibration_candidates(
                 selected_quadrant_counts[q_row, q_col] += 1
         selected_radius_bins.add(_candidate_radius_bin(chosen.metrics))
         selected_size_bins.add(_candidate_size_bin(chosen.metrics))
+        selected_tilt_bins.add(_candidate_tilt_bin(chosen.metrics))
+        if float(np.nan_to_num(chosen.metrics.get("tilt_deg", 0.0), nan=0.0)) >= STRONG_TILT_DEG:
+            selected_strong_tilt_views += 1
         covered_ids.update(_charuco_id_set(chosen.det))
+
+    _feed_hungry_cells(
+        selected,
+        remaining,
+        selected_cell_counts,
+        image_size=image_size,
+        grid_cols=grid_cols,
+        grid_rows=grid_rows,
+        min_cell_corners=min_cell_corners,
+        max_extra=target_views,
+    )
+
+    return sorted(selected, key=lambda c: c.frame_index)
+
+
+def _feed_hungry_cells(
+    selected: list[CalibrationCandidate],
+    remaining: list[CalibrationCandidate],
+    selected_cell_counts: np.ndarray,
+    *,
+    image_size: tuple[int, int],
+    grid_cols: int,
+    grid_rows: int,
+    min_cell_corners: int,
+    max_extra: int,
+) -> None:
+    """Guarantee phase for the per-cell corner minimum: any greedy selection
+    optimizes several goals at once and may stop at target_views with
+    individual cells still underfed although the candidate pool has plenty of
+    corners there (observed live 2026-07-05: candidates 35/35 cells >= 40 but
+    the selected 80 views left r1c1 at 13). Appends the candidates that feed
+    the most still-missing corners into hungry cells; mutates all three
+    leading arguments in place."""
+    if int(min_cell_corners) <= 0:
+        return
+    extra = 0
+    while remaining and extra < max_extra:
+        hungry = selected_cell_counts < int(min_cell_corners)
+        if not np.any(hungry):
+            break
+        best_i = -1
+        best_hits = 0
+        for i, cand in enumerate(remaining):
+            pts = _candidate_corner_points(cand)
+            if not pts.size:
+                continue
+            cnts = _corner_grid_cell_counts(
+                pts,
+                image_size,
+                grid_cols=grid_cols,
+                grid_rows=grid_rows,
+            )
+            hits = int(np.minimum(cnts, np.maximum(
+                int(min_cell_corners) - selected_cell_counts, 0
+            ))[hungry].sum())
+            if hits > best_hits:
+                best_hits = hits
+                best_i = i
+        if best_i < 0 or best_hits == 0:
+            break
+        chosen = remaining.pop(best_i)
+        selected.append(chosen)
+        selected_cell_counts += _corner_grid_cell_counts(
+            _candidate_corner_points(chosen),
+            image_size,
+            grid_cols=grid_cols,
+            grid_rows=grid_rows,
+        )
+        extra += 1
+
+
+def _candidate_information_matrix(
+    cand: CalibrationCandidate,
+    board: Any,
+    K: np.ndarray,
+    dist: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Intrinsics information contribution of one view: J_C^T J_C with the
+    per-view pose marginalized out via the Schur complement. Uses the
+    analytic Jacobian from cv2.projectPoints (columns: rvec 3, t 3, fx fy,
+    cx cy, dist n)."""
+    det = cand.det
+    if det.charuco_ids is None or det.charuco_corners is None:
+        return None
+    if det.num_charuco < 6:
+        return None
+    obj = _charuco_object_points(board, det.charuco_ids).astype(np.float64)
+    img = det.charuco_corners.reshape(-1, 2).astype(np.float64)
+    ok, rvec, tvec = cv2.solvePnP(
+        obj.reshape(-1, 1, 3),
+        img.reshape(-1, 1, 2),
+        K,
+        dist,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        return None
+    proj, J = cv2.projectPoints(obj.reshape(-1, 1, 3), rvec, tvec, K, dist)
+    err = np.linalg.norm(proj.reshape(-1, 2) - img, axis=1)
+    if float(np.mean(err)) > 3.0:
+        return None
+    J = np.asarray(J, dtype=np.float64)
+    n_intr = 4 + int(np.asarray(dist).reshape(-1).size)
+    if J.shape[1] < 6 + n_intr:
+        return None
+    Jp = J[:, :6]
+    Jc = J[:, 6:6 + n_intr]
+    Mpp = Jp.T @ Jp
+    Mpc = Jp.T @ Jc
+    Mcc = Jc.T @ Jc
+    return Mcc - Mpc.T @ np.linalg.pinv(Mpp) @ Mpc
+
+
+def select_calibration_candidates_information(
+    candidates: Sequence[CalibrationCandidate],
+    *,
+    target_views: int,
+    min_charuco_corners: int,
+    image_size: tuple[int, int],
+    board: Any,
+    min_edge_charuco_corners: int = MIN_CHARUCO_EDGE_CAPTURE,
+    grid_cols: int = SELECTION_GRID_COLS,
+    grid_rows: int = SELECTION_GRID_ROWS,
+    edge_fraction: float = COVERAGE_EDGE_FRACTION,
+    min_cell_corners: int = MIN_CELL_CORNERS,
+    **heuristic_kwargs: Any,
+) -> list[CalibrationCandidate]:
+    """Information-driven (D-optimal) candidate selection.
+
+    Following Rojtberg & Kuijper (ISMAR'18) / optimal experiment design: a
+    view is worth selecting iff it grows the information volume
+    logdet(M + dM) of the intrinsics. This subsumes the hand-tuned diversity
+    bonuses — near-duplicate views contribute ~zero new information, tilted
+    views are picked automatically because they decorrelate focal length and
+    principal point, and edge corners weigh more because the distortion
+    Jacobian is largest there. The per-cell coverage guarantee stays on top
+    (it is model-agnostic; the Jacobian is conditional on the seed model).
+    Falls back to the heuristic selection if seeding or Jacobians fail.
+    """
+    def _fallback() -> list[CalibrationCandidate]:
+        return select_calibration_candidates(
+            candidates,
+            target_views=target_views,
+            min_charuco_corners=min_charuco_corners,
+            min_edge_charuco_corners=min_edge_charuco_corners,
+            image_size=image_size,
+            grid_cols=grid_cols,
+            grid_rows=grid_rows,
+            edge_fraction=edge_fraction,
+            min_cell_corners=min_cell_corners,
+            **heuristic_kwargs,
+        )
+
+    valid = [
+        c
+        for c in candidates
+        if c.det.charuco_corners is not None
+        and c.det.charuco_ids is not None
+        and (
+            c.det.num_charuco >= min_charuco_corners
+            or (
+                c.det.num_charuco >= min_edge_charuco_corners
+                and _is_fov_edge_candidate(
+                    c.metrics, image_size, edge_fraction=edge_fraction
+                )
+            )
+        )
+    ]
+    if len(valid) <= target_views:
+        return sorted(valid, key=lambda c: c.frame_index)
+
+    # Seed intrinsics for the Jacobians: quick standard5 calibration on a
+    # small heuristically diverse subset. The selection is conditional on
+    # this rough model, which is fine — information geometry changes little
+    # with the seed, and the final calibration refits everything.
+    seed_views = select_calibration_candidates(
+        valid,
+        target_views=12,
+        min_charuco_corners=min_charuco_corners,
+        min_edge_charuco_corners=min_edge_charuco_corners,
+        image_size=image_size,
+        grid_cols=grid_cols,
+        grid_rows=grid_rows,
+        edge_fraction=edge_fraction,
+        min_cell_corners=0,
+        **heuristic_kwargs,
+    )
+    try:
+        _, K0, dist0 = _calibrate_charuco_compat(
+            all_charuco_corners=[c.det.charuco_corners for c in seed_views],
+            all_charuco_ids=[c.det.charuco_ids for c in seed_views],
+            board=board,
+            image_size=image_size,
+            K_init=np.eye(3, dtype=np.float64),
+            dist_init=np.zeros((5, 1), dtype=np.float64),
+            flags=0,
+            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 1e-6),
+        )
+    except Exception:
+        print("[calib_camera] Information selection: seed calibration failed, "
+              "using heuristic selection.")
+        return _fallback()
+
+    infos: list[tuple[CalibrationCandidate, np.ndarray]] = []
+    for cand in valid:
+        dM = _candidate_information_matrix(cand, board, K0, dist0)
+        if dM is not None and np.all(np.isfinite(dM)):
+            infos.append((cand, dM))
+    if len(infos) < target_views:
+        print("[calib_camera] Information selection: too few usable "
+              f"Jacobians ({len(infos)}), using heuristic selection.")
+        return _fallback()
+
+    dim = infos[0][1].shape[0]
+    mean_diag = np.mean([np.diag(dM) for _, dM in infos], axis=0)
+    M = np.diag(np.maximum(mean_diag, 1e-12)) * 1e-6
+
+    selected: list[CalibrationCandidate] = []
+    remaining_info = list(infos)
+    for _ in range(min(target_views, len(remaining_info))):
+        best_i = -1
+        best_gain = -np.inf
+        for i, (_, dM) in enumerate(remaining_info):
+            sign, logdet = np.linalg.slogdet(M + dM)
+            if sign > 0 and logdet > best_gain:
+                best_gain = logdet
+                best_i = i
+        if best_i < 0:
+            break
+        cand, dM = remaining_info.pop(best_i)
+        selected.append(cand)
+        M = M + dM
+    if len(selected) < min(target_views, 8):
+        print("[calib_camera] Information selection: greedy selection "
+              "degenerated, using heuristic selection.")
+        return _fallback()
+
+    selected_cell_counts = np.zeros((grid_rows, grid_cols), dtype=np.int32)
+    for cand in selected:
+        selected_cell_counts += _corner_grid_cell_counts(
+            _candidate_corner_points(cand),
+            image_size,
+            grid_cols=grid_cols,
+            grid_rows=grid_rows,
+        )
+    selected_ids = {id(c) for c in selected}
+    remaining = [c for c in valid if id(c) not in selected_ids]
+
+    # The information greedy concentrates on informative poses and knows
+    # nothing about the hard coverage gates that are later checked on the
+    # SELECTED set (observed live: pool center=154 but only 17 center views
+    # selected; 7 cells left hungry with a capped top-up). Top up every hard
+    # gate explicitly, using the information gain as tie-breaker.
+    _feed_hungry_cells(
+        selected,
+        remaining,
+        selected_cell_counts,
+        image_size=image_size,
+        grid_cols=grid_cols,
+        grid_rows=grid_rows,
+        min_cell_corners=min_cell_corners,
+        max_extra=target_views,
+    )
+
+    info_by_id = {id(c): dM for c, dM in infos}
+
+    def info_gain(cand: CalibrationCandidate) -> float:
+        dM = info_by_id.get(id(cand))
+        if dM is None:
+            return -np.inf
+        sign, logdet = np.linalg.slogdet(M + dM)
+        return logdet if sign > 0 else -np.inf
+
+    def remove_by_identity(pool: list[CalibrationCandidate], item: CalibrationCandidate) -> None:
+        # list.remove() compares via the dataclass __eq__, which chokes on the
+        # numpy array fields ("truth value of an array is ambiguous")
+        for i, c in enumerate(pool):
+            if c is item:
+                pool.pop(i)
+                return
+
+    def top_up(predicate, needed: int) -> None:
+        nonlocal M
+        added = 0
+        while added < needed:
+            pool = [c for c in remaining if predicate(c)]
+            if not pool:
+                break
+            best = max(pool, key=info_gain)
+            remove_by_identity(remaining, best)
+            selected.append(best)
+            dM = info_by_id.get(id(best))
+            if dM is not None:
+                M = M + dM
+            added += 1
+
+    view_grid_cols = int(heuristic_kwargs.get("view_grid_cols", VIEW_CENTER_GRID_COLS))
+    view_grid_rows = int(heuristic_kwargs.get("view_grid_rows", VIEW_CENTER_GRID_ROWS))
+    min_center_views = int(heuristic_kwargs.get("min_center_views", MIN_CENTER_VIEWS))
+    min_view_quadrant_views = int(
+        heuristic_kwargs.get("min_view_quadrant_views", MIN_VIEW_QUADRANT_VIEWS)
+    )
+    min_view_center_cells = int(
+        heuristic_kwargs.get("min_view_center_cells", MIN_VIEW_CENTER_CELLS)
+    )
+    center_half = float(
+        heuristic_kwargs.get("center_view_half_width_norm", CENTER_VIEW_HALF_WIDTH_NORM)
+    )
+
+    def is_center(c: CalibrationCandidate) -> bool:
+        return _is_center_view(c.metrics, center_half_width_norm=center_half)
+
+    n_center = sum(1 for c in selected if is_center(c))
+    top_up(is_center, max(0, min_center_views - n_center))
+
+    def is_strong_tilt(c: CalibrationCandidate) -> bool:
+        return float(
+            np.nan_to_num(c.metrics.get("tilt_deg", 0.0), nan=0.0)
+        ) >= STRONG_TILT_DEG
+
+    n_tilt = sum(1 for c in selected if is_strong_tilt(c))
+    top_up(is_strong_tilt, max(0, MIN_STRONG_TILT_VIEWS - n_tilt))
+
+    def view_quadrant(c: CalibrationCandidate) -> tuple[int, int]:
+        u = float(np.nan_to_num(c.metrics.get("centroid_u_norm", 0.5), nan=0.5))
+        v = float(np.nan_to_num(c.metrics.get("centroid_v_norm", 0.5), nan=0.5))
+        return (int(v >= 0.5), int(u >= 0.5))
+
+    for q_row in range(2):
+        for q_col in range(2):
+            n_q = sum(1 for c in selected if view_quadrant(c) == (q_row, q_col))
+            top_up(
+                lambda c, rc=(q_row, q_col): view_quadrant(c) == rc,
+                max(0, min_view_quadrant_views - n_q),
+            )
+
+    def view_cell(c: CalibrationCandidate) -> tuple[int, int]:
+        return _candidate_view_grid_cell(
+            c.metrics, grid_cols=view_grid_cols, grid_rows=view_grid_rows
+        )
+
+    seen_cells = {view_cell(c) for c in selected}
+    while len(seen_cells) < min_view_center_cells:
+        pool = [c for c in remaining if view_cell(c) not in seen_cells]
+        if not pool:
+            break
+        best = max(pool, key=info_gain)
+        remove_by_identity(remaining, best)
+        selected.append(best)
+        seen_cells.add(view_cell(best))
 
     return sorted(selected, key=lambda c: c.frame_index)
 
@@ -1022,7 +1615,12 @@ def calibrate_charuco_intrinsics(
     criteria: Optional[Tuple[int, int, float]] = None,
     intrinsic_refinement_passes: int = CHARUCO_INTRINSIC_REFINEMENT_PASSES,
     K_seed: Optional[np.ndarray] = None,
+    dist_seed: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
+    """dist_seed (only used together with K_seed): warm-start distortion, e.g.
+    the compact-model solution when fitting the rational model. Starting LM
+    from k4..k6=0 near a good compact fit avoids the degenerate rational
+    solutions with huge near-cancelling numerator/denominator coefficients."""
     if len(calib_images) == 0:
         raise ValueError("No calibration images provided.")
 
@@ -1091,7 +1689,14 @@ def calibrate_charuco_intrinsics(
             effective_flags = int(flags) | int(getattr(cv2, "CALIB_USE_INTRINSIC_GUESS", 0))
         elif K_seed is not None:
             K_init = np.asarray(K_seed, dtype=np.float64).reshape(3, 3)
-            dist_init = np.zeros((max(4, int(dist_coeff_count)), 1), dtype=np.float64)
+            n_coeffs = max(4, int(dist_coeff_count))
+            if dist_seed is not None:
+                seed = np.asarray(dist_seed, dtype=np.float64).reshape(-1)
+                n_coeffs = max(n_coeffs, seed.size)
+                dist_init = np.zeros((n_coeffs, 1), dtype=np.float64)
+                dist_init[: seed.size, 0] = seed
+            else:
+                dist_init = np.zeros((n_coeffs, 1), dtype=np.float64)
             effective_flags = int(flags) | int(getattr(cv2, "CALIB_USE_INTRINSIC_GUESS", 0))
         else:
             K_init = np.eye(3, dtype=np.float64)
@@ -1410,7 +2015,332 @@ def reprojection_error_charuco(
     return mean_px, per_view, stats
 
 
-def calibration_model_specs() -> list[CalibrationModelSpec]:
+def intrinsics_sanity_warnings(
+    K: np.ndarray,
+    factory_K: Optional[np.ndarray] = None,
+) -> list[str]:
+    """Plausibility checks that catch bad capture sessions early.
+
+    |fx-fy| beyond ~2px is non-physical for square pixels and is the
+    rolling-shutter/motion-blur fingerprint; large deviations from the
+    per-unit factory intrinsics point the same way."""
+    warnings: list[str] = []
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
+    if abs(fx - fy) > 2.0:
+        warnings.append(
+            f"fx-fy = {fx - fy:+.1f} px (expected ~0): motion blur / rolling "
+            "shutter during capture suspected - redo with stop-and-hold poses"
+        )
+
+    if factory_K is not None:
+        ffx, ffy = float(factory_K[0, 0]), float(factory_K[1, 1])
+        fcx, fcy = float(factory_K[0, 2]), float(factory_K[1, 2])
+        if abs(fx - ffx) > 10.0 or abs(fy - ffy) > 10.0:
+            warnings.append(
+                f"focal length deviates from factory by ({fx - ffx:+.1f}, "
+                f"{fy - ffy:+.1f}) px (>10)"
+            )
+        if abs(cx - fcx) > 15.0 or abs(cy - fcy) > 15.0:
+            warnings.append(
+                f"principal point deviates from factory by ({cx - fcx:+.1f}, "
+                f"{cy - fcy:+.1f}) px (>15)"
+            )
+
+    return warnings
+
+
+def holdout_model_stats(
+    calib_images: Sequence[np.ndarray],
+    board: Any,
+    aruco_dict: Any,
+    detector_params: Optional[Any],
+    *,
+    min_charuco_corners: int,
+    flags: int,
+    dist_coeff_count: int,
+    K_seed: Optional[np.ndarray] = None,
+    dist_seed: Optional[np.ndarray] = None,
+    n_folds: int = 3,
+) -> Dict[str, Any]:
+    """K-fold hold-out validation for one calibration model.
+
+    The in-sample reprojection error rewards the most flexible model, which is
+    exactly the failure mode we measured (rational8 fitting near-cancelling
+    k2/k6). Calibrating on train folds and scoring corners on held-out images
+    punishes that honestly; the fx/fy/cx/cy spread across folds exposes
+    parameter instability.
+    """
+    n_folds = int(n_folds)
+    images = list(calib_images)
+    if n_folds < 2 or len(images) < 2 * n_folds:
+        return {}
+
+    # Contiguous blocks, not interleaved: capture frames are temporally ordered
+    # and neighbouring frames are near-duplicates, so an i%n split leaks the
+    # test views into training and lets overfitted models look like they
+    # generalize (observed: rational8 scored the best interleaved hold-out).
+    fold_bounds = np.linspace(0, len(images), n_folds + 1).astype(int)
+
+    fold_err: list[float] = []
+    fold_params: list[list[float]] = []
+    for fold in range(n_folds):
+        lo, hi = int(fold_bounds[fold]), int(fold_bounds[fold + 1])
+        train = images[:lo] + images[hi:]
+        test = images[lo:hi]
+        if not test or len(train) < 3:
+            continue
+        try:
+            K_f, dist_f, _, _ = calibrate_charuco_intrinsics(
+                train,
+                board,
+                aruco_dict,
+                detector_params,
+                min_charuco_corners=min_charuco_corners,
+                flags=flags,
+                dist_coeff_count=dist_coeff_count,
+                intrinsic_refinement_passes=0,
+                K_seed=K_seed,
+                dist_seed=dist_seed,
+            )
+        except Exception:
+            continue
+
+        _, _, reproj_stats = reprojection_error_charuco(
+            test,
+            board,
+            aruco_dict,
+            K_f,
+            dist_f,
+            detector_params,
+            min_charuco_corners=min_charuco_corners,
+        )
+        err = float(reproj_stats.get("corner_reprojection_mean_px", float("nan")))
+        if np.isfinite(err):
+            fold_err.append(err)
+        fold_params.append(
+            [float(K_f[0, 0]), float(K_f[1, 1]), float(K_f[0, 2]), float(K_f[1, 2])]
+        )
+
+    if not fold_err or len(fold_params) < 2:
+        return {}
+
+    params_arr = np.asarray(fold_params, dtype=np.float64)
+    spread_px = float(np.max(np.ptp(params_arr, axis=0)))
+    return {
+        "holdout_folds": int(len(fold_err)),
+        "holdout_corner_reprojection_mean_px": float(np.mean(fold_err)),
+        "holdout_corner_reprojection_worst_px": float(np.max(fold_err)),
+        "holdout_intrinsics_spread_px": spread_px,
+    }
+
+
+def detect_charuco_all(
+    calib_images: Sequence[np.ndarray],
+    board: Any,
+    aruco_dict: Any,
+    detector_params: Optional[Any],
+    *,
+    min_charuco_corners: int,
+) -> list[CharucoDetection]:
+    """Detect once, reuse across the model sweep — detection dominates the
+    spatial-holdout cost and is model-independent."""
+    dets: list[CharucoDetection] = []
+    for img in calib_images:
+        det = detect_charuco(img, board, aruco_dict, detector_params)
+        if (
+            det.charuco_corners is None
+            or det.charuco_ids is None
+            or det.num_charuco < min_charuco_corners
+        ):
+            continue
+        dets.append(det)
+    return dets
+
+
+def spatial_holdout_model_stats(
+    calib_images: Sequence[np.ndarray],
+    board: Any,
+    aruco_dict: Any,
+    detector_params: Optional[Any],
+    *,
+    min_charuco_corners: int,
+    flags: int,
+    dist_coeff_count: int,
+    K_seed: Optional[np.ndarray] = None,
+    dist_seed: Optional[np.ndarray] = None,
+    region_cols: int = 3,
+    region_rows: int = 3,
+    min_train_corners_per_view: int = 8,
+    min_test_corners: int = 40,
+    detections: Optional[Sequence[CharucoDetection]] = None,
+    max_views: int = 40,
+) -> Dict[str, Any]:
+    """Leave-REGION-out validation: refit without the corners of one image
+    region, then score the reprojection error exactly there.
+
+    The temporal k-fold hold-out shares the spatial coverage between train and
+    test folds, so a flexible model that extrapolates wildly into thinly
+    covered image regions still scores well (measured 2026-07-05: rational8
+    had the best temporal hold-out AND a -1.8 mm/100mm pose slope caused in
+    the starved lower image half). This metric measures extrapolation
+    quality directly and is the honest overfitting detector for the model
+    sweep.
+    """
+    if not calib_images:
+        return {}
+    image_size = _image_size(calib_images[0])
+    width, height = int(image_size[0]), int(image_size[1])
+
+    if detections is not None:
+        dets = list(detections)
+    else:
+        dets = detect_charuco_all(
+            calib_images,
+            board,
+            aruco_dict,
+            detector_params,
+            min_charuco_corners=min_charuco_corners,
+        )
+    if len(dets) < 3:
+        return {}
+    # evenly subsample: 9 region refits on all 80 views cost minutes per
+    # model; ~40 views give the same regional error signal
+    if int(max_views) > 0 and len(dets) > int(max_views):
+        idx = np.linspace(0, len(dets) - 1, int(max_views)).astype(int)
+        dets = [dets[i] for i in idx]
+
+    if K_seed is not None:
+        K_init = np.asarray(K_seed, dtype=np.float64).reshape(3, 3)
+        n_coeffs = max(4, int(dist_coeff_count))
+        if dist_seed is not None:
+            seed = np.asarray(dist_seed, dtype=np.float64).reshape(-1)
+            n_coeffs = max(n_coeffs, seed.size)
+            dist_init = np.zeros((n_coeffs, 1), dtype=np.float64)
+            dist_init[: seed.size, 0] = seed
+        else:
+            dist_init = np.zeros((n_coeffs, 1), dtype=np.float64)
+        effective_flags = int(flags) | int(getattr(cv2, "CALIB_USE_INTRINSIC_GUESS", 0))
+    else:
+        K_init = np.eye(3, dtype=np.float64)
+        dist_init = np.zeros((max(4, int(dist_coeff_count)), 1), dtype=np.float64)
+        effective_flags = int(flags)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 1e-6)
+    region_err = np.full((region_rows, region_cols), np.nan)
+
+    for r_row in range(region_rows):
+        for r_col in range(region_cols):
+            x0 = r_col * width / region_cols
+            x1 = (r_col + 1) * width / region_cols
+            y0 = r_row * height / region_rows
+            y1 = (r_row + 1) * height / region_rows
+
+            train_corners: list[np.ndarray] = []
+            train_ids: list[np.ndarray] = []
+            test_views: list[tuple[int, np.ndarray, np.ndarray]] = []
+            n_test = 0
+            for det in dets:
+                pts = det.charuco_corners.reshape(-1, 2)
+                ids = det.charuco_ids.reshape(-1)
+                inside = (
+                    (pts[:, 0] >= x0)
+                    & (pts[:, 0] < x1)
+                    & (pts[:, 1] >= y0)
+                    & (pts[:, 1] < y1)
+                )
+                keep = ~inside
+                if int(keep.sum()) < int(min_train_corners_per_view):
+                    continue
+                view_index = len(train_corners)
+                train_corners.append(
+                    np.ascontiguousarray(pts[keep].reshape(-1, 1, 2), dtype=np.float32)
+                )
+                train_ids.append(
+                    np.ascontiguousarray(ids[keep].reshape(-1, 1), dtype=np.int32)
+                )
+                if int(inside.sum()) > 0:
+                    test_views.append((view_index, pts[inside], ids[inside]))
+                    n_test += int(inside.sum())
+
+            if len(train_corners) < 3 or n_test < int(min_test_corners):
+                continue
+
+            try:
+                _, K_f, dist_f = _calibrate_charuco_compat(
+                    all_charuco_corners=train_corners,
+                    all_charuco_ids=train_ids,
+                    board=board,
+                    image_size=image_size,
+                    K_init=K_init.copy(),
+                    dist_init=dist_init.copy(),
+                    flags=effective_flags,
+                    criteria=criteria,
+                )
+            except Exception:
+                continue
+
+            errs: list[float] = []
+            for view_index, test_pts, test_ids in test_views:
+                obj_train = _charuco_object_points(board, train_ids[view_index])
+                img_train = train_corners[view_index].reshape(-1, 1, 2)
+                ok, rvec, tvec = cv2.solvePnP(
+                    obj_train.reshape(-1, 1, 3),
+                    img_train.astype(np.float64),
+                    K_f,
+                    dist_f,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if not ok:
+                    continue
+                obj_test = _charuco_object_points(
+                    board, test_ids.reshape(-1, 1).astype(np.int32)
+                )
+                proj, _ = cv2.projectPoints(
+                    obj_test.reshape(-1, 1, 3), rvec, tvec, K_f, dist_f
+                )
+                errs.extend(
+                    np.linalg.norm(proj.reshape(-1, 2) - test_pts, axis=1).tolist()
+                )
+            if errs:
+                region_err[r_row, r_col] = float(np.mean(errs))
+
+    finite = region_err[np.isfinite(region_err)]
+    if finite.size == 0:
+        return {}
+    worst_idx = np.unravel_index(int(np.nanargmax(region_err)), region_err.shape)
+    return {
+        "spatial_holdout_regions": int(finite.size),
+        "spatial_holdout_mean_px": float(np.mean(finite)),
+        "spatial_holdout_worst_px": float(np.max(finite)),
+        "spatial_holdout_worst_region": f"r{worst_idx[0] + 1}c{worst_idx[1] + 1}",
+        "spatial_holdout_region_err_px": region_err,
+    }
+
+
+# Production model set: no_k3 and the no_tangent variants were diagnostic
+# models from the 2026-07-02 distortion analysis and only slow the sweep down.
+DEFAULT_SWEEP_MODELS = "standard5,rational6,rational8"
+
+
+def calibration_model_specs(
+    model_names: Optional[str] = None,
+) -> list[CalibrationModelSpec]:
+    specs = _all_calibration_model_specs()
+    if not model_names:
+        return specs
+    wanted = [name.strip() for name in str(model_names).split(",") if name.strip()]
+    unknown = [n for n in wanted if n not in {s.name for s in specs}]
+    if unknown:
+        raise ValueError(
+            f"Unknown calibration model(s) {unknown}; "
+            f"available: {[s.name for s in specs]}"
+        )
+    return [s for s in specs if s.name in wanted]
+
+
+def _all_calibration_model_specs() -> list[CalibrationModelSpec]:
     return [
         CalibrationModelSpec(
             name="standard5",
@@ -1423,6 +2353,31 @@ def calibration_model_specs() -> list[CalibrationModelSpec]:
             flags=int(getattr(cv2, "CALIB_FIX_K3", 0)),
             dist_coeff_count=5,
             description="OpenCV k1,k2,p1,p2 with k3 fixed to zero",
+        ),
+        CalibrationModelSpec(
+            name="standard5_no_tangent",
+            flags=int(getattr(cv2, "CALIB_ZERO_TANGENT_DIST", 0)),
+            dist_coeff_count=5,
+            description="OpenCV k1,k2,k3 with tangential distortion zeroed",
+        ),
+        CalibrationModelSpec(
+            name="no_k3_no_tangent",
+            flags=(
+                int(getattr(cv2, "CALIB_FIX_K3", 0))
+                | int(getattr(cv2, "CALIB_ZERO_TANGENT_DIST", 0))
+            ),
+            dist_coeff_count=5,
+            description="OpenCV k1,k2 only (k3 fixed, tangential zeroed)",
+        ),
+        CalibrationModelSpec(
+            name="rational6",
+            flags=(
+                int(getattr(cv2, "CALIB_RATIONAL_MODEL", 0))
+                | int(getattr(cv2, "CALIB_FIX_K5", 0))
+                | int(getattr(cv2, "CALIB_FIX_K6", 0))
+            ),
+            dist_coeff_count=8,
+            description="OpenCV rational model k1,k2,p1,p2,k3,k4 (k5,k6 fixed)",
         ),
         CalibrationModelSpec(
             name="rational8",
@@ -1548,6 +2503,23 @@ def calibration_model_quality_score(stats: Dict[str, Any]) -> float:
         score += 100.0
     if radial_turns > 0:
         score += 2.0 * float(radial_turns)
+
+    # Hold-out terms dominate the in-sample ones when available: generalization
+    # to unseen views is what predicts pose stability, in-sample RMS does not.
+    holdout_px = value("holdout_corner_reprojection_mean_px", float("nan"))
+    if np.isfinite(holdout_px):
+        score += 2.0 * holdout_px
+        score += 0.05 * value("holdout_intrinsics_spread_px", 0.0)
+
+    # Spatial (leave-region-out) hold-out weighs heaviest: it is the only
+    # metric here that measures extrapolation into image regions, which is
+    # where flexible models silently fail (pose-space z-slope) while every
+    # in-sample and temporal-holdout pixel metric rewards them.
+    spatial_mean_px = value("spatial_holdout_mean_px", float("nan"))
+    if np.isfinite(spatial_mean_px):
+        score += 2.0 * spatial_mean_px
+        score += 1.0 * value("spatial_holdout_worst_px", 0.0)
+
     return float(score)
 
 
@@ -1613,6 +2585,53 @@ def draw_text_box(
     return out
 
 
+def _draw_coverage_grid(
+    vis: np.ndarray,
+    coverage: Optional[Dict[str, Any]],
+    min_cell_corners: int = MIN_CELL_CORNERS,
+) -> np.ndarray:
+    """Overlay the corner-coverage grid on the live view. Cells are graded by
+    corner COUNT, not mere touch: empty cells are tinted red, cells below
+    min_cell_corners get an orange border plus their current count so the
+    operator keeps the board there until the cell is actually fed, and only
+    cells at/above the minimum turn green."""
+    if not coverage:
+        return vis
+    counts = np.asarray(coverage.get("grid_counts", []))
+    if counts.ndim != 2 or counts.size == 0:
+        return vis
+
+    rows, cols = counts.shape
+    h, w = vis.shape[:2]
+    red_fill = vis.copy()
+    for row in range(rows):
+        for col in range(cols):
+            x0 = int(round(col * w / cols))
+            x1 = int(round((col + 1) * w / cols))
+            y0 = int(round(row * h / rows))
+            y1 = int(round((row + 1) * h / rows))
+            count = int(counts[row, col])
+            if count >= int(min_cell_corners):
+                cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 170, 0), 1)
+            elif count > 0:
+                cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 150, 255), 2)
+                cv2.putText(
+                    vis,
+                    f"{count}/{int(min_cell_corners)}",
+                    (x0 + 6, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 150, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            else:
+                cv2.rectangle(red_fill, (x0, y0), (x1, y1), (0, 0, 220), -1)
+                cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 0, 220), 2)
+
+    return cv2.addWeighted(red_fill, 0.18, vis, 0.82, 0)
+
+
 def draw_live_overlay(
     frame_bgr: np.ndarray,
     det: Optional[CharucoDetection],
@@ -1627,8 +2646,14 @@ def draw_live_overlay(
     view_coverage: Optional[Dict[str, Any]] = None,
     coverage_ok: bool = False,
     view_coverage_ok: bool = False,
+    sharpness: Optional[float] = None,
+    motion_px: Optional[float] = None,
+    min_cell_corners: int = MIN_CELL_CORNERS,
 ) -> np.ndarray:
     vis = frame_bgr.copy()
+
+    if recording:
+        vis = _draw_coverage_grid(vis, coverage, min_cell_corners=min_cell_corners)
 
     if det is not None:
         if det.aruco_ids is not None and len(det.aruco_ids) > 0:
@@ -1659,21 +2684,40 @@ def draw_live_overlay(
         status = "READY (SPACE starts auto capture)" if found else "NOT FOUND"
         status_color = (0, 255, 0) if found else (0, 0, 255)
 
+    sharp_text = (
+        "-" if sharpness is None or not np.isfinite(sharpness) else f"{sharpness:.0f}"
+    )
+    motion_text = (
+        "-" if motion_px is None or not np.isfinite(motion_px) else f"{motion_px:.2f}"
+    )
+    moving = (
+        motion_px is not None
+        and np.isfinite(motion_px)
+        and motion_px > MAX_CAPTURE_MOTION_PX
+    )
+    quality_line = (
+        f"Sharpness: {sharp_text}  Motion: {motion_text} px/frame "
+        f"(max {MAX_CAPTURE_MOTION_PX:.1f})"
+    )
+    if recording and moving:
+        quality_line += "  -> HOLD STILL, not capturing"
+
     lines = [
         status,
         f"ArUco: {aruco}/{MAX_ARUCO}  ChArUco: {charuco}/{MAX_CHARUCO_CORNERS}",
         f"Candidates: {num_candidates}  Selected: {num_selected}/{target_views}",
+        quality_line,
         _coverage_short_text(coverage),
         _view_coverage_short_text(view_coverage),
         "Keys: SPACE start/stop | T accuracy | R redo | Q/ESC quit",
     ]
 
     if recording and coverage is not None and (not coverage_ok or not view_coverage_ok):
-        missing = coverage_failures(coverage)
+        missing = coverage_failures(coverage, min_cell_corners=min_cell_corners)
         if view_coverage is not None:
             missing += view_center_coverage_failures(view_coverage)
         if missing:
-            lines.append("Need: " + "; ".join(missing[:2]))
+            lines.append("Need: " + "; ".join(missing[:4]))
 
     if have_calibration:
         lines.append("Calibration ready and saved.")
@@ -2027,6 +3071,10 @@ def save_tracking_calibration_npz(
             int(stats.get("coverage_min_cells", 0)),
             dtype=np.int32,
         ),
+        "coverage_min_cell_corners": np.asarray(
+            int(stats.get("coverage_min_cell_corners", 0)),
+            dtype=np.int32,
+        ),
         "coverage_min_edge_corners": np.asarray(
             int(stats.get("coverage_min_edge_corners", 0)),
             dtype=np.int32,
@@ -2069,6 +3117,41 @@ def save_tracking_calibration_npz(
         ),
         "model_quality_score": np.asarray(
             float(stats.get("model_quality_score", np.nan)),
+            dtype=np.float64,
+        ),
+        "spatial_holdout_regions": np.asarray(
+            int(stats.get("spatial_holdout_regions", 0)),
+            dtype=np.int32,
+        ),
+        "spatial_holdout_mean_px": np.asarray(
+            float(stats.get("spatial_holdout_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "spatial_holdout_worst_px": np.asarray(
+            float(stats.get("spatial_holdout_worst_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "spatial_holdout_worst_region": np.asarray(
+            str(stats.get("spatial_holdout_worst_region", ""))
+        ),
+        "spatial_holdout_region_err_px": np.asarray(
+            stats.get("spatial_holdout_region_err_px", np.zeros((0, 0))),
+            dtype=np.float64,
+        ),
+        "holdout_folds": np.asarray(
+            int(stats.get("holdout_folds", 0)),
+            dtype=np.int32,
+        ),
+        "holdout_corner_reprojection_mean_px": np.asarray(
+            float(stats.get("holdout_corner_reprojection_mean_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "holdout_corner_reprojection_worst_px": np.asarray(
+            float(stats.get("holdout_corner_reprojection_worst_px", np.nan)),
+            dtype=np.float64,
+        ),
+        "holdout_intrinsics_spread_px": np.asarray(
+            float(stats.get("holdout_intrinsics_spread_px", np.nan)),
             dtype=np.float64,
         ),
         "dist_coeff_abs_max": np.asarray(
@@ -2184,11 +3267,76 @@ def start_realsense(
     config = rs.config()
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
     profile = pipeline.start(config)
+    disable_realsense_ir_projector(profile, log_prefix="[calib_camera]")
 
     for _ in range(15):
         pipeline.wait_for_frames()
 
     return pipeline, profile
+
+
+def disable_realsense_ir_projector(
+    profile: Any,
+    *,
+    log_prefix: str = "[calib_camera]",
+) -> dict[str, Any]:
+    """Best-effort guard against IR speckle during visual calibration.
+
+    The camera calibration uses only the colour stream, but explicitly forcing
+    the depth-module emitter/laser off makes the capture state unambiguous and
+    protects against persistent device settings from a previous depth session.
+    """
+    result: dict[str, Any] = {
+        "attempted": False,
+        "emitter_disabled": False,
+        "laser_disabled": False,
+        "errors": [],
+    }
+    try:
+        import pyrealsense2 as rs
+    except ImportError:
+        result["errors"].append("pyrealsense2 unavailable")
+        return result
+
+    if profile is None:
+        result["errors"].append("no active profile")
+        return result
+
+    try:
+        device = profile.get_device()
+        sensors = list(device.query_sensors())
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        return result
+
+    option_specs = (
+        ("emitter_enabled", "emitter_disabled"),
+        ("laser_power", "laser_disabled"),
+    )
+    for sensor in sensors:
+        for option_name, result_key in option_specs:
+            option = getattr(rs.option, option_name, None)
+            if option is None:
+                continue
+            try:
+                if not sensor.supports(option):
+                    continue
+                result["attempted"] = True
+                sensor.set_option(option, 0.0)
+                result[result_key] = True
+            except Exception as exc:
+                result["errors"].append(f"{option_name}: {exc}")
+
+    if result["attempted"]:
+        print(
+            f"{log_prefix} RealSense IR projector guard: "
+            f"emitter_off={int(bool(result['emitter_disabled']))} "
+            f"laser_off={int(bool(result['laser_disabled']))}"
+        )
+    elif result["errors"]:
+        print(f"{log_prefix} RealSense IR projector guard skipped: {result['errors'][0]}")
+
+    return result
 
 
 def get_realsense_factory_intrinsics(
@@ -2291,6 +3439,7 @@ def save_calibration_diagnostics(
         "edge_margin_norm",
         "radius_norm",
         "corner_radius_norm_max",
+        "tilt_deg",
         "grid_col",
         "grid_row",
         "corner_grid_cells",
@@ -2381,6 +3530,36 @@ def write_model_comparison_csv(path: Path, rows: Sequence[dict[str, Any]]) -> No
         writer.writerows(rows)
 
 
+def select_images_dir_via_dialog(start_dir: Optional[Path] = None) -> Optional[Path]:
+    """Open a Qt folder picker and return the chosen directory, or None on cancel."""
+    try:
+        from PySide6.QtWidgets import QApplication, QFileDialog
+    except ImportError as exc:
+        try:
+            from PyQt5.QtWidgets import QApplication, QFileDialog
+        except ImportError:
+            raise RuntimeError(
+                "Offline mode needs PySide6 or PyQt5 for the folder dialog. "
+                "Alternatively pass --images-dir explicitly."
+            ) from exc
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+
+    if start_dir is None:
+        start_dir = Path(__file__).resolve().parent
+
+    directory = QFileDialog.getExistingDirectory(
+        None,
+        "Ordner mit gespeicherten Kalibrierbildern (selected views) waehlen",
+        str(start_dir),
+        QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks,
+    )
+
+    return Path(directory) if directory else None
+
+
 def collect_image_paths(images_dir: Path) -> list[Path]:
     images_dir = Path(images_dir).expanduser().resolve()
     if not images_dir.exists():
@@ -2408,6 +3587,8 @@ def run_model_sweep_for_images(
     output_path: Path,
     min_capture_corners: int,
     intrinsic_refinement_passes: int = CHARUCO_INTRINSIC_REFINEMENT_PASSES,
+    holdout_folds: int = 3,
+    model_names: Optional[str] = DEFAULT_SWEEP_MODELS,
 ) -> Path:
     output_path = Path(output_path).expanduser().resolve()
     board, aruco_dict, detector_params = make_charuco_board()
@@ -2416,9 +3597,22 @@ def run_model_sweep_for_images(
     model_rows: list[dict[str, Any]] = []
     first_success: Path | None = None
     best_success: tuple[np.ndarray, np.ndarray, float, dict[str, Any]] | None = None
+    compact_warm_start: Optional[tuple[np.ndarray, np.ndarray]] = None
+    spatial_dets = detect_charuco_all(
+        calib_images,
+        board,
+        aruco_dict,
+        detector_params,
+        min_charuco_corners=min_capture_corners,
+    )
 
-    for spec in calibration_model_specs():
+    for spec in calibration_model_specs(model_names):
         print(f"[calib_camera] Model {spec.name}: {spec.description}")
+        is_rational = "rational" in spec.name
+        seed_K = compact_warm_start[0] if (is_rational and compact_warm_start) else None
+        seed_dist = compact_warm_start[1] if (is_rational and compact_warm_start) else None
+        if seed_K is not None:
+            print("[calib_camera]   warm start from compact-model solution")
         try:
             K, dist, rms, stats = calibrate_charuco_intrinsics(
                 calib_images=calib_images,
@@ -2429,7 +3623,14 @@ def run_model_sweep_for_images(
                 flags=spec.flags,
                 dist_coeff_count=spec.dist_coeff_count,
                 intrinsic_refinement_passes=intrinsic_refinement_passes,
+                K_seed=seed_K,
+                dist_seed=seed_dist,
             )
+            if not is_rational and compact_warm_start is None:
+                compact_warm_start = (
+                    np.asarray(K, dtype=np.float64).reshape(3, 3).copy(),
+                    np.asarray(dist, dtype=np.float64).reshape(-1).copy(),
+                )
             reproj_mean_px, selected_reproj, reproj_stats = reprojection_error_charuco(
                 calib_images,
                 board=board,
@@ -2443,6 +3644,33 @@ def run_model_sweep_for_images(
                 float("nan") if value is None else float(value)
                 for value in selected_reproj
             ]
+            holdout_stats = holdout_model_stats(
+                calib_images,
+                board,
+                aruco_dict,
+                detector_params,
+                min_charuco_corners=min_capture_corners,
+                flags=spec.flags,
+                dist_coeff_count=spec.dist_coeff_count,
+                K_seed=seed_K,
+                dist_seed=seed_dist,
+                n_folds=holdout_folds,
+            )
+            stats.update(holdout_stats)
+            stats.update(
+                spatial_holdout_model_stats(
+                    calib_images,
+                    board,
+                    aruco_dict,
+                    detector_params,
+                    min_charuco_corners=min_capture_corners,
+                    flags=spec.flags,
+                    dist_coeff_count=spec.dist_coeff_count,
+                    K_seed=seed_K,
+                    dist_seed=seed_dist,
+                    detections=spatial_dets,
+                )
+            )
             radial_stats = radial_plausibility_stats(K, dist, image_size)
             dist_flat = np.asarray(dist, dtype=np.float64).reshape(-1)
             stats.update(
@@ -2512,12 +3740,31 @@ def run_model_sweep_for_images(
                     "radial_residual_abs_mean_px": stats.get(
                         "radial_residual_abs_mean_px"
                     ),
+                    "holdout_folds": stats.get("holdout_folds"),
+                    "holdout_corner_reprojection_mean_px": stats.get(
+                        "holdout_corner_reprojection_mean_px"
+                    ),
+                    "holdout_corner_reprojection_worst_px": stats.get(
+                        "holdout_corner_reprojection_worst_px"
+                    ),
+                    "holdout_intrinsics_spread_px": stats.get(
+                        "holdout_intrinsics_spread_px"
+                    ),
+                    "spatial_holdout_mean_px": stats.get("spatial_holdout_mean_px"),
+                    "spatial_holdout_worst_px": stats.get("spatial_holdout_worst_px"),
+                    "spatial_holdout_worst_region": stats.get(
+                        "spatial_holdout_worst_region"
+                    ),
                     **radial_stats,
                 }
             )
             print(
                 "[calib_camera]   "
                 f"rms={float(rms):.6f} reproj={float(reproj_mean_px):.6f}px "
+                f"holdout={float(stats.get('holdout_corner_reprojection_mean_px', float('nan'))):.6f}px "
+                f"spatial={float(stats.get('spatial_holdout_mean_px', float('nan'))):.3f}px"
+                f"/worst {float(stats.get('spatial_holdout_worst_px', float('nan'))):.3f}px"
+                f"@{stats.get('spatial_holdout_worst_region', '-')} "
                 f"score={float(stats['model_quality_score']):.6f} "
                 f"dist_n={dist_flat.size} radial_turns={radial_stats['radial_turn_count']} "
                 f"positive={radial_stats['radial_positive']}"
@@ -2526,6 +3773,8 @@ def run_model_sweep_for_images(
                 "[calib_camera]   saved -> "
                 + " | ".join(str(path) for path in save_paths)
             )
+            for warning in intrinsics_sanity_warnings(K):
+                print(f"[calib_camera]   WARNING: {warning}")
         except Exception as exc:
             model_rows.append(
                 {
@@ -2584,6 +3833,7 @@ def run_live_calibration(
     coverage_grid_cols: int = SELECTION_GRID_COLS,
     coverage_grid_rows: int = SELECTION_GRID_ROWS,
     min_coverage_cells: int = MIN_COVERAGE_CELLS,
+    min_cell_corners: int = MIN_CELL_CORNERS,
     min_edge_corners: int = MIN_EDGE_CORNERS,
     min_quadrant_corners: int = MIN_QUADRANT_CORNERS,
     min_corner_radius_norm: float = MIN_CORNER_RADIUS_NORM,
@@ -2595,6 +3845,9 @@ def run_live_calibration(
     center_view_half_width_norm: float = CENTER_VIEW_HALF_WIDTH_NORM,
     force_save_insufficient_coverage: bool = False,
     intrinsic_refinement_passes: int = CHARUCO_INTRINSIC_REFINEMENT_PASSES,
+    holdout_folds: int = 3,
+    selection_mode: str = "information",
+    model_names: Optional[str] = DEFAULT_SWEEP_MODELS,
 ) -> Path:
     output_path = Path(output_path).expanduser().resolve()
     target_views = max(3, int(target_views))
@@ -2605,6 +3858,7 @@ def run_live_calibration(
     coverage_grid_cols = max(2, int(coverage_grid_cols))
     coverage_grid_rows = max(2, int(coverage_grid_rows))
     min_coverage_cells = max(1, min(int(min_coverage_cells), coverage_grid_cols * coverage_grid_rows))
+    min_cell_corners = max(0, int(min_cell_corners))
     view_grid_cols = max(2, int(view_grid_cols))
     view_grid_rows = max(2, int(view_grid_rows))
     min_view_center_cells = max(1, min(int(min_view_center_cells), view_grid_cols * view_grid_rows))
@@ -2641,6 +3895,8 @@ def run_live_calibration(
 
         last_frame: Optional[np.ndarray] = None
         frame_index = 0
+        prev_corner_map: dict[int, np.ndarray] = {}
+        motion_px = float("nan")
 
         while True:
             frame = get_color_frame_bgr(pipeline)
@@ -2664,6 +3920,14 @@ def run_live_calibration(
             )
             found = bool(last_det.num_charuco >= MIN_CHARUCO_LIVE_FOUND)
 
+            if got_new_frame:
+                cur_corner_map = _charuco_corner_map(last_det)
+                motion_px = _median_corner_motion_px(prev_corner_map, cur_corner_map)
+                prev_corner_map = cur_corner_map
+            board_still = bool(
+                np.isfinite(motion_px) and motion_px <= MAX_CAPTURE_MOTION_PX
+            )
+
             now_s = time.monotonic()
             live_metrics = _candidate_metrics(frame, last_det)
             edge_capture_ready = bool(
@@ -2682,6 +3946,7 @@ def run_live_calibration(
                 state["recording"]
                 and got_new_frame
                 and capture_ready
+                and board_still
                 and len(state["candidates"]) < max_candidates
                 and now_s - float(state["last_candidate_time_s"]) >= auto_capture_interval_s
             )
@@ -2736,6 +4001,7 @@ def run_live_calibration(
                 coverage_ok=not coverage_failures(
                     state["coverage"] or {},
                     min_coverage_cells=min_coverage_cells,
+                    min_cell_corners=min_cell_corners,
                     min_edge_corners=min_edge_corners,
                     min_quadrant_corners=min_quadrant_corners,
                     min_corner_radius_norm=min_corner_radius_norm,
@@ -2746,6 +4012,9 @@ def run_live_calibration(
                     min_center_views=min_center_views,
                     min_view_quadrant_views=min_view_quadrant_views,
                 ),
+                sharpness=float(live_metrics.get("sharpness", float("nan"))),
+                motion_px=motion_px,
+                min_cell_corners=min_cell_corners,
             )
 
             cv2.imshow(WINDOW_NAME, vis)
@@ -2806,6 +4075,7 @@ def run_live_calibration(
                 print(
                     "[calib_camera] Required coverage: "
                     f"{min_coverage_cells}/{coverage_grid_cols * coverage_grid_rows} grid cells, "
+                    f"{min_cell_corners}+ corners in EVERY grid cell, "
                     f"{min_edge_corners}+ corners near each edge, "
                     f"{min_quadrant_corners}+ corners in each quadrant, "
                     f"Rmax>={min_corner_radius_norm:.2f}."
@@ -2829,7 +4099,15 @@ def run_live_calibration(
                 f"{len(state['candidates'])} candidates."
             )
 
-            selected_candidates = select_calibration_candidates(
+            select_fn = (
+                select_calibration_candidates_information
+                if selection_mode == "information"
+                else select_calibration_candidates
+            )
+            select_extra = (
+                {"board": board} if selection_mode == "information" else {}
+            )
+            selected_candidates = select_fn(
                 state["candidates"],
                 target_views=target_views,
                 min_charuco_corners=min_capture_corners,
@@ -2837,6 +4115,7 @@ def run_live_calibration(
                 image_size=_image_size(frame),
                 grid_cols=coverage_grid_cols,
                 grid_rows=coverage_grid_rows,
+                min_cell_corners=min_cell_corners,
                 min_edge_corners=min_edge_corners,
                 min_quadrant_corners=min_quadrant_corners,
                 view_grid_cols=view_grid_cols,
@@ -2845,6 +4124,7 @@ def run_live_calibration(
                 min_center_views=min_center_views,
                 min_view_quadrant_views=min_view_quadrant_views,
                 center_view_half_width_norm=center_view_half_width_norm,
+                **select_extra,
             )
             state["selected_candidates"] = selected_candidates
 
@@ -2865,6 +4145,7 @@ def run_live_calibration(
             candidate_failures = coverage_failures(
                 candidate_coverage,
                 min_coverage_cells=min_coverage_cells,
+                min_cell_corners=min_cell_corners,
                 min_edge_corners=min_edge_corners,
                 min_quadrant_corners=min_quadrant_corners,
                 min_corner_radius_norm=min_corner_radius_norm,
@@ -2878,6 +4159,7 @@ def run_live_calibration(
             selected_failures = coverage_failures(
                 selected_coverage,
                 min_coverage_cells=min_coverage_cells,
+                min_cell_corners=min_cell_corners,
                 min_edge_corners=min_edge_corners,
                 min_quadrant_corners=min_quadrant_corners,
                 min_corner_radius_norm=min_corner_radius_norm,
@@ -2935,6 +4217,20 @@ def run_live_calibration(
                 f"{len(selected_candidates)}/{target_views} views from "
                 f"{len(state['candidates'])} candidates."
             )
+            selected_sharpness = np.asarray(
+                [
+                    float(cand.metrics.get("sharpness", float("nan")))
+                    for cand in selected_candidates
+                ],
+                dtype=np.float64,
+            )
+            if np.any(np.isfinite(selected_sharpness)):
+                print(
+                    "[calib_camera] Selected sharpness "
+                    f"median={np.nanmedian(selected_sharpness):.0f} "
+                    f"min={np.nanmin(selected_sharpness):.0f} "
+                    "(known-good session: median ~6500)"
+                )
 
             print("[calib_camera] Calibrating intrinsics model sweep...")
 
@@ -3032,6 +4328,7 @@ def run_live_calibration(
                 "view_center_min_quadrant_views": int(min_view_quadrant_views),
                 "view_center_half_width_norm": float(center_view_half_width_norm),
                 "coverage_min_cells": int(min_coverage_cells),
+                "coverage_min_cell_corners": int(min_cell_corners),
                 "coverage_min_edge_corners": int(min_edge_corners),
                 "coverage_min_quadrant_corners": int(min_quadrant_corners),
                 "coverage_min_corner_radius_norm": float(min_corner_radius_norm),
@@ -3045,9 +4342,25 @@ def run_live_calibration(
             first_success: tuple[np.ndarray, np.ndarray, float, dict[str, Any], Path] | None = None
             best_success: tuple[np.ndarray, np.ndarray, float, dict[str, Any], Path] | None = None
             primary_success = False
+            compact_warm_start: Optional[tuple[np.ndarray, np.ndarray]] = None
+            # detections already exist on the candidates — reuse them for the
+            # spatial holdout instead of re-detecting per model
+            spatial_dets = [
+                c.det
+                for c in selected_candidates
+                if c.det.charuco_corners is not None
+                and c.det.charuco_ids is not None
+                and c.det.num_charuco >= min_edge_capture_corners
+            ]
 
-            for spec in calibration_model_specs():
+            for spec in calibration_model_specs(model_names):
                 print(f"[calib_camera] Model {spec.name}: {spec.description}")
+                is_rational = "rational" in spec.name
+                if is_rational and compact_warm_start is not None:
+                    seed_K, seed_dist = compact_warm_start
+                    print("[calib_camera]   warm start from compact-model solution")
+                else:
+                    seed_K, seed_dist = factory_K, None
                 try:
                     K, dist, rms, stats = calibrate_charuco_intrinsics(
                         calib_images=selected_images,
@@ -3058,8 +4371,14 @@ def run_live_calibration(
                         flags=spec.flags,
                         dist_coeff_count=spec.dist_coeff_count,
                         intrinsic_refinement_passes=intrinsic_refinement_passes,
-                        K_seed=factory_K,
+                        K_seed=seed_K,
+                        dist_seed=seed_dist,
                     )
+                    if not is_rational and compact_warm_start is None:
+                        compact_warm_start = (
+                            np.asarray(K, dtype=np.float64).reshape(3, 3).copy(),
+                            np.asarray(dist, dtype=np.float64).reshape(-1).copy(),
+                        )
 
                     reproj_mean_px, selected_reproj, reproj_stats = reprojection_error_charuco(
                         selected_images,
@@ -3074,6 +4393,34 @@ def run_live_calibration(
                         float("nan") if value is None else float(value)
                         for value in selected_reproj
                     ]
+
+                    holdout_stats = holdout_model_stats(
+                        selected_images,
+                        board,
+                        aruco_dict,
+                        detector_params,
+                        min_charuco_corners=min_edge_capture_corners,
+                        flags=spec.flags,
+                        dist_coeff_count=spec.dist_coeff_count,
+                        K_seed=seed_K,
+                        dist_seed=seed_dist,
+                        n_folds=holdout_folds,
+                    )
+                    stats.update(holdout_stats)
+                    stats.update(
+                        spatial_holdout_model_stats(
+                            selected_images,
+                            board,
+                            aruco_dict,
+                            detector_params,
+                            min_charuco_corners=min_edge_capture_corners,
+                            flags=spec.flags,
+                            dist_coeff_count=spec.dist_coeff_count,
+                            K_seed=seed_K,
+                            dist_seed=seed_dist,
+                            detections=spatial_dets,
+                        )
+                    )
 
                     if diagnostics_dir is None:
                         diagnostics_dir = save_calibration_diagnostics(
@@ -3169,12 +4516,35 @@ def run_live_calibration(
                             "radial_residual_abs_mean_px": stats.get(
                                 "radial_residual_abs_mean_px"
                             ),
+                            "holdout_folds": stats.get("holdout_folds"),
+                            "holdout_corner_reprojection_mean_px": stats.get(
+                                "holdout_corner_reprojection_mean_px"
+                            ),
+                            "holdout_corner_reprojection_worst_px": stats.get(
+                                "holdout_corner_reprojection_worst_px"
+                            ),
+                            "holdout_intrinsics_spread_px": stats.get(
+                                "holdout_intrinsics_spread_px"
+                            ),
+                            "spatial_holdout_mean_px": stats.get(
+                                "spatial_holdout_mean_px"
+                            ),
+                            "spatial_holdout_worst_px": stats.get(
+                                "spatial_holdout_worst_px"
+                            ),
+                            "spatial_holdout_worst_region": stats.get(
+                                "spatial_holdout_worst_region"
+                            ),
                             **radial_stats,
                         }
                     )
                     print(
                         "[calib_camera]   "
                         f"rms={float(rms):.6f} reproj={float(reproj_mean_px):.6f}px "
+                        f"holdout={float(stats.get('holdout_corner_reprojection_mean_px', float('nan'))):.6f}px "
+                        f"spatial={float(stats.get('spatial_holdout_mean_px', float('nan'))):.3f}px"
+                        f"/worst {float(stats.get('spatial_holdout_worst_px', float('nan'))):.3f}px"
+                        f"@{stats.get('spatial_holdout_worst_region', '-')} "
                         f"score={float(stats['model_quality_score']):.6f} "
                         f"dist_n={dist_flat.size} radial_turns={radial_stats['radial_turn_count']} "
                         f"positive={radial_stats['radial_positive']}"
@@ -3183,6 +4553,8 @@ def run_live_calibration(
                         "[calib_camera]   saved -> "
                         + " | ".join(str(path) for path in save_paths)
                     )
+                    for warning in intrinsics_sanity_warnings(K, factory_K):
+                        print(f"[calib_camera]   WARNING: {warning}")
                 except Exception as exc:
                     model_rows.append(
                         {
@@ -3271,6 +4643,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Run the model sweep offline on images from this directory instead of opening the camera.",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Offline mode: pick the folder with saved calibration images "
+            "(e.g. a selected_views directory) via a Qt folder dialog, then run "
+            "the model sweep on those images. Combine with --images-dir to skip the dialog."
+        ),
+    )
     parser.add_argument("--width", type=int, default=REALSENSE_WIDTH)
     parser.add_argument("--height", type=int, default=REALSENSE_HEIGHT)
     parser.add_argument("--fps", type=int, default=REALSENSE_FPS)
@@ -3311,6 +4692,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of candidates to keep during one recording.",
     )
     parser.add_argument(
+        "--holdout-folds",
+        type=int,
+        default=3,
+        help=(
+            "Number of cross-validation folds for the model-selection score. "
+            "Each model is recalibrated on train folds and scored on held-out "
+            "views, so overfitted distortion models lose. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--charuco-refinement-passes",
         type=int,
         default=CHARUCO_INTRINSIC_REFINEMENT_PASSES,
@@ -3337,6 +4728,37 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=MIN_COVERAGE_CELLS,
         help="Minimum covered corner-grid cells required before saving.",
+    )
+    parser.add_argument(
+        "--models",
+        default=DEFAULT_SWEEP_MODELS,
+        help=(
+            "Comma-separated calibration models for the sweep "
+            "(default: production set). Available: standard5, no_k3, "
+            "standard5_no_tangent, no_k3_no_tangent, rational6, rational8. "
+            "Empty string = all."
+        ),
+    )
+    parser.add_argument(
+        "--selection-mode",
+        choices=("information", "heuristic"),
+        default="information",
+        help=(
+            "View selection strategy: 'information' = D-optimal greedy on the "
+            "intrinsics information matrix (Rojtberg & Kuijper ISMAR'18; "
+            "auto-diversity, tilt and edge weighting from the Jacobian), "
+            "'heuristic' = legacy hand-tuned diversity bonuses."
+        ),
+    )
+    parser.add_argument(
+        "--min-cell-corners",
+        type=int,
+        default=MIN_CELL_CORNERS,
+        help=(
+            "Minimum ChArUco corner observations required in EVERY coverage "
+            "grid cell before saving (0 disables). Prevents captures whose "
+            "distortion is extrapolated in whole image regions."
+        ),
     )
     parser.add_argument(
         "--min-edge-corners",
@@ -3395,7 +4817,7 @@ def parse_args() -> argparse.Namespace:
         default=CENTER_VIEW_HALF_WIDTH_NORM,
         help=(
             "Half-width of the accepted central board-center box in normalized "
-            "half-FOV coordinates. 0.25 means roughly the central 25% of half-width/height."
+            "half-FOV coordinates. 0.25 means roughly the central 25%% of half-width/height."
         ),
     )
     parser.add_argument(
@@ -3413,14 +4835,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.images_dir is not None:
-        image_paths = collect_image_paths(args.images_dir)
-        print(f"[calib_camera] Offline model sweep from {len(image_paths)} images in {args.images_dir}")
+    images_dir = args.images_dir
+    if args.offline and images_dir is None:
+        images_dir = select_images_dir_via_dialog()
+        if images_dir is None:
+            print("[calib_camera] Offline mode cancelled: no folder selected.")
+            return
+    if images_dir is not None:
+        image_paths = collect_image_paths(images_dir)
+        print(f"[calib_camera] Offline model sweep from {len(image_paths)} images in {images_dir}")
         saved_path = run_model_sweep_for_images(
             calib_images=load_images(image_paths),
             output_path=args.output,
             min_capture_corners=args.min_corners,
             intrinsic_refinement_passes=args.charuco_refinement_passes,
+            holdout_folds=args.holdout_folds,
+            model_names=args.models,
         )
         print(f"[calib_camera] Done: {saved_path}")
         return
@@ -3439,6 +4869,7 @@ def main() -> None:
         coverage_grid_cols=args.coverage_grid_cols,
         coverage_grid_rows=args.coverage_grid_rows,
         min_coverage_cells=args.min_coverage_cells,
+        min_cell_corners=args.min_cell_corners,
         min_edge_corners=args.min_edge_corners,
         min_quadrant_corners=args.min_quadrant_corners,
         min_corner_radius_norm=args.min_corner_radius_norm,
@@ -3450,6 +4881,9 @@ def main() -> None:
         center_view_half_width_norm=args.center_view_half_width_norm,
         force_save_insufficient_coverage=args.force_save,
         intrinsic_refinement_passes=args.charuco_refinement_passes,
+        holdout_folds=args.holdout_folds,
+        selection_mode=args.selection_mode,
+        model_names=args.models,
     )
     print(f"[calib_camera] Done: {saved_path}")
 

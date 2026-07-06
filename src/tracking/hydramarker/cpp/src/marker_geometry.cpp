@@ -1,5 +1,6 @@
 #include "marker_geometry.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
@@ -40,6 +41,11 @@ double readDoubleOrDefault(
     value >> out;
     return out;
 }
+
+// Margins added around the exported marker band so that template windows of
+// border corners are not masked away (matches the validated A1 prototype).
+constexpr double kBandAxialMarginMm   = 4.0;
+constexpr double kBandAngularMarginRad = 0.35;
 
 } // namespace
 
@@ -109,6 +115,96 @@ MarkerGeometry MarkerGeometry::loadFromJson(const std::string& path) {
     }
 
     MarkerGeometry geometry;
+
+    // Surface-model loading shared by both exit paths (explicit SfM corners
+    // and planar fallback).  Must run after the corner coordinates are
+    // filled because the planar band is derived from the corner bbox.
+    const auto load_surface_model = [&fs, &geometry]() {
+        SurfaceModel sm;
+
+        const cv::FileNode surface_node = fs["surface_model"];
+        std::string surface_type;
+        if (!surface_node.empty()) {
+            surface_node["type"] >> surface_type;
+        }
+
+        if (surface_type == "cylinder") {
+            const cv::FileNode fitted = surface_node["fitted"];
+            if (!fitted.empty()) {
+                std::vector<double> p0, d, e1, ax, th;
+                double r = 0.0;
+                double rms = 0.0;
+                fitted["axis_point_mm"] >> p0;
+                fitted["axis_dir"] >> d;
+                fitted["radial_ref_dir"] >> e1;
+                fitted["radius_mm"] >> r;
+                fitted["fit_rms_mm"] >> rms;
+                fitted["axial_range_mm"] >> ax;
+                fitted["angular_range_rad"] >> th;
+
+                if (p0.size() == 3 && d.size() == 3 && e1.size() == 3 &&
+                    ax.size() == 2 && th.size() == 2 && r > 0.0 &&
+                    cv::norm(cv::Vec3d(d[0], d[1], d[2])) > 1e-9) {
+                    sm.type = SurfaceModel::Type::Cylinder;
+                    sm.point = cv::Vec3d(p0[0], p0[1], p0[2]);
+                    const cv::Vec3d dd(d[0], d[1], d[2]);
+                    sm.dir = dd / cv::norm(dd);
+                    const cv::Vec3d ee(e1[0], e1[1], e1[2]);
+                    sm.radial_ref = ee / cv::norm(ee);
+                    sm.radius_mm = r;
+                    sm.fit_rms_mm = rms;
+                    sm.band_a_min = ax[0] - kBandAxialMarginMm;
+                    sm.band_a_max = ax[1] + kBandAxialMarginMm;
+                    sm.band_b_min = th[0] - kBandAngularMarginRad;
+                    sm.band_b_max = th[1] + kBandAngularMarginRad;
+                }
+            }
+        }
+
+        // Plane fallback based on the ACTUAL tracked geometry: when every
+        // valid corner lies in the z = 0 marker plane, the surface is that
+        // plane — regardless of a declared (future) curved mounting that
+        // has no fitted numbers yet.  marker_type is ignored on purpose:
+        // a stale "surface_model: cylinder" without "fitted" must not
+        // disable the measurement for a marker whose geometry is planar.
+        if (sm.type == SurfaceModel::Type::None) {
+            constexpr double kPlanarTolMm = 0.2;
+            double x_min = 0.0, x_max = 0.0, y_min = 0.0, y_max = 0.0;
+            bool first = true;
+            bool planar_ok = true;
+            for (size_t i = 0; i < geometry.corner_xyz_mm_.size(); ++i) {
+                if (!geometry.corner_valid_[i]) continue;
+                const cv::Point3f& p = geometry.corner_xyz_mm_[i];
+                if (std::abs(static_cast<double>(p.z)) > kPlanarTolMm) {
+                    planar_ok = false;
+                    break;
+                }
+                if (first) {
+                    x_min = x_max = p.x;
+                    y_min = y_max = p.y;
+                    first = false;
+                } else {
+                    x_min = std::min(x_min, static_cast<double>(p.x));
+                    x_max = std::max(x_max, static_cast<double>(p.x));
+                    y_min = std::min(y_min, static_cast<double>(p.y));
+                    y_max = std::max(y_max, static_cast<double>(p.y));
+                }
+            }
+            if (!first && planar_ok) {
+                sm.type = SurfaceModel::Type::Plane;
+                sm.point = cv::Vec3d(0.0, 0.0, 0.0);
+                sm.dir = cv::Vec3d(0.0, 0.0, 1.0);
+                sm.basis_u = cv::Vec3d(1.0, 0.0, 0.0);
+                sm.basis_v = cv::Vec3d(0.0, 1.0, 0.0);
+                sm.band_a_min = x_min - kBandAxialMarginMm;
+                sm.band_a_max = x_max + kBandAxialMarginMm;
+                sm.band_b_min = y_min - kBandAxialMarginMm;
+                sm.band_b_max = y_max + kBandAxialMarginMm;
+            }
+        }
+
+        geometry.surface_model_ = sm;
+    };
 
     fs["corner_rows"] >> geometry.corner_rows_;
     fs["corner_cols"] >> geometry.corner_cols_;
@@ -234,6 +330,7 @@ MarkerGeometry MarkerGeometry::loadFromJson(const std::string& path) {
             geometry.corner_valid_[idx] = 1;
         }
 
+        load_surface_model();
         return geometry;
     }
 
@@ -287,6 +384,7 @@ MarkerGeometry MarkerGeometry::loadFromJson(const std::string& path) {
         }
     }
 
+    load_surface_model();
     return geometry;
 }
 

@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "checkerboard_types.hpp"
 #include "tracker_persistence.hpp"
 
 namespace hydramarker {
@@ -56,6 +57,12 @@ struct TrackerFrameResult {
     std::vector<double> pose_tracker_T_marker_camera;
 
     bool current_pose_accepted = false;
+    // Latched warmup status: false right after (re)acquisition while the
+    // corner set is still saturating (pose wanders along the weak
+    // observability mode there); true once the set has been stable for the
+    // configured window. Downstream should treat poses with
+    // pose_converged == false as "initializing".
+    bool pose_converged = false;
     bool has_accepted_pose = false;
     int accepted_pose_frame = -1;
     int accepted_visual_corner_count = 0;
@@ -79,6 +86,12 @@ struct TrackerFrameResult {
     std::vector<TrackerCorner> corners;
     std::vector<TrackerCorner> correspondence_corners;
     int persistent_count = 0;
+
+    // Per-corner operator comparison (LK / subpix baseline / final
+    // measurement) of this frame's tracked refinement.  Only populated
+    // while model_warp is the active refine method, so such runs also log
+    // the full subpix measurement for offline method comparison.
+    std::vector<TrackedRefineSample> tracked_refine_samples;
 
     bool fast_attempted = false;
     bool fast_success = false;

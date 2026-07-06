@@ -16,6 +16,117 @@ import numpy as np
 from tracking.hydramarker.model.state import SfMState
 
 
+def _fit_cylinder_surface(points_mm: np.ndarray, axis: str) -> dict:
+    """Fit a full 3D cylinder to the exported corner coordinates.
+
+    The axis is initialised from the declared marker axis ("row" -> +Y,
+    "col" -> +X) but a small tilt is optimised as well, because the printed
+    sheet never wraps perfectly parallel to the nominal axis.  The fit runs
+    on the final metric-scaled, id-mapped corners so the stored parameters
+    live in exactly the coordinate frame the runtime tracker loads.
+
+    Returns a dict for surface_model["fitted"].  Raises on degenerate input.
+    """
+    pts = np.asarray(points_mm, dtype=np.float64).reshape(-1, 3)
+
+    if len(pts) < 8:
+        raise ValueError("Need at least 8 corners for a cylinder fit.")
+
+    axis = str(axis).lower()
+    if axis not in ("row", "col"):
+        raise ValueError(f"Unsupported cylinder axis {axis!r}.")
+
+    # Work in a permuted frame where the nominal axis is +Y, then map back.
+    # row-axis markers already have the axis along +Y; col-axis markers get
+    # X and Y swapped.
+    perm = (0, 1, 2) if axis == "row" else (1, 0, 2)
+    p = pts[:, perm]
+
+    # Kasa circle fit in the xz cross-section for the initial guess:
+    # x^2 + z^2 = 2*a*x + 2*b*z + c
+    A = np.column_stack([2.0 * p[:, 0], 2.0 * p[:, 2], np.ones(len(p))])
+    rhs = p[:, 0] ** 2 + p[:, 2] ** 2
+    (a, b, c), *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    r0 = float(np.sqrt(max(c + a * a + b * b, 1e-9)))
+
+    # Parameters: axis point (x0, 0, z0), axis dir (dx, 1, dz)/norm, radius.
+    q = np.array([a, b, 0.0, 0.0, r0], dtype=np.float64)
+
+    def residuals(qv):
+        x0, z0, dx, dz, r = qv
+        p0 = np.array([x0, 0.0, z0])
+        d = np.array([dx, 1.0, dz])
+        d = d / np.linalg.norm(d)
+        w = p - p0
+        along = w @ d
+        radial = w - np.outer(along, d)
+        return np.linalg.norm(radial, axis=1) - r
+
+    # Gauss-Newton with a central-difference Jacobian.  Five parameters and
+    # ~100 points: convergence in a handful of iterations, no SciPy needed.
+    for _ in range(12):
+        r_vec = residuals(q)
+        J = np.empty((len(p), len(q)))
+        for k in range(len(q)):
+            h = 1e-6 * max(1.0, abs(q[k]))
+            qp = q.copy(); qp[k] += h
+            qm = q.copy(); qm[k] -= h
+            J[:, k] = (residuals(qp) - residuals(qm)) / (2.0 * h)
+        try:
+            step, *_ = np.linalg.lstsq(J, -r_vec, rcond=None)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(f"Cylinder fit did not converge: {exc}") from exc
+        q += step
+        if np.max(np.abs(step)) < 1e-9:
+            break
+
+    x0, z0, dx, dz, radius = q
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("Cylinder fit produced a non-positive radius.")
+
+    res = residuals(q)
+    fit_rms = float(np.sqrt(np.mean(res ** 2)))
+    fit_max = float(np.max(np.abs(res)))
+
+    p0 = np.array([x0, 0.0, z0])
+    d = np.array([dx, 1.0, dz])
+    d = d / np.linalg.norm(d)
+
+    w = p - p0
+    along = w @ d
+
+    # Deterministic radial basis centred on the corner band so the stored
+    # angular range never straddles the atan2 wrap.
+    radial = w - np.outer(along, d)
+    e1 = radial.mean(axis=0)
+    e1_norm = np.linalg.norm(e1)
+    if e1_norm < 1e-9:
+        raise ValueError("Degenerate radial basis for cylinder fit.")
+    e1 = e1 / e1_norm
+    e2 = np.cross(d, e1)
+    theta = np.arctan2(radial @ e2, radial @ e1)
+
+    inv = np.argsort(perm)  # map the permuted frame back to marker frame
+
+    def back(v):
+        return [round(float(x), 6) for x in np.asarray(v)[inv]]
+
+    return {
+        "radius_mm": round(float(radius), 6),
+        "axis_point_mm": back(p0),
+        "axis_dir": back(d),
+        "radial_ref_dir": back(e1),
+        "fit_rms_mm": round(fit_rms, 6),
+        "fit_max_mm": round(fit_max, 6),
+        "axial_range_mm": [round(float(along.min()), 6),
+                           round(float(along.max()), 6)],
+        "angular_range_rad": [round(float(theta.min()), 6),
+                              round(float(theta.max()), 6)],
+        "num_corners": int(len(p)),
+        "fitted_from": "exported_corners",
+    }
+
+
 def _load_json(path: str | Path) -> dict:
     path = Path(path)
 
@@ -386,6 +497,29 @@ def export_marker_geometry_json(
     }
 
     meta_out["corners"] = corners
+
+    # Enrich a declared curved-surface model with parameters fitted on the
+    # exported corners.  The qualitative surface_model block (written by the
+    # marker generator and passed through from the source JSON) tells the
+    # runtime tracker only THAT the marker sits on a cylinder; the fitted
+    # sub-block provides radius/axis/validity in the exact coordinate frame
+    # of the exported geometry so the tracker never has to fit anything.
+    surface_model = meta_out.get("surface_model")
+    if (
+        isinstance(surface_model, dict)
+        and str(surface_model.get("type", "")).lower() == "cylinder"
+    ):
+        try:
+            surface_model["fitted"] = _fit_cylinder_surface(
+                np.array([c["xyz_mm"] for c in corners], dtype=np.float64),
+                axis=surface_model.get("axis", "row"),
+            )
+        except ValueError as exc:
+            surface_model.pop("fitted", None)
+            print(
+                "WARNING: cylinder surface fit failed during export "
+                f"({exc}); surface_model.fitted not written."
+            )
 
     if include_camera_poses:
         camera_poses = []

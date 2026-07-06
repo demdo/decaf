@@ -47,6 +47,49 @@ class TrackerConfig:
     checker_max_undecodeable_tracking_frames: int = 12
     checker_min_fresh_correspondences_for_stable_tracking: int = 8
     checker_max_low_fresh_correspondence_frames: int = 12
+    # Measurement operator for LK-tracked corners ("subpix" = cornerSubPix
+    # snap, "model_warp" = forward-model template registration once
+    # implemented; unknown values fall back to "subpix").
+    checker_tracked_refine_method: str = "model_warp"
+
+    # Pose-set stabilisation (2026-07-05). The cylinder pose is nearly blind
+    # along one direction (~1 mm z per 0.1 px), so predicted corners (which
+    # feed the previous pose back into PnP) and freshly appeared corners
+    # (which jump the pose along the weak mode when they enter the set) are
+    # kept out of the POSE input. Detection/decoding/persistence still use
+    # every corner; the filter relaxes automatically if it would starve the
+    # solver.
+    pose_exclude_predicted_corners: bool = True
+    pose_min_observed_frames: int = 5  # 0 disables the entry hysteresis
+    # Pose warmup status: after (re)acquisition the pose wanders while the
+    # corner set saturates (measured: z std 0.64 mm although static).
+    # result.pose_converged latches once the set has been quiet; poses are
+    # still produced during warmup, downstream decides how to treat them.
+    pose_warmup_min_accepted_frames: int = 20  # 0 = always converged
+    pose_warmup_stable_window: int = 15
+    pose_warmup_max_young_corners: int = 2
+    # Anisotropic pose Kalman filter (OUTPUT-only: rvec/tvec/T of the frame
+    # result are filtered, the internal tracking chain keeps the raw pose so
+    # no feedback loop forms). Constant-velocity model; the per-frame
+    # measurement covariance sigma^2*(J^T J)^-1 smooths only the weak
+    # observability mode, real motion follows the measurement directly.
+    pose_kf_enabled: bool = True
+    pose_kf_sigma_px: float = 0.12
+    pose_kf_q_translation_mm: float = 0.15  # accel noise per frame
+    pose_kf_q_rotation_deg: float = 0.05    # accel noise per frame
+    pose_kf_gate_mahalanobis: float = 30.0  # spike deweighting gate
+    pose_kf_reset_rotation_deg: float = 10.0
+    # Model-warp reference re-enrollment: fresh reference after a full
+    # tracking loss and when the viewing direction moved beyond the angle
+    # threshold (stale-reference guard for reorientation — NOT a slope fix;
+    # threshold far above normal in-run angle changes). (Re-)enrollment
+    # only happens while the tool is quiet (sharp reference).
+    # Threshold sized against real data: +-85mm step runs reach ~15 deg
+    # viewing-angle offset, a deliberate fb<->rl reorientation is ~90 deg.
+    model_warp_reenroll_on_loss: bool = True
+    model_warp_reenroll_angle_deg: float = 20.0  # 0 disables
+    model_warp_enroll_max_motion_mm: float = 1.0     # per frame
+    model_warp_enroll_max_rotation_deg: float = 0.25  # per frame
 
     # Dot/Patch/Decode
     # Dot values are copied by TrackerEngine::makeDotDetectorConfig, decoder
