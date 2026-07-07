@@ -17,11 +17,25 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+
+def _ensure_tracking_package_on_path() -> None:
+    src_root = Path(__file__).resolve().parents[3]
+    src = str(src_root)
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+
+_ensure_tracking_package_on_path()
+
+from tracking.hydramarker.camera_setup import create_camera_source
+from tracking.hydramarker.config import CameraConfig
 
 
 # Same board/workflow defaults as overlay.gui.pages.page_camera_calibration.
@@ -2797,6 +2811,136 @@ def default_output_path() -> Path:
     return Path(__file__).resolve().parent / f"hydramarker_camera_calibration_{ts}.npz"
 
 
+def _first_npz_array(npz: Any, names: tuple[str, ...]) -> np.ndarray | None:
+    for name in names:
+        if name in npz:
+            return np.asarray(npz[name], dtype=np.float64)
+    return None
+
+
+def _read_calibration_image_size(npz: Any) -> list[int] | None:
+    if "image_size" in npz:
+        values = np.asarray(npz["image_size"]).reshape(-1)
+        if values.size >= 2:
+            return [int(values[0]), int(values[1])]
+
+    width_keys = ("width", "image_width", "rgb_width")
+    height_keys = ("height", "image_height", "rgb_height")
+    width = next(
+        (int(np.asarray(npz[key]).reshape(-1)[0]) for key in width_keys if key in npz),
+        None,
+    )
+    height = next(
+        (int(np.asarray(npz[key]).reshape(-1)[0]) for key in height_keys if key in npz),
+        None,
+    )
+    if width is not None and height is not None:
+        return [width, height]
+
+    return None
+
+
+def load_tracking_calibration_npz(
+    path: Path | str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Load the OpenCV camera model used by HydraMarker tracking."""
+    path = Path(path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Camera calibration file not found: {path}")
+
+    with np.load(path, allow_pickle=True) as npz:
+        K = _first_npz_array(
+            npz,
+            ("K", "K_rgb", "camera_matrix", "camera_intrinsics", "intrinsics"),
+        )
+        if K is None:
+            raise KeyError(
+                "Camera calibration NPZ must contain one of: "
+                "K, K_rgb, camera_matrix, camera_intrinsics, intrinsics."
+            )
+
+        dist = _first_npz_array(
+            npz,
+            (
+                "dist",
+                "dist_rgb",
+                "dist_coeffs",
+                "distortion_coeffs",
+                "opencv_dist_coeffs",
+                "effective_opencv_dist_coeffs",
+            ),
+        )
+        if dist is None:
+            raise KeyError(
+                "Camera calibration NPZ must contain OpenCV distortion coefficients: "
+                "dist, dist_rgb, dist_coeffs, distortion_coeffs, opencv_dist_coeffs, "
+                "or effective_opencv_dist_coeffs."
+            )
+
+        image_size = _read_calibration_image_size(npz)
+        info: dict[str, Any] = {
+            key: _npz_scalar_or_list(npz[key])
+            for key in (
+                "camera_source",
+                "camera_backend",
+                "camera_serial",
+                "camera_model",
+                "pixel_format",
+                "distortion_model",
+                "created_at",
+                "calibration_model",
+                "recommended_primary_model",
+            )
+            if key in npz
+        }
+
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    dist = np.asarray(dist, dtype=np.float64).reshape(-1, 1)
+    if dist.size == 0:
+        raise ValueError("Distortion coefficients must not be empty.")
+
+    info.update(
+        {
+            "camera_source": str(info.get("camera_source", "opencv_calibration_npz")),
+            "camera_calibration_path": str(path),
+            "distortion_model": str(
+                info.get("distortion_model", "opencv_brown_conrady")
+            ),
+            "K": K.tolist(),
+            "opencv_dist_coeffs": dist.reshape(-1).tolist(),
+            "effective_opencv_dist_coeffs": dist.reshape(-1).tolist(),
+        }
+    )
+    if image_size is not None:
+        info["calibration_image_size"] = image_size
+
+    return K, dist, info
+
+
+def validate_calibration_image_size(
+    calibration_info: dict[str, Any],
+    *,
+    width: int,
+    height: int,
+) -> None:
+    calibration_size = calibration_info.get("calibration_image_size")
+    if calibration_size is None:
+        return
+    expected = [int(width), int(height)]
+    if list(calibration_size) != expected:
+        raise RuntimeError(
+            f"Selected camera calibration image_size={calibration_size} does not "
+            f"match the active camera stream {expected}."
+        )
+
+
+def _npz_scalar_or_list(value: Any) -> Any:
+    arr = np.asarray(value)
+    if arr.shape == ():
+        return arr.item()
+    return arr.tolist()
+
+
 def save_tracking_calibration_npz(
     path: Path,
     *,
@@ -3224,7 +3368,9 @@ def save_tracking_calibration_npz(
         "marker_length_m": np.asarray(MARKER_LEN_M, dtype=np.float64),
         "aruco_dictionary_id": np.asarray(DICT_ID, dtype=np.int32),
         "created_at": np.asarray(datetime.now().isoformat(timespec="seconds")),
-        "camera_source": np.asarray("charuco_realsense_color"),
+        "camera_source": np.asarray(
+            str(stats.get("camera_source", "charuco_camera"))
+        ),
         "distortion_model": np.asarray(
             str(stats.get("distortion_model", "opencv_brown_conrady"))
         ),
@@ -3239,6 +3385,18 @@ def save_tracking_calibration_npz(
         ),
         "diagnostics_dir": np.asarray(str(stats.get("diagnostics_dir", ""))),
     }
+
+    for key in (
+        "camera_backend",
+        "camera_serial",
+        "camera_model",
+        "camera_width",
+        "camera_height",
+        "camera_fps",
+        "pixel_format",
+    ):
+        if key in stats:
+            payload[key] = np.asarray(stats[key])
 
     if latest_accuracy_mean_px is not None:
         payload["latest_accuracy_mean_reproj_px"] = np.asarray(
@@ -3373,6 +3531,30 @@ def get_color_frame_bgr(pipeline) -> Optional[np.ndarray]:
         return None
 
     return color_frame_to_bgr(color_frame)
+
+
+def make_live_camera_config(
+    *,
+    backend: Optional[str] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[int] = None,
+    serial: Optional[str] = None,
+) -> CameraConfig:
+    default_camera = CameraConfig()
+    return CameraConfig(
+        backend=default_camera.backend if backend is None else backend,
+        width=default_camera.width if width is None else int(width),
+        height=default_camera.height if height is None else int(height),
+        fps=default_camera.fps if fps is None else int(fps),
+        serial=default_camera.serial if serial is None else serial,
+    )
+
+
+def start_camera_source(camera_config):
+    camera = create_camera_source(camera_config)
+    camera.start()
+    return camera
 
 
 def reset_state() -> dict[str, Any]:
@@ -3821,9 +4003,12 @@ def run_model_sweep_for_images(
 def run_live_calibration(
     *,
     output_path: Path,
-    width: int = REALSENSE_WIDTH,
-    height: int = REALSENSE_HEIGHT,
-    fps: int = REALSENSE_FPS,
+    camera_config: Any = None,
+    camera_backend: Optional[str] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[int] = None,
+    serial: Optional[str] = None,
     target_views: int = N_VIEWS,
     min_capture_corners: int = MIN_CHARUCO_CAPTURE,
     min_edge_capture_corners: int = MIN_CHARUCO_EDGE_CAPTURE,
@@ -3872,18 +4057,42 @@ def run_live_calibration(
     board, aruco_dict, detector_params = make_charuco_board()
     state = reset_state()
 
-    pipeline = None
+    camera = None
+    camera_metadata: dict[str, Any] = {}
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
     try:
-        pipeline, rs_profile = start_realsense(width=width, height=height, fps=fps)
-        factory_K = get_realsense_factory_intrinsics(rs_profile, width, height)
+        if camera_config is None:
+            camera_config = make_live_camera_config(
+                backend=camera_backend,
+                width=width,
+                height=height,
+                fps=fps,
+                serial=serial,
+            )
+        camera = start_camera_source(camera_config)
+        camera_metadata = camera.metadata()
+        profile = getattr(camera, "profile", None)
+        factory_K = (
+            None
+            if profile is None
+            else get_realsense_factory_intrinsics(
+                profile,
+                int(camera_metadata.get("width", width)),
+                int(camera_metadata.get("height", height)),
+            )
+        )
         if factory_K is not None:
             print(f"[calib_camera] Factory K: fx={factory_K[0,0]:.1f} fy={factory_K[1,1]:.1f} "
                   f"cx={factory_K[0,2]:.1f} cy={factory_K[1,2]:.1f}")
         else:
             print("[calib_camera] Factory intrinsics not available, using identity init.")
-        print("[calib_camera] RealSense running.")
+        print(
+            "[calib_camera] Camera running: "
+            f"{camera_metadata.get('camera_backend', 'camera')} "
+            f"{camera_metadata.get('width', '')}x{camera_metadata.get('height', '')} "
+            f"@ {camera_metadata.get('fps', '')} fps"
+        )
         print("[calib_camera] SPACE: start/stop automatic capture")
         print(
             "[calib_camera] Move the board through the full image: center, "
@@ -3899,7 +4108,8 @@ def run_live_calibration(
         motion_px = float("nan")
 
         while True:
-            frame = get_color_frame_bgr(pipeline)
+            camera_frame = camera.read()
+            frame = None if camera_frame is None else camera_frame.image_bgr
             got_new_frame = frame is not None
             if got_new_frame:
                 frame_index += 1
@@ -4237,6 +4447,14 @@ def run_live_calibration(
             selected_images = [cand.image for cand in selected_candidates]
             image_size = _image_size(frame)
             common_stats: dict[str, Any] = {
+                "camera_source": f"charuco_{camera_metadata.get('camera_backend', 'camera')}",
+                "camera_backend": str(camera_metadata.get("camera_backend", "")),
+                "camera_serial": str(camera_metadata.get("camera_serial", "")),
+                "camera_model": str(camera_metadata.get("camera_model", "")),
+                "camera_width": int(camera_metadata.get("width", image_size[0])),
+                "camera_height": int(camera_metadata.get("height", image_size[1])),
+                "camera_fps": int(camera_metadata.get("fps", fps)),
+                "pixel_format": str(camera_metadata.get("pixel_format", "")),
                 "num_candidates_total": len(state["candidates"]),
                 "num_candidates_selected": len(selected_candidates),
                 "selected_frame_indices": [
@@ -4617,8 +4835,8 @@ def run_live_calibration(
             print("[calib_camera] Optional: press T for the accuracy test on the primary model.")
 
     finally:
-        if pipeline is not None:
-            pipeline.stop()
+        if camera is not None:
+            camera.stop()
         cv2.destroyAllWindows()
 
     if state["saved_path"] is None:
@@ -4628,6 +4846,7 @@ def run_live_calibration(
 
 
 def parse_args() -> argparse.Namespace:
+    default_camera = CameraConfig()
     parser = argparse.ArgumentParser(
         description="Calibrate the RGB camera for HydraMarker tracking."
     )
@@ -4652,9 +4871,20 @@ def parse_args() -> argparse.Namespace:
             "the model sweep on those images. Combine with --images-dir to skip the dialog."
         ),
     )
-    parser.add_argument("--width", type=int, default=REALSENSE_WIDTH)
-    parser.add_argument("--height", type=int, default=REALSENSE_HEIGHT)
-    parser.add_argument("--fps", type=int, default=REALSENSE_FPS)
+    parser.add_argument(
+        "--camera",
+        choices=("realsense", "basler"),
+        default=default_camera.backend,
+        help="Live camera backend. Defaults to CameraConfig in config.py.",
+    )
+    parser.add_argument(
+        "--serial",
+        default=default_camera.serial,
+        help="Optional camera serial number. Defaults to CameraConfig in config.py.",
+    )
+    parser.add_argument("--width", type=int, default=default_camera.width)
+    parser.add_argument("--height", type=int, default=default_camera.height)
+    parser.add_argument("--fps", type=int, default=default_camera.fps)
     parser.add_argument(
         "--target-views",
         type=int,
@@ -4855,11 +5085,16 @@ def main() -> None:
         print(f"[calib_camera] Done: {saved_path}")
         return
 
-    saved_path = run_live_calibration(
-        output_path=args.output,
+    camera_config = CameraConfig(
+        backend=args.camera,
         width=args.width,
         height=args.height,
         fps=args.fps,
+        serial=args.serial,
+    )
+    saved_path = run_live_calibration(
+        output_path=args.output,
+        camera_config=camera_config,
         target_views=args.target_views,
         min_capture_corners=args.min_corners,
         min_edge_capture_corners=args.min_edge_corners_visible,

@@ -1,19 +1,160 @@
-"""Runtime configuration for the C++ HydraMarker tracker engine.
+"""Runtime configuration for HydraMarker tracking.
 
-This module is intentionally the only Python-side configuration surface for the
-live HydraMarker tracker.  The values below are copied into the native
-``TrackerConfig`` object in ``tracker.py`` and then consumed by the staged C++
-pipeline in ``cpp/src/tracker_engine.cpp`` and the related detector, decoder,
-pose, persistence, and logging helpers.
+This module is intentionally the user-facing Python configuration surface for
+live HydraMarker tracking. Camera and logging options are plain data consumed by
+``camera_setup.py`` and ``run_tracker.py``; they do not import or open camera
+SDKs. ``TrackerConfig`` is copied into the native tracker runtime in
+``tracker.py`` and then consumed by the staged C++ pipeline.
 
-Changing these values does not require rebuilding C++.  A new ``HydraTracker``
-instance copies the current Python dataclass values into the native runtime at
-startup.
+Changing these values does not require rebuilding C++. A new ``HydraTracker``
+instance copies the current Python tracker dataclass values into the native
+runtime at startup.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+MAX_CAMERA_FPS = 30
+CAMERA_BACKENDS = ("realsense", "basler")
+LOGGING_START_MODES = ("manual", "auto", "disabled")
+
+
+@dataclass
+class CameraConfig:
+    """User-selected live camera settings.
+
+    The config is deliberately inert: hardware-specific validation and SDK
+    imports live in ``camera_setup.py`` so importing the tracker remains
+    possible without any camera package installed.
+
+    ----- Tested cameras ----------------------------------
+    backend: str = "basler"
+    width: int = 1920
+    height: int = 1080
+    fps: int = MAX_CAMERA_FPS
+    pixel_format: Optional[str] = "auto"
+    exposure_auto: Optional[str] = "Off"
+    exposure_time_us: Optional[float] = 8000.0
+    gain_auto: Optional[str] = "Off"
+    gain_db: Optional[float] = None
+    device_link_throughput_limit_mode: Optional[str] = "Off"
+    device_link_throughput_limit: Optional[int] = None
+    calibration_path: Optional[str] = "data/basler/basler_camera_calibration_standard5.npz"
+    serial: Optional[str] = None
+
+    backend: str = "realsense"
+    width: int = 1920
+    height: int = 1080
+    fps: int = MAX_CAMERA_FPS
+    calibration_path: Optional[str] = None
+    serial: Optional[str] = None
+    """
+
+    backend: str = "basler"
+    width: int = 1920
+    height: int = 1080
+    fps: int = MAX_CAMERA_FPS
+    pixel_format: Optional[str] = "auto"
+    exposure_auto: Optional[str] = "Off"
+    exposure_time_us: Optional[float] = 8000.0
+    gain_auto: Optional[str] = "Off"
+    gain_db: Optional[float] = None
+    device_link_throughput_limit_mode: Optional[str] = "Off"
+    device_link_throughput_limit: Optional[int] = None
+    calibration_path: Optional[str] = "data/basler/basler_camera_calibration_standard5.npz"
+    serial: Optional[str] = None
+
+    def validate_common(self) -> None:
+        backend = str(self.backend).strip().lower()
+        if backend not in CAMERA_BACKENDS:
+            raise ValueError(
+                "camera backend must be one of "
+                f"{', '.join(CAMERA_BACKENDS)}; got {self.backend!r}."
+            )
+        if int(self.width) <= 0 or int(self.height) <= 0:
+            raise ValueError(
+                f"camera width/height must be positive; got "
+                f"{self.width}x{self.height}."
+            )
+        if int(self.fps) <= 0:
+            raise ValueError(f"camera fps must be positive; got {self.fps}.")
+        if int(self.fps) > MAX_CAMERA_FPS:
+            raise ValueError(
+                f"camera fps={self.fps} exceeds the HydraMarker limit of "
+                f"{MAX_CAMERA_FPS} fps."
+            )
+        if self.pixel_format is not None and not str(self.pixel_format).strip():
+            raise ValueError("camera pixel_format must not be empty.")
+        if self.exposure_auto is not None and not str(self.exposure_auto).strip():
+            raise ValueError("camera exposure_auto must not be empty.")
+        if self.exposure_time_us is not None and float(self.exposure_time_us) <= 0.0:
+            raise ValueError(
+                f"camera exposure_time_us must be positive; got {self.exposure_time_us}."
+            )
+        if self.gain_auto is not None and not str(self.gain_auto).strip():
+            raise ValueError("camera gain_auto must not be empty.")
+        if self.device_link_throughput_limit_mode is not None and not str(
+            self.device_link_throughput_limit_mode
+        ).strip():
+            raise ValueError("camera device_link_throughput_limit_mode must not be empty.")
+        if (
+            self.device_link_throughput_limit is not None
+            and int(self.device_link_throughput_limit) <= 0
+        ):
+            raise ValueError(
+                "camera device_link_throughput_limit must be positive when set; "
+                f"got {self.device_link_throughput_limit}."
+            )
+
+    def calibration_path_obj(self) -> Optional[Path]:
+        if self.calibration_path is None or str(self.calibration_path).strip() == "":
+            return None
+        path = Path(self.calibration_path).expanduser()
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        return path
+
+
+@dataclass
+class LoggingConfig:
+    """Live run logging behavior."""
+
+    enabled: bool = True
+    start_mode: str = "manual"
+    output_dir: str = "hydramarker_tracker_runs"
+    frame_details: bool = True
+    pose_candidates: bool = True
+
+    def validate_common(self) -> None:
+        mode = str(self.start_mode).strip().lower()
+        if mode not in LOGGING_START_MODES:
+            raise ValueError(
+                "logging start_mode must be one of "
+                f"{', '.join(LOGGING_START_MODES)}; got {self.start_mode!r}."
+            )
+
+    @property
+    def active(self) -> bool:
+        return bool(self.enabled) and str(self.start_mode).strip().lower() != "disabled"
+
+
+@dataclass
+class LiveTrackerConfig:
+    """Top-level live tracking options used by ``run_tracker.py``."""
+
+    camera: CameraConfig = field(default_factory=CameraConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    tracker: "TrackerConfig" = field(default_factory=lambda: TrackerConfig())
+    show_window: bool = True
+    start_tracking_manually: bool = True
+
+    def validate_common(self) -> None:
+        self.camera.validate_common()
+        self.logging.validate_common()
 
 
 @dataclass
@@ -225,4 +366,12 @@ class TrackerConfig:
     visual_corner_min_count: int = 6
 
 
-__all__ = ["TrackerConfig"]
+__all__ = [
+    "CAMERA_BACKENDS",
+    "LOGGING_START_MODES",
+    "MAX_CAMERA_FPS",
+    "CameraConfig",
+    "LiveTrackerConfig",
+    "LoggingConfig",
+    "TrackerConfig",
+]

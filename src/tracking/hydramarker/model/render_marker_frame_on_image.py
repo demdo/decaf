@@ -6,20 +6,21 @@ validate calibration, geometry export, and tracker alignment.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import sys
-from typing import Optional
 
 import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from tracking.hydramarker.config import TrackerConfig
+from tracking.hydramarker.camera_setup import create_camera_source
+from tracking.hydramarker.config import CameraConfig, TrackerConfig
 from tracking.hydramarker.tracker import HydraTracker, TrackerResult
 
 
-INPUT_MODE = "realsense"  # "realsense" or "image"
+INPUT_MODE = "camera"  # "camera" or "image"
 
 WINDOW_NAME = "HydraMarker frame renderer"
 
@@ -35,11 +36,6 @@ AXIS_LENGTH_MM = 30.0
 
 POINT_RADIUS_ALL = 4
 POINT_RADIUS_VISIBLE = 5
-
-REALSENSE_WIDTH = 1920
-REALSENSE_HEIGHT = 1080
-REALSENSE_FPS = 30
-
 
 def choose_file_qt(title: str, file_filter: str) -> Path:
     app = QApplication.instance()
@@ -85,56 +81,6 @@ def load_image_bgr(path: Path) -> np.ndarray:
     if image is None:
         raise RuntimeError(f"Could not load image: {path}")
     return image
-
-
-def realsense_intrinsics_to_opencv(intr) -> tuple[np.ndarray, np.ndarray]:
-    K = np.array(
-        [
-            [intr.fx, 0.0, intr.ppx],
-            [0.0, intr.fy, intr.ppy],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
-    dist = np.asarray(intr.coeffs, dtype=np.float64).reshape(-1, 1)
-    return K, dist
-
-
-def start_realsense():
-    import pyrealsense2 as rs
-
-    pipeline = rs.pipeline()
-    config = rs.config()
-
-    config.enable_stream(
-        rs.stream.color,
-        REALSENSE_WIDTH,
-        REALSENSE_HEIGHT,
-        rs.format.bgr8,
-        REALSENSE_FPS,
-    )
-
-    profile = pipeline.start(config)
-
-    color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-    intr = color_profile.get_intrinsics()
-    K, dist = realsense_intrinsics_to_opencv(intr)
-
-    for _ in range(15):
-        pipeline.wait_for_frames()
-
-    return pipeline, K, dist
-
-
-def get_realsense_frame_bgr(pipeline) -> Optional[np.ndarray]:
-    frames = pipeline.wait_for_frames()
-    color_frame = frames.get_color_frame()
-
-    if not color_frame:
-        return None
-
-    return np.asanyarray(color_frame.get_data()).copy()
 
 
 def point2_from_cpp(p) -> tuple[float, float]:
@@ -509,14 +455,25 @@ def run_image_mode(
     print(f"Saved: {output_path}")
 
 
-def run_realsense_mode(
+def run_camera_mode(
     field_path: Path,
     marker_geometry_path: Path,
 ) -> None:
-    pipeline = None
+    camera_config = CameraConfig()
+    if camera_config.calibration_path_obj() is None:
+        camera_path = choose_file_qt(
+            "Select camera intrinsics .npz",
+            "NPZ files (*.npz)",
+        )
+        camera_config = replace(camera_config, calibration_path=str(camera_path))
 
+    camera = create_camera_source(camera_config)
     try:
-        pipeline, K, dist = start_realsense()
+        camera.start()
+        if camera.K is None or camera.dist_coeffs is None:
+            raise RuntimeError("Camera mode requires a calibration NPZ.")
+        K = np.asarray(camera.K, dtype=np.float64).reshape(3, 3)
+        dist = np.asarray(camera.dist_coeffs, dtype=np.float64).reshape(-1, 1)
 
         tracker = create_tracker(
             field_path=field_path,
@@ -525,14 +482,21 @@ def run_realsense_mode(
             dist=dist,
         )
 
-        print("RealSense running.")
+        meta = camera.metadata()
+        print(
+            "Camera running: "
+            f"{meta.get('camera_backend', camera_config.backend)} "
+            f"{meta.get('width', camera_config.width)}x{meta.get('height', camera_config.height)} "
+            f"@ {meta.get('fps', camera_config.fps)} fps"
+        )
         print("SPACE: capture + render")
         print("ESC/q: quit")
 
         while True:
-            frame = get_realsense_frame_bgr(pipeline)
-            if frame is None:
+            camera_frame = camera.read()
+            if camera_frame is None:
                 continue
+            frame = camera_frame.image_bgr
 
             preview = frame.copy()
 
@@ -581,8 +545,7 @@ def run_realsense_mode(
                 cv2.waitKey(0)
 
     finally:
-        if pipeline is not None:
-            pipeline.stop()
+        camera.stop()
         cv2.destroyAllWindows()
 
 
@@ -602,8 +565,8 @@ def main() -> None:
             field_path=field_path,
             marker_geometry_path=marker_geometry_path,
         )
-    elif INPUT_MODE == "realsense":
-        run_realsense_mode(
+    elif INPUT_MODE in ("camera", "realsense"):
+        run_camera_mode(
             field_path=field_path,
             marker_geometry_path=marker_geometry_path,
         )

@@ -865,12 +865,58 @@ def get_color_frame_bgr(pipeline) -> np.ndarray | None:
     return np.asanyarray(color_frame.get_data()).copy()
 
 
-def wait_color_frame_bgr(pipeline) -> np.ndarray | None:
-    frames = pipeline.wait_for_frames()
+def wait_color_frame_bgr(source) -> np.ndarray | None:
+    if hasattr(source, "read") and not hasattr(source, "wait_for_frames"):
+        frame = source.read()
+        return None if frame is None else frame.image_bgr
+
+    frames = source.wait_for_frames()
     color_frame = frames.get_color_frame()
     if not color_frame:
         return None
     return np.asanyarray(color_frame.get_data()).copy()
+
+
+def capture_charuco_table_calibration_from_camera_source(
+    camera,
+    K: np.ndarray,
+    dist: np.ndarray,
+    **kwargs,
+) -> CharucoTableCalibration | None:
+    return capture_charuco_table_calibration_from_pipeline(
+        camera,
+        K,
+        dist,
+        **kwargs,
+    )
+
+
+def capture_checkerboard_detections_from_camera_source(
+    camera,
+    K: np.ndarray,
+    dist: np.ndarray,
+    **kwargs,
+) -> list[np.ndarray]:
+    return capture_checkerboard_detections_from_pipeline(
+        camera,
+        K,
+        dist,
+        **kwargs,
+    )
+
+
+def capture_checkerboard_pose_from_camera_source(
+    camera,
+    K: np.ndarray,
+    dist: np.ndarray,
+    **kwargs,
+) -> CheckerboardPose | None:
+    return capture_checkerboard_pose_from_pipeline(
+        camera,
+        K,
+        dist,
+        **kwargs,
+    )
 
 
 def _draw_text_box(
@@ -1389,9 +1435,12 @@ def capture_charuco_table_calibration(
     K: np.ndarray,
     dist: np.ndarray,
     *,
-    width: int = REALSENSE_WIDTH,
-    height: int = REALSENSE_HEIGHT,
-    fps: int = REALSENSE_FPS,
+    camera_config: Any = None,
+    camera_backend: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    serial: str | None = None,
     min_positions: int = CHARUCO_TABLE_MIN_POSITIONS,
     target_positions: int = CHARUCO_TABLE_TARGET_POSITIONS,
     min_frames_per_position: int = CHARUCO_TABLE_MIN_FRAMES_PER_POSITION,
@@ -1402,15 +1451,19 @@ def capture_charuco_table_calibration(
     mad_scale: float = DEFAULT_FRAME_OUTLIER_MAD_SCALE,
     status_callback: StatusCallback | None = None,
 ) -> CharucoTableCalibration | None:
-    pipeline = None
+    camera = None
     try:
-        pipeline, _profile = start_realsense_color_stream(
-            width=int(width),
-            height=int(height),
-            fps=int(fps),
-        )
-        return capture_charuco_table_calibration_from_pipeline(
-            pipeline,
+        if camera_config is None:
+            camera_config = calib_camera.make_live_camera_config(
+                backend=camera_backend,
+                width=width,
+                height=height,
+                fps=fps,
+                serial=serial,
+            )
+        camera = calib_camera.start_camera_source(camera_config)
+        return capture_charuco_table_calibration_from_camera_source(
+            camera,
             K,
             dist,
             min_positions=min_positions,
@@ -1424,8 +1477,8 @@ def capture_charuco_table_calibration(
             status_callback=status_callback,
         )
     finally:
-        if pipeline is not None:
-            pipeline.stop()
+        if camera is not None:
+            camera.stop()
 
 
 def align_detection_to_reference(corners: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -1547,9 +1600,12 @@ def capture_checkerboard_detections(
     K: np.ndarray,
     dist: np.ndarray,
     *,
-    width: int = REALSENSE_WIDTH,
-    height: int = REALSENSE_HEIGHT,
-    fps: int = REALSENSE_FPS,
+    camera_config: Any = None,
+    camera_backend: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    serial: str | None = None,
     min_frames: int = DEFAULT_MIN_FRAMES,
     max_frames: int = DEFAULT_MAX_FRAMES,
     capture_interval_s: float = DEFAULT_CAPTURE_INTERVAL_S,
@@ -1558,15 +1614,19 @@ def capture_checkerboard_detections(
     square_size_mm: float = CHECKERBOARD_SQUARE_SIZE_MM,
     status_callback: StatusCallback | None = None,
 ) -> list[np.ndarray]:
-    pipeline = None
+    camera = None
     try:
-        pipeline, _profile = start_realsense_color_stream(
-            width=int(width),
-            height=int(height),
-            fps=int(fps),
-        )
-        return capture_checkerboard_detections_from_pipeline(
-            pipeline,
+        if camera_config is None:
+            camera_config = calib_camera.make_live_camera_config(
+                backend=camera_backend,
+                width=width,
+                height=height,
+                fps=fps,
+                serial=serial,
+            )
+        camera = calib_camera.start_camera_source(camera_config)
+        return capture_checkerboard_detections_from_camera_source(
+            camera,
             K,
             dist,
             min_frames=min_frames,
@@ -1578,8 +1638,8 @@ def capture_checkerboard_detections(
             status_callback=status_callback,
         )
     finally:
-        if pipeline is not None:
-            pipeline.stop()
+        if camera is not None:
+            camera.stop()
 
 
 def capture_checkerboard_pose_from_pipeline(
@@ -1624,9 +1684,12 @@ def capture_checkerboard_pose(
     K: np.ndarray,
     dist: np.ndarray,
     *,
-    width: int = REALSENSE_WIDTH,
-    height: int = REALSENSE_HEIGHT,
-    fps: int = REALSENSE_FPS,
+    camera_config: Any = None,
+    camera_backend: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    serial: str | None = None,
     min_frames: int = DEFAULT_MIN_FRAMES,
     max_frames: int = DEFAULT_MAX_FRAMES,
     capture_interval_s: float = DEFAULT_CAPTURE_INTERVAL_S,
@@ -1639,9 +1702,12 @@ def capture_checkerboard_pose(
     detections = capture_checkerboard_detections(
         K,
         dist,
+        camera_config=camera_config,
+        camera_backend=camera_backend,
         width=width,
         height=height,
         fps=fps,
+        serial=serial,
         min_frames=min_frames,
         max_frames=max_frames,
         capture_interval_s=capture_interval_s,

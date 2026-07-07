@@ -1,6 +1,6 @@
-"""Record RealSense observations for HydraMarker model construction.
+"""Record camera observations for HydraMarker model construction.
 
-The live recorder runs ``HydraTracker`` against a RealSense stream and writes
+The live recorder runs ``HydraTracker`` against a configured camera stream and writes
 the corner, pose, and camera metadata needed by the SfM model-building pipeline.
 """
 
@@ -10,14 +10,15 @@ import json
 from pathlib import Path
 import sys
 from datetime import datetime
+from dataclasses import replace
 
 import cv2
 import numpy as np
-import pyrealsense2 as rs
 
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from tracking.hydramarker.config import TrackerConfig
+from tracking.hydramarker.camera_setup import create_camera_source
+from tracking.hydramarker.config import CameraConfig, TrackerConfig
 from tracking.hydramarker.tracker import HydraTracker, PoseSource
 from tracking.hydramarker.model.observations import (
     FrameObservation,
@@ -147,20 +148,19 @@ def read_num_corner_cols(marker_json_path: Path) -> int:
     return num_cols
 
 
-def load_tracker_camera_calibration(profile) -> tuple[np.ndarray, np.ndarray]:
-    color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
-    intr = color_stream.get_intrinsics()
-    calib_path = choose_file_qt(
-        "Select OpenCV camera calibration NPZ",
-        CAMERA_CALIBRATION_FILTER,
-    )
+def load_tracker_camera_calibration(
+    calib_path: Path,
+    *,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray]:
     K, dist, calib_info = load_opencv_camera_calibration_npz(calib_path)
-    stream_size = [int(getattr(intr, "width", 0)), int(getattr(intr, "height", 0))]
+    stream_size = [int(width), int(height)]
     calib_size = calib_info.get("calibration_image_size")
     if calib_size is not None and list(calib_size) != stream_size:
         raise RuntimeError(
             f"Selected camera calibration image_size={calib_size} does not match "
-            f"the active RealSense color stream {stream_size}."
+            f"the active camera stream {stream_size}."
         )
 
     print(
@@ -171,12 +171,10 @@ def load_tracker_camera_calibration(profile) -> tuple[np.ndarray, np.ndarray]:
     return K, dist
 
 
-def create_realsense_pipeline():
-    pipe = rs.pipeline()
-    cfg = rs.config()
-    cfg.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
-    profile = pipe.start(cfg)
-    return pipe, profile
+def create_recording_camera(camera_config: CameraConfig):
+    camera = create_camera_source(camera_config)
+    camera.start()
+    return camera
 
 
 def put_text(
@@ -426,7 +424,7 @@ def make_sfm_tracker(
     )
 
 
-def main() -> None:
+def main(camera_config: CameraConfig | None = None) -> None:
     field_path = choose_file_qt(
         "Select HydraMarker .field file",
         "HydraMarker field (*.field)",
@@ -444,8 +442,17 @@ def main() -> None:
 
     observations_path = make_output_path()
 
-    pipe, profile = create_realsense_pipeline()
-    K, dist = load_tracker_camera_calibration(profile)
+    calib_path = choose_file_qt(
+        "Select OpenCV camera calibration NPZ",
+        CAMERA_CALIBRATION_FILTER,
+    )
+    camera_config = replace(camera_config or CameraConfig(), calibration_path=str(calib_path))
+    camera = create_recording_camera(camera_config)
+    K, dist = load_tracker_camera_calibration(
+        calib_path,
+        width=camera.actual_width,
+        height=camera.actual_height,
+    )
 
     tracker = make_sfm_tracker(
         field_path,
@@ -482,13 +489,11 @@ def main() -> None:
 
     try:
         while True:
-            frames = pipe.wait_for_frames()
-            color_frame = frames.get_color_frame()
-
-            if not color_frame:
+            camera_frame = camera.read()
+            if camera_frame is None:
                 continue
 
-            frame = np.asanyarray(color_frame.get_data())
+            frame = camera_frame.image_bgr
             result = tracker.process_frame(frame)
             source_value = pose_source_value(result)
 
@@ -618,7 +623,7 @@ def main() -> None:
                 last_saved_motion_px = None
 
     finally:
-        pipe.stop()
+        camera.stop()
         cv2.destroyAllWindows()
 
         if observations:
