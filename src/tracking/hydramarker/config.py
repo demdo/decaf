@@ -52,6 +52,21 @@ class CameraConfig:
     fps: int = MAX_CAMERA_FPS
     calibration_path: Optional[str] = None
     serial: Optional[str] = None
+
+    # RealSense D435i color tuning. Leave values as None to keep the device
+    # default/current setting. For low-noise tracking, use fixed exposure/gain
+    # together with enough external light.
+    realsense_enable_auto_exposure: Optional[bool] = None
+    realsense_exposure: Optional[float] = None
+    realsense_gain: Optional[float] = None
+    realsense_enable_auto_white_balance: Optional[bool] = None
+    realsense_white_balance: Optional[float] = None
+    realsense_power_line_frequency: Optional[float] = None
+    realsense_brightness: Optional[float] = None
+    realsense_contrast: Optional[float] = None
+    realsense_saturation: Optional[float] = None
+    realsense_sharpness: Optional[float] = None
+    realsense_gamma: Optional[float] = None
     """
 
     backend: str = "basler"
@@ -87,28 +102,41 @@ class CameraConfig:
                 f"camera fps={self.fps} exceeds the HydraMarker limit of "
                 f"{MAX_CAMERA_FPS} fps."
             )
-        if self.pixel_format is not None and not str(self.pixel_format).strip():
+        # Basler-specific fields are optional: the RealSense variant of this
+        # dataclass omits them, so validate only the ones actually present.
+        pixel_format = getattr(self, "pixel_format", None)
+        if pixel_format is not None and not str(pixel_format).strip():
             raise ValueError("camera pixel_format must not be empty.")
-        if self.exposure_auto is not None and not str(self.exposure_auto).strip():
+        exposure_auto = getattr(self, "exposure_auto", None)
+        if exposure_auto is not None and not str(exposure_auto).strip():
             raise ValueError("camera exposure_auto must not be empty.")
-        if self.exposure_time_us is not None and float(self.exposure_time_us) <= 0.0:
+        exposure_time_us = getattr(self, "exposure_time_us", None)
+        if exposure_time_us is not None and float(exposure_time_us) <= 0.0:
             raise ValueError(
-                f"camera exposure_time_us must be positive; got {self.exposure_time_us}."
+                f"camera exposure_time_us must be positive; got {exposure_time_us}."
             )
-        if self.gain_auto is not None and not str(self.gain_auto).strip():
+        gain_auto = getattr(self, "gain_auto", None)
+        if gain_auto is not None and not str(gain_auto).strip():
             raise ValueError("camera gain_auto must not be empty.")
-        if self.device_link_throughput_limit_mode is not None and not str(
-            self.device_link_throughput_limit_mode
-        ).strip():
+        throughput_mode = getattr(self, "device_link_throughput_limit_mode", None)
+        if throughput_mode is not None and not str(throughput_mode).strip():
             raise ValueError("camera device_link_throughput_limit_mode must not be empty.")
-        if (
-            self.device_link_throughput_limit is not None
-            and int(self.device_link_throughput_limit) <= 0
-        ):
+        throughput_limit = getattr(self, "device_link_throughput_limit", None)
+        if throughput_limit is not None and int(throughput_limit) <= 0:
             raise ValueError(
                 "camera device_link_throughput_limit must be positive when set; "
-                f"got {self.device_link_throughput_limit}."
+                f"got {throughput_limit}."
             )
+        realsense_positive_fields = (
+            "realsense_exposure",
+            "realsense_gain",
+            "realsense_white_balance",
+            "realsense_gamma",
+        )
+        for name in realsense_positive_fields:
+            value = getattr(self, name, None)
+            if value is not None and float(value) <= 0.0:
+                raise ValueError(f"camera {name} must be positive when set; got {value}.")
 
     def calibration_path_obj(self) -> Optional[Path]:
         if self.calibration_path is None or str(self.calibration_path).strip() == "":

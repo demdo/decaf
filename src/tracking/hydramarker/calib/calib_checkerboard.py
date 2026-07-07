@@ -1461,6 +1461,8 @@ def capture_charuco_table_calibration(
                 fps=fps,
                 serial=serial,
             )
+        else:
+            camera_config = calib_camera.without_tracking_calibration(camera_config)
         camera = calib_camera.start_camera_source(camera_config)
         return capture_charuco_table_calibration_from_camera_source(
             camera,
@@ -1624,6 +1626,8 @@ def capture_checkerboard_detections(
                 fps=fps,
                 serial=serial,
             )
+        else:
+            camera_config = calib_camera.without_tracking_calibration(camera_config)
         camera = calib_camera.start_camera_source(camera_config)
         return capture_checkerboard_detections_from_camera_source(
             camera,

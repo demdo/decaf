@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -3547,8 +3547,16 @@ def make_live_camera_config(
         width=default_camera.width if width is None else int(width),
         height=default_camera.height if height is None else int(height),
         fps=default_camera.fps if fps is None else int(fps),
+        calibration_path=None,
         serial=default_camera.serial if serial is None else serial,
     )
+
+
+def without_tracking_calibration(camera_config: CameraConfig) -> CameraConfig:
+    """Return a camera config that opens the live stream without loading an NPZ."""
+    if getattr(camera_config, "calibration_path", None) in (None, ""):
+        return camera_config
+    return replace(camera_config, calibration_path=None)
 
 
 def start_camera_source(camera_config):
@@ -4070,6 +4078,8 @@ def run_live_calibration(
                 fps=fps,
                 serial=serial,
             )
+        else:
+            camera_config = without_tracking_calibration(camera_config)
         camera = start_camera_source(camera_config)
         camera_metadata = camera.metadata()
         profile = getattr(camera, "profile", None)
@@ -5090,6 +5100,7 @@ def main() -> None:
         width=args.width,
         height=args.height,
         fps=args.fps,
+        calibration_path=None,
         serial=args.serial,
     )
     saved_path = run_live_calibration(

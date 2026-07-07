@@ -136,6 +136,7 @@ class RealSenseCameraSource(CameraSource):
             int(self.config.fps),
         )
         profile = pipeline.start(cfg)
+        realsense_details = _configure_realsense_color_sensor(profile, self.config, rs)
 
         color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
@@ -166,6 +167,7 @@ class RealSenseCameraSource(CameraSource):
                 "raw_realsense_coeffs": [float(c) for c in intr.coeffs],
                 "raw_realsense_K": raw_K.tolist(),
                 "raw_realsense_dist_coeffs": raw_dist.reshape(-1).tolist(),
+                **realsense_details,
             }
         )
 
@@ -357,6 +359,122 @@ def _require_pypylon():
     except ImportError as exc:
         raise RuntimeError("pypylon is required for camera backend='basler'.") from exc
     return pylon
+
+
+def _configure_realsense_color_sensor(profile, config: CameraConfig, rs) -> dict[str, Any]:
+    sensor = _find_realsense_color_sensor(profile, rs)
+    if sensor is None:
+        return {"realsense_color_sensor_found": False}
+
+    option_specs = (
+        ("enable_auto_exposure", "realsense_enable_auto_exposure"),
+        ("exposure", "realsense_exposure"),
+        ("gain", "realsense_gain"),
+        ("enable_auto_white_balance", "realsense_enable_auto_white_balance"),
+        ("white_balance", "realsense_white_balance"),
+        ("power_line_frequency", "realsense_power_line_frequency"),
+        ("brightness", "realsense_brightness"),
+        ("contrast", "realsense_contrast"),
+        ("saturation", "realsense_saturation"),
+        ("sharpness", "realsense_sharpness"),
+        ("gamma", "realsense_gamma"),
+    )
+
+    for option_name, config_name in option_specs:
+        value = getattr(config, config_name, None)
+        if value is not None:
+            _set_realsense_option(sensor, rs, option_name, value, config_name)
+
+    sensor_name = _realsense_sensor_name(sensor, rs)
+    details: dict[str, Any] = {
+        "realsense_color_sensor_found": True,
+        "realsense_color_sensor_name": sensor_name,
+    }
+    for option_name, config_name in option_specs:
+        current = _read_realsense_option(sensor, rs, option_name)
+        if current is not None:
+            details[config_name] = current
+        option_range = _read_realsense_option_range(sensor, rs, option_name)
+        if option_range is not None:
+            details[f"{config_name}_range"] = option_range
+    return details
+
+
+def _find_realsense_color_sensor(profile, rs):
+    device = profile.get_device()
+    fallback = None
+    for sensor in device.query_sensors():
+        name = _realsense_sensor_name(sensor, rs).lower()
+        if "rgb" in name or "color" in name:
+            return sensor
+        awb = getattr(rs.option, "enable_auto_white_balance", None)
+        if awb is not None:
+            try:
+                if sensor.supports(awb):
+                    fallback = sensor
+            except Exception:
+                pass
+    return fallback
+
+
+def _realsense_sensor_name(sensor, rs) -> str:
+    try:
+        return str(sensor.get_info(rs.camera_info.name))
+    except Exception:
+        return "unknown"
+
+
+def _set_realsense_option(sensor, rs, option_name: str, value, config_name: str) -> None:
+    option = getattr(rs.option, option_name, None)
+    if option is None:
+        raise RuntimeError(f"RealSense option {option_name!r} is not available in pyrealsense2.")
+    if not sensor.supports(option):
+        raise RuntimeError(f"RealSense color sensor does not support option {option_name!r}.")
+
+    numeric = 1.0 if isinstance(value, bool) and value else 0.0 if isinstance(value, bool) else float(value)
+    try:
+        option_range = sensor.get_option_range(option)
+        minimum = float(option_range.min)
+        maximum = float(option_range.max)
+    except Exception:
+        minimum = maximum = None
+
+    if minimum is not None and maximum is not None and not (minimum <= numeric <= maximum):
+        raise RuntimeError(
+            f"RealSense {config_name}={value!r} outside supported range "
+            f"{minimum:g}..{maximum:g}."
+        )
+    sensor.set_option(option, numeric)
+
+
+def _read_realsense_option(sensor, rs, option_name: str):
+    option = getattr(rs.option, option_name, None)
+    if option is None:
+        return None
+    try:
+        if not sensor.supports(option):
+            return None
+        return float(sensor.get_option(option))
+    except Exception:
+        return None
+
+
+def _read_realsense_option_range(sensor, rs, option_name: str):
+    option = getattr(rs.option, option_name, None)
+    if option is None:
+        return None
+    try:
+        if not sensor.supports(option):
+            return None
+        option_range = sensor.get_option_range(option)
+        return {
+            "min": float(option_range.min),
+            "max": float(option_range.max),
+            "step": float(option_range.step),
+            "default": float(option_range.def_),
+        }
+    except Exception:
+        return None
 
 
 def _validate_active_stream(
