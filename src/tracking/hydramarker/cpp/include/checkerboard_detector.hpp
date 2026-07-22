@@ -31,6 +31,16 @@ struct CheckerboardRecoveryDebug {
     bool has_detection = false;
 
     float scale = 1.0f;
+
+    // Intermediate image maps for step-by-step documentation. All at the
+    // WORK resolution (post ROI/det_width scaling); multiply point overlays
+    // that use these by `scale` accordingly. Populated by debugRecoveryStages.
+    cv::Mat gray;        // full-res grayscale (toGray8), before any scaling
+    cv::Mat work;        // actual detection input (ROI / det_width scaled)
+    cv::Mat fast_image;  // blurred image the gradient detector runs on
+    cv::Mat grad_x;      // Sobel x on fast_image (CV_32F)
+    cv::Mat grad_y;      // Sobel y (CV_32F)
+    cv::Mat response;    // saddle response after NMS+threshold (CV_32F)
 };
 
 // Simplified persistent corner — no quadrant scoring.
@@ -112,6 +122,21 @@ private:
     int held_output_frames_ = 0;
     int roi_align_fail_frames_ = 0;
     int roi_recovery_fail_frames_ = 0;
+    // Slow-decaying ceiling of the tracked corner count: reference for the
+    // moving-and-eroding refresh trigger (health relative to the visible
+    // marker region, not an absolute count).
+    double refresh_corner_ceiling_ = 0.0;
+    // Frame-to-frame pose rotation (deg) fed by the engine each frame; the
+    // conservative default (large) keeps the old always-weak-while-moving
+    // behaviour for callers that never provide it.
+    double inter_frame_rotation_deg_ = 1e9;
+
+public:
+    void setInterFrameRotationDeg(double deg) {
+        inter_frame_rotation_deg_ = deg;
+    }
+
+private:
     int stable_refresh_zero_gain_count_ = 0;
     int local_completion_soft_zero_gain_count_ = 0;
 
@@ -182,6 +207,15 @@ private:
     std::optional<CheckerboardDetection>
     buildDetectionFromCorners(
         const std::vector<cv::Point2f>& corners
+    ) const;
+
+    // Thread-safe variant for the parallel subset search: timings go into
+    // the out-params instead of the shared (mutable) timings map.
+    std::optional<CheckerboardDetection>
+    buildDetectionFromCornersTimed(
+        const std::vector<cv::Point2f>& corners,
+        double& lattice_fit_ms,
+        double& grid_build_ms
     ) const;
 
     std::optional<CheckerboardDetection>

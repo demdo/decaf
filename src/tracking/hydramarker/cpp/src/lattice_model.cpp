@@ -140,40 +140,65 @@ static int findCentralSeed(
     return best_idx;
 }
 
-static bool directionalGeometryOk(
+// Step-vector based neighbour search (2026-07-13 acquisition fix).
+//
+// The grid growth used FIXED global axis directions with fixed spacing.  On
+// the cylindrical marker the local column direction rotates and the spacing
+// compresses from column to column (measured: 0.5 cells of phase drift over
+// 4 columns), so growth died after 1-2 circumferential steps; together with
+// detection holes (~35% of crossings missing per frame, and a plain +-1 BFS
+// cannot cross a hole) a single detection kept only 7-9 of 33 good corners.
+//
+// Fix: (A) each node carries its own LOCAL step vectors, updated from the
+// actually measured link (curvature following); (B) when no direct
+// neighbour is found, a 2x step bridges a single missing corner.
+//
+// `step` is the expected ONE-step vector; `mult` = 1 direct, 2 = bridge.
+static bool stepGeometryOk(
     const cv::Point2f& src,
     const cv::Point2f& dst,
-    const cv::Point2f& dir,
-    float spacing
+    const cv::Point2f& step,
+    int mult
 ) {
+    const float len = std::sqrt(dot(step, step));
+    if (len < kEps) {
+        return false;
+    }
+
+    const cv::Point2f dir = step * (1.0f / len);
     const cv::Point2f v = dst - src;
 
     const float forward = dot(v, dir);
     const float lateral = std::abs(cross(dir, v));
 
-    const float min_forward = 0.60f * spacing;
-    const float max_forward = 1.35f * spacing;
-    const float max_lateral = 0.28f * spacing;
-
-    if (forward < min_forward || forward > max_forward) {
-        return false;
+    if (mult == 1) {
+        return forward >= 0.60f * len &&
+               forward <= 1.35f * len &&
+               lateral <= 0.28f * len;
     }
 
-    if (lateral > max_lateral) {
-        return false;
-    }
-
-    return true;
+    // Hole bridge (expected distance 2*len): tighter relative gates — a
+    // long step carries more direction information, and bridging must not
+    // become a licence for greedy drift.
+    return forward >= 1.65f * len &&
+           forward <= 2.40f * len &&
+           lateral <= 0.35f * len;
 }
 
-static int findDirectionalNeighbor(
+static int findNeighborByStep(
     int src_idx,
     const std::vector<cv::Point2f>& pts,
     const std::vector<bool>& assigned,
-    const cv::Point2f& dir,
-    float spacing
+    const cv::Point2f& step,
+    int mult
 ) {
     const cv::Point2f src = pts[src_idx];
+    const float len = std::sqrt(dot(step, step));
+    if (len < kEps) {
+        return -1;
+    }
+    const cv::Point2f dir = step * (1.0f / len);
+    const float expected = len * static_cast<float>(mult);
 
     int best_idx = -1;
     float best_score = std::numeric_limits<float>::max();
@@ -187,14 +212,14 @@ static int findDirectionalNeighbor(
             continue;
         }
 
-        if (!directionalGeometryOk(src, pts[k], dir, spacing)) {
+        if (!stepGeometryOk(src, pts[k], step, mult)) {
             continue;
         }
 
         // Bidirectional consistency:
-        // If k is the +dir neighbor of src, then src must also be the -dir
-        // neighbor candidate of k geometrically.
-        if (!directionalGeometryOk(pts[k], src, -dir, spacing)) {
+        // If k is the +step neighbor of src, then src must also be the
+        // -step neighbor candidate of k geometrically.
+        if (!stepGeometryOk(pts[k], src, -step, mult)) {
             continue;
         }
 
@@ -204,7 +229,7 @@ static int findDirectionalNeighbor(
         const float lateral = std::abs(cross(dir, v));
 
         const float score =
-            std::abs(forward - spacing) +
+            std::abs(forward - expected) +
             2.5f * lateral;
 
         if (score < best_score) {
@@ -216,19 +241,24 @@ static int findDirectionalNeighbor(
     return best_idx;
 }
 
-static float localNeighborResidual(
+static float stepNeighborResidual(
     const std::vector<cv::Point2f>& pts,
     int src_idx,
     int nb_idx,
-    const cv::Point2f& dir,
-    float spacing
+    const cv::Point2f& step,
+    int mult
 ) {
+    const float len = std::sqrt(dot(step, step));
+    if (len < kEps) {
+        return std::numeric_limits<float>::max();
+    }
+    const cv::Point2f dir = step * (1.0f / len);
     const cv::Point2f v = pts[nb_idx] - pts[src_idx];
 
     const float forward = dot(v, dir);
     const float lateral = std::abs(cross(dir, v));
 
-    return std::abs(forward - spacing) + lateral;
+    return std::abs(forward - len * static_cast<float>(mult)) + lateral;
 }
 
 static bool validateLatticeStructure(
@@ -663,6 +693,13 @@ std::vector<LatticePoint> LatticeModel::growGrid(
     std::vector<cv::Point2i> ij(pts.size(), cv::Point2i(0, 0));
     std::vector<float>     residuals(pts.size(), 0.0f);
 
+    // Per-node local step vectors (+u / +v direction, one grid unit).
+    // Seeded from the global lattice fit, then updated with each measured
+    // link so the growth follows the cylinder curvature instead of dying
+    // against a fixed global axis.
+    std::vector<cv::Point2f> step_u_vec(pts.size(), axis_u * spacing_u);
+    std::vector<cv::Point2f> step_v_vec(pts.size(), axis_v * spacing_v);
+
     std::unordered_map<std::int64_t, int> index_by_grid;
     index_by_grid.reserve(pts.size());
 
@@ -674,13 +711,6 @@ std::vector<LatticePoint> LatticeModel::growGrid(
     index_by_grid[gridKey(0, 0)] = seed;
     q.push(seed);
 
-    const std::array<cv::Point2f, 4> dirs = {
-        axis_u,
-        -axis_u,
-        axis_v,
-        -axis_v
-    };
-
     const std::array<cv::Point2i, 4> steps = {
         cv::Point2i(1,  0),
         cv::Point2i(-1, 0),
@@ -688,45 +718,57 @@ std::vector<LatticePoint> LatticeModel::growGrid(
         cv::Point2i(0, -1)
     };
 
-    const std::array<float, 4> spacings = {
-        spacing_u,
-        spacing_u,
-        spacing_v,
-        spacing_v
-    };
-
     while (!q.empty()) {
         const int current = q.front();
         q.pop();
 
         for (int d = 0; d < 4; ++d) {
-            const int nb = findDirectionalNeighbor(
-                current,
-                pts,
-                assigned,
-                dirs[d],
-                spacings[d]
-            );
+            const bool along_u = d < 2;
+            const float sign = (d == 0 || d == 2) ? 1.0f : -1.0f;
+            const cv::Point2f base =
+                along_u ? step_u_vec[current] : step_v_vec[current];
+            const cv::Point2f want = base * sign;
+
+            // direct neighbour first, then bridge a single missing corner
+            int mult = 1;
+            int nb = findNeighborByStep(current, pts, assigned, want, 1);
+            if (nb < 0) {
+                nb = findNeighborByStep(current, pts, assigned, want, 2);
+                mult = 2;
+            }
 
             if (nb < 0) {
                 continue;
             }
 
-            const cv::Point2i next_ij = ij[current] + steps[d];
+            const cv::Point2i next_ij = ij[current] + steps[d] * mult;
             const auto key = gridKey(next_ij.x, next_ij.y);
 
             if (index_by_grid.find(key) != index_by_grid.end()) {
                 continue;
             }
 
+            // curvature following: the traversed axis takes the measured
+            // one-step equivalent, the other axis is inherited
+            const cv::Point2f actual =
+                (pts[nb] - pts[current]) *
+                (sign / static_cast<float>(mult));
+            if (along_u) {
+                step_u_vec[nb] = actual;
+                step_v_vec[nb] = step_v_vec[current];
+            } else {
+                step_v_vec[nb] = actual;
+                step_u_vec[nb] = step_u_vec[current];
+            }
+
             assigned[nb] = true;
             ij[nb]       = next_ij;
-            residuals[nb] = localNeighborResidual(
+            residuals[nb] = stepNeighborResidual(
                 pts,
                 current,
                 nb,
-                dirs[d],
-                spacings[d]
+                want,
+                mult
             );
 
             index_by_grid[key] = nb;

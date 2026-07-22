@@ -46,7 +46,6 @@ from tracking.hydramarker.model.visualization import (
 )
 from tracking.hydramarker.model.alignment import (
     align_state_to_marker_frame_inplace,
-    regularize_marker_columns_z_inplace,
 )
 from tracking.hydramarker.model.export_marker_map import (
     export_marker_geometry_json,
@@ -56,12 +55,16 @@ from tracking.hydramarker.model.diagnostics import (
 )
 
 
+# NOTE (2026-07-15): cylinder surface/grid regularization was REMOVED from
+# this pipeline. It assumed ideal conditions (perfect cylinder, rows exactly
+# parallel to the axis, exact grid spacing) and erased real shape modes (label
+# skew ~0.4 deg, ~0.2 mm glue/print relief) that barely change reprojection
+# but bias the estimated poses -- measured as +2 mm tool-tip lever error at
+# 180 mm. The exporter still fits cylinder parameters post-hoc from the
+# exported corners (surface_model.fitted) for the runtime model_warp.
 TOPOLOGY_REGULARIZATION_WEIGHT = 0.5
 CELL_SHAPE_REGULARIZATION_WEIGHT = 0.1
-CYLINDER_SURFACE_REGULARIZATION_WEIGHT = 0.35
-CYLINDER_GRID_REGULARIZATION_WEIGHT = 50.0
 BA_MAX_ITERATIONS = 100
-CYLINDER_BA_MAX_ITERATIONS = 80
 BA_SHOW_PROGRESS = True
 
 BOOTSTRAP_MAX_PAIRS = None
@@ -161,185 +164,6 @@ def final_json_path() -> Path:
 
 def final_diagnostics_path() -> Path:
     return Path(__file__).resolve().parent / DIAGNOSTICS_FILENAME
-
-
-def should_regularize_column_z(marker_json_path: Path) -> bool:
-    surface_model = load_surface_model(marker_json_path)
-
-    return (
-        is_cylinder_surface_model(surface_model)
-        and bool(surface_model.get("regularize_columns_z", False))
-        and not bool(surface_model.get("regularize_with_ba", True))
-    )
-
-
-def load_surface_model(marker_json_path: Path) -> dict:
-    marker_json_path = Path(marker_json_path)
-
-    with marker_json_path.open("r", encoding="utf-8") as f:
-        meta = json.load(f)
-
-    surface_model = meta.get("surface_model", {})
-
-    if not isinstance(surface_model, dict):
-        return {}
-
-    return surface_model
-
-
-def is_cylinder_surface_model(surface_model: dict) -> bool:
-    model_type = str(surface_model.get("type", "")).lower()
-
-    return model_type == "cylinder"
-
-
-def cylinder_axis_is_supported(surface_model: dict) -> bool:
-    axis = str(surface_model.get("axis", "row")).lower()
-
-    return axis in {
-        "row",
-        "rows",
-        "y",
-        "marker_y",
-    }
-
-
-def cylinder_regularization_config(
-    marker_json_path: Path,
-) -> tuple[float, float | None, tuple[float, float] | None]:
-    surface_model = load_surface_model(marker_json_path)
-
-    if not is_cylinder_surface_model(surface_model):
-        return 0.0, None, None
-
-    if not cylinder_axis_is_supported(surface_model):
-        print(
-            "[SfM] cylinder regularization skipped: "
-            f"unsupported axis={surface_model.get('axis')!r}"
-        )
-        return 0.0, None, None
-
-    if not bool(surface_model.get("regularize_with_ba", True)):
-        return 0.0, None, None
-
-    weight = float(
-        surface_model.get(
-            "surface_regularization_weight",
-            surface_model.get(
-                "cylinder_regularization_weight",
-                CYLINDER_SURFACE_REGULARIZATION_WEIGHT,
-            ),
-        )
-    )
-
-    if weight <= 0.0:
-        return 0.0, None, None
-
-    radius = surface_model.get(
-        "radius_mm",
-        surface_model.get("cylinder_radius_mm"),
-    )
-    radius_value = None
-
-    if radius is not None:
-        radius_value = float(radius)
-        if radius_value <= 0.0:
-            radius_value = None
-
-    center = surface_model.get(
-        "center_xz_mm",
-        surface_model.get("cylinder_center_xz_mm"),
-    )
-    center_value = None
-
-    if center is not None:
-        center_arr = np.asarray(
-            center,
-            dtype=np.float64,
-        ).reshape(-1)
-        if center_arr.size >= 2:
-            center_value = (
-                float(center_arr[0]),
-                float(center_arr[1]),
-            )
-
-    return weight, radius_value, center_value
-
-
-def cylinder_grid_regularization_config(
-    marker_json_path: Path,
-) -> tuple[
-    float,
-    float | None,
-    tuple[float, float] | None,
-    bool,
-]:
-    surface_model = load_surface_model(marker_json_path)
-
-    if not is_cylinder_surface_model(surface_model):
-        return 0.0, None, None, True
-
-    if not cylinder_axis_is_supported(surface_model):
-        return 0.0, None, None, True
-
-    if not bool(surface_model.get("regularize_with_ba", True)):
-        return 0.0, None, None, True
-
-    weight = float(
-        surface_model.get(
-            "grid_regularization_weight",
-            surface_model.get(
-                "cylinder_grid_regularization_weight",
-                CYLINDER_GRID_REGULARIZATION_WEIGHT,
-            ),
-        )
-    )
-
-    if weight <= 0.0:
-        return 0.0, None, None, True
-
-    radius = surface_model.get(
-        "radius_mm",
-        surface_model.get("cylinder_radius_mm"),
-    )
-    radius_value = None
-
-    if radius is not None:
-        radius_value = float(radius)
-        if radius_value <= 0.0:
-            radius_value = None
-
-    center = surface_model.get(
-        "center_xz_mm",
-        surface_model.get("cylinder_center_xz_mm"),
-    )
-    center_value = None
-
-    if center is not None:
-        center_arr = np.asarray(
-            center,
-            dtype=np.float64,
-        ).reshape(-1)
-        if center_arr.size >= 2:
-            center_value = (
-                float(center_arr[0]),
-                float(center_arr[1]),
-            )
-
-    spacing_mode = str(
-        surface_model.get(
-            "grid_spacing_mode",
-            surface_model.get("cylinder_grid_spacing_mode", "chord"),
-        )
-    ).lower()
-
-    use_chord_spacing = spacing_mode not in {
-        "arc",
-        "surface",
-        "geodesic",
-    }
-
-    return weight, radius_value, center_value, use_chord_spacing
 
 
 def read_id_num_cols(marker_json_path: Path) -> int | None:
@@ -446,68 +270,6 @@ def run_second_bundle_adjustment(
         raise RuntimeError(ba_result.message)
 
     return ba_result
-
-
-def run_cylinder_bundle_adjustment(
-    state: SfMState,
-    ba_frame_ids: list[int],
-    marker_json_path: Path,
-    ignored_observations: set[tuple[int, int]],
-    adaptive_observation_weights: dict[tuple[int, int], float],
-) -> bool:
-    (
-        cylinder_weight,
-        cylinder_radius,
-        cylinder_center_xz,
-    ) = cylinder_regularization_config(marker_json_path)
-
-    (
-        cylinder_grid_weight,
-        cylinder_grid_radius,
-        cylinder_grid_center_xz,
-        cylinder_grid_use_chord_spacing,
-    ) = cylinder_grid_regularization_config(marker_json_path)
-
-    if cylinder_weight <= 0.0 and cylinder_grid_weight <= 0.0:
-        return False
-
-    print(
-        "[SfM] cylinder surface/grid BA: "
-        f"surface_weight={cylinder_weight:.3f}, "
-        f"grid_weight={cylinder_grid_weight:.3f}"
-    )
-
-    ba_result = run_bundle_adjustment(
-        state,
-        frame_ids=ba_frame_ids,
-        options=PyCeresOptions(
-            loss="huber",
-            loss_scale=1.0,
-            max_iterations=CYLINDER_BA_MAX_ITERATIONS,
-            progress_to_stdout=BA_SHOW_PROGRESS,
-            report_full=False,
-        ),
-        update_state=True,
-        marker_json_path=marker_json_path,
-        topology_regularization_weight=TOPOLOGY_REGULARIZATION_WEIGHT,
-        cell_shape_regularization_weight=CELL_SHAPE_REGULARIZATION_WEIGHT,
-        cylinder_regularization_weight=cylinder_weight,
-        cylinder_radius=cylinder_radius,
-        cylinder_center_xz=cylinder_center_xz,
-        cylinder_grid_regularization_weight=cylinder_grid_weight,
-        cylinder_grid_radius=cylinder_grid_radius,
-        cylinder_grid_center_xz=cylinder_grid_center_xz,
-        cylinder_grid_use_chord_spacing=cylinder_grid_use_chord_spacing,
-        ignored_observations=ignored_observations,
-        observation_weights=adaptive_observation_weights,
-    )
-
-    print_bundle_adjustment_summary(ba_result)
-
-    if not ba_result.success:
-        raise RuntimeError(ba_result.message)
-
-    return True
 
 
 def triangulate_missing_markers_for_stage(
@@ -718,33 +480,6 @@ def run_sfm_pipeline(
         alignment_mode="topology",
     )
 
-    column_regularization_stats = {}
-
-    did_cylinder_ba = run_cylinder_bundle_adjustment(
-        state=state,
-        ba_frame_ids=ba_frame_ids,
-        marker_json_path=marker_json_path,
-        ignored_observations=ignored_observations,
-        adaptive_observation_weights=adaptive_observation_weights,
-    )
-
-    if did_cylinder_ba:
-        final_observation_errors = compute_observation_reprojection_errors(
-            state,
-            frame_ids=ba_frame_ids,
-        )
-
-    if should_regularize_column_z(marker_json_path):
-        column_regularization_stats = regularize_marker_columns_z_inplace(
-            state,
-            marker_json_path=marker_json_path,
-        )
-
-        print(
-            "[SfM] column Z regularization: "
-            f"columns={len(column_regularization_stats)}"
-        )
-
     if SHOW_PLOTS:
         call_silent(
             visualize_aligned_state,
@@ -766,7 +501,7 @@ def run_sfm_pipeline(
         marker_json_path=marker_json_path,
         observation_errors=final_observation_errors,
         triangulation_results=triangulation_results,
-        column_regularization_stats=column_regularization_stats,
+        column_regularization_stats={},
     )
 
     print(f"[SfM] geometry diagnostics written: {diagnostics_path}")

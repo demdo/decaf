@@ -28,6 +28,30 @@ std::string formatDouble(double value, int precision)
     return stream.str();
 }
 
+PoseOutputFilterConfig makePoseOutputFilterConfig(const TrackerConfig& config)
+{
+    PoseOutputFilterConfig cfg;
+    cfg.enabled = config.pose_kf_enabled;
+    cfg.sigma_px = config.pose_kf_sigma_px;
+    cfg.q_translation_mm = config.pose_kf_q_translation_mm;
+    cfg.q_rotation_deg = config.pose_kf_q_rotation_deg;
+    cfg.adaptive = config.pose_kf_adaptive;
+    cfg.q_rotation_floor_deg = config.pose_kf_q_rotation_floor_deg;
+    cfg.q_translation_floor_mm = config.pose_kf_q_translation_floor_mm;
+    cfg.adaptive_ema_alpha = config.pose_kf_adaptive_ema_alpha;
+    cfg.auto_noise = config.pose_kf_auto_noise;
+    cfg.noise_window = config.pose_kf_noise_window;
+    cfg.motion_floor_rot_deg = config.pose_kf_motion_floor_rot_deg;
+    cfg.motion_floor_trans_mm = config.pose_kf_motion_floor_trans_mm;
+    cfg.meas_floor_rot_deg = config.pose_kf_meas_floor_rot_deg;
+    cfg.meas_floor_trans_mm = config.pose_kf_meas_floor_trans_mm;
+    cfg.gate_mahalanobis = config.pose_kf_gate_mahalanobis;
+    cfg.reset_rotation_deg = config.pose_kf_reset_rotation_deg;
+    cfg.max_translation_jump_mm = config.max_translation_jump_mm;
+    cfg.min_points = config.min_points;
+    return cfg;
+}
+
 } // namespace
 
 TrackerEngine::TrackerEngine(
@@ -56,6 +80,8 @@ TrackerEngine::TrackerEngine(
     if (geometry_.empty()) {
         throw std::runtime_error("TrackerEngine could not load marker geometry");
     }
+    pose_output_filter_.configure(
+        makePoseOutputFilterConfig(config_), K_, dist_coeffs_);
 }
 
 void TrackerEngine::reset()
@@ -83,11 +109,188 @@ void TrackerEngine::reset()
     model_enroll_count_ = 0;
     model_ref_view_angle_deg_ = 0.0;
     resetPoseWarmup();
-    resetPoseKalman();
+    resetPoseFilter();
+    ir_pose_refiner_.reset();
     checkerboard_detector_.resetTracking();
     dot_detector_.reset();
     pose_tracker_.reset();
     persistent_matcher_.reset();
+}
+
+TrackerFrameResult TrackerEngine::processFrame(
+    const cv::Mat& frame,
+    const cv::Mat& ir_left,
+    const cv::Mat& ir_right,
+    bool run_detection
+)
+{
+    current_ir_left_ = ir_left;
+    current_ir_right_ = ir_right;
+    TrackerFrameResult result = processFrame(frame, run_detection);
+    current_ir_left_ = cv::Mat();
+    current_ir_right_ = cv::Mat();
+    return result;
+}
+
+void TrackerEngine::setIrCalibration(
+    const cv::Matx33d& K_rgb,
+    const std::vector<double>& dist_rgb,
+    const cv::Matx33d& K_left,
+    const std::vector<double>& dist_left,
+    const cv::Matx33d& K_right,
+    const std::vector<double>& dist_right,
+    const cv::Matx33d& R_rgb_left,
+    const cv::Vec3d& t_rgb_left_mm,
+    const cv::Matx33d& R_left_right,
+    const cv::Vec3d& t_left_right_mm
+)
+{
+    IrCameraCalibration calib;
+    calib.K_rgb = K_rgb;
+    calib.dist_rgb = dist_rgb;
+    calib.K_left = K_left;
+    calib.dist_left = dist_left;
+    calib.K_right = K_right;
+    calib.dist_right = dist_right;
+    calib.R_rgb_left = R_rgb_left;
+    calib.t_rgb_left_mm = t_rgb_left_mm;
+    calib.R_left_right = R_left_right;
+    calib.t_left_right_mm = t_left_right_mm;
+    calib.valid = true;
+
+    IrPoseRefinerConfig ir_cfg;
+    ir_cfg.enabled = config_.ir_refine_enabled;
+    ir_cfg.min_pairs = config_.ir_min_pairs;
+    ir_cfg.min_ref_rot_deg = config_.ir_min_ref_rot_deg;
+    ir_cfg.max_ref_rot_deg = config_.ir_max_ref_rot_deg;
+    ir_cfg.fallback_min_ref_rot_deg = config_.ir_fallback_min_ref_rot_deg;
+    ir_cfg.sat_threshold = config_.ir_sat_threshold;
+    ir_cfg.sat_half_px = config_.ir_sat_half_px;
+    ir_cfg.epipolar_max_dv_px = config_.ir_epipolar_max_dv_px;
+    ir_cfg.zncc_weight_floor = config_.ir_zncc_weight_floor;
+    ir_cfg.dtz_clamp_mm = config_.ir_dtz_clamp_mm;
+    ir_cfg.depth_scale = config_.ir_depth_scale;
+    ir_cfg.sigma_px = config_.ir_sigma_px;
+    ir_cfg.sigma_ir_px = config_.ir_sigma_ir_px;
+    ir_cfg.w3d = config_.ir_w3d;
+    ir_cfg.fit_gate_rms_mm = config_.ir_fit_gate_rms_mm;
+    ir_cfg.fit_gate_max_trans_jump_mm = config_.ir_fit_gate_max_trans_jump_mm;
+    ir_cfg.mw_min_zncc = config_.ir_mw_min_zncc;
+    ir_cfg.mw_max_shift_px = config_.ir_mw_max_shift_px;
+    ir_cfg.ref_tile_deg = config_.ir_ref_tile_deg;
+    ir_cfg.ref_tile_trans_mm = config_.ir_ref_tile_trans_mm;
+    ir_cfg.fallback_min_ref_trans_mm = config_.ir_fallback_min_ref_trans_mm;
+    // NOTE: ir_cfg.enroll_max_sat_frac deliberately stays at its own default
+    // (0.50, template-usability ceiling) and is NOT tied to
+    // ir_enroll_max_sat_frac (0.35, the engine's measurement-quality gate for
+    // position tiles): coupling them starved the IR path when a run started
+    // inside a mildly specular zone (sat 0.38 -> no reference for 500 frames).
+    ir_cfg.max_references = config_.ir_max_references;
+    ir_cfg.corner_method = config_.ir_corner_method;
+    ir_cfg.qf_max_dev_px = config_.ir_qf_max_dev_px;
+
+    // Full corner cloud: the fusion computes its own visibility set.
+    std::vector<cv::Vec3d> cloud;
+    for (int row = 0; row < geometry_.cornerRows(); ++row) {
+        for (int col = 0; col < geometry_.cornerCols(); ++col) {
+            if (geometry_.hasCorner(row, col)) {
+                const cv::Point3f p = geometry_.cornerPoint(row, col);
+                cloud.emplace_back(p.x, p.y, p.z);
+            }
+        }
+    }
+    ir_pose_refiner_.configure(ir_cfg, geometry_.surfaceModel(), cloud);
+    ir_pose_refiner_.setCalibration(calib);
+
+    // Full marker-pattern LUT for the synthetic-template registration:
+    // corner-node grids in surface coordinates (same decomposition the
+    // saddle warp uses: u = w.dir, theta = atan2(w.(dir x radial_ref),
+    // w.radial_ref)) + the HydraMarker field bits.  Conventions validated
+    // against a real frame (corr +0.73 / counter-hypothesis -0.73).
+    {
+        MarkerPatternLut lut;
+        const SurfaceModel& sm2 = geometry_.surfaceModel();
+        const int R = geometry_.cornerRows();
+        const int C = geometry_.cornerCols();
+        if (sm2.valid() && !field_.empty() &&
+            field_.height() == R - 1 && field_.width() == C - 1) {
+            const bool cyl2 = sm2.type == SurfaceModel::Type::Cylinder;
+            const cv::Vec3d e2c = sm2.dir.cross(sm2.radial_ref);
+            std::vector<double> u_nodes(static_cast<size_t>(R));
+            std::vector<double> s_nodes(static_cast<size_t>(C));
+            std::vector<double> tmp;
+            bool nodes_ok = true;
+            for (int r = 0; r < R && nodes_ok; ++r) {
+                tmp.clear();
+                for (int c = 0; c < C; ++c) {
+                    if (!geometry_.hasCorner(r, c)) continue;
+                    const cv::Point3f p = geometry_.cornerPoint(r, c);
+                    const cv::Vec3d w =
+                        cv::Vec3d(p.x, p.y, p.z) - sm2.point;
+                    tmp.push_back(cyl2 ? w.dot(sm2.dir)
+                                       : w.dot(sm2.basis_u));
+                }
+                if (tmp.empty()) { nodes_ok = false; break; }
+                std::nth_element(tmp.begin(),
+                                 tmp.begin() + tmp.size() / 2, tmp.end());
+                u_nodes[static_cast<size_t>(r)] = tmp[tmp.size() / 2];
+            }
+            for (int c = 0; c < C && nodes_ok; ++c) {
+                tmp.clear();
+                for (int r = 0; r < R; ++r) {
+                    if (!geometry_.hasCorner(r, c)) continue;
+                    const cv::Point3f p = geometry_.cornerPoint(r, c);
+                    const cv::Vec3d w =
+                        cv::Vec3d(p.x, p.y, p.z) - sm2.point;
+                    if (cyl2) {
+                        const double u = w.dot(sm2.dir);
+                        const cv::Vec3d rv = w - u * sm2.dir;
+                        tmp.push_back(
+                            std::atan2(rv.dot(e2c), rv.dot(sm2.radial_ref)) *
+                            sm2.radius_mm);
+                    } else {
+                        tmp.push_back(w.dot(sm2.basis_v));
+                    }
+                }
+                if (tmp.empty()) { nodes_ok = false; break; }
+                std::nth_element(tmp.begin(),
+                                 tmp.begin() + tmp.size() / 2, tmp.end());
+                s_nodes[static_cast<size_t>(c)] = tmp[tmp.size() / 2];
+            }
+            const bool u_asc =
+                nodes_ok && std::is_sorted(u_nodes.begin(), u_nodes.end());
+            if (nodes_ok && u_asc) {
+                const double s_sign =
+                    s_nodes.back() > s_nodes.front() ? 1.0 : -1.0;
+                std::vector<double> sn(s_nodes.size());
+                for (size_t i = 0; i < s_nodes.size(); ++i) {
+                    sn[i] = s_sign * s_nodes[i];
+                }
+                if (std::is_sorted(sn.begin(), sn.end())) {
+                    lut.u_nodes = u_nodes;
+                    lut.s_neg_nodes = sn;
+                    lut.s_sign = s_sign;
+                    lut.cell_rows = R - 1;
+                    lut.cell_cols = C - 1;
+                    lut.bits.resize(
+                        static_cast<size_t>((R - 1) * (C - 1)));
+                    for (int r = 0; r < R - 1; ++r) {
+                        for (int c = 0; c < C - 1; ++c) {
+                            lut.bits[static_cast<size_t>(
+                                r * (C - 1) + c)] = field_.at(c, r);
+                        }
+                    }
+                }
+            }
+        }
+        ir_pose_refiner_.setPattern(lut);
+    }
+}
+
+void TrackerEngine::resetIrReferences()
+{
+    ir_pose_refiner_.reset();
+    ir_meas_cov_valid_ = false;
 }
 
 TrackerFrameResult TrackerEngine::processFrame(
@@ -100,6 +303,21 @@ TrackerFrameResult TrackerEngine::processFrame(
     // source / reference enrollment update after the pose was accepted.
     current_frame_ = frame;
     updateCornerModelInput();
+    // Last accepted frame-to-frame pose rotation for the detector's lean
+    // refresh cadence (translation-like motion skips the aggressive weak-state
+    // maintenance; rotation keeps it). Conservative large default while no
+    // pose pair exists yet.
+    {
+        double drot_deg = 1e9;
+        if (model_prev_rvec_.size() == 3 && model_curr_rvec_.size() == 3) {
+            cv::Mat R_prev, R_curr, r_delta;
+            cv::Rodrigues(cv::Mat(model_prev_rvec_, true), R_prev);
+            cv::Rodrigues(cv::Mat(model_curr_rvec_, true), R_curr);
+            cv::Rodrigues(R_curr * R_prev.t(), r_delta);
+            drot_deg = cv::norm(r_delta) * 180.0 / CV_PI;
+        }
+        checkerboard_detector_.setInterFrameRotationDeg(drot_deg);
+    }
 
     TrackerFrameResult result = processFrameInternal(frame, run_detection);
 
@@ -107,9 +325,13 @@ TrackerFrameResult TrackerEngine::processFrame(
         checkerboard_detector_.lastTrackedRefineSamples();
     updatePoseWarmupState(result);
     updateModelWarpStateAfterFrame(result);
+    // IR refinement FIRST in the output chain: it replaces the reported pose
+    // with the global-shutter measurement; the anchor/filter stages then act
+    // on that pose. The internal chain keeps the raw RGB pose.
+    applyIrRefinement(result);
     // Output filter LAST: the model-warp anchors above must see the raw
     // pose, otherwise the filtered pose feeds back into tracking.
-    applyPoseKalman(result);
+    applyPoseFilter(result);
     if (config_.checker_tracked_refine_method == "model_warp") {
         result.timings_ms["modelwarp_surface_valid"] =
             geometry_.surfaceModel().valid() ? 1.0 : 0.0;
@@ -121,6 +343,11 @@ TrackerFrameResult TrackerEngine::processFrame(
             static_cast<double>(model_enroll_count_);
         result.timings_ms["modelwarp_ref_view_angle_deg"] =
             model_ref_view_angle_deg_;
+    } else if (config_.checker_tracked_refine_method == "quadratic_form") {
+        result.timings_ms["qf_surface_valid"] =
+            geometry_.surfaceModel().valid() ? 1.0 : 0.0;
+        result.timings_ms["qf_prev_corner_count"] =
+            static_cast<double>(model_prev_uv_.size());
     }
     current_frame_ = cv::Mat();
     return result;
@@ -303,6 +530,26 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
     result.correspondence_count = static_cast<int>(
         correspondences.correspondences.size()
     );
+
+    // quadratic_form anchor source: fresh per-frame correspondences (uv +
+    // marker xyz via grid identity), captured BEFORE the pose decision so
+    // the anchors stay current through pose-rejected streaks.  Frames
+    // without a correspondence build (holds) keep the last capture — the
+    // anchor ages by one frame per hold, exactly the accepted-only
+    // degradation, never worse.
+    if (config_.checker_tracked_refine_method == "quadratic_form") {
+        qf_frame_anchor_uv_.clear();
+        qf_frame_anchor_xyz_.clear();
+        for (const Correspondence2D3D& c :
+             correspondences.correspondences) {
+            if (c.predicted) {
+                continue;
+            }
+            qf_frame_anchor_uv_.push_back(c.uv);
+            qf_frame_anchor_xyz_.emplace_back(
+                c.xyz_mm.x, c.xyz_mm.y, c.xyz_mm.z);
+        }
+    }
 
     if (!correspondences.valid()) {
         noteLowFreshCorrespondenceFailure(0);
@@ -846,15 +1093,21 @@ void TrackerEngine::finalizeFrameResult(
 
 void TrackerEngine::updateCornerModelInput()
 {
-    if (config_.checker_tracked_refine_method != "model_warp") {
+    const bool is_mw =
+        config_.checker_tracked_refine_method == "model_warp";
+    const bool is_qf =
+        config_.checker_tracked_refine_method == "quadratic_form";
+    if (!is_mw && !is_qf) {
         return;
     }
 
     CornerModelFrameInput input;
     const SurfaceModel& surface = geometry_.surfaceModel();
 
+    // quadratic_form is reference-free: it needs no enrolled template, only
+    // the surface model, a pose prediction and the previous-frame anchors.
     if (surface.valid() &&
-        model_ref_enrolled_ &&
+        (model_ref_enrolled_ || is_qf) &&
         !model_prev_uv_.empty() &&
         model_curr_rvec_.size() == 3 &&
         model_curr_tvec_.size() == 3) {
@@ -924,9 +1177,11 @@ void TrackerEngine::updateCornerModelInput()
         input.R = R_pred;
         input.t = t_pred;
         input.surface = surface;
-        input.ref_gray = model_ref_gray_;
-        input.R_ref = model_ref_R_;
-        input.t_ref = model_ref_t_;
+        if (is_mw) {
+            input.ref_gray = model_ref_gray_;
+            input.R_ref = model_ref_R_;
+            input.t_ref = model_ref_t_;
+        }
         input.prev_uv = model_prev_uv_;
         input.prev_xyz_mm = model_prev_xyz_;
     }
@@ -953,14 +1208,12 @@ void TrackerEngine::resetPoseWarmup()
     pose_converged_ = false;
 }
 
-void TrackerEngine::resetPoseKalman()
+void TrackerEngine::resetPoseFilter()
 {
-    pose_kf_initialized_ = false;
-    pose_kf_x_ = cv::Mat();
-    pose_kf_P_ = cv::Mat();
+    pose_output_filter_.reset();
 }
 
-void TrackerEngine::applyPoseKalman(TrackerFrameResult& result)
+void TrackerEngine::applyPoseFilter(TrackerFrameResult& result)
 {
     if (!config_.pose_kf_enabled) {
         return;
@@ -970,17 +1223,14 @@ void TrackerEngine::applyPoseKalman(TrackerFrameResult& result)
         result.tvec.size() != 3) {
         // No fresh measurement this frame (hold / rejection): coast the
         // state so velocities stay time-consistent, output stays untouched.
-        if (pose_kf_initialized_) {
-            for (int i = 0; i < 6; ++i) {
-                pose_kf_x_.at<double>(i) += pose_kf_x_.at<double>(i + 6);
-            }
-        }
+        pose_output_filter_.coast();
         return;
     }
 
     // Measured pose-set corners; their Jacobian at the measured pose gives
     // the per-frame information matrix (huge along observable directions,
-    // near-singular along the weak mode).
+    // near-singular along the weak mode). Tip-agnostic: the filter only ever
+    // sees the generic pose and this corner geometry.
     std::vector<cv::Point3d> object_points;
     object_points.reserve(result.corners.size());
     for (const TrackerCorner& c : result.corners) {
@@ -988,119 +1238,41 @@ void TrackerEngine::applyPoseKalman(TrackerFrameResult& result)
             object_points.emplace_back(c.xyz_mm[0], c.xyz_mm[1], c.xyz_mm[2]);
         }
     }
-    if (static_cast<int>(object_points.size()) < config_.min_points) {
-        return;
-    }
 
-    cv::Mat z(6, 1, CV_64F);
-    for (int i = 0; i < 3; ++i) {
-        z.at<double>(i) = result.rvec[static_cast<size_t>(i)];
-        z.at<double>(i + 3) = result.tvec[static_cast<size_t>(i)];
+    const std::array<double, 3> rvec_in = {
+        result.rvec[0], result.rvec[1], result.rvec[2]};
+    const std::array<double, 3> tvec_in = {
+        result.tvec[0], result.tvec[1], result.tvec[2]};
+    // When the IR MAP fusion applied this frame, smooth its IR-informed pose
+    // with the MAP measurement covariance instead of the RGB-only Sigma.
+    // When the fusion ATTEMPTED and REJECTED (references existed, gates
+    // failed: glare veil, adverse geometry), the surviving RGB-only pose is
+    // known-degraded evidence — inflate its covariance so the filter damps
+    // the episode instead of following the drift at full confidence.
+    const double meas_var_scale =
+        (ir_last_fusion_rejected_ && config_.ir_reject_cov_inflate > 1.0)
+            ? config_.ir_reject_cov_inflate
+            : 1.0;
+    result.timings_ms["pose_kf_meas_var_scale"] = meas_var_scale;
+    const PoseOutputFilterResult filtered = pose_output_filter_.update(
+        rvec_in, tvec_in, object_points,
+        ir_meas_cov_valid_ ? &ir_meas_cov_ : nullptr,
+        meas_var_scale);
+    if (!filtered.applied) {
+        return;  // too few points: leave the raw pose as reported
     }
-
-    // Large real jumps (accepted by the engine's own gates, e.g. after
-    // recovery) restart the filter instead of being dragged in slowly.
-    if (pose_kf_initialized_) {
-        double dr = 0.0;
-        double dt = 0.0;
-        for (int i = 0; i < 3; ++i) {
-            const double er = z.at<double>(i) - pose_kf_x_.at<double>(i);
-            const double et = z.at<double>(i + 3) - pose_kf_x_.at<double>(i + 3);
-            dr += er * er;
-            dt += et * et;
-        }
-        const double reset_rot_rad =
-            config_.pose_kf_reset_rotation_deg * CV_PI / 180.0;
-        if (std::sqrt(dr) > reset_rot_rad ||
-            std::sqrt(dt) > config_.max_translation_jump_mm) {
-            pose_kf_initialized_ = false;
-        }
-    }
-
-    if (!pose_kf_initialized_) {
-        pose_kf_x_ = cv::Mat::zeros(12, 1, CV_64F);
-        z.copyTo(pose_kf_x_.rowRange(0, 6));
-        pose_kf_P_ = cv::Mat::zeros(12, 12, CV_64F);
-        const double r2 = std::pow(2.0 * CV_PI / 180.0, 2.0);
-        const double vr2 = std::pow(0.5 * CV_PI / 180.0, 2.0);
-        for (int i = 0; i < 3; ++i) {
-            pose_kf_P_.at<double>(i, i) = r2;
-            pose_kf_P_.at<double>(i + 3, i + 3) = 25.0;       // (5 mm)^2
-            pose_kf_P_.at<double>(i + 6, i + 6) = vr2;
-            pose_kf_P_.at<double>(i + 9, i + 9) = 4.0;        // (2 mm/f)^2
-        }
-        pose_kf_initialized_ = true;
-        result.timings_ms["pose_kf_applied"] = 0.0;
-        return;  // first frame: output = measurement
-    }
-
-    // Constant-velocity predict; process noise on the acceleration.
-    cv::Mat F = cv::Mat::eye(12, 12, CV_64F);
-    for (int i = 0; i < 6; ++i) {
-        F.at<double>(i, i + 6) = 1.0;
-    }
-    const double q_r =
-        std::pow(config_.pose_kf_q_rotation_deg * CV_PI / 180.0, 2.0);
-    const double q_t = std::pow(config_.pose_kf_q_translation_mm, 2.0);
-    cv::Mat Q = cv::Mat::zeros(12, 12, CV_64F);
-    for (int i = 0; i < 6; ++i) {
-        const double q = (i < 3) ? q_r : q_t;
-        Q.at<double>(i, i) = 0.25 * q;
-        Q.at<double>(i, i + 6) = 0.5 * q;
-        Q.at<double>(i + 6, i) = 0.5 * q;
-        Q.at<double>(i + 6, i + 6) = q;
-    }
-    pose_kf_x_ = F * pose_kf_x_;
-    pose_kf_P_ = F * pose_kf_P_ * F.t() + Q;
-
-    // Measurement covariance sigma^2 (J^T J)^-1 from the pose Jacobian.
-    cv::Mat rvec_m = z.rowRange(0, 3).clone();
-    cv::Mat tvec_m = z.rowRange(3, 6).clone();
-    cv::Mat dist_mat;
-    if (!dist_coeffs_.empty()) {
-        dist_mat = cv::Mat(dist_coeffs_, true);
-    }
-    std::vector<cv::Point2d> projected;
-    cv::Mat J;
-    cv::projectPoints(object_points, rvec_m, tvec_m, K_, dist_mat,
-                      projected, J);
-    const cv::Mat Jp = J.colRange(0, 6);  // columns: drvec(3), dtvec(3)
-    const cv::Mat info = Jp.t() * Jp;
-    const double sigma2 = std::pow(config_.pose_kf_sigma_px, 2.0);
-    cv::Mat Sigma;
-    cv::invert(info, Sigma, cv::DECOMP_SVD);
-    Sigma *= sigma2;
-
-    cv::Mat Hm = cv::Mat::zeros(6, 12, CV_64F);  // H = [I6 | 0]
-    for (int i = 0; i < 6; ++i) {
-        Hm.at<double>(i, i) = 1.0;
-    }
-
-    cv::Mat innov = z - Hm * pose_kf_x_;
-    cv::Mat S = Hm * pose_kf_P_ * Hm.t() + Sigma;
-    cv::Mat S_inv;
-    cv::invert(S, S_inv, cv::DECOMP_SVD);
-    const double m2 = cv::Mat(innov.t() * S_inv * innov).at<double>(0);
-    if (m2 > config_.pose_kf_gate_mahalanobis &&
-        config_.pose_kf_gate_mahalanobis > 0.0) {
-        // Spike: deweight the measurement instead of dropping it, so a
-        // genuine fast motion still pulls the state over a few frames.
-        Sigma *= m2 / config_.pose_kf_gate_mahalanobis;
-        S = Hm * pose_kf_P_ * Hm.t() + Sigma;
-        cv::invert(S, S_inv, cv::DECOMP_SVD);
-        result.timings_ms["pose_kf_gated"] = 1.0;
-    }
-    const cv::Mat Kg = pose_kf_P_ * Hm.t() * S_inv;
-    pose_kf_x_ = pose_kf_x_ + Kg * innov;
-    pose_kf_P_ = (cv::Mat::eye(12, 12, CV_64F) - Kg * Hm) * pose_kf_P_;
 
     // Write the filtered pose into the OUTPUT fields only.
     for (int i = 0; i < 3; ++i) {
-        result.rvec[static_cast<size_t>(i)] = pose_kf_x_.at<double>(i);
-        result.tvec[static_cast<size_t>(i)] = pose_kf_x_.at<double>(i + 3);
+        result.rvec[static_cast<size_t>(i)] = filtered.rvec[static_cast<size_t>(i)];
+        result.tvec[static_cast<size_t>(i)] = filtered.tvec[static_cast<size_t>(i)];
+    }
+    cv::Mat rvec_mat(3, 1, CV_64F);
+    for (int i = 0; i < 3; ++i) {
+        rvec_mat.at<double>(i) = filtered.rvec[static_cast<size_t>(i)];
     }
     cv::Mat R;
-    cv::Rodrigues(pose_kf_x_.rowRange(0, 3), R);
+    cv::Rodrigues(rvec_mat, R);
     if (result.T_marker_camera.size() == 16) {
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) {
@@ -1108,11 +1280,251 @@ void TrackerEngine::applyPoseKalman(TrackerFrameResult& result)
                     R.at<double>(r, c);
             }
             result.T_marker_camera[static_cast<size_t>(r * 4 + 3)] =
-                pose_kf_x_.at<double>(r + 3);
+                filtered.tvec[static_cast<size_t>(r)];
         }
     }
-    result.timings_ms["pose_kf_applied"] = 1.0;
-    result.timings_ms["pose_kf_mahalanobis"] = m2;
+    result.pose_covariance.assign(
+        filtered.covariance.begin(), filtered.covariance.end());
+    result.timings_ms["pose_kf_applied"] =
+        filtered.initialized_this_frame ? 0.0 : 1.0;
+    result.timings_ms["pose_kf_mahalanobis"] = filtered.mahalanobis;
+    if (filtered.gated) {
+        result.timings_ms["pose_kf_gated"] = 1.0;
+    }
+}
+
+void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
+{
+    ir_meas_cov_valid_ = false;   // reset each frame; set below iff MAP applied
+    ir_last_fusion_rejected_ = false;
+    if (!ir_pose_refiner_.active()) {
+        return;
+    }
+    if (current_ir_left_.empty() || current_ir_right_.empty()) {
+        return;
+    }
+    if (!result.current_pose_accepted ||
+        result.rvec.size() != 3 || result.tvec.size() != 3) {
+        return;
+    }
+
+    const std::array<double, 3> rvec_in = {
+        result.rvec[0], result.rvec[1], result.rvec[2]};
+    const std::array<double, 3> tvec_in = {
+        result.tvec[0], result.tvec[1], result.tvec[2]};
+    // The MAP fusion reprojects the SAME tracked corners the RGB pose was solved
+    // on (model position + detected pixel) and fuses their IR triangulation.
+    std::vector<cv::Vec3d> rgb_xyz;
+    std::vector<cv::Point2d> rgb_uv;
+    rgb_xyz.reserve(result.corners.size());
+    rgb_uv.reserve(result.corners.size());
+    for (const TrackerCorner& c : result.corners) {
+        rgb_xyz.emplace_back(c.xyz_mm[0], c.xyz_mm[1], c.xyz_mm[2]);
+        rgb_uv.emplace_back(c.uv[0], c.uv[1]);
+    }
+    // Rolling-shutter-aware RGB sigma. The RGB camera is rolling shutter, the
+    // IR pair is global shutter: fast in-image motion shears the marker
+    // COHERENTLY, which PnP absorbs as a fake roll about the view axis (live
+    // fb runs: roll delta proportional to push velocity, corr +0.6..+0.8) -
+    // over the ~180 mm tool lever that is millimetres of fake tip motion. The
+    // shear is invisible to the IID still-frame sigma (the reprojection stays
+    // consistent), so inflate sigma_px with the measured per-frame corner
+    // velocity: at rest the calibrated weighting, under motion the orientation
+    // authority moves to the shear-free IR measurement.
+    double vpx = ir_last_vpx_;
+    {
+        std::vector<double> dmov;
+        std::unordered_map<int, cv::Point2d> cur;
+        cur.reserve(result.corners.size());
+        for (const TrackerCorner& c : result.corners) {
+            if (c.predicted) {
+                continue;
+            }
+            const int key = c.global_row * 1024 + c.global_col;
+            const cv::Point2d uv(c.uv[0], c.uv[1]);
+            cur.emplace(key, uv);
+            const auto it = ir_prev_corner_uv_.find(key);
+            if (it != ir_prev_corner_uv_.end()) {
+                dmov.push_back(cv::norm(uv - it->second));
+            }
+        }
+        if (dmov.size() >= 8) {
+            std::nth_element(dmov.begin(),
+                             dmov.begin() +
+                                 static_cast<std::ptrdiff_t>(dmov.size() / 2),
+                             dmov.end());
+            vpx = dmov[dmov.size() / 2];
+            ir_last_vpx_ = vpx;    // few matches -> keep the last estimate
+        }
+        ir_prev_corner_uv_ = std::move(cur);
+    }
+    // Rotation gate on the shear compensation: image velocity from
+    // TRANSLATION is the rolling-shutter case (RGB corrupt, global-shutter IR
+    // clean -> shift authority). Image velocity from fast ROTATION (divot
+    // sweep) stresses the IR warp itself - shifting authority there made the
+    // divot z_perp WORSE (0.48 -> 0.72). Fade the inflation out with the
+    // per-frame rotation delta so it only acts on translation-like motion.
+    double drot_deg = 0.0;
+    if (ir_prev_rvec_valid_) {
+        const cv::Mat rv_prev =
+            (cv::Mat_<double>(3, 1) << ir_prev_rvec_[0], ir_prev_rvec_[1],
+             ir_prev_rvec_[2]);
+        const cv::Mat rv_curr =
+            (cv::Mat_<double>(3, 1) << result.rvec[0], result.rvec[1],
+             result.rvec[2]);
+        cv::Mat R_prev, R_curr, r_delta;
+        cv::Rodrigues(rv_prev, R_prev);
+        cv::Rodrigues(rv_curr, R_curr);
+        cv::Rodrigues(R_curr * R_prev.t(), r_delta);
+        drot_deg = cv::norm(r_delta) * 180.0 / CV_PI;
+    }
+    ir_prev_rvec_ = {result.rvec[0], result.rvec[1], result.rvec[2]};
+    ir_prev_rvec_valid_ = true;
+    double sigma_px_eff = config_.ir_sigma_px;
+    if (config_.ir_sigma_px_motion_coeff > 0.0) {
+        // Only the TRANSLATION share of the image velocity drives the shear
+        // compensation: subtract the rotation-induced share (~rot_px_per_deg
+        // px per deg/frame of pose rotation). A pure push keeps nearly the
+        // full vpx; an orientation sweep (divot) cancels it, because there
+        // the IR warp is stressed too and must keep its normal weight.
+        const double v_trans = std::max(
+            0.0, vpx - config_.ir_sigma_px_motion_rot_px_per_deg * drot_deg);
+        const double sm = config_.ir_sigma_px_motion_coeff * v_trans;
+        sigma_px_eff = std::sqrt(sigma_px_eff * sigma_px_eff + sm * sm);
+    }
+    result.timings_ms["ir_vpx"] = vpx;
+    result.timings_ms["ir_drot_deg"] = drot_deg;
+    result.timings_ms["ir_sigma_px_eff"] = sigma_px_eff;
+    const std::int64_t ir_t0 = cv::getTickCount();
+    const IrPoseRefinerResult fused = ir_pose_refiner_.fuse(
+        current_ir_left_, current_ir_right_, rvec_in, tvec_in, rgb_xyz, rgb_uv,
+        sigma_px_eff);
+    result.timings_ms["ir_refine_ms"] = elapsedMs(ir_t0);
+    result.timings_ms["ir_fit_rms_mm"] = fused.fit_rms_mm;
+    result.timings_ms["ir_applied"] = fused.applied ? 1.0 : 0.0;
+    result.timings_ms["ir_mode"] = static_cast<double>(fused.mode);
+    result.timings_ms["ir_ref_count"] =
+        static_cast<double>(fused.ref_count);
+    result.timings_ms["ir_refs_measured"] =
+        static_cast<double>(fused.refs_measured);
+    result.timings_ms["ir_ref_enrolled"] = fused.ref_count > 0 ? 1.0 : 0.0;
+    result.timings_ms["ir_pairs"] = static_cast<double>(fused.pairs);
+    result.timings_ms["ir_saturated_frac"] = fused.saturated_frac;
+    result.timings_ms["ir_best_ref_angle_deg"] = fused.best_ref_angle_deg;
+    result.timings_ms["ir_best_ref_trans_mm"] = fused.best_ref_trans_mm;
+    result.timings_ms["ir_quality"] = fused.quality;
+    result.timings_ms["ir_dtz_mm"] = fused.dtz_mm;   // legacy: depth part of shift
+    result.timings_ms["ir_delta_trans_mm"] = 0.0;
+    // The MAP corrects the FULL pose; the depth-only path never touched rotation,
+    // so ir_delta_rot_deg (how far the fusion rotated the pose) is a new signal.
+    result.timings_ms["ir_delta_rot_deg"] = 0.0;
+
+    // Remember the RGB-only pose before the fusion overwrites rvec/tvec. The tip
+    // blend downstream keeps this pose's image-plane and takes only the fused
+    // depth (see TrackerFrameResult::rvec_prefusion).
+    result.rvec_prefusion = result.rvec;
+    result.tvec_prefusion = result.tvec;
+
+    if (fused.applied) {
+        // MAP fusion: the tightly-coupled RGB-reprojection + IR-stereo-3D solve
+        // replaces the reported pose (rotation + translation), covariance-
+        // weighted so IR only moves the DOF it observes well.
+        const cv::Vec3d dt(fused.tvec[0] - result.tvec[0],
+                           fused.tvec[1] - result.tvec[1],
+                           fused.tvec[2] - result.tvec[2]);
+        result.timings_ms["ir_delta_trans_mm"] = cv::norm(dt);
+        const cv::Mat rvec_rgb_m =
+            (cv::Mat_<double>(3, 1) << rvec_in[0], rvec_in[1], rvec_in[2]);
+        const cv::Mat rvec_fus_m =
+            (cv::Mat_<double>(3, 1) << fused.rvec[0], fused.rvec[1], fused.rvec[2]);
+        cv::Mat R_rgb_m, R_fus_m, r_delta;
+        cv::Rodrigues(rvec_rgb_m, R_rgb_m);
+        cv::Rodrigues(rvec_fus_m, R_fus_m);
+        cv::Rodrigues(R_fus_m * R_rgb_m.t(), r_delta);
+        result.timings_ms["ir_delta_rot_deg"] = cv::norm(r_delta) * 180.0 / CV_PI;
+        // Weak-evidence honesty: the Huber-trimmed GN understates uncertainty
+        // when the fit is poor (fb3 frame 4057: 23 pairs, fit_rms 0.42 vs
+        // typical 0.09, yet near-nominal covariance -> +3.25mm tip spike passed
+        // the filter). Scale by the reduced chi-square so the temporal filter
+        // damps such frames instead of following them.
+        double cov_scale = 1.0;
+        if (config_.ir_cov_inflate_ref_rms_mm > 0.0 && fused.fit_rms_mm > 0.0) {
+            const double r =
+                fused.fit_rms_mm / config_.ir_cov_inflate_ref_rms_mm;
+            cov_scale = std::max(1.0, r * r);
+        }
+        result.timings_ms["ir_cov_scale"] = cov_scale;
+        // Hand the MAP measurement covariance to the temporal filter, reordered
+        // from the MAP's [t, rot] layout to the filter's [rvec(rot), tvec(t)].
+        for (int a = 0; a < 6; ++a) {
+            const int ma = a < 3 ? a + 3 : a - 3;
+            for (int b = 0; b < 6; ++b) {
+                const int mb = b < 3 ? b + 3 : b - 3;
+                ir_meas_cov_[static_cast<size_t>(6 * a + b)] =
+                    cov_scale * fused.cov[static_cast<size_t>(6 * ma + mb)];
+            }
+        }
+        ir_meas_cov_valid_ = true;
+        for (int i = 0; i < 3; ++i) {
+            result.rvec[static_cast<size_t>(i)] =
+                fused.rvec[static_cast<size_t>(i)];
+            result.tvec[static_cast<size_t>(i)] =
+                fused.tvec[static_cast<size_t>(i)];
+        }
+        cv::Mat rv_out(3, 1, CV_64F);
+        for (int i = 0; i < 3; ++i) {
+            rv_out.at<double>(i) = fused.rvec[static_cast<size_t>(i)];
+        }
+        cv::Mat R_out;
+        cv::Rodrigues(rv_out, R_out);
+        if (result.T_marker_camera.size() == 16) {
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    result.T_marker_camera[static_cast<size_t>(r * 4 + c)] =
+                        R_out.at<double>(r, c);
+                }
+                result.T_marker_camera[static_cast<size_t>(r * 4 + 3)] =
+                    fused.tvec[static_cast<size_t>(r)];
+            }
+        }
+    }
+
+    // Reference enrollment AFTER the fusion, with the FUSED pose (bootstrap:
+    // later references are enrolled on already depth-corrected poses; the
+    // self-enslavement guard is the min_ref_rot_deg selection distance).
+    cv::Mat rv_mat(3, 1, CV_64F);
+    for (int i = 0; i < 3; ++i) {
+        rv_mat.at<double>(i) = result.rvec[static_cast<size_t>(i)];
+    }
+    cv::Mat R_mat;
+    cv::Rodrigues(rv_mat, R_mat);
+    // Position-only enrollments additionally require a demonstrably good
+    // fusion THIS frame (bootstrap-bias guard); orientation enrollments are
+    // exempt inside updateReferences.
+    const bool fusion_quality_ok =
+        fused.applied &&
+        fused.fit_rms_mm <= config_.ir_enroll_max_fit_rms_mm &&
+        fused.saturated_frac >= 0.0 &&
+        fused.saturated_frac <= config_.ir_enroll_max_sat_frac;
+    // Corner evidence existed but no attempt survived the gates: this
+    // frame is suspect (glare, adverse geometry, RGB drift beyond the
+    // trans-jump gate) — the pose filter inflates the measurement
+    // covariance for this frame. Pair count covers the reference-free
+    // (quadratic_form) mode where ref_count is always zero.
+    ir_last_fusion_rejected_ =
+        !fused.applied && (fused.ref_count > 0 || fused.pairs > 0);
+    result.timings_ms["ir_fusion_rejected"] =
+        ir_last_fusion_rejected_ ? 1.0 : 0.0;
+    // Remembered for the NEXT frame's model_warp (re-)enrollment gate (that
+    // runs before the fusion in the frame pipeline). Bootstrap exemption:
+    // without any IR reference there is no quality evidence either way.
+    ir_last_fusion_quality_ok_ =
+        fused.ref_count == 0 ? true : fusion_quality_ok;
+    ir_pose_refiner_.updateReferences(
+        current_ir_left_, current_ir_right_, cv::Matx33d(R_mat),
+        cv::Vec3d(result.tvec[0], result.tvec[1], result.tvec[2]),
+        pose_converged_ && irEnrollMotionOk(),
+        fusion_quality_ok);
 }
 
 void TrackerEngine::updatePoseWarmupState(TrackerFrameResult& result)
@@ -1152,38 +1564,69 @@ void TrackerEngine::updateModelWarpStateAfterFrame(
     const TrackerFrameResult& result
 )
 {
-    if (config_.checker_tracked_refine_method != "model_warp") {
+    const bool is_mw =
+        config_.checker_tracked_refine_method == "model_warp";
+    const bool is_qf =
+        config_.checker_tracked_refine_method == "quadratic_form";
+    if (!is_mw && !is_qf) {
         return;
     }
+
+    // Anchor source for the next frame: corners of this frame — their uv
+    // plus the marker coordinate (id-derived, pose-independent).
+    const auto refreshAnchors = [&]() {
+        model_prev_uv_.clear();
+        model_prev_xyz_.clear();
+        model_prev_uv_.reserve(result.corners.size());
+        model_prev_xyz_.reserve(result.corners.size());
+        for (const TrackerCorner& c : result.corners) {
+            if (c.predicted) {
+                continue;
+            }
+            model_prev_uv_.emplace_back(
+                static_cast<float>(c.uv[0]),
+                static_cast<float>(c.uv[1]));
+            model_prev_xyz_.emplace_back(
+                c.xyz_mm[0], c.xyz_mm[1], c.xyz_mm[2]);
+        }
+    };
 
     if (!result.current_pose_accepted ||
         result.rvec.size() != 3 ||
         result.tvec.size() != 3) {
+        // quadratic_form: the anchors track every FRESHLY MEASURED frame —
+        // the corner identity and its marker coordinate do not depend on
+        // the pose, and the detector matches anchors against its PREVIOUS
+        // frame. Refreshing only on accepted poses lets the positional
+        // match (1.5 px) tear off during rejected streaks under motion —
+        // exactly the rotation phases where coverage matters most.  The
+        // source is the per-frame correspondence capture (fresh uv by
+        // construction) — result.corners on hold frames carry STALE
+        // held positions and must never feed the anchors (v6 regression:
+        // divot corners 45->30).  model_warp keeps the accepted-only
+        // behaviour (bit-identity; its reference warp also bakes the
+        // pose, so stale anchors are safer there than wrong ones).
+        if (is_qf && qf_frame_anchor_uv_.size() >= 8) {
+            model_prev_uv_ = qf_frame_anchor_uv_;
+            model_prev_xyz_ = qf_frame_anchor_xyz_;
+        }
         return;
     }
 
-    // Anchor source for the next frame: pose corners of this (now last
-    // accepted) frame — their uv in this frame plus the marker coordinate.
-    model_prev_uv_.clear();
-    model_prev_xyz_.clear();
-    model_prev_uv_.reserve(result.corners.size());
-    model_prev_xyz_.reserve(result.corners.size());
-    for (const TrackerCorner& c : result.corners) {
-        if (c.predicted) {
-            continue;
-        }
-        model_prev_uv_.emplace_back(
-            static_cast<float>(c.uv[0]),
-            static_cast<float>(c.uv[1]));
-        model_prev_xyz_.emplace_back(
-            c.xyz_mm[0], c.xyz_mm[1], c.xyz_mm[2]);
-    }
+    refreshAnchors();
 
     // Pose history for the constant-velocity prediction.
     model_prev_rvec_ = model_curr_rvec_;
     model_prev_tvec_ = model_curr_tvec_;
     model_curr_rvec_ = result.rvec;
     model_curr_tvec_ = result.tvec;
+
+    // Everything below is reference/template state — model_warp only.
+    // quadratic_form is reference-free and needs just the anchors and the
+    // pose history maintained above.
+    if (!is_mw) {
+        return;
+    }
 
     // Re-enrollment trigger: drop the reference once the viewing direction
     // (camera centre seen from the marker) moved beyond the threshold —
@@ -1220,9 +1663,17 @@ void TrackerEngine::updateModelWarpStateAfterFrame(
     // the tool is QUIET (a blurred reference degrades every later
     // measurement). Runs again whenever the re-enrollment policy dropped
     // the reference; short tracking losses keep it, a full loss drops it.
+    // ir_last_fusion_quality_ok_: the template pose is baked into the warp
+    // reference, so never (re-)enroll while the IR fusion says the current
+    // pose is untrustworthy (fb3: the far-end pause coincided with the yaw
+    // episode, the 6-deg re-enroll baked its bias in and the RETURN leg read
+    // +0.32; with the gate the re-enroll defers to the next clean pause).
+    // Defaults to true while IR is off / has no references yet, so RGB-only
+    // projects and the initial enrollment are unaffected.
     if (!model_ref_enrolled_ &&
         pose_converged_ &&
         poseMotionQuiet() &&
+        ir_last_fusion_quality_ok_ &&
         geometry_.surfaceModel().valid() &&
         !current_frame_.empty() &&
         result.num_inliers >= 15 &&
@@ -1248,6 +1699,33 @@ void TrackerEngine::updateModelWarpStateAfterFrame(
         model_ref_enrolled_ = true;
         ++model_enroll_count_;
     }
+}
+
+bool TrackerEngine::irEnrollMotionOk() const
+{
+    // Same motion measure as poseMotionQuiet(), but with the RELAXED IR
+    // enrollment caps: the IR pair is global shutter, so a moderately-moving
+    // frame still yields a sharp reference. This lets the library fill across
+    // the orientation sweep during continuous motion.
+    if (model_prev_rvec_.size() != 3 || model_prev_tvec_.size() != 3 ||
+        model_curr_rvec_.size() != 3 || model_curr_tvec_.size() != 3) {
+        return true;  // no pose history yet
+    }
+    double dt2 = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        const double d = model_curr_tvec_[static_cast<size_t>(i)] -
+                         model_prev_tvec_[static_cast<size_t>(i)];
+        dt2 += d * d;
+    }
+    if (std::sqrt(dt2) > config_.ir_enroll_max_trans_mm) {
+        return false;
+    }
+    cv::Mat R_prev, R_curr, r_delta;
+    cv::Rodrigues(cv::Mat(model_prev_rvec_, true), R_prev);
+    cv::Rodrigues(cv::Mat(model_curr_rvec_, true), R_curr);
+    cv::Rodrigues(R_curr * R_prev.t(), r_delta);
+    const double rot_deg = cv::norm(r_delta) * 180.0 / CV_PI;
+    return rot_deg <= config_.ir_enroll_max_rot_deg;
 }
 
 bool TrackerEngine::poseMotionQuiet() const
@@ -1895,7 +2373,7 @@ void TrackerEngine::onTrackingFailure()
         // Full loss: the corner set will be rebuilt from scratch, so the
         // pose has to warm up again before it counts as converged.
         resetPoseWarmup();
-        resetPoseKalman();
+        resetPoseFilter();
         // Re-acquisition may happen in a different tool orientation; a
         // reference from before the loss is then stale. Drop it — a fresh
         // one is enrolled after the pose has re-converged.
@@ -1906,7 +2384,14 @@ void TrackerEngine::onTrackingFailure()
     }
 
     if (pose_tracker_.hasPose()) {
-        mode_ = TrackerMode::Recovering;
+        // Hysteresis: don't escalate to the expensive full recovery on a
+        // single transient failure (a high-reproj frame on the cylinder). Hold
+        // the last pose in Tracking mode so the NEXT frame retries the cheap
+        // tracking path from the still-tracked corners; escalate to Recovering
+        // only once the failure persists.
+        if (lost_frames_ >= config_.recovery_grace_frames) {
+            mode_ = TrackerMode::Recovering;
+        }
         dot_detector_.reset_smoothing();
         return;
     }
@@ -2073,6 +2558,16 @@ CheckerboardDetectorConfig TrackerEngine::makeCheckerboardConfig(
         config.checker_max_undecodeable_tracking_frames;
     checker_config.tracked_refine_method =
         config.checker_tracked_refine_method;
+    checker_config.qf_profile_half_px = config.checker_qf_profile_half_px;
+    checker_config.qf_min_contrast = config.checker_qf_min_contrast;
+    checker_config.qf_max_profile_rms = config.checker_qf_max_profile_rms;
+    checker_config.qf_junction_margin_frac =
+        config.checker_qf_junction_margin_frac;
+    checker_config.qf_min_row_points = config.checker_qf_min_row_points;
+    checker_config.qf_min_col_points = config.checker_qf_min_col_points;
+    checker_config.qf_conic_gain = config.checker_qf_conic_gain;
+    checker_config.qf_max_fit_rms_px = config.checker_qf_max_fit_rms_px;
+    checker_config.qf_max_dev_px = config.checker_qf_max_dev_px;
     return checker_config;
 }
 

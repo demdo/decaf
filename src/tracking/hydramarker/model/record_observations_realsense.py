@@ -1,14 +1,19 @@
 """Record camera observations for HydraMarker model construction.
 
 The live recorder runs ``HydraTracker`` against a configured camera stream and writes
-the corner, pose, and camera metadata needed by the SfM model-building pipeline.
+the corner observations needed by the SfM model-building pipeline. Alongside the
+observations NPZ it also saves the raw frame behind each saved observation
+(``<observations>_frames/frame_NNNNNN.png``, keyed to the observation frame_id) so the
+geometry can later be rebuilt offline with the model_warp corner operator.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+import queue
 import sys
+import threading
 from datetime import datetime
 from dataclasses import replace
 
@@ -424,6 +429,104 @@ def make_sfm_tracker(
     )
 
 
+class _FrameWriter:
+    """Background PNG writer for the raw frame behind each saved observation.
+
+    The heavy PNG encode runs on a daemon thread so it never blocks the recording
+    loop (synchronous encoding caused capture lag in the pivot recorder). Frames
+    are written under their observation frame_id (``frame_NNNNNN.png``) so the
+    offline model_warp re-extraction can map each observation back to the exact
+    image it was measured on. If the writer falls behind, the frame's IMAGE is
+    dropped -- never the observation.
+    """
+
+    def __init__(self, frames_dir: Path) -> None:
+        self.frames_dir = Path(frames_dir)
+        self._ready = False
+        self._q: queue.Queue | None = None
+        self._thread: threading.Thread | None = None
+
+    def _ensure_writer(self) -> None:
+        if self._thread is None:
+            self._q = queue.Queue(maxsize=512)
+            self._thread = threading.Thread(
+                target=self._writer_loop,
+                name="sfm-obs-img-writer",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _writer_loop(self) -> None:
+        assert self._q is not None
+        while True:
+            path, arr = self._q.get()
+            try:
+                cv2.imwrite(path, arr)
+            except Exception:  # never let a bad write kill the writer thread
+                pass
+            finally:
+                self._q.task_done()
+
+    def save(
+        self,
+        frame_id: int,
+        frame_bgr: np.ndarray,
+        extras: dict[str, np.ndarray] | None = None,
+    ) -> None:
+        """Save the RGB frame, plus optional named side images
+        (``frame_NNNNNN_<name>.png``, e.g. the IR pair for the optional
+        IR model refinement). Cameras without those streams simply pass
+        no extras — nothing else changes."""
+        if not self._ready:
+            self.frames_dir.mkdir(parents=True, exist_ok=True)
+            for old in self.frames_dir.glob("frame_*.png"):  # wipe stale prior-run frames
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            self._ensure_writer()
+            self._ready = True
+
+        assert self._q is not None
+        try:
+            self._q.put_nowait(
+                (
+                    str(self.frames_dir / f"frame_{int(frame_id):06d}.png"),
+                    frame_bgr.copy(),
+                )
+            )
+            for name, img in (extras or {}).items():
+                if img is None:
+                    continue
+                self._q.put_nowait(
+                    (
+                        str(self.frames_dir /
+                            f"frame_{int(frame_id):06d}_{name}.png"),
+                        img.copy(),
+                    )
+                )
+        except queue.Full:
+            # Writer fell behind (slow disk): drop this frame's IMAGE only; the
+            # observation is still saved. Better a sparse image set than lag.
+            pass
+
+    def flush(self) -> None:
+        """Block until every queued frame has been written to disk."""
+        if self._q is not None:
+            self._q.join()
+
+    def wipe(self) -> None:
+        """Drain pending writes and delete saved frames (session reset)."""
+        self.flush()
+        if self.frames_dir.is_dir():
+            for old in self.frames_dir.glob("frame_*.png"):
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        self._ready = False
+
+
 def main(camera_config: CameraConfig | None = None) -> None:
     field_path = choose_file_qt(
         "Select HydraMarker .field file",
@@ -441,12 +544,20 @@ def main(camera_config: CameraConfig | None = None) -> None:
     print(f"[recorder] num_corner_cols = {num_corner_cols} (from marker JSON)")
 
     observations_path = make_output_path()
+    frames_dir = observations_path.with_name(observations_path.stem + "_frames")
+    frame_writer = _FrameWriter(frames_dir)
 
     calib_path = choose_file_qt(
         "Select OpenCV camera calibration NPZ",
         CAMERA_CALIBRATION_FILTER,
     )
-    camera_config = replace(camera_config or CameraConfig(), calibration_path=str(calib_path))
+    # Default recorder config enables the IR pair (RealSense only; every
+    # other backend ignores the flag and delivers ir_left/ir_right = None,
+    # so the recorder stays fully usable without IR). An explicitly passed
+    # camera_config is respected as-is.
+    camera_config = replace(
+        camera_config or CameraConfig(realsense_enable_ir=True),
+        calibration_path=str(calib_path))
     camera = create_recording_camera(camera_config)
     K, dist = load_tracker_camera_calibration(
         calib_path,
@@ -518,6 +629,18 @@ def main(camera_config: CameraConfig | None = None) -> None:
 
                 if should_save:
                     observations.append(obs)
+                    # obs.frame_id == frame_id here (incremented just below), so the
+                    # saved image and the observation share the same index.
+                    # IR pair (optional): saved alongside for the IR model
+                    # refinement post-pass; None for cameras without IR.
+                    frame_writer.save(
+                        obs.frame_id,
+                        frame,
+                        extras={
+                            "irL": getattr(camera_frame, "ir_left", None),
+                            "irR": getattr(camera_frame, "ir_right", None),
+                        },
+                    )
                     frame_id += 1
                     saved_frames += 1
                     last_saved_motion_px = motion_px
@@ -609,11 +732,15 @@ def main(camera_config: CameraConfig | None = None) -> None:
                     start_recording()
 
             elif key == ord("s"):
+                frame_writer.flush()
                 save_observations_npz(observations_path, observations)
                 print(f"Saved observations: {observations_path}")
+                if frames_dir.is_dir():
+                    print(f"Saved frames: {frames_dir}")
 
             elif key == ord("r"):
                 tracker.reset()
+                frame_writer.wipe()
                 observations.clear()
                 frame_id = 0
                 saved_frames = 0
@@ -625,10 +752,13 @@ def main(camera_config: CameraConfig | None = None) -> None:
     finally:
         camera.stop()
         cv2.destroyAllWindows()
+        frame_writer.flush()
 
         if observations:
             save_observations_npz(observations_path, observations)
             print(f"Saved observations: {observations_path}")
+            if frames_dir.is_dir():
+                print(f"Saved frames: {frames_dir}")
 
 
 if __name__ == "__main__":

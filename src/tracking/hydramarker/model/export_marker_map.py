@@ -354,7 +354,8 @@ def _metric_normalization_from_topology(
         if int(marker_id) in marker_positions
     }
 
-    distances: list[float] = []
+    vertical_distances: list[float] = []
+    horizontal_distances: list[float] = []
 
     for (row, col), marker_id in id_by_row_col.items():
         p = np.asarray(
@@ -362,7 +363,10 @@ def _metric_normalization_from_topology(
             dtype=np.float64,
         ).reshape(3)
 
-        for neighbor_key in ((row, col + 1), (row + 1, col)):
+        for neighbor_key, bucket in (
+            ((row + 1, col), vertical_distances),
+            ((row, col + 1), horizontal_distances),
+        ):
             neighbor_id = id_by_row_col.get(neighbor_key)
             if neighbor_id is None:
                 continue
@@ -374,7 +378,19 @@ def _metric_normalization_from_topology(
 
             d = float(np.linalg.norm(q - p))
             if np.isfinite(d) and d > 1e-12:
-                distances.append(d)
+                bucket.append(d)
+
+    # On a cylinder-wrapped print the horizontal neighbour distances are
+    # CHORDS (shorter than the printed 6 mm arc, ~5.95 mm at r~14.5), so
+    # mixing them into the median inflates the global scale by ~0.5%
+    # (measured: axial 10-cell span 60.31 mm exported vs 60.00 mm physical).
+    # The vertical (row-direction/axial) edges are curvature-free and carry
+    # the true printed spacing; anchor the metric scale on them alone.
+    # Horizontal edges are only used as a fallback for degenerate exports.
+    if len(vertical_distances) >= 8:
+        distances = vertical_distances
+    else:
+        distances = vertical_distances + horizontal_distances
 
     values = np.asarray(distances, dtype=np.float64)
     values = values[np.isfinite(values) & (values > 1e-12)]

@@ -541,9 +541,35 @@ void compactCornersToCells(
             }
         }
 
+        // Single-shot detection (recovery, tracking == false): requiring
+        // cell membership discards most of a holey-but-correct lattice
+        // (measured 2026-07-13: growth assigned 33/33 corners, compaction
+        // kept 6).  Accept corners with at least one INPUT-lattice
+        // 4-neighbour at a plausible distance instead — chain ends across
+        // detection holes survive, isolated misassignments still die.
+        bool recovery_chain_ok = false;
+        if (!tracking && spacing > 1.0f && input_neighbours >= 1) {
+            for (const auto& offset : {
+                     std::pair<int, int>{-1, 0},
+                     std::pair<int, int>{ 1, 0},
+                     std::pair<int, int>{ 0,-1},
+                     std::pair<int, int>{ 0, 1}}) {
+                const GridCorner* nb =
+                    findInputGrid(c.i + offset.first, c.j + offset.second);
+                if (!nb) continue;
+
+                const float d = geom::dist(c.uv, nb->uv);
+                if (d >= spacing * 0.35f && d <= spacing * 1.85f) {
+                    recovery_chain_ok = true;
+                    break;
+                }
+            }
+        }
+
         if (!bridges_compact_gap &&
             !extends_compact_line &&
             !tracking_edge_anchor &&
+            !recovery_chain_ok &&
             (neighbours < 2 || !local_geometry_ok)) {
             continue;
         }

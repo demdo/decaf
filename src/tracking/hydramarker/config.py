@@ -67,21 +67,42 @@ class CameraConfig:
     realsense_saturation: Optional[float] = None
     realsense_sharpness: Optional[float] = None
     realsense_gamma: Optional[float] = None
+    # Global-shutter IR pair co-streaming for the tracker's IR pose
+    # refinement (design B). RealSense-only: every other backend ignores it
+    # and delivers ir_left/ir_right = None. Enabling this also disables the
+    # IR emitter (speckle would ruin the checkerboard corners).
+    realsense_enable_ir: bool = False
+    realsense_ir_width: int = 1280
+    realsense_ir_height: int = 720
     """
 
-    backend: str = "basler"
+    backend: str = "realsense"
     width: int = 1920
     height: int = 1080
     fps: int = MAX_CAMERA_FPS
-    pixel_format: Optional[str] = "auto"
-    exposure_auto: Optional[str] = "Off"
-    exposure_time_us: Optional[float] = 8000.0
-    gain_auto: Optional[str] = "Off"
-    gain_db: Optional[float] = None
-    device_link_throughput_limit_mode: Optional[str] = "Off"
-    device_link_throughput_limit: Optional[int] = None
-    calibration_path: Optional[str] = "data/basler/basler_camera_calibration_standard5.npz"
+    calibration_path: Optional[str] = None
     serial: Optional[str] = None
+    # Global-shutter IR pair co-streaming for the tracker's IR pose
+    # refinement (design B). RealSense-only: every other backend ignores it
+    # and delivers ir_left/ir_right = None. Enabling this also disables the
+    # IR emitter (speckle would ruin the checkerboard corners).
+    realsense_enable_ir: bool = False
+    realsense_ir_width: int = 1280
+    realsense_ir_height: int = 720
+    # Constant frame rate: auto_exposure_priority=0 makes the colour AE keep
+    # the configured fps ALWAYS - exposure is capped at the frame period and
+    # brightness is compensated via gain instead of longer exposures. Without
+    # this (None = camera default, priority ON) the camera silently drops to
+    # ~17-19 fps in dim light (measured on the 12.07 evening runs). Trade-off:
+    # in dim light the image gets noisier (gain); provide decent lighting.
+    # With the IR refinement the geometry comes from IR anyway - RGB only
+    # needs to identify corners, which tolerates gain noise well.
+    realsense_auto_exposure_priority: Optional[float] = 0.0
+    # Manual IR exposure (microseconds). None = auto. Short values (3000-8000)
+    # reduce motion blur on the IR pair -> higher model_warp success during
+    # fast motion; needs enough scene brightness (or realsense_ir_gain).
+    realsense_ir_exposure_us: Optional[float] = None
+    realsense_ir_gain: Optional[float] = None
 
     def validate_common(self) -> None:
         backend = str(self.backend).strip().lower()
@@ -179,6 +200,15 @@ class LiveTrackerConfig:
     tracker: "TrackerConfig" = field(default_factory=lambda: TrackerConfig())
     show_window: bool = True
     start_tracking_manually: bool = True
+    # Couple the JSONL logger to the manual 's' tracking start.  When True the
+    # logger opens exactly when tracking starts (single conscious start via 's')
+    # and closes when the operator stops tracking, instead of the separate SPACE
+    # toggle.  Opt-in so other tools keep the independent tracking/logging keys.
+    start_logging_with_tracking: bool = False
+    # Re-arm acquisition automatically from IDLE via a periodic detection
+    # probe.  Default OFF: during tests the operator keeps explicit control
+    # over the start via the 's' key.
+    idle_auto_reacquire: bool = False
 
     def validate_common(self) -> None:
         self.camera.validate_common()
@@ -201,7 +231,7 @@ class TrackerConfig:
     # CheckerboardDetectorConfig. These values control LK tracking, refresh
     # cadence, and recovery for the visible checkerboard lattice.
     checker_min_tracking_decode_cell_span: int = 3
-    checker_refresh_interval_frames: int = 1
+    checker_refresh_interval_frames: int = 3
     checker_tracking_recovery_stable_interval_frames: int = 9
     checker_tracking_recovery_zero_gain_backoff_after: int = 3
     checker_tracking_recovery_zero_gain_backoff_max_factor: int = 16
@@ -219,7 +249,36 @@ class TrackerConfig:
     # Measurement operator for LK-tracked corners ("subpix" = cornerSubPix
     # snap, "model_warp" = forward-model template registration once
     # implemented; unknown values fall back to "subpix").
-    checker_tracked_refine_method: str = "model_warp"
+    checker_tracked_refine_method: str = "quadratic_form"
+
+    # quadratic_form corner measurement (reference-free curve intersection;
+    # active when checker_tracked_refine_method == "quadratic_form").
+    checker_qf_profile_half_px: float = 4.5
+    checker_qf_min_contrast: float = 12.0
+    checker_qf_max_profile_rms: float = 0.35
+    checker_qf_junction_margin_frac: float = 0.18
+    checker_qf_min_row_points: int = 6
+    checker_qf_min_col_points: int = 3
+    checker_qf_conic_gain: float = 0.95
+    checker_qf_max_fit_rms_px: float = 0.6
+    checker_qf_max_dev_px: float = 2.5
+
+    # Pose-filter distrust for frames where the IR MAP fusion attempted and
+    # REJECTED (references existed, gates failed: glare veil, adverse
+    # geometry): the surviving RGB-only pose is known-degraded evidence, so
+    # its measurement covariance is inflated by this factor (the filter
+    # coasts on its motion model through the episode). C++ struct default
+    # is 1.0 (off) so acceptance replays stay bit-identical.
+    ir_reject_cov_inflate: float = 25.0
+
+    # IR corner measurement operator: "model_warp" = registration against
+    # enrolled reference photo pairs (established behaviour), or
+    # "quadratic_form" = reference-free direct measurement of the projected
+    # model grid curves in each IR view (Phase 2 — no reference library, no
+    # enrollment, works at any orientation from frame 1). Stays model_warp
+    # until the offline A/B on the full corpus validates the QF-IR path.
+    ir_corner_method: str = "quadratic_form"
+    ir_qf_max_dev_px: float = 4.0
 
     # Pose-set stabilisation (2026-07-05). The cylinder pose is nearly blind
     # along one direction (~1 mm z per 0.1 px), so predicted corners (which
@@ -244,10 +303,96 @@ class TrackerConfig:
     # observability mode, real motion follows the measurement directly.
     pose_kf_enabled: bool = True
     pose_kf_sigma_px: float = 0.12
-    pose_kf_q_translation_mm: float = 0.15  # accel noise per frame
-    pose_kf_q_rotation_deg: float = 0.05    # accel noise per frame
+    pose_kf_q_translation_mm: float = 0.15  # moving accel noise per frame
+    pose_kf_q_rotation_deg: float = 0.5     # moving accel noise per frame
     pose_kf_gate_mahalanobis: float = 30.0  # spike deweighting gate
     pose_kf_reset_rotation_deg: float = 10.0
+    # Adaptive process noise (default): Q collapses to the floor while the tool
+    # is still (averages many frames -> static tip jitter 0.10 -> 0.034 mm) and
+    # opens up the instant motion is measured (follows without lag). The fixed
+    # pose_kf_q_* above are the non-adaptive fallback, unused while adaptive.
+    pose_kf_adaptive: bool = True
+    pose_kf_q_rotation_floor_deg: float = 0.002
+    pose_kf_q_translation_floor_mm: float = 0.002
+    pose_kf_adaptive_ema_alpha: float = 0.4
+    # Self-calibrating noise level (default): estimate the quiet-baseline pose
+    # delta online and derive both floors from it (adapts per session/orientation;
+    # fixed floors cannot). Manual floors are fallback + lower bound.
+    pose_kf_auto_noise: bool = True
+    pose_kf_noise_window: int = 90
+    pose_kf_motion_floor_rot_deg: float = 0.12
+    pose_kf_motion_floor_trans_mm: float = 0.05
+    pose_kf_meas_floor_rot_deg: float = 0.035
+    pose_kf_meas_floor_trans_mm: float = 0.02
+    # IR depth-only stereo fusion (output-only). Fuses absolute depth and the
+    # two out-of-plane tilt DoF from the global-shutter IR stereo pair into
+    # the reported pose; RGB keeps rotation and lateral position (full IR
+    # pose replacement is WORSE at the tip: stereo rotation noise times the
+    # tool lever). Multi-reference model_warp measurement (>= min_ref_rot_deg
+    # away from each reference's own enrollment orientation, best reference
+    # by summed ZNCC quality), per-corner saturation gate, robust
+    # ZNCC-weighted tilt fit with clamped median-depth fallback; without
+    # enough pairs the RGB pose stays. Validated offline on divot session
+    # 20260718_181438 (tests/prove_ir_depth_fusion.py: |e| med 1.43->0.20mm).
+    # TRIPLE-GATED: this flag AND tracker.set_ir_calibration(...) AND the IR
+    # frame pair per process_frame call; without any of these the tracker
+    # behaves exactly as before.
+    ir_refine_enabled: bool = False
+    ir_min_pairs: int = 6
+    ir_min_ref_rot_deg: float = 6.0
+    ir_max_ref_rot_deg: float = 180.0
+    # Fixed-orientation fallback floor: only used when no reference reaches
+    # ir_min_ref_rot_deg (pure translation). Lets IR still correct depth at a
+    # single held orientation without touching the divot/tilt path.
+    ir_fallback_min_ref_rot_deg: float = 0.05
+    ir_sat_threshold: int = 250
+    ir_sat_half_px: int = 8
+    ir_epipolar_max_dv_px: float = 2.5
+    ir_zncc_weight_floor: float = 0.05
+    ir_dtz_clamp_mm: float = 2.5
+    # Absolute stereo scale from the session's ChArUco validation shots
+    # (triangulated square size vs known; 1.00197 on session 20260718).
+    ir_depth_scale: float = 1.00197
+    # MAP fusion (tightly-coupled RGB reproj + IR stereo 3D). Sigmas calibrated
+    # from residuals -> ir_w3d = 1. The fit gate rejects an unreliable fusion.
+    ir_sigma_px: float = 0.10
+    # Rolling-shutter compensation: sigma_px_eff^2 = sigma_px^2 + (coeff*v_px)^2
+    # (v_px = median per-frame corner motion). 0 disables.
+    ir_sigma_px_motion_coeff: float = 0.20
+    # Rotation share of the image velocity (px per deg/frame), subtracted from
+    # vpx so only the TRANSLATION share drives the shear compensation.
+    ir_sigma_px_motion_rot_px_per_deg: float = 8.0
+    ir_sigma_ir_px: float = 0.05
+    # IR/reproj balance: 1 = still-frame sigma calibration; 4 compensates the
+    # correlated (non-IID) RGB corner errors during motion (weak-mode wobble).
+    ir_w3d: float = 4.0
+    # Gate calibration 2026-07-22 (fb1_22 glare window): monocular RGB z drifts
+    # 3-4.5mm while stereo fit stays 1.5-1.65, so the old 1.5/3.0 gates rejected
+    # the fusion exactly when it was needed most (z spikes to -4.4). 1.8/6.0
+    # validated across fb1_22/fb4/fb5/fb1_21/fb_rl (p95|z| 10.8->2.4) with only
+    # a small robust-std cost on fb_rl2 (0.87->1.15); divot ABS unchanged.
+    ir_fit_gate_rms_mm: float = 1.8
+    ir_fit_gate_max_trans_jump_mm: float = 6.0
+    # Weak-evidence honesty: inflate the MAP covariance handed to the temporal
+    # filter by the reduced chi-square (fit_rms / this)^2 so the filter damps
+    # poor-fit frames instead of following them. 0 disables.
+    ir_cov_inflate_ref_rms_mm: float = 0.10
+    ir_mw_min_zncc: float = 0.35
+    ir_mw_max_shift_px: float = 6.0
+    ir_enroll_max_rot_deg: float = 3.0
+    ir_enroll_max_trans_mm: float = 8.0
+    ir_ref_tile_deg: float = 12.0
+    # Position tile: also enroll when the pose moved this far from every
+    # reference (a translation sweep at fixed orientation never leaves the
+    # orientation tile, freezing the library at one home reference).
+    # <= 0 disables the position dimension = previous behaviour.
+    ir_ref_tile_trans_mm: float = 40.0
+    ir_fallback_min_ref_trans_mm: float = 15.0
+    # Bootstrap-bias guard: position-only references enroll only on a frame
+    # with a demonstrably good fusion (never blocks new-orientation refs).
+    ir_enroll_max_fit_rms_mm: float = 0.20
+    ir_enroll_max_sat_frac: float = 0.35
+    ir_max_references: int = 12
     # Model-warp reference re-enrollment: fresh reference after a full
     # tracking loss and when the viewing direction moved beyond the angle
     # threshold (stale-reference guard for reorientation — NOT a slope fix;
@@ -256,7 +401,10 @@ class TrackerConfig:
     # Threshold sized against real data: +-85mm step runs reach ~15 deg
     # viewing-angle offset, a deliberate fb<->rl reorientation is ~90 deg.
     model_warp_reenroll_on_loss: bool = True
-    model_warp_reenroll_angle_deg: float = 20.0  # 0 disables
+    # Template refresh distance: 20 was never reached by the fb sweeps (max
+    # ~11deg) -> whole push refined against a skewed template (z step +0.4 in
+    # the 8-12deg band). 6 re-enrolls during natural pauses. 0 disables.
+    model_warp_reenroll_angle_deg: float = 6.0
     model_warp_enroll_max_motion_mm: float = 1.0     # per frame
     model_warp_enroll_max_rotation_deg: float = 0.25  # per frame
 
@@ -297,6 +445,7 @@ class TrackerConfig:
     # MapPoseTrackerConfig. MapPoseTracker and the fast-path pose estimator use
     # these thresholds for RANSAC, direct-prior solving, and motion/reprojection
     # gates.
+    recovery_grace_frames: int = 3
     min_points: int = 6
     min_inliers: int = 5
     max_mean_reprojection_error_px: float = 4.0
@@ -320,7 +469,7 @@ class TrackerConfig:
     # tracker_engine.cpp. Domain-level feature switches remain here; backend
     # selection switches are intentionally absent.
     enable_fast_persistent_path: bool = True
-    fast_persistent_min_points: int = 10
+    fast_persistent_min_points: int = 8
     fast_persistent_refresh_mean_error_px: float = 1.5
     fast_persistent_dense_refine_enabled: bool = True
     fast_persistent_dense_min_points: int = 24

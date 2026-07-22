@@ -27,6 +27,11 @@ class CameraFrame:
     frame_index: int
     timestamp_s: float
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Synchronized global-shutter IR pair (same RealSense frameset as the
+    # colour image). None on every backend except RealSense with
+    # realsense_enable_ir; consumers must treat them as optional.
+    ir_left: np.ndarray | None = None
+    ir_right: np.ndarray | None = None
 
 
 class CameraSource:
@@ -112,6 +117,8 @@ class RealSenseCameraSource(CameraSource):
         self._rs = None
         self._pipeline = None
         self._profile = None
+        self._stereo_sensor_cache = None
+        self._ir_exposure_us = None
 
     @property
     def pipeline(self):
@@ -135,7 +142,46 @@ class RealSenseCameraSource(CameraSource):
             rs.format.bgr8,
             int(self.config.fps),
         )
+        self._ir_enabled = bool(getattr(self.config, "realsense_enable_ir", False))
+        if self._ir_enabled:
+            # global-shutter IR pair for the tracker's IR pose refinement
+            # (design B); same frameset as the colour image -> synchronized
+            # by the SDK. Emitter is disabled below (the speckle pattern
+            # ruins the checkerboard corners).
+            ir_w = int(getattr(self.config, "realsense_ir_width", 1280))
+            ir_h = int(getattr(self.config, "realsense_ir_height", 720))
+            cfg.enable_stream(rs.stream.infrared, 1, ir_w, ir_h,
+                              rs.format.y8, int(self.config.fps))
+            cfg.enable_stream(rs.stream.infrared, 2, ir_w, ir_h,
+                              rs.format.y8, int(self.config.fps))
         profile = pipeline.start(cfg)
+        if self._ir_enabled:
+            ir_exposure = getattr(self.config, "realsense_ir_exposure_us", None)
+            ir_gain = getattr(self.config, "realsense_ir_gain", None)
+            for sensor in profile.get_device().query_sensors():
+                options = [
+                    (rs.option.emitter_enabled, 0.0),
+                    (rs.option.laser_power, 0.0),
+                ]
+                # optional manual IR exposure (short -> less motion blur on the
+                # global-shutter pair during fast motion)
+                is_depth = False
+                try:
+                    is_depth = "stereo" in sensor.get_info(
+                        rs.camera_info.name).lower()
+                except Exception:
+                    pass
+                if is_depth and ir_exposure is not None:
+                    options.append((rs.option.enable_auto_exposure, 0.0))
+                    options.append((rs.option.exposure, float(ir_exposure)))
+                    if ir_gain is not None:
+                        options.append((rs.option.gain, float(ir_gain)))
+                for option, value in options:
+                    try:
+                        if sensor.supports(option):
+                            sensor.set_option(option, value)
+                    except Exception:
+                        pass
         realsense_details = _configure_realsense_color_sensor(profile, self.config, rs)
 
         color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
@@ -171,6 +217,45 @@ class RealSenseCameraSource(CameraSource):
             }
         )
 
+    def _stereo_sensor(self):
+        if self._stereo_sensor_cache is not None:
+            return self._stereo_sensor_cache
+        if self._profile is None or self._rs is None:
+            return None
+        rs = self._rs
+        for sensor in self._profile.get_device().query_sensors():
+            try:
+                name = sensor.get_info(rs.camera_info.name).lower()
+            except Exception:
+                name = ""
+            if "stereo" in name:
+                self._stereo_sensor_cache = sensor
+                return sensor
+        return None
+
+    def set_ir_exposure(self, exposure_us: float) -> bool:
+        """Set a MANUAL IR (stereo module) exposure at runtime (disables IR
+        auto-exposure). Driven ONCE by the marker exposure calibration at
+        start-up; never called in steady state, so zero per-frame cost."""
+        if not getattr(self, "_ir_enabled", False):
+            return False
+        sensor = self._stereo_sensor()
+        if sensor is None:
+            return False
+        rs = self._rs
+        ok = False
+        for option, value in ((rs.option.enable_auto_exposure, 0.0),
+                              (rs.option.exposure, float(exposure_us))):
+            try:
+                if sensor.supports(option):
+                    sensor.set_option(option, value)
+                    ok = True
+            except Exception:
+                pass
+        if ok:
+            self._ir_exposure_us = float(exposure_us)
+        return ok
+
     def read(self) -> CameraFrame | None:
         if self._pipeline is None:
             raise RuntimeError("RealSense camera is not started.")
@@ -179,11 +264,20 @@ class RealSenseCameraSource(CameraSource):
         if not color_frame:
             return None
         image = np.asanyarray(color_frame.get_data()).copy()
+        ir_left = ir_right = None
+        if getattr(self, "_ir_enabled", False):
+            irl = frames.get_infrared_frame(1)
+            irr = frames.get_infrared_frame(2)
+            if irl and irr:
+                ir_left = np.asanyarray(irl.get_data()).copy()
+                ir_right = np.asanyarray(irr.get_data()).copy()
         return CameraFrame(
             image_bgr=image,
             frame_index=self._next_frame_index(),
             timestamp_s=time.time(),
             metadata={"backend": "realsense"},
+            ir_left=ir_left,
+            ir_right=ir_right,
         )
 
     def stop(self) -> None:
@@ -368,6 +462,9 @@ def _configure_realsense_color_sensor(profile, config: CameraConfig, rs) -> dict
 
     option_specs = (
         ("enable_auto_exposure", "realsense_enable_auto_exposure"),
+        # 0 = constant frame rate: AE caps the exposure at the frame period
+        # and compensates via gain (guaranteed fps even in dim light)
+        ("auto_exposure_priority", "realsense_auto_exposure_priority"),
         ("exposure", "realsense_exposure"),
         ("gain", "realsense_gain"),
         ("enable_auto_white_balance", "realsense_enable_auto_white_balance"),

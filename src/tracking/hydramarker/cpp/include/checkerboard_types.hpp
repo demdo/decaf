@@ -80,6 +80,17 @@ struct CheckerboardDetectorConfig {
     int min_tracking_corners = 6;
     int min_tracking_cells = 2;
 
+    // Lean maintenance cadence for TRANSLATION-like motion: below this
+    // frame-to-frame pose rotation, a moving frame with a healthy corner set
+    // follows the stable-interval+backoff refresh cadence instead of the
+    // aggressive weak-state path (translation neither loses nor gains corner
+    // rows, so the frequent refresh mostly burns 5-9 ms on motion-blur fails;
+    // ROTATION brings new rows over the horizon and keeps the fast path).
+    // <= 0 disables the lean path (always treat moving frames as weak = old
+    // behaviour). The caller feeds the rotation rate via
+    // setInterFrameRotationDeg(); without a caller it defaults conservative.
+    float refresh_lean_max_rot_deg = 0.3f;
+
     // A k x k HydraMarker code patch needs at least k contiguous cell rows and
     // k contiguous cell columns.  LK tracking can otherwise get stuck in a
     // visually plausible but undecodable narrow strip (for example 4x2 cells).
@@ -252,6 +263,17 @@ struct CheckerboardDetectorConfig {
     //                  known surface model (not implemented yet; currently
     //                  falls back to "subpix" with a one-time warning)
     std::string tracked_refine_method = "subpix";
+
+    // ---- quadratic_form parameters (see CornerRefinementConfig) ----
+    double qf_profile_half_px = 4.5;
+    double qf_min_contrast = 12.0;
+    double qf_max_profile_rms = 0.35;
+    double qf_junction_margin_frac = 0.18;
+    int    qf_min_row_points = 6;
+    int    qf_min_col_points = 3;
+    double qf_conic_gain = 0.95;
+    double qf_max_fit_rms_px = 0.6;
+    double qf_max_dev_px = 2.5;
 
     // Quadrant intensity symmetry filter — used ONLY during recovery
     // (detectRecovery) to distinguish true checkerboard corners from

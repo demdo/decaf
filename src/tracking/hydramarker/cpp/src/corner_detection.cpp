@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <future>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -207,6 +208,20 @@ CornerDetectionResult CornerDetector::detect(
         return finish(CornerDetectionResult{});
     }
 
+    // The gradient-junction and GFTT branches are independent computations on
+    // the same fast_img; run them concurrently.  Each branch writes into its
+    // own timing map (merged below), every pixel operation stays unchanged, so
+    // the results are bit-identical to the sequential order.
+    std::unordered_map<std::string, double> gftt_timings;
+    std::future<std::vector<cv::Point2f>> gftt_future = std::async(
+        std::launch::async,
+        [&]() {
+            return detectFastCandidates(
+                fast_img,
+                &gftt_timings,
+                "corner_detect_fast_gftt_");
+        });
+
     CornerDetectionResult fast_result = detectGradientJunctions(
         fast_img,
         std::max(max_corners, 300),
@@ -218,10 +233,10 @@ CornerDetectionResult CornerDetector::detect(
 
     std::vector<cv::Point2f> fast_points = fast_result.points;
 
-    std::vector<cv::Point2f> fast_gftt = detectFastCandidates(
-        fast_img,
-        &timings,
-        "corner_detect_fast_gftt_");
+    std::vector<cv::Point2f> fast_gftt = gftt_future.get();
+    for (const auto& kv : gftt_timings) {
+        addTiming(&timings, kv.first, kv.second);
+    }
 
     fast_points = mergeCandidates(
         fast_points,
@@ -268,33 +283,58 @@ CornerDetectionResult CornerDetector::detect(
 
     const int per_variant_max = std::max(max_corners, 300);
 
+    // Per-variant detections are independent of each other; only the merge
+    // chain is order-dependent.  Compute all detections concurrently, then
+    // merge sequentially in the exact original order -> identical output.
+    struct VariantJob {
+        CornerDetectionResult jr;
+        std::vector<cv::Point2f> gftt;
+        std::unordered_map<std::string, double> timings;
+    };
+
+    std::vector<std::future<VariantJob>> variant_futures;
+    variant_futures.reserve(variants.size());
+
     for (const cv::Mat& v : variants) {
-        CornerDetectionResult jr = detectGradientJunctions(
-            v,
-            per_variant_max,
-            sigma,
-            response_threshold * 0.65f,
-            &timings,
-            "corner_detect_variant_gradient_"
-        );
+        variant_futures.emplace_back(std::async(
+            std::launch::async,
+            [&, v]() {
+                VariantJob job;
+                job.jr = detectGradientJunctions(
+                    v,
+                    per_variant_max,
+                    sigma,
+                    response_threshold * 0.65f,
+                    &job.timings,
+                    "corner_detect_variant_gradient_"
+                );
+                job.gftt = detectFastCandidates(
+                    v,
+                    &job.timings,
+                    "corner_detect_variant_gftt_");
+                return job;
+            }));
+    }
+
+    for (auto& fut : variant_futures) {
+        VariantJob job = fut.get();
+
+        for (const auto& kv : job.timings) {
+            addTiming(&timings, kv.first, kv.second);
+        }
 
         merged = mergeCandidates(
             merged,
-            jr.points,
+            job.jr.points,
             3.0f,
             max_corners * 3,
             &timings,
             "corner_detect_variant_merge_gradient_ms"
         );
 
-        std::vector<cv::Point2f> gftt = detectFastCandidates(
-            v,
-            &timings,
-            "corner_detect_variant_gftt_");
-
         merged = mergeCandidates(
             merged,
-            gftt,
+            job.gftt,
             4.0f,
             max_corners * 3,
             &timings,

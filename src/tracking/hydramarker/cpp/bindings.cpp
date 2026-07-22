@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -28,8 +29,10 @@
 #include "lk_tracker.hpp"
 #include "tracking_validator.hpp"
 
+#include "ir_pose_refiner.hpp"
 #include "patch_extractor.hpp"
 #include "patch_decoder.hpp"
+#include "pose_output_filter.hpp"
 #include "tracker_config.hpp"
 #include "tracker_engine.hpp"
 #include "tracker_geometry.hpp"
@@ -97,6 +100,36 @@ py::array_t<uint8_t> mat1bToNumpy(const cv::Mat1b& mat)
         }
     }
 
+    return arr;
+}
+
+// Generic single-channel Mat -> numpy for the debug/visualisation API.
+// CV_8U stays uint8; anything else is returned as float32 (a copy). Empty
+// Mats become an empty (0,0) array so Python can test `.size`.
+py::array debugMatToNumpy(const cv::Mat& mat)
+{
+    if (mat.empty() || mat.channels() != 1) {
+        return py::array_t<float>(std::vector<py::ssize_t>{0, 0});
+    }
+    if (mat.type() == CV_8U) {
+        py::array_t<uint8_t> arr({mat.rows, mat.cols});
+        auto info = arr.request();
+        auto* dst = static_cast<uint8_t*>(info.ptr);
+        for (int r = 0; r < mat.rows; ++r) {
+            const uint8_t* src = mat.ptr<uint8_t>(r);
+            std::copy(src, src + mat.cols, dst + r * mat.cols);
+        }
+        return arr;
+    }
+    cv::Mat f32;
+    mat.convertTo(f32, CV_32F);
+    py::array_t<float> arr({f32.rows, f32.cols});
+    auto info = arr.request();
+    auto* dst = static_cast<float*>(info.ptr);
+    for (int r = 0; r < f32.rows; ++r) {
+        const float* src = f32.ptr<float>(r);
+        std::copy(src, src + f32.cols, dst + r * f32.cols);
+    }
     return arr;
 }
 
@@ -193,6 +226,36 @@ std::vector<cv::Point2f> numpyToPoint2fVector(
 
 PYBIND11_MODULE(hydramarker_cpp, m) {
     m.doc() = "HydraMarker C++ bindings";
+
+    m.def(
+        "opencv_threading_info",
+        []() -> py::dict {
+            py::dict d;
+            d["num_threads"] = cv::getNumThreads();
+            d["num_cpus"] = cv::getNumberOfCPUs();
+
+            // extract the "Parallel framework" line from the build info
+            const cv::String info = cv::getBuildInformation();
+            const std::string key = "Parallel framework";
+            const size_t pos = info.find(key);
+            std::string framework = "unknown";
+            if (pos != cv::String::npos) {
+                const size_t colon = info.find(':', pos);
+                const size_t eol = info.find('\n', pos);
+                if (colon != cv::String::npos && eol != cv::String::npos) {
+                    framework = info.substr(colon + 1, eol - colon - 1);
+                    const auto first = framework.find_first_not_of(" \t");
+                    const auto last = framework.find_last_not_of(" \t\r");
+                    framework = first == std::string::npos
+                        ? ""
+                        : framework.substr(first, last - first + 1);
+                }
+            }
+            d["parallel_framework"] = framework;
+            return d;
+        },
+        "OpenCV threading diagnostics (thread count + parallel backend)."
+    );
 
     m.def(
         "generate_planar_field",
@@ -550,6 +613,284 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         py::arg("saddle_radius") = 5
     );
 
+    // Offline drive of the depth-only IR fusion stage: same IrPoseRefiner
+    // the engine runs, but with explicit calibration/references/poses so the
+    // replay verification (tests/replay_ir_fusion_cpp.py) can reproduce
+    // tests/prove_ir_depth_fusion.py frame by frame.
+    py::class_<IrPoseRefiner>(m, "IrDepthFusion")
+        .def(py::init<>())
+        .def(
+            "configure",
+            [](IrPoseRefiner& self,
+               const std::string& marker_json_path,
+               py::array_t<double, py::array::c_style | py::array::forcecast>
+                   corner_cloud,  // N x 3, marker frame mm
+               int min_pairs,
+               double min_ref_rot_deg,
+               double max_ref_rot_deg,
+               double fallback_min_ref_rot_deg,
+               int sat_threshold,
+               int sat_half_px,
+               double epipolar_max_dv_px,
+               double zncc_weight_floor,
+               double dtz_clamp_mm,
+               double depth_scale,
+               int mw_half_window,
+               double mw_min_zncc,
+               double mw_max_shift_px,
+               double mw_max_incidence_deg,
+               double mw_min_valid_frac)
+            {
+                const MarkerGeometry geometry =
+                    MarkerGeometry::loadFromJson(marker_json_path);
+                py::buffer_info info = corner_cloud.request();
+                if (info.ndim != 2 || info.shape[1] != 3) {
+                    throw std::runtime_error(
+                        "IrDepthFusion.configure: corner_cloud must be Nx3.");
+                }
+                const double* data = static_cast<const double*>(info.ptr);
+                std::vector<cv::Vec3d> cloud(
+                    static_cast<size_t>(info.shape[0]));
+                for (size_t i = 0; i < cloud.size(); ++i) {
+                    cloud[i] = cv::Vec3d(data[3 * i], data[3 * i + 1],
+                                         data[3 * i + 2]);
+                }
+                IrPoseRefinerConfig cfg;
+                cfg.enabled = true;
+                cfg.min_pairs = min_pairs;
+                cfg.min_ref_rot_deg = min_ref_rot_deg;
+                cfg.max_ref_rot_deg = max_ref_rot_deg;
+                cfg.fallback_min_ref_rot_deg = fallback_min_ref_rot_deg;
+                cfg.sat_threshold = sat_threshold;
+                cfg.sat_half_px = sat_half_px;
+                cfg.epipolar_max_dv_px = epipolar_max_dv_px;
+                cfg.zncc_weight_floor = zncc_weight_floor;
+                cfg.dtz_clamp_mm = dtz_clamp_mm;
+                cfg.depth_scale = depth_scale;
+                cfg.mw_half_window = mw_half_window;
+                cfg.mw_min_zncc = mw_min_zncc;
+                cfg.mw_max_shift_px = mw_max_shift_px;
+                cfg.mw_max_incidence_deg = mw_max_incidence_deg;
+                cfg.mw_min_valid_frac = mw_min_valid_frac;
+                self.configure(cfg, geometry.surfaceModel(), cloud);
+            },
+            py::arg("marker_json_path"),
+            py::arg("corner_cloud"),
+            py::arg("min_pairs") = 6,
+            py::arg("min_ref_rot_deg") = 6.0,
+            py::arg("max_ref_rot_deg") = 180.0,
+            py::arg("fallback_min_ref_rot_deg") = 0.5,
+            py::arg("sat_threshold") = 250,
+            py::arg("sat_half_px") = 8,
+            py::arg("epipolar_max_dv_px") = 2.5,
+            py::arg("zncc_weight_floor") = 0.05,
+            py::arg("dtz_clamp_mm") = 2.5,
+            py::arg("depth_scale") = 1.0,
+            py::arg("mw_half_window") = 8,
+            py::arg("mw_min_zncc") = 0.35,
+            py::arg("mw_max_shift_px") = 6.0,
+            py::arg("mw_max_incidence_deg") = 80.0,
+            py::arg("mw_min_valid_frac") = 0.4
+        )
+        .def(
+            "set_calibration",
+            [](IrPoseRefiner& self,
+               std::vector<double> K_rgb,
+               std::vector<double> dist_rgb,
+               std::vector<double> K_left,
+               std::vector<double> dist_left,
+               std::vector<double> K_right,
+               std::vector<double> dist_right,
+               std::vector<double> R_rgb_left,
+               std::vector<double> t_rgb_left_mm,
+               std::vector<double> R_left_right,
+               std::vector<double> t_left_right_mm)
+            {
+                if (K_rgb.size() != 9 || K_left.size() != 9 ||
+                    K_right.size() != 9 || R_rgb_left.size() != 9 ||
+                    R_left_right.size() != 9 || t_rgb_left_mm.size() != 3 ||
+                    t_left_right_mm.size() != 3) {
+                    throw std::runtime_error(
+                        "IrDepthFusion.set_calibration: bad array sizes.");
+                }
+                auto m33 = [](const std::vector<double>& v) {
+                    return cv::Matx33d(v[0], v[1], v[2],
+                                       v[3], v[4], v[5],
+                                       v[6], v[7], v[8]);
+                };
+                IrCameraCalibration calib;
+                calib.K_rgb = m33(K_rgb);
+                calib.dist_rgb = dist_rgb;
+                calib.K_left = m33(K_left);
+                calib.dist_left = dist_left;
+                calib.K_right = m33(K_right);
+                calib.dist_right = dist_right;
+                calib.R_rgb_left = m33(R_rgb_left);
+                calib.t_rgb_left_mm = cv::Vec3d(
+                    t_rgb_left_mm[0], t_rgb_left_mm[1], t_rgb_left_mm[2]);
+                calib.R_left_right = m33(R_left_right);
+                calib.t_left_right_mm = cv::Vec3d(
+                    t_left_right_mm[0], t_left_right_mm[1],
+                    t_left_right_mm[2]);
+                calib.valid = true;
+                self.setCalibration(calib);
+            },
+            py::arg("K_rgb"), py::arg("dist_rgb"),
+            py::arg("K_left"), py::arg("dist_left"),
+            py::arg("K_right"), py::arg("dist_right"),
+            py::arg("R_rgb_left"), py::arg("t_rgb_left_mm"),
+            py::arg("R_left_right"), py::arg("t_left_right_mm")
+        )
+        .def(
+            "add_reference",
+            [](IrPoseRefiner& self,
+               py::array_t<uint8_t,
+                           py::array::c_style | py::array::forcecast> ir_left,
+               py::array_t<uint8_t,
+                           py::array::c_style | py::array::forcecast> ir_right,
+               std::vector<double> R_rgb,   // 9 row-major
+               std::vector<double> t_rgb_mm)
+            {
+                if (R_rgb.size() != 9 || t_rgb_mm.size() != 3) {
+                    throw std::runtime_error(
+                        "IrDepthFusion.add_reference: bad array sizes.");
+                }
+                self.enrollReference(
+                    numpyToMat(ir_left), numpyToMat(ir_right),
+                    cv::Matx33d(R_rgb[0], R_rgb[1], R_rgb[2],
+                                R_rgb[3], R_rgb[4], R_rgb[5],
+                                R_rgb[6], R_rgb[7], R_rgb[8]),
+                    cv::Vec3d(t_rgb_mm[0], t_rgb_mm[1], t_rgb_mm[2]));
+            },
+            py::arg("ir_left"), py::arg("ir_right"),
+            py::arg("R_rgb"), py::arg("t_rgb_mm")
+        )
+        .def("reset", &IrPoseRefiner::reset)
+        .def("reference_count", &IrPoseRefiner::referenceCount)
+        .def(
+            "fuse",
+            [](IrPoseRefiner& self,
+               py::array_t<uint8_t,
+                           py::array::c_style | py::array::forcecast> ir_left,
+               py::array_t<uint8_t,
+                           py::array::c_style | py::array::forcecast> ir_right,
+               std::vector<double> rvec,
+               std::vector<double> tvec,
+               py::array_t<double, py::array::c_style | py::array::forcecast> rgb_xyz,
+               py::array_t<double, py::array::c_style | py::array::forcecast> rgb_uv)
+                -> py::dict
+            {
+                if (rvec.size() != 3 || tvec.size() != 3) {
+                    throw std::runtime_error(
+                        "IrDepthFusion.fuse: rvec/tvec must have 3 entries.");
+                }
+                auto bx = rgb_xyz.request(), bu = rgb_uv.request();
+                if (bx.ndim != 2 || bx.shape[1] != 3)
+                    throw std::runtime_error("IrDepthFusion.fuse: rgb_xyz Nx3.");
+                if (bu.ndim != 2 || bu.shape[1] != 2 ||
+                    bu.shape[0] != bx.shape[0])
+                    throw std::runtime_error("IrDepthFusion.fuse: rgb_uv Nx2.");
+                const size_t N = static_cast<size_t>(bx.shape[0]);
+                const double* px = static_cast<const double*>(bx.ptr);
+                const double* pu = static_cast<const double*>(bu.ptr);
+                std::vector<cv::Vec3d> Xv(N);
+                std::vector<cv::Point2d> Uv(N);
+                for (size_t i = 0; i < N; ++i) {
+                    Xv[i] = cv::Vec3d(px[3 * i], px[3 * i + 1], px[3 * i + 2]);
+                    Uv[i] = cv::Point2d(pu[2 * i], pu[2 * i + 1]);
+                }
+                const IrPoseRefinerResult r = self.fuse(
+                    numpyToMat(ir_left), numpyToMat(ir_right),
+                    {rvec[0], rvec[1], rvec[2]},
+                    {tvec[0], tvec[1], tvec[2]}, Xv, Uv);
+                py::dict out;
+                out["applied"] = r.applied;
+                out["mode"] = r.mode == IrFusionMode::Depth ? "depth" : "rgb";
+                out["ref_count"] = r.ref_count;
+                out["refs_measured"] = r.refs_measured;
+                out["pairs"] = r.pairs;
+                out["saturated_frac"] = r.saturated_frac;
+                out["best_ref_angle_deg"] = r.best_ref_angle_deg;
+                out["quality"] = r.quality;
+                out["fit_rms_mm"] = r.fit_rms_mm;
+                out["dtz_mm"] = r.dtz_mm;
+                out["rvec"] = std::vector<double>{
+                    r.rvec[0], r.rvec[1], r.rvec[2]};
+                out["tvec"] = std::vector<double>{
+                    r.tvec[0], r.tvec[1], r.tvec[2]};
+                out["cov"] = std::vector<double>(r.cov.begin(), r.cov.end());
+                return out;
+            },
+            py::arg("ir_left"), py::arg("ir_right"),
+            py::arg("rvec"), py::arg("tvec"),
+            py::arg("rgb_xyz"), py::arg("rgb_uv")
+        );
+
+    // Standalone MAP pose-fusion solver (isolates the Gauss-Newton from the IR
+    // corner localisation) so it can be replay-compared to map_core.fuse_map_vec
+    // on identical inputs. Returns R (flat 9), t (3), cov (flat 36).
+    m.def(
+        "map_pose_fuse",
+        [](py::array_t<double, py::array::c_style | py::array::forcecast> X,
+           py::array_t<double, py::array::c_style | py::array::forcecast> u_norm,
+           py::array_t<double, py::array::c_style | py::array::forcecast> Y,
+           py::array_t<double, py::array::c_style | py::array::forcecast> SigY_inv,
+           std::vector<double> R0, std::vector<double> t0, double f,
+           double sig_px, double w3d, int iters, double huber, bool trim)
+            -> py::dict
+        {
+            auto bx = X.request(), bu = u_norm.request();
+            auto by = Y.request(), bs = SigY_inv.request();
+            if (bx.ndim != 2 || bx.shape[1] != 3)
+                throw std::runtime_error("map_pose_fuse: X must be Nx3.");
+            if (bu.ndim != 2 || bu.shape[1] != 2)
+                throw std::runtime_error("map_pose_fuse: u_norm must be Nx2.");
+            if (by.ndim != 2 || by.shape[1] != 3)
+                throw std::runtime_error("map_pose_fuse: Y must be Nx3.");
+            if (bs.ndim != 3 || bs.shape[1] != 3 || bs.shape[2] != 3)
+                throw std::runtime_error("map_pose_fuse: SigY_inv must be Nx3x3.");
+            if (R0.size() != 9 || t0.size() != 3)
+                throw std::runtime_error("map_pose_fuse: R0=9, t0=3.");
+            const size_t N = static_cast<size_t>(bx.shape[0]);
+            const double* px = static_cast<const double*>(bx.ptr);
+            const double* pu = static_cast<const double*>(bu.ptr);
+            const double* pyv = static_cast<const double*>(by.ptr);
+            const double* ps = static_cast<const double*>(bs.ptr);
+            std::vector<cv::Vec3d> Xv(N), Yv(N);
+            std::vector<cv::Point2d> Uv(N);
+            std::vector<cv::Matx33d> Sv(N);
+            for (size_t i = 0; i < N; ++i) {
+                Xv[i] = cv::Vec3d(px[3 * i], px[3 * i + 1], px[3 * i + 2]);
+                Uv[i] = cv::Point2d(pu[2 * i], pu[2 * i + 1]);
+                Yv[i] = cv::Vec3d(pyv[3 * i], pyv[3 * i + 1], pyv[3 * i + 2]);
+                Sv[i] = cv::Matx33d(ps[9 * i + 0], ps[9 * i + 1], ps[9 * i + 2],
+                                    ps[9 * i + 3], ps[9 * i + 4], ps[9 * i + 5],
+                                    ps[9 * i + 6], ps[9 * i + 7], ps[9 * i + 8]);
+            }
+            const cv::Matx33d R0m(R0[0], R0[1], R0[2], R0[3], R0[4], R0[5],
+                                  R0[6], R0[7], R0[8]);
+            const cv::Vec3d t0v(t0[0], t0[1], t0[2]);
+            const MapFuseResult r = mapPoseFuse(Xv, Uv, Yv, Sv, R0m, t0v, f,
+                                                sig_px, w3d, iters, huber, trim);
+            std::vector<double> Rout(9), tout(3), cout(36);
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b) Rout[3 * a + b] = r.R(a, b);
+            for (int a = 0; a < 3; ++a) tout[a] = r.t[a];
+            for (int a = 0; a < 6; ++a)
+                for (int b = 0; b < 6; ++b) cout[6 * a + b] = r.cov(a, b);
+            py::dict out;
+            out["R"] = Rout;
+            out["t"] = tout;
+            out["cov"] = cout;
+            out["n_used"] = r.n_used;
+            out["ok"] = r.ok;
+            return out;
+        },
+        py::arg("X"), py::arg("u_norm"), py::arg("Y"), py::arg("SigY_inv"),
+        py::arg("R0"), py::arg("t0"), py::arg("f"), py::arg("sig_px"),
+        py::arg("w3d") = 1.0, py::arg("iters") = 8, py::arg("huber") = 1.5,
+        py::arg("trim") = true);
+
     py::enum_<TrackerMode>(m, "TrackerMode")
         .value("LOST", TrackerMode::Lost)
         .value("DETECTING", TrackerMode::Detecting)
@@ -645,6 +986,77 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             "config",
             [](const MapPoseTracker& self) { return self.config(); },
             py::return_value_policy::copy
+        );
+
+    // Standalone output pose filter (also used internally by TrackerEngine).
+    // Exposed so it can be unit-tested and reused independently of the tracker.
+    py::class_<PoseOutputFilterConfig>(m, "PoseOutputFilterConfig")
+        .def(py::init<>())
+        .def_readwrite("enabled", &PoseOutputFilterConfig::enabled)
+        .def_readwrite("sigma_px", &PoseOutputFilterConfig::sigma_px)
+        .def_readwrite("q_translation_mm", &PoseOutputFilterConfig::q_translation_mm)
+        .def_readwrite("q_rotation_deg", &PoseOutputFilterConfig::q_rotation_deg)
+        .def_readwrite("adaptive", &PoseOutputFilterConfig::adaptive)
+        .def_readwrite("q_rotation_floor_deg", &PoseOutputFilterConfig::q_rotation_floor_deg)
+        .def_readwrite("q_translation_floor_mm", &PoseOutputFilterConfig::q_translation_floor_mm)
+        .def_readwrite("adaptive_ema_alpha", &PoseOutputFilterConfig::adaptive_ema_alpha)
+        .def_readwrite("auto_noise", &PoseOutputFilterConfig::auto_noise)
+        .def_readwrite("noise_window", &PoseOutputFilterConfig::noise_window)
+        .def_readwrite("motion_floor_rot_deg", &PoseOutputFilterConfig::motion_floor_rot_deg)
+        .def_readwrite("motion_floor_trans_mm", &PoseOutputFilterConfig::motion_floor_trans_mm)
+        .def_readwrite("meas_floor_rot_deg", &PoseOutputFilterConfig::meas_floor_rot_deg)
+        .def_readwrite("meas_floor_trans_mm", &PoseOutputFilterConfig::meas_floor_trans_mm)
+        .def_readwrite("gate_mahalanobis", &PoseOutputFilterConfig::gate_mahalanobis)
+        .def_readwrite("reset_rotation_deg", &PoseOutputFilterConfig::reset_rotation_deg)
+        .def_readwrite("max_translation_jump_mm", &PoseOutputFilterConfig::max_translation_jump_mm)
+        .def_readwrite("min_points", &PoseOutputFilterConfig::min_points);
+
+    py::class_<PoseOutputFilterResult>(m, "PoseOutputFilterResult")
+        .def_readonly("applied", &PoseOutputFilterResult::applied)
+        .def_readonly("initialized_this_frame", &PoseOutputFilterResult::initialized_this_frame)
+        .def_readonly("gated", &PoseOutputFilterResult::gated)
+        .def_readonly("mahalanobis", &PoseOutputFilterResult::mahalanobis)
+        .def_property_readonly("rvec", [](const PoseOutputFilterResult& r) {
+            return std::vector<double>(r.rvec.begin(), r.rvec.end());
+        })
+        .def_property_readonly("tvec", [](const PoseOutputFilterResult& r) {
+            return std::vector<double>(r.tvec.begin(), r.tvec.end());
+        })
+        .def_property_readonly("covariance", [](const PoseOutputFilterResult& r) {
+            return std::vector<double>(r.covariance.begin(), r.covariance.end());
+        });
+
+    py::class_<PoseOutputFilter>(m, "PoseOutputFilter")
+        .def(py::init<>())
+        .def(
+            "configure",
+            [](PoseOutputFilter& self,
+               const PoseOutputFilterConfig& config,
+               py::array_t<double, py::array::c_style | py::array::forcecast> K,
+               py::object dist_coeffs) {
+                self.configure(config, numpyToMatx33d(K),
+                               optionalNumpyToVectorDouble(dist_coeffs));
+            },
+            py::arg("config"), py::arg("K"), py::arg("dist_coeffs") = py::none()
+        )
+        .def("reset", &PoseOutputFilter::reset)
+        .def("coast", &PoseOutputFilter::coast)
+        .def_property_readonly("initialized", &PoseOutputFilter::initialized)
+        .def(
+            "update",
+            [](PoseOutputFilter& self,
+               const std::array<double, 3>& rvec,
+               const std::array<double, 3>& tvec,
+               py::array_t<double, py::array::c_style | py::array::forcecast> object_points) {
+                auto buf = object_points.unchecked<2>();
+                std::vector<cv::Point3d> pts;
+                pts.reserve(static_cast<size_t>(buf.shape(0)));
+                for (py::ssize_t i = 0; i < buf.shape(0); ++i) {
+                    pts.emplace_back(buf(i, 0), buf(i, 1), buf(i, 2));
+                }
+                return self.update(rvec, tvec, pts);
+            },
+            py::arg("rvec"), py::arg("tvec"), py::arg("object_points")
         );
 
     py::class_<GlobalCornerIdentity>(m, "GlobalCornerIdentity")
@@ -964,6 +1376,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("max_mean_reprojection_error_px", &TrackerConfig::max_mean_reprojection_error_px)
         .def_readwrite("max_max_reprojection_error_px", &TrackerConfig::max_max_reprojection_error_px)
         .def_readwrite("max_lost_frames", &TrackerConfig::max_lost_frames)
+        .def_readwrite("recovery_grace_frames", &TrackerConfig::recovery_grace_frames)
         .def_readwrite("max_translation_jump_mm", &TrackerConfig::max_translation_jump_mm)
         .def_readwrite("max_rotation_jump_deg", &TrackerConfig::max_rotation_jump_deg)
         .def_readwrite("rotation_gate_scale_per_lost_frame", &TrackerConfig::rotation_gate_scale_per_lost_frame)
@@ -975,6 +1388,18 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("pnp_direct_prior_enabled", &TrackerConfig::pnp_direct_prior_enabled)
         .def_readwrite("pnp_direct_refine_method", &TrackerConfig::pnp_direct_refine_method)
         .def_readwrite("checker_tracked_refine_method", &TrackerConfig::checker_tracked_refine_method)
+        .def_readwrite("checker_qf_profile_half_px", &TrackerConfig::checker_qf_profile_half_px)
+        .def_readwrite("checker_qf_min_contrast", &TrackerConfig::checker_qf_min_contrast)
+        .def_readwrite("checker_qf_max_profile_rms", &TrackerConfig::checker_qf_max_profile_rms)
+        .def_readwrite("checker_qf_junction_margin_frac", &TrackerConfig::checker_qf_junction_margin_frac)
+        .def_readwrite("checker_qf_min_row_points", &TrackerConfig::checker_qf_min_row_points)
+        .def_readwrite("checker_qf_min_col_points", &TrackerConfig::checker_qf_min_col_points)
+        .def_readwrite("checker_qf_conic_gain", &TrackerConfig::checker_qf_conic_gain)
+        .def_readwrite("checker_qf_max_fit_rms_px", &TrackerConfig::checker_qf_max_fit_rms_px)
+        .def_readwrite("checker_qf_max_dev_px", &TrackerConfig::checker_qf_max_dev_px)
+        .def_readwrite("ir_reject_cov_inflate", &TrackerConfig::ir_reject_cov_inflate)
+        .def_readwrite("ir_corner_method", &TrackerConfig::ir_corner_method)
+        .def_readwrite("ir_qf_max_dev_px", &TrackerConfig::ir_qf_max_dev_px)
         .def_readwrite("pose_exclude_predicted_corners", &TrackerConfig::pose_exclude_predicted_corners)
         .def_readwrite("pose_min_observed_frames", &TrackerConfig::pose_min_observed_frames)
         .def_readwrite("pose_warmup_min_accepted_frames", &TrackerConfig::pose_warmup_min_accepted_frames)
@@ -986,6 +1411,53 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("pose_kf_q_rotation_deg", &TrackerConfig::pose_kf_q_rotation_deg)
         .def_readwrite("pose_kf_gate_mahalanobis", &TrackerConfig::pose_kf_gate_mahalanobis)
         .def_readwrite("pose_kf_reset_rotation_deg", &TrackerConfig::pose_kf_reset_rotation_deg)
+        .def_readwrite("pose_kf_adaptive", &TrackerConfig::pose_kf_adaptive)
+        .def_readwrite("pose_kf_q_rotation_floor_deg", &TrackerConfig::pose_kf_q_rotation_floor_deg)
+        .def_readwrite("pose_kf_q_translation_floor_mm", &TrackerConfig::pose_kf_q_translation_floor_mm)
+        .def_readwrite("pose_kf_adaptive_ema_alpha", &TrackerConfig::pose_kf_adaptive_ema_alpha)
+        .def_readwrite("pose_kf_auto_noise", &TrackerConfig::pose_kf_auto_noise)
+        .def_readwrite("pose_kf_noise_window", &TrackerConfig::pose_kf_noise_window)
+        .def_readwrite("pose_kf_motion_floor_rot_deg", &TrackerConfig::pose_kf_motion_floor_rot_deg)
+        .def_readwrite("pose_kf_motion_floor_trans_mm", &TrackerConfig::pose_kf_motion_floor_trans_mm)
+        .def_readwrite("pose_kf_meas_floor_rot_deg", &TrackerConfig::pose_kf_meas_floor_rot_deg)
+        .def_readwrite("pose_kf_meas_floor_trans_mm", &TrackerConfig::pose_kf_meas_floor_trans_mm)
+        .def_readwrite("ir_refine_enabled", &TrackerConfig::ir_refine_enabled)
+        .def_readwrite("ir_min_pairs", &TrackerConfig::ir_min_pairs)
+        .def_readwrite("ir_min_ref_rot_deg", &TrackerConfig::ir_min_ref_rot_deg)
+        .def_readwrite("ir_max_ref_rot_deg", &TrackerConfig::ir_max_ref_rot_deg)
+        .def_readwrite("ir_fallback_min_ref_rot_deg", &TrackerConfig::ir_fallback_min_ref_rot_deg)
+        .def_readwrite("ir_sat_threshold", &TrackerConfig::ir_sat_threshold)
+        .def_readwrite("ir_sat_half_px", &TrackerConfig::ir_sat_half_px)
+        .def_readwrite("ir_epipolar_max_dv_px", &TrackerConfig::ir_epipolar_max_dv_px)
+        .def_readwrite("ir_zncc_weight_floor", &TrackerConfig::ir_zncc_weight_floor)
+        .def_readwrite("ir_dtz_clamp_mm", &TrackerConfig::ir_dtz_clamp_mm)
+        .def_readwrite("ir_depth_scale", &TrackerConfig::ir_depth_scale)
+        .def_readwrite("ir_sigma_px", &TrackerConfig::ir_sigma_px)
+        .def_readwrite("ir_sigma_ir_px", &TrackerConfig::ir_sigma_ir_px)
+        .def_readwrite("ir_w3d", &TrackerConfig::ir_w3d)
+        .def_readwrite("ir_fit_gate_rms_mm", &TrackerConfig::ir_fit_gate_rms_mm)
+        .def_readwrite("ir_cov_inflate_ref_rms_mm",
+                       &TrackerConfig::ir_cov_inflate_ref_rms_mm)
+        .def_readwrite("ir_fit_gate_max_trans_jump_mm",
+                       &TrackerConfig::ir_fit_gate_max_trans_jump_mm)
+        .def_readwrite("ir_mw_min_zncc", &TrackerConfig::ir_mw_min_zncc)
+        .def_readwrite("ir_mw_max_shift_px", &TrackerConfig::ir_mw_max_shift_px)
+        .def_readwrite("ir_enroll_max_rot_deg", &TrackerConfig::ir_enroll_max_rot_deg)
+        .def_readwrite("ir_enroll_max_trans_mm", &TrackerConfig::ir_enroll_max_trans_mm)
+        .def_readwrite("ir_ref_tile_deg", &TrackerConfig::ir_ref_tile_deg)
+        .def_readwrite("ir_ref_tile_trans_mm",
+                       &TrackerConfig::ir_ref_tile_trans_mm)
+        .def_readwrite("ir_fallback_min_ref_trans_mm",
+                       &TrackerConfig::ir_fallback_min_ref_trans_mm)
+        .def_readwrite("ir_enroll_max_fit_rms_mm",
+                       &TrackerConfig::ir_enroll_max_fit_rms_mm)
+        .def_readwrite("ir_sigma_px_motion_coeff",
+                       &TrackerConfig::ir_sigma_px_motion_coeff)
+        .def_readwrite("ir_sigma_px_motion_rot_px_per_deg",
+                       &TrackerConfig::ir_sigma_px_motion_rot_px_per_deg)
+        .def_readwrite("ir_enroll_max_sat_frac",
+                       &TrackerConfig::ir_enroll_max_sat_frac)
+        .def_readwrite("ir_max_references", &TrackerConfig::ir_max_references)
         .def_readwrite("model_warp_reenroll_on_loss", &TrackerConfig::model_warp_reenroll_on_loss)
         .def_readwrite("model_warp_reenroll_angle_deg", &TrackerConfig::model_warp_reenroll_angle_deg)
         .def_readwrite("model_warp_enroll_max_motion_mm", &TrackerConfig::model_warp_enroll_max_motion_mm)
@@ -1256,7 +1728,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("pose_source", &TrackerFrameResult::pose_source)
         .def_readwrite("rvec", &TrackerFrameResult::rvec)
         .def_readwrite("tvec", &TrackerFrameResult::tvec)
+        .def_readwrite("rvec_prefusion", &TrackerFrameResult::rvec_prefusion)
+        .def_readwrite("tvec_prefusion", &TrackerFrameResult::tvec_prefusion)
         .def_readwrite("T_marker_camera", &TrackerFrameResult::T_marker_camera)
+        .def_readwrite("pose_covariance", &TrackerFrameResult::pose_covariance)
         .def_readwrite("num_points", &TrackerFrameResult::num_points)
         .def_readwrite("num_inliers", &TrackerFrameResult::num_inliers)
         .def_readwrite("mean_reprojection_error_px", &TrackerFrameResult::mean_reprojection_error_px)
@@ -1320,7 +1795,139 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("frame"),
             py::arg("run_detection") = true
         )
+        .def(
+            "process_frame_ir",
+            [](TrackerEngine& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> img,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> ir_left,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> ir_right,
+               bool run_detection) -> TrackerFrameResult
+            {
+                cv::Mat mat = numpyToMat(img);
+                cv::Mat irl = numpyToMat(ir_left);
+                cv::Mat irr = numpyToMat(ir_right);
+                return self.processFrame(mat, irl, irr, run_detection);
+            },
+            py::arg("frame"),
+            py::arg("ir_left"),
+            py::arg("ir_right"),
+            py::arg("run_detection") = true
+        )
+        .def(
+            "set_ir_calibration",
+            [](TrackerEngine& self,
+               std::vector<double> K_rgb,         // 9 row-major
+               std::vector<double> dist_rgb,
+               std::vector<double> K_left,        // 9 row-major
+               std::vector<double> dist_left,
+               std::vector<double> K_right,       // 9 row-major
+               std::vector<double> dist_right,
+               std::vector<double> R_rgb_left,    // 9 row-major
+               std::vector<double> t_rgb_left_mm, // 3
+               std::vector<double> R_left_right,  // 9 row-major
+               std::vector<double> t_left_right_mm)
+            {
+                if (K_rgb.size() != 9 ||
+                    K_left.size() != 9 || K_right.size() != 9 ||
+                    R_rgb_left.size() != 9 || R_left_right.size() != 9 ||
+                    t_rgb_left_mm.size() != 3 || t_left_right_mm.size() != 3) {
+                    throw std::runtime_error(
+                        "set_ir_calibration: inconsistent array sizes.");
+                }
+                auto m33 = [](const std::vector<double>& v) {
+                    return cv::Matx33d(v[0], v[1], v[2],
+                                       v[3], v[4], v[5],
+                                       v[6], v[7], v[8]);
+                };
+                self.setIrCalibration(
+                    m33(K_rgb), dist_rgb,
+                    m33(K_left), dist_left, m33(K_right), dist_right,
+                    m33(R_rgb_left),
+                    cv::Vec3d(t_rgb_left_mm[0], t_rgb_left_mm[1],
+                              t_rgb_left_mm[2]),
+                    m33(R_left_right),
+                    cv::Vec3d(t_left_right_mm[0], t_left_right_mm[1],
+                              t_left_right_mm[2]));
+            },
+            py::arg("K_rgb"),
+            py::arg("dist_rgb"),
+            py::arg("K_left"),
+            py::arg("dist_left"),
+            py::arg("K_right"),
+            py::arg("dist_right"),
+            py::arg("R_rgb_left"),
+            py::arg("t_rgb_left_mm"),
+            py::arg("R_left_right"),
+            py::arg("t_left_right_mm")
+        )
         .def("reset", &TrackerEngine::reset)
+        .def("reset_ir_references", &TrackerEngine::resetIrReferences)
+        .def("set_ir_selfcal", &TrackerEngine::setIrSelfCal)
+        .def("set_ir_selfcal_corners", &TrackerEngine::setIrSelfCalCorners)
+        .def("measure_ir_view_qf", [](
+                 const TrackerEngine& self,
+                 py::array_t<uint8_t,
+                             py::array::c_style | py::array::forcecast> gray,
+                 bool right_view,
+                 const std::vector<double>& rvec,
+                 const std::vector<double>& tvec,
+                 const std::vector<double>& flat_xyz,
+                 const std::vector<double>& flat_seeds) {
+            // Offline model refinement: reference-free QF measurement of
+            // the given marker corners in ONE IR view under an explicit
+            // marker->view pose (rvec/tvec, mm). Returns per corner
+            // (u, v, ok, quality).
+            const cv::Mat img = numpyToMat(gray);
+            const IrPoseRefiner& ref = self.irPoseRefiner();
+            const IrCameraCalibration& cal = ref.calibration();
+            const cv::Matx33d& K = right_view ? cal.K_right : cal.K_left;
+            const std::vector<double>& dist =
+                right_view ? cal.dist_right : cal.dist_left;
+            const cv::Mat rv_m = (cv::Mat_<double>(3, 1)
+                                      << rvec.at(0), rvec.at(1), rvec.at(2));
+            cv::Mat R_m;
+            cv::Rodrigues(rv_m, R_m);
+            const cv::Matx33d R_view(R_m.ptr<double>());
+            const cv::Vec3d t_view(tvec.at(0), tvec.at(1), tvec.at(2));
+            const size_t n = flat_xyz.size() / 3;
+            std::vector<cv::Vec3d> xyz(n);
+            std::vector<cv::Point2f> seeds(n);
+            for (size_t i = 0; i < n; ++i) {
+                xyz[i] = cv::Vec3d(flat_xyz[3 * i], flat_xyz[3 * i + 1],
+                                   flat_xyz[3 * i + 2]);
+                seeds[i] = cv::Point2f(
+                    static_cast<float>(flat_seeds[2 * i]),
+                    static_cast<float>(flat_seeds[2 * i + 1]));
+            }
+            std::vector<cv::Point2f> uv;
+            std::vector<uint8_t> ok;
+            std::vector<float> q;
+            ref.measureViewQf(img, K, dist, R_view, t_view, xyz, seeds,
+                              uv, ok, q);
+            py::list out;
+            for (size_t i = 0; i < n; ++i) {
+                out.append(py::make_tuple(uv[i].x, uv[i].y,
+                                          static_cast<int>(ok[i]), q[i]));
+            }
+            return out;
+        })
+        .def("last_ir_pair_dump", [](const TrackerEngine& self) {
+            // Offline stereo self-calibration input: last frame's measured
+            // QF-IR stereo pairs (marker xyz mm, uv in each IR view).
+            const auto& d = self.lastIrPairDump();
+            py::list xyz, uvl, uvr;
+            for (size_t i = 0; i < d.xyz.size(); ++i) {
+                xyz.append(py::make_tuple(
+                    d.xyz[i][0], d.xyz[i][1], d.xyz[i][2]));
+                uvl.append(py::make_tuple(d.uvL[i].x, d.uvL[i].y));
+                uvr.append(py::make_tuple(d.uvR[i].x, d.uvR[i].y));
+            }
+            py::dict out;
+            out["xyz"] = xyz;
+            out["uvL"] = uvl;
+            out["uvR"] = uvr;
+            return out;
+        })
         .def("frame_index", &TrackerEngine::frameIndex)
         .def("mode", &TrackerEngine::mode)
         .def("marker_assets_loaded", &TrackerEngine::markerAssetsLoaded)
@@ -1631,7 +2238,19 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("detection", &CheckerboardRecoveryDebug::detection)
         .def_readwrite("has_lattice", &CheckerboardRecoveryDebug::has_lattice)
         .def_readwrite("has_detection", &CheckerboardRecoveryDebug::has_detection)
-        .def_readwrite("scale", &CheckerboardRecoveryDebug::scale);
+        .def_readwrite("scale", &CheckerboardRecoveryDebug::scale)
+        .def_property_readonly("gray", [](const CheckerboardRecoveryDebug& d) {
+            return debugMatToNumpy(d.gray); })
+        .def_property_readonly("work", [](const CheckerboardRecoveryDebug& d) {
+            return debugMatToNumpy(d.work); })
+        .def_property_readonly("fast_image", [](const CheckerboardRecoveryDebug& d) {
+            return debugMatToNumpy(d.fast_image); })
+        .def_property_readonly("grad_x", [](const CheckerboardRecoveryDebug& d) {
+            return debugMatToNumpy(d.grad_x); })
+        .def_property_readonly("grad_y", [](const CheckerboardRecoveryDebug& d) {
+            return debugMatToNumpy(d.grad_y); })
+        .def_property_readonly("response", [](const CheckerboardRecoveryDebug& d) {
+            return debugMatToNumpy(d.response); });
 
     py::class_<CheckerboardDetector>(m, "CheckerboardDetector")
         .def(py::init<>())
@@ -1759,6 +2378,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def(py::init<>())
         .def(py::init<CorrespondenceBuilderConfig>())
         .def("build", &CorrespondenceBuilder::build);
+
 }
 
 } // namespace hydramarker

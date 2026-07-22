@@ -204,6 +204,7 @@ MarkerGeometry MarkerGeometry::loadFromJson(const std::string& path) {
         }
 
         geometry.surface_model_ = sm;
+
     };
 
     fs["corner_rows"] >> geometry.corner_rows_;

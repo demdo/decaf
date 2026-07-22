@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 import json
+import os
 
 import cv2
 import numpy as np
@@ -79,7 +80,10 @@ class PyCeresOptions:
     linear_solver: Optional["pyceres.LinearSolverType"] = None
     loss: Optional[str] = "huber"
     loss_scale: float = 1.0
-    max_iterations: int = 100
+    # Iteration CAP, not a target: convergence still terminates early via
+    # the Ceres tolerances. 100 truncated the large 2026-07-22 session
+    # (2282 recorded frames -> ~1000 BA cameras) mid-descent.
+    max_iterations: int = 300
     progress_to_stdout: bool = False
     report_full: bool = False
 
@@ -2301,10 +2305,14 @@ def run_bundle_adjustment(
 
         solver_options = pyceres.SolverOptions()
         solver_options.max_num_iterations = opts.max_iterations
+        # (SPARSE_SCHUR was tried for the ~1000-camera session and was
+        # SLOWER on this pyceres build — no fast sparse backend; identical
+        # numbers, so behaviour-neutral either way. Dense stays.)
         solver_options.linear_solver_type = (
             opts.linear_solver
             or pyceres.LinearSolverType.DENSE_SCHUR
         )
+        solver_options.num_threads = max(1, (os.cpu_count() or 1) - 1)
         solver_options.minimizer_progress_to_stdout = (
             bool(opts.progress_to_stdout)
             or bool(opts.report_full)

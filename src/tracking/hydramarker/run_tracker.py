@@ -8,9 +8,11 @@ detector, pose, or debug-overlay drawing logic.
 from __future__ import annotations
 
 from dataclasses import replace
+import gc
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -44,8 +46,115 @@ PROVISIONAL_STALE_TIMEOUT_FRAMES = 30
 PROVISIONAL_TOTAL_TIMEOUT_FRAMES = 180
 TRACKING_STALE_TO_IDLE_FRAMES = 45
 
+# IDLE is no longer a dead state: every N-th frame runs one detection probe
+# (~5 ms each 0.5 s).  Sees the probe a plausible marker fragment, the app
+# re-arms acquisition automatically — no manual 's' needed after a timeout.
+# (Fail-run 2026-07-13: 232 frames sat in IDLE with detection skipped while
+# the tool was held perfectly; forced-detection replay locked after ~41
+# frames and tracked 191/232.)
+IDLE_REACQUIRE_PROBE_INTERVAL_FRAMES = 15
+
 LOG_FRAME_DETAILS_ENV = "HYDRAMARKER_LOG_FRAME_DETAILS"
 LOG_POSE_CANDIDATES_ENV = "HYDRAMARKER_LOG_POSE_CANDIDATES"
+
+# preview cap (Hz->interval): display is decoupled from the 30 fps processing
+# loop; imshow+waitKey on Windows cost 15-25 ms and previously throttled the
+# whole pipeline to ~19 fps
+RENDER_MIN_INTERVAL_S = 0.05
+
+
+class IrExposureController:
+    """Continuous marker-tuned IR exposure control (replaces the old one-shot
+    freeze). Driven ONLY by tracking frames: ir_saturated_frac exists solely
+    while a pose + IR reference are live, so idle/lost phases hold the last
+    exposure. Two phases:
+
+    TUNING (right after lock, aligned with the pose warmup): step DOWN fast
+    (every 4 tracking frames) until the marker saturation is ~zero. No active
+    brightening toward a saturation band -- the old target band [0.05, 0.18)
+    tolerated up to 18% clipped corners and their sub-threshold halos distort
+    the MAP warp measurement (21.07 run: frozen at the band edge from the
+    startup pose, working pose then sat 0.3-0.4 all run, fit RMS ~1.4).
+
+    HOLD (settled): windowed-median watchdog. Persistent saturation (a pose-
+    dependent specular stripe entering the marker mid-run) steps the exposure
+    down; long clean stretches recover it slowly toward the configured base,
+    never above. Every applied change invalidates the IR reference library
+    (templates are exposure-dependent) via the caller.
+    """
+
+    def __init__(self, base_exposure_us: float):
+        self.base = float(base_exposure_us)
+        self.exposure = float(base_exposure_us)
+        self.state = "tuning"
+        self.min_exposure = 500.0
+        self.tune_interval = 6        # tracking frames between tuning steps
+                                      # (exposure applies asynchronously ~2-3
+                                      # frames later; 6 avoids double-stepping
+                                      # on stale saturation samples)
+        self.tune_target = 0.02       # marker saturation considered "clean"
+        self.tune_settle_samples = 6  # consecutive clean samples to settle
+        self.hold_window = 45         # sat samples for the runtime median
+        self.hold_down_med = 0.03     # persistent saturation -> step down
+        self.hold_down_cooldown = 30  # tracking frames between down steps
+        self.hold_up_clean = 120      # clean tracking frames before recovery
+        self.down_factor = 0.7
+        self.up_factor = 1.3          # asymmetric: down fast, recover moderate
+                                      # (a wrong up-step is corrected within
+                                      # ~30 frames by the down watchdog)
+        self._last_change = -10**9
+        self._clean_streak = 0
+        self._win: list[float] = []
+
+    def update(self, frame_idx: int, sat: float) -> Optional[float]:
+        """Feed one frame's ir_saturated_frac (< 0 = not measured). Returns a
+        new exposure value when the camera should be re-programmed."""
+        if sat is None or sat < 0.0:
+            return None
+        if self.state == "tuning":
+            if sat <= self.tune_target:
+                self._clean_streak += 1
+                if self._clean_streak >= self.tune_settle_samples:
+                    self.state = "hold"
+                    self._win.clear()
+                    self._clean_streak = 0
+                    return self.exposure   # settle signal: re-enroll refs now
+                return None
+            self._clean_streak = 0
+            if (frame_idx - self._last_change) < self.tune_interval:
+                return None
+            if self.exposure <= self.min_exposure:
+                self.state = "hold"        # floor reached: watchdog takes over
+                self._win.clear()
+                return self.exposure
+            self.exposure = max(self.min_exposure,
+                                self.exposure * self.down_factor)
+            self._last_change = frame_idx
+            return self.exposure
+
+        # HOLD: windowed watchdog on tracking frames only.
+        self._win.append(sat)
+        if len(self._win) > self.hold_window:
+            self._win.pop(0)
+        self._clean_streak = self._clean_streak + 1 if sat <= 0.0 else 0
+        if (frame_idx - self._last_change) < self.hold_down_cooldown:
+            return None
+        if len(self._win) >= self.hold_window:
+            med = sorted(self._win)[len(self._win) // 2]
+            if med > self.hold_down_med and self.exposure > self.min_exposure:
+                self.exposure = max(self.min_exposure,
+                                    self.exposure * self.down_factor)
+                self._last_change = frame_idx
+                self._win.clear()
+                return self.exposure
+        if (self._clean_streak >= self.hold_up_clean
+                and self.exposure < self.base):
+            self.exposure = min(self.base, self.exposure * self.up_factor)
+            self._last_change = frame_idx
+            self._clean_streak = 0
+            self._win.clear()
+            return self.exposure
+        return None
 
 
 TrackerRenderCallback = Callable[
@@ -162,6 +271,16 @@ def make_live_tracker_config() -> TrackerConfig:
         pnp_ransac_confidence=0.99,
         use_pose_prior=True,
         pnp_direct_refine_method="vvs",
+        # Pose output filter: ADAPTIVE process noise (PoseOutputFilter). While
+        # the tool is still, Q collapses to a tiny floor so the filter averages
+        # many frames -> static tip jitter 0.10 -> 0.034 mm (validated offline
+        # on raw pose logs, calib/output/080726/filter_validation.png); it opens
+        # up the instant motion is measured so the pose follows without lag
+        # (rotation/translation stay lag-free, all cases < 1 mm tip error). The
+        # anisotropic measurement noise sigma^2 (J^T J)^-1 still smooths the weak
+        # observability mode. The fixed pose_kf_q_* values are the non-adaptive
+        # fallback and unused while pose_kf_adaptive is True.
+        pose_kf_adaptive=True,
         corr_min_votes=2,
         corr_discard_conflicts=True,
         corr_require_detection_stable=False,
@@ -289,6 +408,20 @@ def run_tracker(
             return None
 
         tracker = make_tracker(field_path, marker_json_path, K, dist, live_config.tracker)
+        # arm the IR pose refinement stage (design B) when it is enabled in
+        # the tracker config AND the rig calibration exists; the third gate
+        # (the IR frame pair) comes from the camera per frame below.
+        if getattr(live_config.tracker, "ir_refine_enabled", False):
+            ir_calib = (
+                Path(__file__).resolve().parent
+                / "data" / "realsense" / "realsense_ir_calibration.npz"
+            )
+            if ir_calib.exists():
+                tracker.set_ir_calibration(ir_calib)
+                print(f"{console_prefix} IR pose refinement armed ({ir_calib.name})")
+            else:
+                print(f"{console_prefix} ir_refine_enabled but calibration "
+                      f"missing: {ir_calib} - stage stays inert")
         if after_tracker_created is not None:
             after_tracker_created(tracker)
 
@@ -296,6 +429,10 @@ def run_tracker(
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
         frame_idx = 0
+        _last_render_t = [0.0]
+        _fps_win: list[float] = []
+        from collections import deque
+        _fps_times: deque = deque(maxlen=30)   # rolling window for the overlay
         last_mode: Optional[str] = None
         last_success: Optional[bool] = None
         last_message: Optional[str] = None
@@ -345,6 +482,48 @@ def run_tracker(
             if on_log_open is not None:
                 on_log_open(Path(field_path), Path(marker_json_path), tracker)
 
+        # Frame-time jitter: Python's automatic cyclic GC fires mid-frame at
+        # unpredictable moments and adds multi-ms pauses (proven: the >27ms
+        # wall spikes land on DIFFERENT frames across bit-identical replays of
+        # the same session = scheduler/GC jitter, not tracker work). The
+        # per-frame objects (corners, dicts, arrays) are non-cyclic and freed
+        # immediately by reference counting, so disabling automatic collection
+        # does NOT leak them; only genuine reference-cycle cleanup is deferred.
+        # gc.freeze() moves all setup objects out of the scan set; a periodic
+        # manual collect below bounds any cycle buildup at a controlled moment.
+        # Restored in the finally block. Behaviour-neutral: GC never affects a
+        # computed value, only WHEN memory is reclaimed.
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+        _gc_collect_interval = 900   # ~30 s at 30 fps; one scheduled collect
+
+        # ---- continuous marker-tuned IR exposure control ----
+        # The IR fusion reports the fraction of MARKER corners clipped in the
+        # IR pair (ir_saturated_frac, computed for free by the saturation
+        # gate) -- a tracking-period signal by construction. The controller
+        # tunes fast during warmup and keeps a slow watchdog afterwards, so a
+        # pose-dependent specular reflex entering the marker MID-RUN re-tunes
+        # instead of staying frozen (21.07: frozen at the startup pose, the
+        # working pose then ran at sat 0.3-0.4 for the whole session). Every
+        # applied change drops the IR reference library: the warp templates
+        # are exposure-dependent.
+        _ir_exp_on = (getattr(live_config.tracker, "ir_refine_enabled", False)
+                      and hasattr(camera, "set_ir_exposure"))
+        _ir_exp_ctrl = None
+        # set_ir_exposure is a blocking UVC control transfer (~100 ms measured
+        # on the first in-loop call, fb2 frame 3386: tracker 13.6 ms but wall
+        # 133 ms). Loop-time changes therefore run on a worker thread — the
+        # new exposure takes effect a frame later anyway. _ir_exp_pending
+        # holds at most the newest requested value until the worker is free.
+        _ir_exp_pending = None
+        _ir_exp_worker = None
+        if _ir_exp_on:
+            _base_us = float(getattr(camera_config, "realsense_ir_exposure_us", None) or 8000.0)
+            if camera.set_ir_exposure(_base_us):   # pre-loop: blocking is fine
+                _ir_exp_ctrl = IrExposureController(_base_us)
+                print(f"{console_prefix} IR exposure control: start {_base_us:.0f} us")
+
         while True:
             frame = camera.read()
             if frame is None:
@@ -353,15 +532,71 @@ def run_tracker(
             frame_idx = int(frame.frame_index)
             raw_frame = frame.image_bgr
 
+            idle_probe = (
+                app_state == APP_IDLE
+                and getattr(live_config, "idle_auto_reacquire", False)
+                and frame_idx % IDLE_REACQUIRE_PROBE_INTERVAL_FRAMES == 0
+            )
+
             t0 = time.perf_counter()
             result = tracker.process_frame(
                 raw_frame,
-                run_detection=(app_state != APP_IDLE),
+                run_detection=(app_state != APP_IDLE) or idle_probe,
+                ir_left=getattr(frame, "ir_left", None),
+                ir_right=getattr(frame, "ir_right", None),
             )
             wall_ms = (time.perf_counter() - t0) * 1000.0
             last_result = result
 
+            # continuous IR exposure control step (see setup above). Any
+            # applied change re-programs the camera AND drops the exposure-
+            # dependent IR reference templates so they re-enroll at the new
+            # exposure through the normal gates.
+            if _ir_exp_ctrl is not None:
+                _sat = (result.timings_ms or {}).get("ir_saturated_frac", -1.0)
+                _was_tuning = _ir_exp_ctrl.state == "tuning"
+                _new_exp = _ir_exp_ctrl.update(frame_idx, _sat)
+                if _new_exp is not None:
+                    _ir_exp_pending = _new_exp   # newest value wins
+                    # References are dropped ONLY during the startup tuning
+                    # phase (incl. the settle transition): templates enrolled
+                    # mid-ramp are worthless. Runtime HOLD steps must NOT
+                    # reset the library - fb_rl2 21.07: a mid-run reset
+                    # re-bootstrapped the references from the current
+                    # (already biased) pose, the MAP then self-confirmed a
+                    # +3.5 mm error at rms 0.11. ZNCC is intensity-normalised,
+                    # so existing templates survive a moderate exposure step;
+                    # fresh tiles replace them through the normal gates.
+                    if _was_tuning and hasattr(tracker, "reset_ir_references"):
+                        tracker.reset_ir_references()
+                        print(f"{console_prefix} IR exposure tuning "
+                              f"-> {_new_exp:.0f} us (marker sat "
+                              f"{100*_sat:.0f}%), IR references re-enroll")
+                    else:
+                        print(f"{console_prefix} IR exposure hold "
+                              f"-> {_new_exp:.0f} us (marker sat "
+                              f"{100*_sat:.0f}%), references kept")
+                if _ir_exp_pending is not None and (
+                        _ir_exp_worker is None or not _ir_exp_worker.is_alive()):
+                    _ir_exp_worker = threading.Thread(
+                        target=camera.set_ir_exposure,
+                        args=(_ir_exp_pending,),
+                        daemon=True,
+                    )
+                    _ir_exp_pending = None
+                    _ir_exp_worker.start()
+
             det_count = len(getattr(result, "detection_corners", []))
+            if idle_probe and det_count >= PROVISIONAL_MIN_CORNERS:
+                # marker sighted from IDLE: re-arm WITHOUT tracker.reset() so
+                # the probe's corners immediately count toward acquisition
+                app_state = APP_ACQUIRE
+                acquire_start_frame = frame_idx
+                provisional_start_frame = 0
+                last_candidate_frame = 0
+                stale_pose_frames = 0
+                print(f"{console_prefix} auto re-acquire "
+                      f"(idle probe det={det_count})")
             if app_state in (APP_ACQUIRE, APP_PROVISIONAL):
                 active_frames = max(0, frame_idx - acquire_start_frame + 1)
                 if tracker_log.has_fresh_pose(result):
@@ -417,8 +652,20 @@ def run_tracker(
             last_success = bool(result.success)
             last_message = result.message
 
+            # Display is DECOUPLED from processing: rendering + imshow + waitKey
+            # cost 15-25 ms on Windows and silently throttled the camera loop to
+            # ~19 fps (frames dropped inside wait_for_frames). Every frame is
+            # still TRACKED and LOGGED; only the on-screen preview is capped at
+            # ~20 Hz, which keeps the loop under the 33 ms budget for true 30 fps.
             draw_t0 = time.perf_counter()
-            if live_config.show_window:
+            now_render = time.perf_counter()
+            do_render = (
+                live_config.show_window
+                and (now_render - _last_render_t[0]) >= RENDER_MIN_INTERVAL_S
+            )
+            _fps_times.append(now_render)
+            if do_render:
+                _last_render_t[0] = now_render
                 if render_frame is None:
                     vis = raw_frame.copy()
                 else:
@@ -429,8 +676,43 @@ def run_tracker(
                         frame_idx,
                         logger.is_active(),
                     )
+                # live fps overlay (top right): green = full rate, yellow =
+                # borderline, red = the camera or the loop is throttling
+                if len(_fps_times) >= 2:
+                    span = _fps_times[-1] - _fps_times[0]
+                    fps_now = (len(_fps_times) - 1) / span if span > 0 else 0.0
+                    color = ((0, 220, 0) if fps_now >= 27.0
+                             else (0, 220, 220) if fps_now >= 22.0
+                             else (0, 0, 255))
+                    cv2.putText(
+                        vis,
+                        f"{fps_now:4.1f} fps | tracker {wall_ms:4.0f} ms",
+                        (vis.shape[1] - 460, 34),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+                # app state (below fps): the dead-IDLE trap was invisible —
+                # the user held the tool while no detection ran at all
+                state_color = ((0, 220, 0) if app_state == APP_TRACKING
+                               else (0, 0, 255) if app_state == APP_IDLE
+                               else (0, 220, 220))
+                cv2.putText(
+                    vis,
+                    app_state,
+                    (vis.shape[1] - 460, 68),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, state_color, 2, cv2.LINE_AA)
                 cv2.imshow(window_name, vis)
             draw_ms = (time.perf_counter() - draw_t0) * 1000.0
+
+            # Expose the loop-level costs to on_frame hooks: wall_ms is the full
+            # process_frame time (C++ engine + numpy->Mat convert + marshal),
+            # draw_ms is the throttled display cost. Lets diagnostic logs tell
+            # tracker-bound from display-bound apart without extra plumbing.
+            try:
+                tmap = getattr(result, "timings_ms", None)
+                if isinstance(tmap, dict):
+                    tmap["wall_ms"] = wall_ms
+                    tmap["draw_ms"] = draw_ms
+            except Exception:
+                pass
 
             logger.log_frame(frame_idx, result, wall_ms, tracker, draw_ms)
 
@@ -440,7 +722,23 @@ def run_tracker(
                 except Exception as exc:
                     print(f"{console_prefix} on_frame hook failed: {exc}")
 
-            key = cv2.waitKey(1) & 0xFF if live_config.show_window else 0xFF
+            # effective-fps heartbeat so a throttled loop is VISIBLE immediately
+            _fps_win.append(time.perf_counter())
+            if len(_fps_win) >= 60:
+                span = _fps_win[-1] - _fps_win[0]
+                if span > 0:
+                    print(f"{console_prefix} effective {59.0 / span:.1f} fps "
+                          f"(tracker {wall_ms:.0f} ms)")
+                _fps_win.clear()
+
+            # Scheduled cycle cleanup at a controlled moment (frame fully
+            # processed + logged): keeps any reference-cycle buildup bounded
+            # while turning the one unavoidable collection into a predictable,
+            # rare event instead of random mid-frame pauses.
+            if frame_idx % _gc_collect_interval == 0:
+                gc.collect()
+
+            key = cv2.waitKey(1) & 0xFF if do_render else 0xFF
             if key != 0xFF and on_key is not None:
                 try:
                     if on_key(key, tracker, last_result, frame_idx):
@@ -460,8 +758,28 @@ def run_tracker(
             if key == ord("s"):
                 if app_state == APP_IDLE:
                     start_acquire(manual=True)
+                    # Single conscious start: open the logger together with
+                    # tracking so the operator arms both with one 's' press.
+                    if (
+                        live_config.start_logging_with_tracking
+                        and isinstance(logger, JsonlTrackerLogger)
+                        and not logger.is_active()
+                    ):
+                        logger.open(Path(field_path), Path(marker_json_path), tracker)
+                        if on_log_open is not None:
+                            on_log_open(Path(field_path), Path(marker_json_path), tracker)
                 else:
                     enter_idle("manual stop")
+                    if (
+                        live_config.start_logging_with_tracking
+                        and isinstance(logger, JsonlTrackerLogger)
+                        and logger.is_active()
+                    ):
+                        closed_log_path = logger.close()
+                        if closed_log_path is not None:
+                            recorded_log_path = closed_log_path
+                            if on_log_close is not None:
+                                on_log_close(closed_log_path)
             if key == ord(" "):
                 if on_space_key is not None and on_space_key(tracker, last_result, frame_idx):
                     continue
@@ -481,6 +799,10 @@ def run_tracker(
                         on_log_open(Path(field_path), Path(marker_json_path), tracker)
 
     finally:
+        # Restore automatic GC and release the frozen set so a later
+        # run_tracking() call in the same process starts from a clean state.
+        gc.unfreeze()
+        gc.enable()
         try:
             if final_cleanup is not None:
                 final_cleanup()

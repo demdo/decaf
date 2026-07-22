@@ -76,6 +76,19 @@ struct TrackerFrameResult {
     std::vector<double> rvec;
     std::vector<double> tvec;
     std::vector<double> T_marker_camera;
+    // Pre-fusion (RGB-only) pose, captured before the IR stereo fusion may
+    // overwrite rvec/tvec. Empty when IR refinement did not run. Downstream tip
+    // computation blends the two: image-plane (camera x,y) from this RGB pose
+    // (rolling-shutter-sharp, monocular-precise laterally), depth (camera z)
+    // from the fused rvec/tvec (the unique IR stereo contribution) -- keeps the
+    // IR depth gain without the IR lateral tilt wandering the tip over the lever.
+    std::vector<double> rvec_prefusion;
+    std::vector<double> tvec_prefusion;
+    // 6x6 covariance (rvec, tvec) of the output pose filter, row-major (36
+    // entries), empty when the filter did not run this frame. Downstream can
+    // propagate a rigidly attached point p (marker frame) to its camera-frame
+    // uncertainty via J * P * J^T with J = d(R(rvec)*p + tvec)/d(rvec, tvec).
+    std::vector<double> pose_covariance;
     int num_points = 0;
     int num_inliers = 0;
     double mean_reprojection_error_px = -1.0;

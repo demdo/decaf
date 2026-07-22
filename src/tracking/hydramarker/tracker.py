@@ -203,6 +203,10 @@ class TrackerResult:
 
     rvec: Optional[np.ndarray] = None
     tvec: Optional[np.ndarray] = None
+    # Pre-fusion (RGB-only) pose; None unless IR refinement ran this frame. Used
+    # by tip_camera_blend() to keep the RGB image-plane and the IR depth.
+    rvec_prefusion: Optional[np.ndarray] = None
+    tvec_prefusion: Optional[np.ndarray] = None
     T_marker_camera: Optional[np.ndarray] = None
 
     mean_reprojection_error_px: float = -1.0
@@ -215,6 +219,35 @@ class TrackerResult:
 
     debug_counters: Dict[str, float] = field(default_factory=dict)
     timings_ms: Dict[str, float] = field(default_factory=dict)
+
+
+def tip_camera_blend(result: "TrackerResult", p_tip) -> Optional[np.ndarray]:
+    """Drill tip in the CAMERA frame, blended across the two sensors' strengths.
+
+    The IR stereo fusion corrects the marker DEPTH (the monocular-weak viewing
+    axis) but its soft 720p lateral measurement drags the pose orientation, which
+    the long tool lever amplifies into an in-plane tip wander whenever the pose is
+    reorienting. So take the tip's image-plane (camera x, y) from the RGB-only
+    pose (laterally sharp) and only its depth (camera z) from the IR-fused pose.
+
+    Falls back to the plain fused-pose tip when no pre-fusion pose is present
+    (IR disabled, not applied, or a non-IR camera), so callers can use it
+    unconditionally.
+    """
+    import cv2
+
+    if result is None or result.rvec is None or result.tvec is None:
+        return None
+    p = np.asarray(p_tip, dtype=np.float64).reshape(3)
+    R, _ = cv2.Rodrigues(np.asarray(result.rvec, np.float64).reshape(3, 1))
+    tip_fused = (R @ p + np.asarray(result.tvec, np.float64).reshape(3))
+    rp = result.rvec_prefusion
+    tp = result.tvec_prefusion
+    if rp is None or tp is None:
+        return tip_fused
+    Rr, _ = cv2.Rodrigues(np.asarray(rp, np.float64).reshape(3, 1))
+    tip_rgb = (Rr @ p + np.asarray(tp, np.float64).reshape(3))
+    return np.array([tip_rgb[0], tip_rgb[1], tip_fused[2]])
 
 
 class _PoseState:
@@ -392,6 +425,10 @@ class HydraTracker:
         )
         rvec = self._cpp_vector_to_array(getattr(cpp_result, "rvec", []), (3, 1))
         tvec = self._cpp_vector_to_array(getattr(cpp_result, "tvec", []), (3, 1))
+        rvec_prefusion = self._cpp_vector_to_array(
+            getattr(cpp_result, "rvec_prefusion", []), (3, 1))
+        tvec_prefusion = self._cpp_vector_to_array(
+            getattr(cpp_result, "tvec_prefusion", []), (3, 1))
         T_marker_camera = self._cpp_vector_to_array(
             getattr(cpp_result, "T_marker_camera", []),
             (4, 4),
@@ -500,10 +537,9 @@ class HydraTracker:
             ),
         }
 
-        timings = {
-            str(key): float(value)
-            for key, value in dict(getattr(cpp_result, "timings_ms", {}) or {}).items()
-        }
+        # pybind already delivers {str: float}; a re-mapping comprehension
+        # over the ~200 entries only costs time on every frame
+        timings = dict(getattr(cpp_result, "timings_ms", {}) or {})
         timings["cpp_tracker_engine_count"] = 1.0
         timings["cpp_tracker_engine_current_pose_accepted_count"] = (
             1.0 if bool(getattr(cpp_result, "current_pose_accepted", False)) else 0.0
@@ -535,6 +571,8 @@ class HydraTracker:
             ),
             rvec=rvec,
             tvec=tvec,
+            rvec_prefusion=rvec_prefusion,
+            tvec_prefusion=tvec_prefusion,
             T_marker_camera=T_marker_camera,
             mean_reprojection_error_px=float(
                 getattr(cpp_result, "mean_reprojection_error_px", -1.0)
@@ -651,14 +689,68 @@ class HydraTracker:
         frame: np.ndarray,
         *,
         run_detection: bool = True,
+        ir_left: Optional[np.ndarray] = None,
+        ir_right: Optional[np.ndarray] = None,
     ) -> TrackerResult:
-        """Process one camera frame through the C++ TrackerEngine."""
+        """Process one camera frame through the C++ TrackerEngine.
+
+        ir_left / ir_right: optional synchronized global-shutter IR pair for
+        the IR pose refinement stage (design "B"). Ignored unless the config
+        enables ir_refine_enabled AND set_ir_calibration() was called."""
         try:
-            cpp_result = self._engine.process_frame(
-                np.asarray(frame, dtype=np.uint8),
-                bool(run_detection),
-            )
+            if ir_left is not None and ir_right is not None:
+                cpp_result = self._engine.process_frame_ir(
+                    np.asarray(frame, dtype=np.uint8),
+                    np.asarray(ir_left, dtype=np.uint8),
+                    np.asarray(ir_right, dtype=np.uint8),
+                    bool(run_detection),
+                )
+            else:
+                cpp_result = self._engine.process_frame(
+                    np.asarray(frame, dtype=np.uint8),
+                    bool(run_detection),
+                )
         except Exception as exc:
             raise RuntimeError("C++ TrackerEngine.process_frame failed.") from exc
 
         return self._tracker_result_from_cpp_engine(cpp_result)
+
+    def reset_ir_references(self) -> None:
+        """Drop the IR reference library (after a runtime IR-exposure change:
+        the warp templates are exposure-dependent). Re-enrolls automatically
+        through the normal gates."""
+        fn = getattr(self._engine, "reset_ir_references", None)
+        if fn is not None:
+            fn()
+
+    def set_ir_calibration(self, npz_path) -> None:
+        """Arm the IR refinement stage with the three-camera rig calibration
+        (realsense_ir_calibration.npz from calib_ir_camera.py)."""
+        with np.load(npz_path, allow_pickle=True) as z:
+            self._engine.set_ir_calibration(
+                list(np.asarray(z["K_rgb"], np.float64).reshape(-1)),
+                list(np.asarray(z["dist_rgb"], np.float64).reshape(-1)),
+                list(np.asarray(z["K_ir_left"], np.float64).reshape(-1)),
+                list(np.asarray(z["dist_ir_left"], np.float64).reshape(-1)),
+                list(np.asarray(z["K_ir_right"], np.float64).reshape(-1)),
+                list(np.asarray(z["dist_ir_right"], np.float64).reshape(-1)),
+                list(np.asarray(z["R_rgb_left"], np.float64).reshape(-1)),
+                list((np.asarray(z["T_rgb_left"], np.float64) * 1000.0).reshape(-1)),
+                list(np.asarray(z["R_left_right"], np.float64).reshape(-1)),
+                list((np.asarray(z["T_left_right"], np.float64) * 1000.0).reshape(-1)),
+            )
+            # Optional stereo self-calibration coefficients (QF-IR path):
+            # extra key written by the marker-based self-calibration fit;
+            # files without it keep the raw factory/ChArUco calibration.
+            if "ir_selfcal_coef" in z.files:
+                fn = getattr(self._engine, "set_ir_selfcal", None)
+                if fn is not None:
+                    fn(list(np.asarray(z["ir_selfcal_coef"],
+                                       np.float64).reshape(-1)))
+            if "ir_selfcal_corner_dxr" in z.files:
+                fn = getattr(self._engine, "set_ir_selfcal_corners", None)
+                if fn is not None:
+                    fn(list(np.asarray(z["ir_selfcal_corner_xyz"],
+                                       np.float64).reshape(-1)),
+                       list(np.asarray(z["ir_selfcal_corner_dxr"],
+                                       np.float64).reshape(-1)))

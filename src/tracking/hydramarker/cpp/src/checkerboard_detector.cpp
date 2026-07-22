@@ -1,4 +1,5 @@
 #include "checkerboard_detector.hpp"
+#include "parallel_util.hpp"
 
 #include <array>
 #include <algorithm>
@@ -811,8 +812,41 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     std::max(24, tracked_corner_count / 2) &&
                 persistent_predicted_count <
                     std::max(24, tracked_corner_count / 2);
+            // Motion alone is NOT structural weakness: validation.stable only
+            // says the frame is quiet, and a MOVING frame with a HEALTHY
+            // corner set does not need the aggressive refresh cadence (fb2
+            // 21.07: the whole push ran refresh every ~6 frames at 5-9.5 ms,
+            // 27/55 attempts hit the ROI-fail path on motion blur and only 6
+            // yielded corners -- the p95 runtime tail landed exactly where
+            // the frame budget is tightest). BUT motion WITH corner erosion
+            // must keep the fast path: the divot's steep-tilt sweeps lose
+            // corners gradually, below the hard sparse/persistent triggers,
+            // and the frequent refresh is what replenishes them (dropping the
+            // motion term entirely cost z_perp 0.51 -> 0.67 on the divot
+            // replay). Health is measured against a slow-decaying ceiling of
+            // the recently tracked corner count, so the criterion adapts to
+            // the visible marker region instead of an absolute count.
+            refresh_corner_ceiling_ = std::max(
+                static_cast<double>(tracked_corner_count),
+                refresh_corner_ceiling_ * 0.99);
+            // Lean cadence ONLY for translation-like motion: rotation brings
+            // new corner rows over the horizon and keeps the fast refresh
+            // (dropping it cost the divot replay z_perp 0.51 -> 0.67), while
+            // pure translation neither loses nor gains rows and mostly burns
+            // 5-9 ms on motion-blur ROI fails (fb2: 27/55 fails, 6 gains).
+            const bool translation_like_motion =
+                config_.refresh_lean_max_rot_deg > 0.0f &&
+                inter_frame_rotation_deg_ <
+                    static_cast<double>(config_.refresh_lean_max_rot_deg);
+            const bool moving_and_eroding =
+                !tracked->stable &&
+                static_cast<double>(tracked_corner_count) <
+                    0.85 * refresh_corner_ceiling_;
+            const bool motion_weak =
+                !tracked->stable &&
+                (!translation_like_motion || moving_and_eroding);
             const bool structural_recovery_state_weak =
-                !tracked->stable ||
+                motion_weak ||
                 !tracked_decodeable ||
                 !tracked_dense_enough ||
                 !persistent_state_not_critical;
@@ -852,6 +886,13 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 (frame_index_ %
                      std::max(1, stable_refresh_effective_interval) ==
                  0);
+            // NOTE 2026-07-13: an "acquisition boost" (bypass this cadence
+            // gating while no pose is accepted, i.e. full recovery EVERY
+            // frame) was tried and made acquisition WORSE (lock after 181
+            // instead of 41 frames on the fail-run replay): the every-frame
+            // recovery keeps replacing the accumulating corner set before
+            // tracking/LC can stabilize it.  The cadence below is load-
+            // bearing for acquisition, not just a CPU saver.
             const bool refresh_due =
                 refresh_cadence_due &&
                 (structural_recovery_state_weak || stable_refresh_due);
@@ -1663,6 +1704,17 @@ CheckerboardRecoveryDebug CheckerboardDetector::debugRecoveryStages(
         work, config_.max_recovery_corners,
         config_.saddle_sigma, config_.saddle_response_threshold);
 
+    // Capture intermediate image maps for documentation (debug-only path,
+    // not performance-critical). fast_image mirrors makeFastImage()
+    // (GaussianBlur 3x3, sigma 0.45); grad/response come straight from the
+    // real detect() call above.
+    dbg.gray = gray;
+    dbg.work = work;
+    cv::GaussianBlur(work, dbg.fast_image, cv::Size(3, 3), 0.45);
+    dbg.grad_x = raw.grad_x;
+    dbg.grad_y = raw.grad_y;
+    dbg.response = raw.response;
+
     const float inv_scale = 1.0f / scale;
     dbg.raw_candidates.reserve(raw.points.size());
     for (const auto& p : raw.points)
@@ -2207,16 +2259,39 @@ CheckerboardDetector::buildDetectionFromCorners(
     if (static_cast<int>(corners.size()) < config_.min_corners)
         return std::nullopt;
 
+    double lattice_fit_ms = 0.0;
+    double grid_build_ms = 0.0;
+    auto detection = buildDetectionFromCornersTimed(
+        corners, lattice_fit_ms, grid_build_ms);
+    addTimingMs("lattice_fit_ms", lattice_fit_ms);
+    if (grid_build_ms > 0.0) {
+        addTimingMs("grid_build_lattice_ms", grid_build_ms);
+    }
+    return detection;
+}
+
+std::optional<CheckerboardDetection>
+CheckerboardDetector::buildDetectionFromCornersTimed(
+    const std::vector<cv::Point2f>& corners,
+    double& lattice_fit_ms,
+    double& grid_build_ms
+) const {
+    lattice_fit_ms = 0.0;
+    grid_build_ms = 0.0;
+
+    if (static_cast<int>(corners.size()) < config_.min_corners)
+        return std::nullopt;
+
     const auto lattice_t0 = cv::getTickCount();
     auto lattice = lattice_model_.fit(corners);
-    addTimingMs("lattice_fit_ms", elapsedMs(lattice_t0));
+    lattice_fit_ms = elapsedMs(lattice_t0);
     if (!lattice || !lattice->valid) return std::nullopt;
 
     const auto grid_build_t0 = cv::getTickCount();
     auto detection = grid_builder_.build(
         *lattice, config_.duplicate_corner_dist_px,
         config_.min_corners, config_.min_cells);
-    addTimingMs("grid_build_lattice_ms", elapsedMs(grid_build_t0));
+    grid_build_ms = elapsedMs(grid_build_t0);
 
     if (!detection || !detection->valid()) return std::nullopt;
     return detection;
@@ -2312,61 +2387,109 @@ CheckerboardDetector::buildBestDetectionFromCornerClusters(
         seed_indices = std::move(reduced);
     }
 
-    std::vector<std::pair<float, int>> by_dist;
-    by_dist.reserve(n);
-    std::vector<cv::Point2f> subset;
-    subset.reserve(max_subset);
+    // Parallel subset search (P2, 2026-07-13).  All candidate builds are
+    // independent; they are precomputed concurrently and the winner is then
+    // selected SEQUENTIALLY in the exact original seed/subset order with the
+    // original prune bookkeeping.  The sequential pruning only ever skipped
+    // candidates whose score bound (5*K) could not beat the current best, so
+    // evaluating them anyway can never change the winner -> the selected
+    // detection is identical to the sequential implementation.
+    struct SubsetJob {
+        int subset_size = 0;
+        std::vector<cv::Point2f> subset;
+        std::optional<CheckerboardDetection> candidate;
+    };
 
-    for (int seed : seed_indices) {
+    std::vector<SubsetJob> jobs;
+    jobs.reserve(seed_indices.size() * 4);
+
+    {
+        std::vector<std::pair<float, int>> by_dist;
+        by_dist.reserve(n);
+
+        for (int seed : seed_indices) {
+            by_dist.clear();
+            for (int k = 0; k < n; ++k) {
+                const float d2 = dist2(corners[seed], corners[k]);
+                by_dist.push_back({d2, k});
+            }
+
+            const int take = max_subset;
+            std::nth_element(
+                by_dist.begin(),
+                by_dist.begin() + static_cast<std::ptrdiff_t>(take - 1),
+                by_dist.end(),
+                [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
+            by_dist.resize(take);
+            std::sort(
+                by_dist.begin(),
+                by_dist.end(),
+                [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
+
+            for (int subset_size : {12, 18, 28, 44}) {
+                if (subset_size < min_subset || subset_size > take) continue;
+
+                SubsetJob job;
+                job.subset_size = subset_size;
+                job.subset.reserve(subset_size);
+                for (int m = 0; m < subset_size; ++m) {
+                    job.subset.push_back(corners[by_dist[m].second]);
+                }
+                jobs.push_back(std::move(job));
+            }
+        }
+    }
+
+    double lattice_ms_sum = 0.0;
+    double grid_ms_sum = 0.0;
+    {
+        std::vector<double> lat_ms(jobs.size(), 0.0);
+        std::vector<double> grd_ms(jobs.size(), 0.0);
+        parallelChunks(
+            static_cast<int>(jobs.size()),
+            2,
+            [&](int begin, int end) {
+                for (int j = begin; j < end; ++j) {
+                    jobs[static_cast<size_t>(j)].candidate =
+                        buildDetectionFromCornersTimed(
+                            jobs[static_cast<size_t>(j)].subset,
+                            lat_ms[static_cast<size_t>(j)],
+                            grd_ms[static_cast<size_t>(j)]);
+                }
+            });
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            lattice_ms_sum += lat_ms[j];
+            grid_ms_sum += grd_ms[j];
+        }
+    }
+    addTimingMs("lattice_fit_ms", lattice_ms_sum);
+    addTimingMs("grid_build_lattice_ms", grid_ms_sum);
+
+    // Sequential winner selection in the original order (identical result
+    // and identical prune diagnostics to the sequential loop).
+    for (auto& job : jobs) {
         if (best_score > max_possible_subset_score) {
             addTimingMs("build_best_subset_pruned_count", 1.0);
             return best;
         }
 
-        by_dist.clear();
-        for (int k = 0; k < n; ++k) {
-            const float d2 = dist2(corners[seed], corners[k]);
-            by_dist.push_back({d2, k});
+        if (best_score > job.subset_size * 5) {
+            addTimingMs("build_best_subset_pruned_count", 1.0);
+            continue;
         }
 
-        const int take = max_subset;
-        std::nth_element(
-            by_dist.begin(),
-            by_dist.begin() + static_cast<std::ptrdiff_t>(take - 1),
-            by_dist.end(),
-            [](const auto& a, const auto& b) {
-                return a.first < b.first;
-            });
-        by_dist.resize(take);
-        std::sort(
-            by_dist.begin(),
-            by_dist.end(),
-            [](const auto& a, const auto& b) {
-                return a.first < b.first;
-            });
+        if (!job.candidate || !job.candidate->valid()) continue;
 
-        for (int subset_size : {12, 18, 28, 44}) {
-            if (subset_size < min_subset || subset_size > take) continue;
-            if (best_score > subset_size * 5) {
+        if (!best || better(*job.candidate, *best)) {
+            best = std::move(job.candidate);
+            best_score = detectionScore(*best);
+            if (best_score > max_possible_subset_score) {
                 addTimingMs("build_best_subset_pruned_count", 1.0);
-                continue;
-            }
-
-            subset.clear();
-            for (int m = 0; m < subset_size; ++m) {
-                subset.push_back(corners[by_dist[m].second]);
-            }
-
-            auto candidate = buildDetectionFromCorners(subset);
-            if (!candidate || !candidate->valid()) continue;
-
-            if (!best || better(*candidate, *best)) {
-                best = std::move(candidate);
-                best_score = detectionScore(*best);
-                if (best_score > max_possible_subset_score) {
-                    addTimingMs("build_best_subset_pruned_count", 1.0);
-                    return best;
-                }
+                return best;
             }
         }
     }
@@ -2784,6 +2907,16 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
         refine_config.subpix_max_iters = config_.saddle_subpix_max_iters;
         refine_config.subpix_epsilon   = config_.saddle_subpix_epsilon;
         refine_config.tracked_refine_method = config_.tracked_refine_method;
+        refine_config.qf_profile_half_px = config_.qf_profile_half_px;
+        refine_config.qf_min_contrast = config_.qf_min_contrast;
+        refine_config.qf_max_profile_rms = config_.qf_max_profile_rms;
+        refine_config.qf_junction_margin_frac =
+            config_.qf_junction_margin_frac;
+        refine_config.qf_min_row_points = config_.qf_min_row_points;
+        refine_config.qf_min_col_points = config_.qf_min_col_points;
+        refine_config.qf_conic_gain = config_.qf_conic_gain;
+        refine_config.qf_max_fit_rms_px = config_.qf_max_fit_rms_px;
+        refine_config.qf_max_dev_px = config_.qf_max_dev_px;
 
         // Resolve per-point 3D anchors from the engine-provided model input:
         // each tracked point is matched against the previous accepted
@@ -2792,7 +2925,8 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
         CornerModelContext model_ctx;
         const CornerModelContext* model_ctx_ptr = nullptr;
 
-        if (config_.tracked_refine_method == "model_warp" &&
+        if ((config_.tracked_refine_method == "model_warp" ||
+             config_.tracked_refine_method == "quadratic_form") &&
             corner_model_input_.enabled &&
             !corner_model_input_.prev_uv.empty() &&
             corner_model_input_.prev_uv.size() ==
@@ -2875,6 +3009,22 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
             static_cast<double>(subpix_stats.model_warp_count);
         last_timings_ms_["tracking_modelwarp_mean_zncc"] =
             subpix_stats.model_warp_mean_zncc;
+        if (config_.tracked_refine_method == "quadratic_form") {
+            last_timings_ms_["tracking_qf_count"] =
+                static_cast<double>(subpix_stats.qf_count);
+            last_timings_ms_["tracking_qf_row_curves"] =
+                static_cast<double>(subpix_stats.qf_row_curves);
+            last_timings_ms_["tracking_qf_row_conics"] =
+                static_cast<double>(subpix_stats.qf_row_conics);
+            last_timings_ms_["tracking_qf_col_lines"] =
+                static_cast<double>(subpix_stats.qf_col_lines);
+            last_timings_ms_["tracking_qf_mean_dev_px"] =
+                subpix_stats.qf_mean_dev_px;
+            last_timings_ms_["tracking_qf_mean_edge_pts"] =
+                subpix_stats.qf_mean_edge_pts;
+            last_timings_ms_["tracking_qf_saddle_count"] =
+                static_cast<double>(subpix_stats.qf_saddle_count);
+        }
 
         // Operator-comparison samples (model_warp runs only): subpix
         // baseline + final measurement per tracked point, for run logging.
@@ -3068,7 +3218,16 @@ void CheckerboardDetector::updateTrackingState(
     const CheckerboardDetection& measured_detection,
     const CheckerboardDetection* recovery_detection
 ) {
-    last_gray_ = gray.clone();
+    // --- instrumentation only (2026-07-13): sub-timers to locate the
+    // refresh-frame cost inside update_tracking_state; no behavior change.
+    const auto uts_clone_t0 = cv::getTickCount();
+    // Share the buffer instead of a full-frame deep copy (~1.3ms/frame).
+    // `gray` is freshly allocated by toGray8() every detect() call (never a
+    // view into the input frame) and is only ever READ afterwards, so cv::Mat
+    // reference counting keeps the pixels alive for next frame's LK with
+    // bit-identical content.  Verified bit-identical on the 814-frame replay.
+    last_gray_ = gray;
+    addTimingMs("update_state_clone_ms", elapsedMs(uts_clone_t0));
     if (pending_current_gray_pyramid_frame_index_ == frame_index_ &&
         !pending_current_gray_pyramid_.empty()) {
         last_gray_pyramid_ = std::move(pending_current_gray_pyramid_);
@@ -3127,6 +3286,7 @@ void CheckerboardDetector::updateTrackingState(
         return;
     }
 
+    const auto uts_match_t0 = cv::getTickCount();
     std::vector<cv::Point2f> old_persistent_uvs;
     old_persistent_uvs.reserve(persistent_corners_.size());
     for (const auto& pc : persistent_corners_)
@@ -3165,10 +3325,13 @@ void CheckerboardDetector::updateTrackingState(
         }
     }
 
+    addTimingMs("update_state_match_ms", elapsedMs(uts_match_t0));
+
     // Local grid-neighbour prediction for established corners that vanished
     // from LK/validation as a block. A single global homography is a poor
     // model for axial rotation of the cylindrical marker; adjacent grid
     // neighbours give a much better short-term motion estimate at the rim.
+    const auto uts_neighbour_t0 = cv::getTickCount();
     {
         const int old_count = std::min(
             static_cast<int>(old_persistent_uvs.size()),
@@ -3280,12 +3443,14 @@ void CheckerboardDetector::updateTrackingState(
             if (!changed) break;
         }
     }
+    addTimingMs("update_state_neighbour_ms", elapsedMs(uts_neighbour_t0));
 
     // Short-term motion-model fill for stable corners that vanished for a
     // single frame.  The previous validator can only project corners that were
     // still present in last_detection_; block losses have already disappeared
     // there.  This uses the persistent grid memory instead, so real corners can
     // survive brief LK/validation dropouts during rotation.
+    const auto uts_homography_t0 = cv::getTickCount();
     if (!unstable_tracking_update &&
         old_persistent_uvs.size() >= 4 &&
         persistent_corners_.size() >= 4) {
@@ -3369,6 +3534,9 @@ void CheckerboardDetector::updateTrackingState(
         }
     }
 
+    addTimingMs("update_state_homography_ms", elapsedMs(uts_homography_t0));
+
+    const auto uts_evict_t0 = cv::getTickCount();
     // Fast eviction for geometrically inconsistent corners.
     //
     // Problem: when a neighbour corner is correctly evicted, the corner next
@@ -3589,11 +3757,16 @@ void CheckerboardDetector::updateTrackingState(
         }
     }
 
+    addTimingMs("update_state_evict_ms", elapsedMs(uts_evict_t0));
+
     // Inject new corners from recovery into persistent state.
     // This is the main mechanism for picking up corners that became newly
     // visible after rotation or were missed by the initial detection.
     // We inject AFTER the LK update so that positions come from recovery
     // (which ran on the current frame) not from stale predictions.
+    // NOTE: this whole block only runs on REFRESH frames (recovery_detection
+    // present) — prime suspect for the refresh-frame update_state doubling.
+    const auto uts_recovery_t0 = cv::getTickCount();
     if (recovery_detection && recovery_detection->valid()) {
         const float spacing = estimateMedianSpacing(measured_detection);
         if (spacing > 1.0f) {
@@ -3794,6 +3967,9 @@ void CheckerboardDetector::updateTrackingState(
         }
     }
 
+    addTimingMs("update_state_recovery_inject_ms", elapsedMs(uts_recovery_t0));
+
+    const auto uts_build_t0 = cv::getTickCount();
     last_detection_ = buildDetectionFromPersistent(
         measured_detection.tracking, measured_detection.stable);
 
@@ -3801,6 +3977,7 @@ void CheckerboardDetector::updateTrackingState(
         last_detection_ = measured_detection;
 
     tracking_active_ = last_detection_.valid();
+    addTimingMs("update_state_build_ms", elapsedMs(uts_build_t0));
 }
 
 

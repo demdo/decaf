@@ -1908,6 +1908,14 @@ def log_frame(
             for key, value in sorted(timings.items())
             if key.startswith("checkerboard_")
         },
+        # IR global-shutter pose refinement diagnostics (design B): applied /
+        # used_left / used_right / reproj_rms_px / delta_* / refine_ms /
+        # ref_enrolled; empty dict while the stage is disabled.
+        "ir_refine": {
+            key[len("ir_"):]: round(float(value), 4)
+            for key, value in sorted(timings.items())
+            if key.startswith("ir_")
+        },
 
         "tracker_backend": tracker_backend,
         "cpp_tracker_engine_count": _fmt_float(cpp_engine_count),
