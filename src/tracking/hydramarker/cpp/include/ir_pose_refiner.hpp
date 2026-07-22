@@ -68,19 +68,13 @@ MapFuseResult mapPoseFuse(const std::vector<cv::Vec3d>& X,
 struct IrPoseRefinerConfig {
     bool enabled = false;
 
-    // IR corner measurement operator:
-    //   "model_warp"     - registration against enrolled reference photo
-    //                      pairs (the reference library below; established
-    //                      behaviour, acceptance replays pin it)
-    //   "quadratic_form" - reference-free: the model grid curves are
-    //                      projected into each IR view and the corners are
-    //                      measured directly (same QF machinery as the RGB
-    //                      tracking path, incl. the saddle-warp layer).
-    //                      The ENTIRE reference library (enrollment, tiles,
-    //                      selection, starvation escape) is bypassed; the
-    //                      saturation measurement for the exposure
-    //                      controller stays.
-    std::string corner_method = "model_warp";
+    // IR corner measurement operator. "quadratic_form" (the only measurement
+    // path): reference-free — the model grid curves are projected into each IR
+    // view and the corners are measured directly (same QF machinery as the RGB
+    // tracking path, incl. the saddle-warp layer). Any other value passes the
+    // RGB pose through unchanged; the saturation measurement for the exposure
+    // controller still runs.
+    std::string corner_method = "quadratic_form";
     // QF acceptance gate vs the seed for the IR views: the seeds are
     // rig-transferred RGB pixels (1-3 px transfer error), so the gate is
     // looser than the RGB-path 2.5 px.
@@ -139,14 +133,8 @@ struct IrPoseRefinerConfig {
                                        // pairs gates catch the divergent tail)
     double fit_gate_max_trans_jump_mm = 3.0;  // reject if |t_map - t_rgb| exceeds
 
-    // --- model_warp tuning for the soft 720p IR views ---
-    int mw_half_window = 8;
-    double mw_min_zncc = 0.35;
-    double mw_max_shift_px = 6.0;
-    double mw_max_incidence_deg = 80.0;
-    double mw_min_valid_frac = 0.4;
-
-    // --- reference library enrollment ---
+    // --- reference library enrollment (dead: kept only so the engine's config
+    //     copy compiles; the reference library itself was removed) ---
     // Enroll a reference the moment the tool enters an ORIENTATION TILE the
     // library does not cover yet (no quiet streak: the IR pair is global
     // shutter, so a moderately-moving frame still yields a sharp reference,

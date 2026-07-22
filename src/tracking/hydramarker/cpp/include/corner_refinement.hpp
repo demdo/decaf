@@ -64,7 +64,7 @@ struct MarkerPatternLut {
     }
 };
 
-// Per-frame model context for forward-model ("model_warp") corner
+// Per-frame model context for the quadratic_form corner
 // measurement.  Filled by the tracker engine; the subpix operator ignores it.
 //
 // All poses map marker-frame points X (mm) to camera-frame points R*X + t.
@@ -184,7 +184,7 @@ struct TrackedRefineStats {
     int qf_saddle_count = 0;       // high-incidence corners measured by the
                                    // synthetic saddle registration
 
-    // Per-point measurement snapshots, filled when model_warp or
+    // Per-point measurement snapshots, filled when quadratic_form or
     // quadratic_form is the active operator: the incoming LK position and
     // the subpix baseline the measurement overwrote.  Lets a run log both
     // operators on the SAME frames for offline comparison.
@@ -293,7 +293,7 @@ struct CornerRefinementConfig {
     // window: subpix AND qf drift mm-scale while the 2D reference warp
     // holds).  Corners steeper than this get a perspective-rendered
     // quadrant template (marker code free, reference free) registered
-    // like model_warp.  <= 0 disables.
+    // <= 0 disables.
     double qf_saddle_min_incidence_deg = 55.0;
 };
 
@@ -316,7 +316,7 @@ public:
     // rejected by the operator) keep their incoming position.
     //
     // The operator is selected by config.tracked_refine_method.  The
-    // model_context is only used by the "model_warp" operator and may be
+    // model_context is only used by the quadratic_form operator and may be
     // null for "subpix".
     TrackedRefineStats refineTrackedCorners(
         const cv::Mat& gray,

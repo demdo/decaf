@@ -55,7 +55,7 @@ double median(std::vector<double> v)
 
 // RGB pixels -> target-camera pixels through the rig extrinsics with a
 // per-corner depth (prototype transfer_to; the depth is the IR-LEFT z for
-// BOTH views - kept as-is for parity, the model_warp snap absorbs the
+// BOTH views - kept as-is for parity, the corner snap absorbs the
 // sub-pixel seed error).
 std::vector<cv::Point2f> transferTo(const std::vector<cv::Point2d>& uv_rgb,
                                     const std::vector<double>& z_mm,
@@ -534,7 +534,7 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
 
     // Seeds: the DETECTED RGB pixels transferred through the rig (per-corner
     // depth from the IR-left frame, prototype convention -> the seed follows the
-    // real corner, model_warp refines from there).
+    // real corner, the operator refines from there).
     const std::vector<cv::Point2d>& uv_rgb = uv_det;
     std::vector<double> z_mm(n);
     for (size_t i = 0; i < n; ++i) {

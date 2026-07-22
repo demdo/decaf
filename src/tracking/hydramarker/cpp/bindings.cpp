@@ -406,7 +406,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
 
     // Offline entry point for the tracked-corner measurement operator.
     // Drives CornerRefiner::refineTrackedCorners with an explicit model
-    // context so the model_warp path can be validated frame by frame from
+    // context so the corner-refinement path can be validated frame by frame from
     // recorded data without a live tracking lock.
     m.def(
         "refine_tracked_corners",
@@ -665,11 +665,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 cfg.zncc_weight_floor = zncc_weight_floor;
                 cfg.dtz_clamp_mm = dtz_clamp_mm;
                 cfg.depth_scale = depth_scale;
-                cfg.mw_half_window = mw_half_window;
-                cfg.mw_min_zncc = mw_min_zncc;
-                cfg.mw_max_shift_px = mw_max_shift_px;
-                cfg.mw_max_incidence_deg = mw_max_incidence_deg;
-                cfg.mw_min_valid_frac = mw_min_valid_frac;
+                (void)mw_half_window; (void)mw_min_zncc; (void)mw_max_shift_px;
+                (void)mw_max_incidence_deg; (void)mw_min_valid_frac;
                 self.configure(cfg, geometry.surfaceModel(), cloud);
             },
             py::arg("marker_json_path"),
@@ -1413,8 +1410,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                        &TrackerConfig::ir_cov_inflate_ref_rms_mm)
         .def_readwrite("ir_fit_gate_max_trans_jump_mm",
                        &TrackerConfig::ir_fit_gate_max_trans_jump_mm)
-        .def_readwrite("ir_mw_min_zncc", &TrackerConfig::ir_mw_min_zncc)
-        .def_readwrite("ir_mw_max_shift_px", &TrackerConfig::ir_mw_max_shift_px)
         .def_readwrite("ir_enroll_max_rot_deg", &TrackerConfig::ir_enroll_max_rot_deg)
         .def_readwrite("ir_enroll_max_trans_mm", &TrackerConfig::ir_enroll_max_trans_mm)
         .def_readwrite("ir_ref_tile_deg", &TrackerConfig::ir_ref_tile_deg)

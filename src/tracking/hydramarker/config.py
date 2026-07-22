@@ -377,8 +377,6 @@ class TrackerConfig:
     # filter by the reduced chi-square (fit_rms / this)^2 so the filter damps
     # poor-fit frames instead of following them. 0 disables.
     ir_cov_inflate_ref_rms_mm: float = 0.10
-    ir_mw_min_zncc: float = 0.35
-    ir_mw_max_shift_px: float = 6.0
     ir_enroll_max_rot_deg: float = 3.0
     ir_enroll_max_trans_mm: float = 8.0
     ir_ref_tile_deg: float = 12.0

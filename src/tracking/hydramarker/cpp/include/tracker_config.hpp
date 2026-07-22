@@ -191,8 +191,6 @@ struct TrackerConfig {
     // fit RMS so the filter damps weak frames instead of following them.
     // 0 disables (raw MAP covariance).
     double ir_cov_inflate_ref_rms_mm = 0.10;
-    double ir_mw_min_zncc = 0.35;         // soft 720p IR: lower ZNCC floor
-    double ir_mw_max_shift_px = 6.0;
     // Reference enrollment: fill the library across the orientation sweep
     // during CONTINUOUS motion. Enroll on entering an uncovered tile as long
     // as the pose is converged and the per-frame motion is below the RELAXED

@@ -171,8 +171,6 @@ void TrackerEngine::setIrCalibration(
     ir_cfg.w3d = config_.ir_w3d;
     ir_cfg.fit_gate_rms_mm = config_.ir_fit_gate_rms_mm;
     ir_cfg.fit_gate_max_trans_jump_mm = config_.ir_fit_gate_max_trans_jump_mm;
-    ir_cfg.mw_min_zncc = config_.ir_mw_min_zncc;
-    ir_cfg.mw_max_shift_px = config_.ir_mw_max_shift_px;
     ir_cfg.ref_tile_deg = config_.ir_ref_tile_deg;
     ir_cfg.ref_tile_trans_mm = config_.ir_ref_tile_trans_mm;
     ir_cfg.fallback_min_ref_trans_mm = config_.ir_fallback_min_ref_trans_mm;

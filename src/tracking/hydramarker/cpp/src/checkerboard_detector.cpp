@@ -2979,7 +2979,7 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
                 }
             }
 
-            last_timings_ms_["tracking_modelwarp_anchor_count"] =
+            last_timings_ms_["tracking_qf_anchor_count"] =
                 static_cast<double>(anchored);
             if (anchored > 0) {
                 model_ctx_ptr = &model_ctx;

@@ -92,7 +92,7 @@ public:
 
     std::optional<CheckerboardDetection> detect(const cv::Mat& image);
 
-    // Per-frame model context for the "model_warp" tracked-corner
+    // Per-frame model context for the quadratic_form tracked-corner
     // measurement.  Set by the tracker engine before detect(); an input
     // with enabled = false switches the operator off for the frame.
     void setCornerModelInput(const CornerModelFrameInput& input);

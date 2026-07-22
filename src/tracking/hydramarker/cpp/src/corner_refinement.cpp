@@ -350,7 +350,7 @@ std::vector<RefinedCorner> CornerRefiner::refine(
 // Tracked-corner measurement (tracking snap).
 // Moved verbatim from the checkerboard-detector tracking path so that every
 // corner measurement of the tracker lives in this component; the
-// "model_warp" operator plugs in here without touching the detector again.
+// operator plugs in here without touching the detector again.
 // ------------------------------------------------------------
 
 TrackedRefineStats CornerRefiner::refineTrackedCorners(
