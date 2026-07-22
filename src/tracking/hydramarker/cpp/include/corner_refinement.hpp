@@ -169,12 +169,10 @@ struct TrackedRefineStats {
     double p95_shift_px = 0.0;
     double max_shift_px = 0.0;
 
-    int model_warp_count = 0;          // points measured by model-warp
-    double model_warp_mean_zncc = 0.0;
-    std::vector<uint8_t> model_warp_ok;   // per input point, empty if unused
-    std::vector<float> model_warp_zncc;   // per input point, empty if unused
+    std::vector<uint8_t> corner_ok;   // per input point, empty if unused
+    std::vector<float> corner_zncc;   // per input point, empty if unused
 
-    // Quadratic-form operator statistics.  model_warp_ok/model_warp_zncc
+    // Quadratic-form operator statistics.  corner_ok/corner_zncc
     // double as the generic per-point ok/quality channels (ok = the operator
     // replaced the subpix baseline, quality in [0,1]).
     int qf_count = 0;              // corners replaced by curve intersection
@@ -255,18 +253,17 @@ struct CornerRefinementConfig {
     //                  curve x column line.  Per-point fallback to subpix.
     std::string tracked_refine_method = "subpix";
 
-    // ---- model_warp parameters (defaults = validated A1 prototype) ----
-    int model_warp_half_window = 12;          // patch half size -> 25x25
-    int model_warp_max_iters = 12;            // LK iterations
-    double model_warp_min_zncc = 0.6;         // template/image match gate
+    // ---- synthetic-saddle template registration (runSaddleWarp) ----
+    // Reused by the high-incidence 2D saddle snap that overrides the 1D
+    // quadratic-form result on strongly foreshortened corners.
+    int saddle_max_iters = 12;            // LK iterations
+    double saddle_min_zncc = 0.6;         // template/image match gate
     // Maximum deviation of the registered position from the LK/subpix
     // estimate the registration was seeded with.  The seed already follows
     // the frame-to-frame motion, so this gate stays tight without rejecting
     // fast motion (the old absolute-shift gate killed whole frames as soon
     // as the marker moved faster than the gate).
-    double model_warp_max_shift_px = 4.0;
-    double model_warp_max_incidence_deg = 72.0;  // grazing-angle cull
-    double model_warp_min_valid_frac = 0.55;  // usable template pixels
+    double saddle_max_shift_px = 4.0;
 
     // ---- quadratic_form parameters ----
     // Edge profiles: samples along the edge normal, sigmoid fit per profile.

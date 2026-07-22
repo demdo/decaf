@@ -547,12 +547,12 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             config.subpix_max_iters = subpix_max_iters;
             config.subpix_epsilon = subpix_epsilon;
             config.tracked_refine_method = method;
-            config.model_warp_half_window = half_window;
-            config.model_warp_max_iters = max_iters;
-            config.model_warp_min_zncc = min_zncc;
-            config.model_warp_max_shift_px = max_shift_px;
-            config.model_warp_max_incidence_deg = max_incidence_deg;
-            config.model_warp_min_valid_frac = min_valid_frac;
+            config.saddle_max_iters = max_iters;
+            config.saddle_min_zncc = min_zncc;
+            config.saddle_max_shift_px = max_shift_px;
+            (void)half_window;
+            (void)max_incidence_deg;
+            (void)min_valid_frac;
 
             CornerRefiner refiner;
             const TrackedRefineStats stats = refiner.refineTrackedCorners(
@@ -572,10 +572,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
 
             py::dict result;
             result["points"] = out_points;
-            result["model_warp_ok"] = stats.model_warp_ok;
-            result["model_warp_zncc"] = stats.model_warp_zncc;
-            result["model_warp_count"] = stats.model_warp_count;
-            result["model_warp_mean_zncc"] = stats.model_warp_mean_zncc;
+            result["corner_ok"] = stats.corner_ok;
+            result["corner_zncc"] = stats.corner_zncc;
             result["subpix_count"] = stats.refined_count;
             result["subpix_mean_shift_px"] = stats.mean_shift_px;
             return result;
@@ -1060,7 +1058,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("uv_lk", &TrackedRefineSample::uv_lk)
         .def_readwrite("uv_subpix", &TrackedRefineSample::uv_subpix)
         .def_readwrite("uv_meas", &TrackedRefineSample::uv_meas)
-        .def_readwrite("model_warp_ok", &TrackedRefineSample::model_warp_ok)
+        .def_readwrite("corner_ok", &TrackedRefineSample::corner_ok)
         .def_readwrite("zncc", &TrackedRefineSample::zncc)
         .def_readwrite("predicted", &TrackedRefineSample::predicted);
 
@@ -1433,10 +1431,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("ir_enroll_max_sat_frac",
                        &TrackerConfig::ir_enroll_max_sat_frac)
         .def_readwrite("ir_max_references", &TrackerConfig::ir_max_references)
-        .def_readwrite("model_warp_reenroll_on_loss", &TrackerConfig::model_warp_reenroll_on_loss)
-        .def_readwrite("model_warp_reenroll_angle_deg", &TrackerConfig::model_warp_reenroll_angle_deg)
-        .def_readwrite("model_warp_enroll_max_motion_mm", &TrackerConfig::model_warp_enroll_max_motion_mm)
-        .def_readwrite("model_warp_enroll_max_rotation_deg", &TrackerConfig::model_warp_enroll_max_rotation_deg)
         .def_readwrite("pnp_direct_max_mean_reprojection_error_px", &TrackerConfig::pnp_direct_max_mean_reprojection_error_px)
         .def_readwrite("pnp_direct_max_max_reprojection_error_px", &TrackerConfig::pnp_direct_max_max_reprojection_error_px)
         .def_readwrite("checker_min_tracking_decode_cell_span", &TrackerConfig::checker_min_tracking_decode_cell_span)

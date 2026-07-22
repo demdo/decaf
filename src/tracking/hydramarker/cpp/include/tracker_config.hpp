@@ -74,10 +74,10 @@ struct TrackerConfig {
     // bit-identical acceptance replays; the live config enables it).
     double ir_reject_cov_inflate = 1.0;
 
-    // IR corner measurement operator ("model_warp" = reference library,
-    // established acceptance behaviour; "quadratic_form" = reference-free
-    // direct measurement, Phase 2).
-    std::string ir_corner_method = "model_warp";
+    // IR corner measurement operator. "quadratic_form" = reference-free direct
+    // measurement (the only measurement path); anything else passes the RGB
+    // pose through unchanged (no IR fusion).
+    std::string ir_corner_method = "quadratic_form";
     double ir_qf_max_dev_px = 4.0;
 
     // Pose-set stabilisation. On the cylinder marker the pose is nearly
@@ -215,32 +215,6 @@ struct TrackerConfig {
     double ir_enroll_max_fit_rms_mm = 0.20;   // fusion residual must be under
     double ir_enroll_max_sat_frac = 0.35;     // IR saturation must be under
     int ir_max_references = 12;           // library capacity across the sweep
-
-    // Model-warp reference re-enrollment. The warp bias grows with the
-    // viewing-angle offset to the enrollment view, and after a full
-    // tracking loss the old reference can belong to a different tool
-    // orientation entirely. Re-enroll (a) after a full tracking loss,
-    // (b) once the viewing direction moved beyond the angle threshold.
-    // Deliberately RARE: chained re-enrollment sums the same bias (no
-    // slope fix), so the threshold sits far above normal in-run angle
-    // changes (<5 deg on step runs) — this guards against stale-reference
-    // catastrophes, nothing else. While no reference is enrolled the
-    // corners fall back to subpix automatically.
-    // Threshold sized against real data: +-85 mm step runs reach ~15 deg
-    // viewing-angle offset (lateral orbit + a few deg of real yaw), a
-    // deliberate fb<->rl reorientation is ~90 deg.
-    bool model_warp_reenroll_on_loss = true;
-    // Refresh the model_warp corner template once the view moved this far
-    // from its enrollment view (0 disables). 20 was never reached by the fb
-    // sweeps (max ~11 deg), so the whole 80 mm push refined corners against
-    // an increasingly skewed template -> correlated corner bias, z step +0.4
-    // in the 8-12 deg band (fb2+fb3), out/back asymmetry flips with this
-    // threshold (replay A/B). 6 re-enrolls during the natural pauses.
-    double model_warp_reenroll_angle_deg = 6.0;
-    // (Re-)enroll only while the tool is quiet — motion blur in the
-    // reference would bake into every later measurement.
-    double model_warp_enroll_max_motion_mm = 1.0;      // per frame
-    double model_warp_enroll_max_rotation_deg = 0.25;  // per frame
 
     int dot_canonical_size = 80;
     double dot_canonical_margin_px = 4.0;

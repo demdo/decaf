@@ -895,9 +895,9 @@ void CornerRefiner::runQuadraticForm(
     TrackedRefineStats& stats
 ) const {
     const size_t n = points.size();
-    if (stats.model_warp_ok.size() != n) {
-        stats.model_warp_ok.assign(n, 0);
-        stats.model_warp_zncc.assign(n, 0.0f);
+    if (stats.corner_ok.size() != n) {
+        stats.corner_ok.assign(n, 0);
+        stats.corner_zncc.assign(n, 0.0f);
     }
 
     const SurfaceModel& sm = ctx.surface;
@@ -1459,8 +1459,8 @@ void CornerRefiner::runQuadraticForm(
             static_cast<float>(c.seed.y + dy));
         const double rms_avg =
             corner_rms[i] / (corner_nr[i] + corner_nc[i]);
-        stats.model_warp_ok[c.idx] = 1;
-        stats.model_warp_zncc[c.idx] =
+        stats.corner_ok[c.idx] = 1;
+        stats.corner_zncc[c.idx] =
             static_cast<float>(1.0 / (1.0 + rms_avg));
         ++accepted;
         dev_sum += dev;
@@ -1490,9 +1490,9 @@ void CornerRefiner::runSaddleWarp(
     const double cos_engage =
         std::cos(config.qf_saddle_min_incidence_deg * CV_PI / 180.0);
 
-    if (stats.model_warp_ok.size() != points.size()) {
-        stats.model_warp_ok.assign(points.size(), 0);
-        stats.model_warp_zncc.assign(points.size(), 0.0f);
+    if (stats.corner_ok.size() != points.size()) {
+        stats.corner_ok.assign(points.size(), 0);
+        stats.corner_zncc.assign(points.size(), 0.0f);
     }
 
     const cv::Vec3d cyl_e2 = sm.dir.cross(sm.radial_ref);
@@ -1567,7 +1567,7 @@ void CornerRefiner::runSaddleWarp(
     constexpr int kHalf = 12;
     constexpr int kWin = 2 * kHalf + 1;
     constexpr int kNpx = kWin * kWin;
-    const double max_dev = config.model_warp_max_shift_px;
+    const double max_dev = config.saddle_max_shift_px;
     constexpr double kMaxSeedOffsetPx = 32.0;
     const double min_valid = 0.35 * static_cast<double>(kNpx);
 
@@ -1787,7 +1787,7 @@ void CornerRefiner::runSaddleWarp(
         double py = w.seed.y;
         bool failed = false;
         bool bicubic_phase = false;
-        for (int iter = 0; iter < config.model_warp_max_iters; ++iter) {
+        for (int iter = 0; iter < config.saddle_max_iters; ++iter) {
             cv::Matx44d ATA = cv::Matx44d::zeros();
             cv::Vec4d ATb(0.0, 0.0, 0.0, 0.0);
             for (int i = 0; i < kNpx; ++i) {
@@ -1868,7 +1868,7 @@ void CornerRefiner::runSaddleWarp(
         const double den = std::sqrt(t_var * i_var);
         const double zncc = den > 1e-9 ? std::abs(num) / den : 0.0;
 
-        if (zncc < config.model_warp_min_zncc) continue;
+        if (zncc < config.saddle_min_zncc) continue;
         if (std::max(std::abs(px - w.seed.x),
                      std::abs(py - w.seed.y)) > max_dev) {
             continue;
@@ -1876,14 +1876,14 @@ void CornerRefiner::runSaddleWarp(
 
         points[k] = cv::Point2f(static_cast<float>(c_uv.x + px),
                                 static_cast<float>(c_uv.y + py));
-        stats.model_warp_ok[k] = 1;
-        stats.model_warp_zncc[k] = static_cast<float>(zncc);
+        stats.corner_ok[k] = 1;
+        stats.corner_zncc[k] = static_cast<float>(zncc);
     }
 
         });  // cv::parallel_for_
 
     for (const SwWork& w : work) {
-        if (stats.model_warp_ok[w.it.k]) ++saddle_count;
+        if (stats.corner_ok[w.it.k]) ++saddle_count;
     }
     stats.qf_saddle_count = saddle_count;
 }

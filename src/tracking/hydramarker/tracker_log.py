@@ -1399,7 +1399,7 @@ def _tracked_refine_records(result) -> list[dict]:
                 "uv_lk": [round(float(v), 4) for v in sample.uv_lk],
                 "uv_subpix": [round(float(v), 4) for v in sample.uv_subpix],
                 "uv_meas": [round(float(v), 4) for v in sample.uv_meas],
-                "warp_ok": int(bool(sample.model_warp_ok)),
+                "warp_ok": int(bool(sample.corner_ok)),
                 "zncc": round(float(sample.zncc), 4),
                 "predicted": int(bool(sample.predicted)),
             })

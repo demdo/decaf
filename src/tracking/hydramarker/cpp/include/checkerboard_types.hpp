@@ -53,7 +53,7 @@ struct TrackedRefineSample {
     std::array<double, 2> uv_lk = {0.0, 0.0};      // incoming LK position
     std::array<double, 2> uv_subpix = {0.0, 0.0};  // subpix baseline
     std::array<double, 2> uv_meas = {0.0, 0.0};    // final measurement
-    bool model_warp_ok = false;   // uv_meas from warp (else subpix fallback)
+    bool corner_ok = false;   // uv_meas from warp (else subpix fallback)
     float zncc = 0.0f;
     bool predicted = false;       // carried by motion model, not measured
 };

@@ -465,7 +465,7 @@ void IrPoseRefiner::measureViewQf(const cv::Mat& gray,
     // The default 0.6 ZNCC gate was tuned for photo-reference matching; a
     // BINARY quadrant template against the soft 720p IR runs lower even
     // when correctly locked.
-    cfg.model_warp_min_zncc = 0.30;
+    cfg.saddle_min_zncc = 0.30;
     // The subpix snap inside refineTrackedCorners first pulls the
     // rig-transferred seeds onto the nearest IR saddle (fixing most of the
     // 1-3 px transfer error), then QF measures on the anchored curves and
@@ -474,13 +474,13 @@ void IrPoseRefiner::measureViewQf(const cv::Mat& gray,
     const TrackedRefineStats stats = refiner_.refineTrackedCorners(
         gray, uv_out, predicted, cfg, &ctx);
 
-    if (stats.model_warp_ok.size() != n) {
+    if (stats.corner_ok.size() != n) {
         uv_out = seeds;
         return;
     }
-    ok_out = stats.model_warp_ok;
-    if (stats.model_warp_zncc.size() == n) {
-        q_out = stats.model_warp_zncc;
+    ok_out = stats.corner_ok;
+    if (stats.corner_zncc.size() == n) {
+        q_out = stats.corner_zncc;
     }
 
     static const bool dbg = std::getenv("HYDRA_QFIR_DEBUG") != nullptr;

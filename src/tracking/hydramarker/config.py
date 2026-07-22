@@ -393,20 +393,6 @@ class TrackerConfig:
     ir_enroll_max_fit_rms_mm: float = 0.20
     ir_enroll_max_sat_frac: float = 0.35
     ir_max_references: int = 12
-    # Model-warp reference re-enrollment: fresh reference after a full
-    # tracking loss and when the viewing direction moved beyond the angle
-    # threshold (stale-reference guard for reorientation — NOT a slope fix;
-    # threshold far above normal in-run angle changes). (Re-)enrollment
-    # only happens while the tool is quiet (sharp reference).
-    # Threshold sized against real data: +-85mm step runs reach ~15 deg
-    # viewing-angle offset, a deliberate fb<->rl reorientation is ~90 deg.
-    model_warp_reenroll_on_loss: bool = True
-    # Template refresh distance: 20 was never reached by the fb sweeps (max
-    # ~11deg) -> whole push refined against a skewed template (z step +0.4 in
-    # the 8-12deg band). 6 re-enrolls during natural pauses. 0 disables.
-    model_warp_reenroll_angle_deg: float = 6.0
-    model_warp_enroll_max_motion_mm: float = 1.0     # per frame
-    model_warp_enroll_max_rotation_deg: float = 0.25  # per frame
 
     # Dot/Patch/Decode
     # Dot values are copied by TrackerEngine::makeDotDetectorConfig, decoder

@@ -2925,8 +2925,7 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
         CornerModelContext model_ctx;
         const CornerModelContext* model_ctx_ptr = nullptr;
 
-        if ((config_.tracked_refine_method == "model_warp" ||
-             config_.tracked_refine_method == "quadratic_form") &&
+        if (config_.tracked_refine_method == "quadratic_form" &&
             corner_model_input_.enabled &&
             !corner_model_input_.prev_uv.empty() &&
             corner_model_input_.prev_uv.size() ==
@@ -3005,10 +3004,6 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
             subpix_stats.p95_shift_px;
         last_timings_ms_["tracking_subpix_max_shift_px"] =
             subpix_stats.max_shift_px;
-        last_timings_ms_["tracking_modelwarp_count"] =
-            static_cast<double>(subpix_stats.model_warp_count);
-        last_timings_ms_["tracking_modelwarp_mean_zncc"] =
-            subpix_stats.model_warp_mean_zncc;
         if (config_.tracked_refine_method == "quadratic_form") {
             last_timings_ms_["tracking_qf_count"] =
                 static_cast<double>(subpix_stats.qf_count);
@@ -3043,11 +3038,11 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
                 sample.uv_meas = {
                     static_cast<double>(validation.visible_points[k].x),
                     static_cast<double>(validation.visible_points[k].y)};
-                sample.model_warp_ok =
-                    k < subpix_stats.model_warp_ok.size() &&
-                    subpix_stats.model_warp_ok[k] != 0;
-                sample.zncc = k < subpix_stats.model_warp_zncc.size()
-                    ? subpix_stats.model_warp_zncc[k] : 0.0f;
+                sample.corner_ok =
+                    k < subpix_stats.corner_ok.size() &&
+                    subpix_stats.corner_ok[k] != 0;
+                sample.zncc = k < subpix_stats.corner_zncc.size()
+                    ? subpix_stats.corner_zncc[k] : 0.0f;
                 sample.predicted = validation.visible_predicted[k];
                 last_tracked_refine_samples_.push_back(sample);
             }
