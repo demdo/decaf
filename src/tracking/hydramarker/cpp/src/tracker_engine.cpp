@@ -1489,42 +1489,19 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
         }
     }
 
-    // Reference enrollment AFTER the fusion, with the FUSED pose (bootstrap:
-    // later references are enrolled on already depth-corrected poses; the
-    // self-enslavement guard is the min_ref_rot_deg selection distance).
-    cv::Mat rv_mat(3, 1, CV_64F);
-    for (int i = 0; i < 3; ++i) {
-        rv_mat.at<double>(i) = result.rvec[static_cast<size_t>(i)];
-    }
-    cv::Mat R_mat;
-    cv::Rodrigues(rv_mat, R_mat);
-    // Position-only enrollments additionally require a demonstrably good
-    // fusion THIS frame (bootstrap-bias guard); orientation enrollments are
-    // exempt inside updateReferences.
-    const bool fusion_quality_ok =
-        fused.applied &&
-        fused.fit_rms_mm <= config_.ir_enroll_max_fit_rms_mm &&
-        fused.saturated_frac >= 0.0 &&
-        fused.saturated_frac <= config_.ir_enroll_max_sat_frac;
     // Corner evidence existed but no attempt survived the gates: this
     // frame is suspect (glare, adverse geometry, RGB drift beyond the
     // trans-jump gate) — the pose filter inflates the measurement
-    // covariance for this frame. Pair count covers the reference-free
-    // (quadratic_form) mode where ref_count is always zero.
+    // covariance for this frame. Pair count is the reference-free
+    // (quadratic_form) signal.
     ir_last_fusion_rejected_ =
         !fused.applied && (fused.ref_count > 0 || fused.pairs > 0);
     result.timings_ms["ir_fusion_rejected"] =
         ir_last_fusion_rejected_ ? 1.0 : 0.0;
-    // Remembered for the NEXT frame's model_warp (re-)enrollment gate (that
-    // runs before the fusion in the frame pipeline). Bootstrap exemption:
-    // without any IR reference there is no quality evidence either way.
-    ir_last_fusion_quality_ok_ =
-        fused.ref_count == 0 ? true : fusion_quality_ok;
-    ir_pose_refiner_.updateReferences(
-        current_ir_left_, current_ir_right_, cv::Matx33d(R_mat),
-        cv::Vec3d(result.tvec[0], result.tvec[1], result.tvec[2]),
-        pose_converged_ && irEnrollMotionOk(),
-        fusion_quality_ok);
+    // Reference-free QF fusion has no IR reference library to enroll, so the
+    // RGB model_ref enrollment gate below sees a clean quality signal every
+    // frame.
+    ir_last_fusion_quality_ok_ = true;
 }
 
 void TrackerEngine::updatePoseWarmupState(TrackerFrameResult& result)

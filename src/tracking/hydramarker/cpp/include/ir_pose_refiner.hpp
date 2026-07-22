@@ -215,25 +215,6 @@ struct IrPoseRefinerResult {
     std::array<double, 36> cov{};
 };
 
-// One enrolled reference: the IR image pair with its marker->view poses.
-struct IrFusionReference {
-    cv::Mat grayL;                 // CV_32F
-    cv::Mat grayR;
-    cv::Matx33d R_rgb = cv::Matx33d::eye();  // for the selection distance
-    cv::Vec3d t_rgb{0.0, 0.0, 0.0};          // enrollment translation (RGB
-                                             // frame) for the position part of
-                                             // the tile/selection distance
-    cv::Matx33d R_A = cv::Matx33d::eye();    // marker -> IR-left
-    cv::Vec3d t_A{0.0, 0.0, 0.0};
-    cv::Matx33d R_B = cv::Matx33d::eye();    // marker -> IR-right
-    cv::Vec3d t_B{0.0, 0.0, 0.0};
-    // Surface-axis vs camera optical axis at enrollment (deg). High = broadside
-    // = the marker is seen most face-on = crispest corners = best warp template.
-    // Fusion prefers the MOST broadside admissible reference (validated on the
-    // divot: 3D-rms 2.45 vs nearest 2.67, tip-z 0.17 vs 0.31).
-    double axis_tilt_deg = 0.0;
-};
-
 // Depth-only IR stereo fusion of the reported pose ("fuse, don't replace").
 //
 // WHY strictly depth (no rotation): the stereo cloud's ROTATION is far noisier
@@ -350,30 +331,6 @@ public:
         return config_.enabled && calib_.valid && surface_.valid() &&
                !corners_.empty();
     }
-    int referenceCount() const { return static_cast<int>(refs_.size()); }
-
-    // Library bookkeeping; call once per accepted frame AFTER fuse() with the
-    // FUSED pose (bootstrap: later references are enrolled on already
-    // depth-corrected poses). enroll_ok = the engine's gate (pose converged +
-    // motion below the relaxed IR cap). Enrolls immediately when the current
-    // orientation is more than ref_tile_deg from every existing reference.
-    // fusion_quality_ok gates POSITION-only enrollments (new position, covered
-    // orientation): the enrolled pose is baked into the template, so a weak
-    // fusion must not seed a reference (bootstrap-bias guard). It never blocks
-    // a new-orientation enrollment.
-    void updateReferences(const cv::Mat& ir_left,
-                          const cv::Mat& ir_right,
-                          const cv::Matx33d& R_rgb,
-                          const cv::Vec3d& t_rgb_mm,
-                          bool enroll_ok,
-                          bool fusion_quality_ok = true);
-
-    // Unconditional enrollment (offline replay drives the library directly).
-    void enrollReference(const cv::Mat& ir_left,
-                         const cv::Mat& ir_right,
-                         const cv::Matx33d& R_rgb,
-                         const cv::Vec3d& t_rgb_mm);
-
     // One MAP fusion step. rvec/tvec: accepted RAW RGB pose, marker -> RGB
     // camera (mm). rgb_xyz/rgb_uv: the tracked RGB corners the pose was solved
     // on - model position (marker frame, mm) and DETECTED pixel (distorted, RGB
@@ -405,7 +362,6 @@ private:
     IrCameraCalibration calib_;
     CornerRefiner refiner_;
 
-    std::vector<IrFusionReference> refs_;
     MarkerPatternLut pattern_;
     IrPairDump pair_dump_;
     std::array<double, 7> selfcal_{};
@@ -419,36 +375,6 @@ private:
                (c + 500000);
     }
     std::unordered_map<long long, double> corner_dxr_;
-    int enroll_sat_refusals_ = 0;   // consecutive bootstrap refusals (escape)
-
-    // model_warp measurement in ONE view against one reference; points are
-    // seeded with `seeds` and overwritten in-place where the warp converged.
-    void measureView(const cv::Mat& gray,
-                     const cv::Mat& ref_gray,
-                     const cv::Matx33d& R_ref,
-                     const cv::Vec3d& t_ref,
-                     const cv::Matx33d& K,
-                     const std::vector<double>& dist,
-                     const cv::Matx33d& R_view,
-                     const cv::Vec3d& t_view,
-                     const std::vector<cv::Vec3d>& xyz,
-                     const std::vector<cv::Point2f>& seeds,
-                     std::vector<cv::Point2f>& uv_out,
-                     std::vector<uint8_t>& ok_out,
-                     std::vector<float>& zncc_out) const;
-
-    // Saturation of a CANDIDATE reference on its own frames (marker corners
-    // projected into both IR views, same window test as the fusion gate).
-    // Also reported through fuse() while NO references exist, so the adaptive
-    // exposure controller keeps its signal during enrollment refusal.
-    double enrollmentSaturationFrac(const cv::Mat& ir_left,
-                                    const cv::Mat& ir_right,
-                                    const cv::Matx33d& R_rgb,
-                                    const cv::Vec3d& t_rgb_mm) const;
-    bool enrollmentSaturationOk(const cv::Mat& ir_left,
-                                const cv::Mat& ir_right,
-                                const cv::Matx33d& R_rgb,
-                                const cv::Vec3d& t_rgb_mm) const;
 
     // One MAP solve against the measured pair set of one reference. Returns
     // true (fills out.rvec/tvec/cov, applied) when the fit gate accepts;

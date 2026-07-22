@@ -741,32 +741,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("R_rgb_left"), py::arg("t_rgb_left_mm"),
             py::arg("R_left_right"), py::arg("t_left_right_mm")
         )
-        .def(
-            "add_reference",
-            [](IrPoseRefiner& self,
-               py::array_t<uint8_t,
-                           py::array::c_style | py::array::forcecast> ir_left,
-               py::array_t<uint8_t,
-                           py::array::c_style | py::array::forcecast> ir_right,
-               std::vector<double> R_rgb,   // 9 row-major
-               std::vector<double> t_rgb_mm)
-            {
-                if (R_rgb.size() != 9 || t_rgb_mm.size() != 3) {
-                    throw std::runtime_error(
-                        "IrDepthFusion.add_reference: bad array sizes.");
-                }
-                self.enrollReference(
-                    numpyToMat(ir_left), numpyToMat(ir_right),
-                    cv::Matx33d(R_rgb[0], R_rgb[1], R_rgb[2],
-                                R_rgb[3], R_rgb[4], R_rgb[5],
-                                R_rgb[6], R_rgb[7], R_rgb[8]),
-                    cv::Vec3d(t_rgb_mm[0], t_rgb_mm[1], t_rgb_mm[2]));
-            },
-            py::arg("ir_left"), py::arg("ir_right"),
-            py::arg("R_rgb"), py::arg("t_rgb_mm")
-        )
         .def("reset", &IrPoseRefiner::reset)
-        .def("reference_count", &IrPoseRefiner::referenceCount)
         .def(
             "fuse",
             [](IrPoseRefiner& self,

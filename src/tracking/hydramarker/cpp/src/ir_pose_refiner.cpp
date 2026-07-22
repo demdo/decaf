@@ -348,240 +348,8 @@ void IrPoseRefiner::setCalibration(const IrCameraCalibration& calib)
 
 void IrPoseRefiner::reset()
 {
-    refs_.clear();
-    enroll_sat_refusals_ = 0;
 }
 
-void IrPoseRefiner::enrollReference(const cv::Mat& ir_left,
-                                    const cv::Mat& ir_right,
-                                    const cv::Matx33d& R_rgb,
-                                    const cv::Vec3d& t_rgb_mm)
-{
-    IrFusionReference ref;
-    ir_left.convertTo(ref.grayL, CV_32F);
-    ir_right.convertTo(ref.grayR, CV_32F);
-    ref.R_rgb = R_rgb;
-    ref.t_rgb = t_rgb_mm;
-    ref.R_A = calib_.R_rgb_left * R_rgb;
-    ref.t_A = calib_.R_rgb_left * t_rgb_mm + calib_.t_rgb_left_mm;
-    ref.R_B = calib_.R_left_right * ref.R_A;
-    ref.t_B = calib_.R_left_right * ref.t_A + calib_.t_left_right_mm;
-    // Broadside-ness: surface axis vs the camera optical axis (deg). High =
-    // face-on = crispest corners = best warp template (fusion prefers it).
-    {
-        const cv::Vec3d axis_cam = R_rgb * surface_.dir;
-        const double na = cv::norm(axis_cam);
-        const double c = na > 0.0 ? std::abs(axis_cam[2]) / na : 1.0;
-        ref.axis_tilt_deg = std::acos(std::min(1.0, c)) * 180.0 / CV_PI;
-    }
-    refs_.push_back(std::move(ref));
-}
-
-void IrPoseRefiner::updateReferences(const cv::Mat& ir_left,
-                                     const cv::Mat& ir_right,
-                                     const cv::Matx33d& R_rgb,
-                                     const cv::Vec3d& t_rgb_mm,
-                                     bool enroll_ok,
-                                     bool fusion_quality_ok)
-{
-    if (config_.corner_method == "quadratic_form") {
-        return;  // reference-free measurement: no library to maintain
-    }
-    if (!active() || ir_left.empty() || ir_right.empty()) {
-        return;
-    }
-    if (static_cast<int>(refs_.size()) >= config_.max_references) {
-        return;
-    }
-    if (!enroll_ok) {
-        return;                 // not converged / moving too fast this frame
-    }
-    // (Orientation x position)-tile gate: enroll the moment the pose leaves
-    // the combined neighbourhood of EVERY reference. No quiet streak - a
-    // single good frame in a new tile captures that view (global-shutter IR;
-    // bad references self-reject at fusion time). This fills the library
-    // across an orientation sweep AND across a translation sweep during
-    // CONTINUOUS motion (a pure translation never leaves the orientation tile,
-    // which used to freeze the library at one home reference).
-    bool rot_covered = false;   // some ref is orientation-near
-    bool covered = false;       // some ref is orientation-near AND position-near
-    for (const IrFusionReference& ref : refs_) {
-        const bool rot_near =
-            rotationAngleDeg(ref.R_rgb, R_rgb) < config_.ref_tile_deg;
-        const bool trans_near =
-            config_.ref_tile_trans_mm <= 0.0 ||
-            cv::norm(t_rgb_mm - ref.t_rgb) < config_.ref_tile_trans_mm;
-        rot_covered = rot_covered || rot_near;
-        if (rot_near && trans_near) {
-            covered = true;
-            break;
-        }
-    }
-    if (!refs_.empty() && covered) {
-        return;                 // this (orientation, position) is covered
-    }
-    // BOOTSTRAP-BIAS GUARD for position-only enrollments: the pose a reference
-    // is enrolled with is baked into its template. Enrolling mid-sweep on a
-    // weak fusion (fb4: ref2 enrolled at y=-42 with a +2.1 mm pose error,
-    // fit_rms 0.55, sat 0.47) bakes that error in and every later measurement
-    // against it inherits the bias (excursion +0.58 -> +0.95 mm). A NEW
-    // ORIENTATION must still enroll unconditionally (the divot sweep needs the
-    // coverage and was validated that way); a position-only tile is additive
-    // luxury - only take it when the fusion at this frame is demonstrably
-    // trustworthy.
-    if (!refs_.empty() && rot_covered && !fusion_quality_ok) {
-        return;
-    }
-    // Saturation check on the CANDIDATE frames themselves (not last frame's
-    // fusion): fb_rl2 21.07 enrolled a position tile in the very frame a
-    // specular blob arrived (last-frame sat 0.00, enroll frame 0.52 - a
-    // one-frame race) and the contaminated template biased z by +1.7 mm.
-    // STARVATION ESCAPE: while the library is EMPTY, repeated refusals must
-    // not silently disable the whole IR path (a run started inside a specular
-    // zone at sat 0.38 tracked 500 frames RGB-only) - after
-    // enroll_starvation_frames refusals the candidate is taken anyway; its
-    // clean corners still fuse, the clipped ones are gated per measurement.
-    if (!enrollmentSaturationOk(ir_left, ir_right, R_rgb, t_rgb_mm)) {
-        const bool starved =
-            refs_.empty() &&
-            config_.enroll_starvation_frames > 0 &&
-            ++enroll_sat_refusals_ >= config_.enroll_starvation_frames;
-        if (!starved) {
-            return;
-        }
-    }
-    enroll_sat_refusals_ = 0;
-    enrollReference(ir_left, ir_right, R_rgb, t_rgb_mm);
-}
-
-double IrPoseRefiner::enrollmentSaturationFrac(const cv::Mat& ir_left,
-                                               const cv::Mat& ir_right,
-                                               const cv::Matx33d& R_rgb,
-                                               const cv::Vec3d& t_rgb_mm) const
-{
-    if (corners_.empty()) {
-        return 1.0;
-    }
-    const cv::Matx33d R_A = calib_.R_rgb_left * R_rgb;
-    const cv::Vec3d t_A = calib_.R_rgb_left * t_rgb_mm + calib_.t_rgb_left_mm;
-    const cv::Matx33d R_B = calib_.R_left_right * R_A;
-    const cv::Vec3d t_B = calib_.R_left_right * t_A + calib_.t_left_right_mm;
-    int n_vis = 0;
-    int n_sat = 0;
-    const auto count_view = [&](const cv::Mat& img,
-                                const cv::Matx33d& R,
-                                const cv::Vec3d& t,
-                                const cv::Matx33d& K,
-                                const std::vector<double>& dist) {
-        std::vector<cv::Point3d> obj;
-        obj.reserve(corners_.size());
-        for (const cv::Vec3d& c : corners_) {
-            const cv::Vec3d cam = R * c + t;
-            if (cam[2] > 1.0) {
-                obj.emplace_back(cam[0] / 1000.0, cam[1] / 1000.0,
-                                 cam[2] / 1000.0);
-            }
-        }
-        if (obj.empty()) {
-            return;
-        }
-        std::vector<cv::Point2d> uv;
-        cv::projectPoints(obj, cv::Vec3d(), cv::Vec3d(), K,
-                          cv::Mat(dist, true), uv);
-        std::vector<cv::Point2f> pts;
-        pts.reserve(uv.size());
-        for (const cv::Point2d& p : uv) {
-            if (p.x >= 0 && p.y >= 0 && p.x < img.cols && p.y < img.rows) {
-                pts.emplace_back(static_cast<float>(p.x),
-                                 static_cast<float>(p.y));
-            }
-        }
-        const std::vector<uint8_t> sf =
-            satFree(img, pts, config_.sat_threshold, config_.sat_half_px);
-        for (uint8_t ok : sf) {
-            ++n_vis;
-            if (!ok) {
-                ++n_sat;
-            }
-        }
-    };
-    count_view(ir_left, R_A, t_A, calib_.K_left, calib_.dist_left);
-    count_view(ir_right, R_B, t_B, calib_.K_right, calib_.dist_right);
-    if (n_vis < 6) {
-        return 1.0;     // marker barely visible in IR: no useful template
-    }
-    return static_cast<double>(n_sat) / static_cast<double>(n_vis);
-}
-
-bool IrPoseRefiner::enrollmentSaturationOk(const cv::Mat& ir_left,
-                                           const cv::Mat& ir_right,
-                                           const cv::Matx33d& R_rgb,
-                                           const cv::Vec3d& t_rgb_mm) const
-{
-    if (config_.enroll_max_sat_frac <= 0.0) {
-        return true;
-    }
-    return enrollmentSaturationFrac(ir_left, ir_right, R_rgb, t_rgb_mm) <=
-           config_.enroll_max_sat_frac;
-}
-
-void IrPoseRefiner::measureView(const cv::Mat& gray,
-                                const cv::Mat& ref_gray,
-                                const cv::Matx33d& R_ref,
-                                const cv::Vec3d& t_ref,
-                                const cv::Matx33d& K,
-                                const std::vector<double>& dist,
-                                const cv::Matx33d& R_view,
-                                const cv::Vec3d& t_view,
-                                const std::vector<cv::Vec3d>& xyz,
-                                const std::vector<cv::Point2f>& seeds,
-                                std::vector<cv::Point2f>& uv_out,
-                                std::vector<uint8_t>& ok_out,
-                                std::vector<float>& zncc_out) const
-{
-    const size_t n = xyz.size();
-    uv_out = seeds;
-    ok_out.assign(n, 0);
-    zncc_out.assign(n, 0.0f);
-    if (n == 0 || gray.empty() || ref_gray.empty()) {
-        return;
-    }
-
-    CornerModelContext ctx;
-    ctx.K = K;
-    ctx.dist = dist;
-    ctx.R = R_view;
-    ctx.t = t_view;
-    ctx.surface = surface_;
-    ctx.anchor_xyz_mm = xyz;
-    ctx.anchor_valid.assign(n, 1);
-    ctx.ref_gray = ref_gray;
-    ctx.R_ref = R_ref;
-    ctx.t_ref = t_ref;
-
-    CornerRefinementConfig cfg;
-    cfg.tracked_refine_method = "model_warp";
-    cfg.model_warp_half_window = config_.mw_half_window;
-    cfg.model_warp_min_zncc = config_.mw_min_zncc;
-    cfg.model_warp_max_shift_px = config_.mw_max_shift_px;
-    cfg.model_warp_max_incidence_deg = config_.mw_max_incidence_deg;
-    cfg.model_warp_min_valid_frac = config_.mw_min_valid_frac;
-
-    // predicted must be all-false: the refiner SKIPS predicted points
-    // entirely (transfer-only results otherwise - the 2026-07-12 lesson).
-    const std::vector<bool> predicted(n, false);
-    const TrackedRefineStats stats = refiner_.refineTrackedCorners(
-        gray, uv_out, predicted, cfg, &ctx);
-
-    if (stats.model_warp_ok.size() != n) {
-        uv_out = seeds;               // operator unavailable -> nothing usable
-        return;
-    }
-    ok_out = stats.model_warp_ok;
-    if (stats.model_warp_zncc.size() == n) {
-        zncc_out = stats.model_warp_zncc;
-    }
-}
 
 namespace {
 
@@ -738,7 +506,6 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
     IrPoseRefinerResult out;
     out.rvec = rvec;
     out.tvec = tvec;
-    out.ref_count = static_cast<int>(refs_.size());
     if (!active() || ir_left.empty() || ir_right.empty() ||
         rgb_xyz.size() != rgb_uv.size() ||
         static_cast<int>(rgb_xyz.size()) < config_.min_pairs) {
@@ -750,18 +517,6 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
     cv::Rodrigues(rvec_mat, R_mat);
     const cv::Matx33d R_rgb(R_mat);
     const cv::Vec3d t_rgb(tvec[0], tvec[1], tvec[2]);
-
-    // WITHOUT references the fusion cannot run, but the marker SATURATION is
-    // still measured and reported: the adaptive exposure controller feeds on
-    // saturated_frac, and leaving it unmeasured while enrollment is refused
-    // for saturation was a DEADLOCK (run 153956: start pose sat 0.54 -> no
-    // enrollment -> no sat signal -> controller blind -> 500 frames RGB-only).
-    const bool qf_mode = config_.corner_method == "quadratic_form";
-    if (!qf_mode && refs_.empty()) {
-        out.saturated_frac = enrollmentSaturationFrac(
-            ir_left, ir_right, R_rgb, t_rgb);
-        return out;
-    }
 
     // The MAP fuses the SAME corners the RGB pose was solved on: model position
     // (reprojection + IR-triangulation share it), detected RGB pixel
@@ -818,7 +573,9 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
     // ---- Reference-free path: measure both IR views directly with the
     // quadratic-form operator and run the SAME MAP once.  No reference
     // library, no enrollment, no selection — the measurement exists at any
-    // orientation and from the very first frame.
+    // orientation and from the very first frame. A non-quadratic corner_method
+    // has no measurement path left, so the RGB pose passes through unchanged.
+    const bool qf_mode = config_.corner_method == "quadratic_form";
     if (qf_mode) {
         ++out.refs_measured;
         std::vector<cv::Point2f> ptsL, ptsR;
