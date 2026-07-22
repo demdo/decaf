@@ -98,16 +98,12 @@ void TrackerEngine::reset()
     last_accepted_rvec_.clear();
     last_accepted_tvec_.clear();
     last_accepted_T_marker_camera_.clear();
-    model_ref_enrolled_ = false;
-    model_ref_gray_ = cv::Mat();
     model_prev_uv_.clear();
     model_prev_xyz_.clear();
     model_curr_rvec_.clear();
     model_curr_tvec_.clear();
     model_prev_rvec_.clear();
     model_prev_tvec_.clear();
-    model_enroll_count_ = 0;
-    model_ref_view_angle_deg_ = 0.0;
     resetPoseWarmup();
     resetPoseFilter();
     ir_pose_refiner_.reset();
@@ -332,18 +328,7 @@ TrackerFrameResult TrackerEngine::processFrame(
     // Output filter LAST: the model-warp anchors above must see the raw
     // pose, otherwise the filtered pose feeds back into tracking.
     applyPoseFilter(result);
-    if (config_.checker_tracked_refine_method == "model_warp") {
-        result.timings_ms["modelwarp_surface_valid"] =
-            geometry_.surfaceModel().valid() ? 1.0 : 0.0;
-        result.timings_ms["modelwarp_ref_enrolled"] =
-            model_ref_enrolled_ ? 1.0 : 0.0;
-        result.timings_ms["modelwarp_prev_corner_count"] =
-            static_cast<double>(model_prev_uv_.size());
-        result.timings_ms["modelwarp_enroll_count"] =
-            static_cast<double>(model_enroll_count_);
-        result.timings_ms["modelwarp_ref_view_angle_deg"] =
-            model_ref_view_angle_deg_;
-    } else if (config_.checker_tracked_refine_method == "quadratic_form") {
+    if (config_.checker_tracked_refine_method == "quadratic_form") {
         result.timings_ms["qf_surface_valid"] =
             geometry_.surfaceModel().valid() ? 1.0 : 0.0;
         result.timings_ms["qf_prev_corner_count"] =
@@ -1093,11 +1078,9 @@ void TrackerEngine::finalizeFrameResult(
 
 void TrackerEngine::updateCornerModelInput()
 {
-    const bool is_mw =
-        config_.checker_tracked_refine_method == "model_warp";
     const bool is_qf =
         config_.checker_tracked_refine_method == "quadratic_form";
-    if (!is_mw && !is_qf) {
+    if (!is_qf) {
         return;
     }
 
@@ -1107,7 +1090,7 @@ void TrackerEngine::updateCornerModelInput()
     // quadratic_form is reference-free: it needs no enrolled template, only
     // the surface model, a pose prediction and the previous-frame anchors.
     if (surface.valid() &&
-        (model_ref_enrolled_ || is_qf) &&
+        is_qf &&
         !model_prev_uv_.empty() &&
         model_curr_rvec_.size() == 3 &&
         model_curr_tvec_.size() == 3) {
@@ -1177,11 +1160,6 @@ void TrackerEngine::updateCornerModelInput()
         input.R = R_pred;
         input.t = t_pred;
         input.surface = surface;
-        if (is_mw) {
-            input.ref_gray = model_ref_gray_;
-            input.R_ref = model_ref_R_;
-            input.t_ref = model_ref_t_;
-        }
         input.prev_uv = model_prev_uv_;
         input.prev_xyz_mm = model_prev_xyz_;
     }
@@ -1541,11 +1519,9 @@ void TrackerEngine::updateModelWarpStateAfterFrame(
     const TrackerFrameResult& result
 )
 {
-    const bool is_mw =
-        config_.checker_tracked_refine_method == "model_warp";
     const bool is_qf =
         config_.checker_tracked_refine_method == "quadratic_form";
-    if (!is_mw && !is_qf) {
+    if (!is_qf) {
         return;
     }
 
@@ -1597,135 +1573,6 @@ void TrackerEngine::updateModelWarpStateAfterFrame(
     model_prev_tvec_ = model_curr_tvec_;
     model_curr_rvec_ = result.rvec;
     model_curr_tvec_ = result.tvec;
-
-    // Everything below is reference/template state — model_warp only.
-    // quadratic_form is reference-free and needs just the anchors and the
-    // pose history maintained above.
-    if (!is_mw) {
-        return;
-    }
-
-    // Re-enrollment trigger: drop the reference once the viewing direction
-    // (camera centre seen from the marker) moved beyond the threshold —
-    // the warp bias grows with the angle offset to the enrollment view.
-    // The enrollment block below then re-enrolls at the next quiet,
-    // high-quality frame; corners fall back to subpix in between.
-    model_ref_view_angle_deg_ = 0.0;
-    if (model_ref_enrolled_) {
-        cv::Mat R_now_m;
-        cv::Rodrigues(cv::Mat(result.rvec, true), R_now_m);
-        const cv::Matx33d R_now(R_now_m.ptr<double>());
-        const cv::Vec3d t_now(result.tvec[0], result.tvec[1],
-                              result.tvec[2]);
-        const cv::Vec3d c_now = -(R_now.t() * t_now);
-        const cv::Vec3d c_ref = -(model_ref_R_.t() * model_ref_t_);
-        const double n_now = cv::norm(c_now);
-        const double n_ref = cv::norm(c_ref);
-        if (n_now > 1e-6 && n_ref > 1e-6) {
-            double cosang = c_now.dot(c_ref) / (n_now * n_ref);
-            cosang = std::max(-1.0, std::min(1.0, cosang));
-            model_ref_view_angle_deg_ =
-                std::acos(cosang) * 180.0 / CV_PI;
-        }
-        if (config_.model_warp_reenroll_angle_deg > 0.0 &&
-            model_ref_view_angle_deg_ >
-                config_.model_warp_reenroll_angle_deg) {
-            model_ref_enrolled_ = false;
-        }
-    }
-
-    // Reference enrollment on a stable accepted pose AFTER pose warmup
-    // (poses during set saturation wander along the weak mode, and a
-    // reference enrolled from such a pose bakes that error in) and while
-    // the tool is QUIET (a blurred reference degrades every later
-    // measurement). Runs again whenever the re-enrollment policy dropped
-    // the reference; short tracking losses keep it, a full loss drops it.
-    // ir_last_fusion_quality_ok_: the template pose is baked into the warp
-    // reference, so never (re-)enroll while the IR fusion says the current
-    // pose is untrustworthy (fb3: the far-end pause coincided with the yaw
-    // episode, the 6-deg re-enroll baked its bias in and the RETURN leg read
-    // +0.32; with the gate the re-enroll defers to the next clean pause).
-    // Defaults to true while IR is off / has no references yet, so RGB-only
-    // projects and the initial enrollment are unaffected.
-    if (!model_ref_enrolled_ &&
-        pose_converged_ &&
-        poseMotionQuiet() &&
-        ir_last_fusion_quality_ok_ &&
-        geometry_.surfaceModel().valid() &&
-        !current_frame_.empty() &&
-        result.num_inliers >= 15 &&
-        result.mean_reprojection_error_px >= 0.0 &&
-        result.mean_reprojection_error_px <= 1.5) {
-        cv::Mat gray;
-        if (current_frame_.channels() == 3) {
-            cv::cvtColor(current_frame_, gray, cv::COLOR_BGR2GRAY);
-        } else if (current_frame_.channels() == 4) {
-            cv::cvtColor(current_frame_, gray, cv::COLOR_BGRA2GRAY);
-        } else {
-            gray = current_frame_;
-        }
-        // Stored as CV_32F so the refiner never converts the reference
-        // again (it is sampled every frame).
-        gray.convertTo(model_ref_gray_, CV_32F);
-
-        cv::Mat R;
-        cv::Rodrigues(cv::Mat(result.rvec, true), R);
-        model_ref_R_ = cv::Matx33d(R.ptr<double>());
-        model_ref_t_ = cv::Vec3d(
-            result.tvec[0], result.tvec[1], result.tvec[2]);
-        model_ref_enrolled_ = true;
-        ++model_enroll_count_;
-    }
-}
-
-bool TrackerEngine::irEnrollMotionOk() const
-{
-    // Same motion measure as poseMotionQuiet(), but with the RELAXED IR
-    // enrollment caps: the IR pair is global shutter, so a moderately-moving
-    // frame still yields a sharp reference. This lets the library fill across
-    // the orientation sweep during continuous motion.
-    if (model_prev_rvec_.size() != 3 || model_prev_tvec_.size() != 3 ||
-        model_curr_rvec_.size() != 3 || model_curr_tvec_.size() != 3) {
-        return true;  // no pose history yet
-    }
-    double dt2 = 0.0;
-    for (int i = 0; i < 3; ++i) {
-        const double d = model_curr_tvec_[static_cast<size_t>(i)] -
-                         model_prev_tvec_[static_cast<size_t>(i)];
-        dt2 += d * d;
-    }
-    if (std::sqrt(dt2) > config_.ir_enroll_max_trans_mm) {
-        return false;
-    }
-    cv::Mat R_prev, R_curr, r_delta;
-    cv::Rodrigues(cv::Mat(model_prev_rvec_, true), R_prev);
-    cv::Rodrigues(cv::Mat(model_curr_rvec_, true), R_curr);
-    cv::Rodrigues(R_curr * R_prev.t(), r_delta);
-    const double rot_deg = cv::norm(r_delta) * 180.0 / CV_PI;
-    return rot_deg <= config_.ir_enroll_max_rot_deg;
-}
-
-bool TrackerEngine::poseMotionQuiet() const
-{
-    if (model_prev_rvec_.size() != 3 || model_prev_tvec_.size() != 3 ||
-        model_curr_rvec_.size() != 3 || model_curr_tvec_.size() != 3) {
-        return true;  // no pose history yet — nothing to compare against
-    }
-    double dt2 = 0.0;
-    for (int i = 0; i < 3; ++i) {
-        const double d = model_curr_tvec_[static_cast<size_t>(i)] -
-                         model_prev_tvec_[static_cast<size_t>(i)];
-        dt2 += d * d;
-    }
-    if (std::sqrt(dt2) > config_.model_warp_enroll_max_motion_mm) {
-        return false;
-    }
-    cv::Mat R_prev, R_curr, r_delta;
-    cv::Rodrigues(cv::Mat(model_prev_rvec_, true), R_prev);
-    cv::Rodrigues(cv::Mat(model_curr_rvec_, true), R_curr);
-    cv::Rodrigues(R_curr * R_prev.t(), r_delta);
-    const double rot_deg = cv::norm(r_delta) * 180.0 / CV_PI;
-    return rot_deg <= config_.model_warp_enroll_max_rotation_deg;
 }
 
 void TrackerEngine::noteLowFreshCorrespondenceFailure(int fresh_count)
@@ -2351,12 +2198,6 @@ void TrackerEngine::onTrackingFailure()
         // pose has to warm up again before it counts as converged.
         resetPoseWarmup();
         resetPoseFilter();
-        // Re-acquisition may happen in a different tool orientation; a
-        // reference from before the loss is then stale. Drop it — a fresh
-        // one is enrolled after the pose has re-converged.
-        if (config_.model_warp_reenroll_on_loss) {
-            model_ref_enrolled_ = false;
-        }
         return;
     }
 

@@ -129,15 +129,10 @@ private:
     std::vector<double> last_accepted_tvec_;
     std::vector<double> last_accepted_T_marker_camera_;
 
-    // ---- model-warp corner measurement (live wiring) ----
-    // Reference view enrolled on the first stable accepted pose plus the
-    // pose corners of the last accepted frame (anchor source).  The input
-    // frame of the current processFrame call is kept as a cheap header copy
-    // so enrollment inside finalizeFrameResult can access it.
-    bool model_ref_enrolled_ = false;
-    cv::Mat model_ref_gray_;            // CV_32F at enrollment
-    cv::Matx33d model_ref_R_ = cv::Matx33d::eye();
-    cv::Vec3d model_ref_t_{0.0, 0.0, 0.0};
+    // ---- quadratic_form corner measurement (live wiring) ----
+    // Anchors from the last accepted frame's corners (uv + pose-independent
+    // marker coordinate) seed the next frame's measurement.  The input frame
+    // of the current processFrame call is kept as a cheap header copy.
     std::vector<cv::Point2f> model_prev_uv_;
     std::vector<cv::Vec3d> model_prev_xyz_;
     // quadratic_form: per-frame fresh correspondence capture (uv + marker
@@ -152,10 +147,6 @@ private:
     std::vector<double> model_curr_tvec_;
     std::vector<double> model_prev_rvec_;
     std::vector<double> model_prev_tvec_;
-    // Re-enrollment policy state: total enrollments this tracking session
-    // and the current viewing-angle offset to the reference view.
-    int model_enroll_count_ = 0;
-    double model_ref_view_angle_deg_ = 0.0;
 
     // ---- pose warmup status ----
     // Right after (re)acquisition the corner set is still saturating and the
@@ -212,8 +203,6 @@ private:
     void applyPoseFilter(TrackerFrameResult& result);
     void resetPoseFilter();
     void applyIrRefinement(TrackerFrameResult& result);
-    bool poseMotionQuiet() const;
-    bool irEnrollMotionOk() const;
 
     static CheckerboardDetectorConfig makeCheckerboardConfig(
         const TrackerConfig& config
