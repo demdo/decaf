@@ -49,9 +49,9 @@ struct TrackerConfig {
     int checker_min_fresh_correspondences_for_stable_tracking = 8;
     int checker_max_low_fresh_correspondence_frames = 12;
 
-    // Measurement operator for LK-tracked corners in the checkerboard
-    // detector ("subpix" = cv::cornerSubPix snap, "model_warp" =
-    // forward-model template registration once implemented).
+    // Measurement operator for LK-tracked corners in the checkerboard detector
+    // ("subpix" = cv::cornerSubPix snap, "quadratic_form" = reference-free
+    // curve-intersection refinement).
     std::string checker_tracked_refine_method = "subpix";
 
     // quadratic_form corner measurement (reference-free curve intersection;
@@ -134,7 +134,7 @@ struct TrackerConfig {
     // Fuses the absolute depth / out-of-plane tilt from the global-shutter
     // IR stereo pair into the reported pose; RGB keeps rotation and lateral
     // position (a full IR pose replacement is WORSE at the tip: stereo
-    // rotation noise times the tool lever). Multi-reference model_warp
+    // rotation noise times the tool lever). Multi-reference IR
     // measurement with self-enslavement guard, saturation gate, robust
     // ZNCC-weighted tilt fit; fallback keeps the RGB pose. DOUBLE-GATED:
     // needs this flag AND setIrCalibration() with the rig calibration AND

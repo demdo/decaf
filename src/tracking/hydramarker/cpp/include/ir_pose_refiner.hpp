@@ -220,7 +220,7 @@ struct IrPoseRefinerResult {
 // the reference library / the offline pivot two-pass, not a single frame.
 //
 // Per frame: model corners visible under the RGB pose are seeded into both IR
-// views, measured by model_warp against the ANGULARLY NEAREST admissible
+// views, measured against the ANGULARLY NEAREST admissible
 // enrolled reference pair (only warp-converged corners in BOTH views survive;
 // saturated patches are gated out), triangulated over the stereo baseline;
 // the robust (MAD-trimmed, clamped) median of the depth residuals

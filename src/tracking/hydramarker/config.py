@@ -99,7 +99,7 @@ class CameraConfig:
     # needs to identify corners, which tolerates gain noise well.
     realsense_auto_exposure_priority: Optional[float] = 0.0
     # Manual IR exposure (microseconds). None = auto. Short values (3000-8000)
-    # reduce motion blur on the IR pair -> higher model_warp success during
+    # reduce motion blur on the IR pair -> higher corner-detection success during
     # fast motion; needs enough scene brightness (or realsense_ir_gain).
     realsense_ir_exposure_us: Optional[float] = None
     realsense_ir_gain: Optional[float] = None
@@ -246,9 +246,9 @@ class TrackerConfig:
     checker_max_undecodeable_tracking_frames: int = 12
     checker_min_fresh_correspondences_for_stable_tracking: int = 8
     checker_max_low_fresh_correspondence_frames: int = 12
-    # Measurement operator for LK-tracked corners ("subpix" = cornerSubPix
-    # snap, "model_warp" = forward-model template registration once
-    # implemented; unknown values fall back to "subpix").
+    # Measurement operator for LK-tracked corners: "quadratic_form" =
+    # reference-free curve-intersection refinement, "subpix" = cornerSubPix snap
+    # (also the fallback for unknown values / corners QF cannot measure).
     checker_tracked_refine_method: str = "quadratic_form"
 
     # quadratic_form corner measurement (reference-free curve intersection;
@@ -271,12 +271,10 @@ class TrackerConfig:
     # is 1.0 (off) so acceptance replays stay bit-identical.
     ir_reject_cov_inflate: float = 25.0
 
-    # IR corner measurement operator: "model_warp" = registration against
-    # enrolled reference photo pairs (established behaviour), or
-    # "quadratic_form" = reference-free direct measurement of the projected
-    # model grid curves in each IR view (Phase 2 — no reference library, no
-    # enrollment, works at any orientation from frame 1). Stays model_warp
-    # until the offline A/B on the full corpus validates the QF-IR path.
+    # IR corner measurement operator: "quadratic_form" = reference-free direct
+    # measurement of the projected model grid curves in each IR view (no
+    # reference library, no enrollment, works at any orientation from frame 1).
+    # Any other value disables the IR fusion (RGB pose passes through).
     ir_corner_method: str = "quadratic_form"
     ir_qf_max_dev_px: float = 4.0
 
@@ -328,7 +326,7 @@ class TrackerConfig:
     # two out-of-plane tilt DoF from the global-shutter IR stereo pair into
     # the reported pose; RGB keeps rotation and lateral position (full IR
     # pose replacement is WORSE at the tip: stereo rotation noise times the
-    # tool lever). Multi-reference model_warp measurement (>= min_ref_rot_deg
+    # tool lever). Multi-reference IR measurement (>= min_ref_rot_deg
     # away from each reference's own enrollment orientation, best reference
     # by summed ZNCC quality), per-corner saturation gate, robust
     # ZNCC-weighted tilt fit with clamped median-depth fallback; without

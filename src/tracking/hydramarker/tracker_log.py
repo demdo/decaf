@@ -1389,7 +1389,7 @@ def _pose_corner_detail_records(result, tracker: HydraTracker) -> list[dict]:
 
 
 def _tracked_refine_records(result) -> list[dict]:
-    """Per-corner operator comparison of a model_warp frame: the incoming LK
+    """Per-corner operator comparison of a refined frame: the incoming LK
     position, the subpix baseline and the final (warp or fallback)
     measurement — lets one run be evaluated with BOTH measurement methods."""
     records = []

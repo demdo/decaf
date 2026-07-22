@@ -198,7 +198,7 @@ class TrackerResult:
 
     # Per-corner operator comparison (LK / subpix baseline / final warp
     # measurement) of this frame; C++ TrackedRefineSample objects, only
-    # populated while model_warp is the active refine method.
+    # populated while a model-based refine method is active.
     tracked_refine_samples: List = field(default_factory=list)
 
     rvec: Optional[np.ndarray] = None

@@ -292,7 +292,7 @@ TrackerFrameResult TrackerEngine::processFrame(
     bool run_detection
 )
 {
-    // Model-warp wiring wraps the actual frame processing: the per-frame
+    // Corner-anchor wiring wraps the actual frame processing: the per-frame
     // context must be on the detector before detect() runs, and the anchor
     // source / reference enrollment update after the pose was accepted.
     current_frame_ = frame;
@@ -318,12 +318,12 @@ TrackerFrameResult TrackerEngine::processFrame(
     result.tracked_refine_samples =
         checkerboard_detector_.lastTrackedRefineSamples();
     updatePoseWarmupState(result);
-    updateModelWarpStateAfterFrame(result);
+    updateCornerAnchorStateAfterFrame(result);
     // IR refinement FIRST in the output chain: it replaces the reported pose
     // with the global-shutter measurement; the anchor/filter stages then act
     // on that pose. The internal chain keeps the raw RGB pose.
     applyIrRefinement(result);
-    // Output filter LAST: the model-warp anchors above must see the raw
+    // Output filter LAST: the corner anchors above must see the raw
     // pose, otherwise the filtered pose feeds back into tracking.
     applyPoseFilter(result);
     if (config_.checker_tracked_refine_method == "quadratic_form") {
@@ -1474,10 +1474,6 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
         !fused.applied && (fused.ref_count > 0 || fused.pairs > 0);
     result.timings_ms["ir_fusion_rejected"] =
         ir_last_fusion_rejected_ ? 1.0 : 0.0;
-    // Reference-free QF fusion has no IR reference library to enroll, so the
-    // RGB model_ref enrollment gate below sees a clean quality signal every
-    // frame.
-    ir_last_fusion_quality_ok_ = true;
 }
 
 void TrackerEngine::updatePoseWarmupState(TrackerFrameResult& result)
@@ -1513,7 +1509,7 @@ void TrackerEngine::updatePoseWarmupState(TrackerFrameResult& result)
     result.timings_ms["pose_converged"] = pose_converged_ ? 1.0 : 0.0;
 }
 
-void TrackerEngine::updateModelWarpStateAfterFrame(
+void TrackerEngine::updateCornerAnchorStateAfterFrame(
     const TrackerFrameResult& result
 )
 {
@@ -1554,7 +1550,7 @@ void TrackerEngine::updateModelWarpStateAfterFrame(
         // source is the per-frame correspondence capture (fresh uv by
         // construction) — result.corners on hold frames carry STALE
         // held positions and must never feed the anchors (v6 regression:
-        // divot corners 45->30).  model_warp keeps the accepted-only
+        // divot corners 45->30).
         // behaviour (bit-identity; its reference warp also bakes the
         // pose, so stale anchors are safer there than wrong ones).
         if (is_qf && qf_frame_anchor_uv_.size() >= 8) {

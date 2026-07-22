@@ -46,8 +46,8 @@ struct GridCell {
 };
 
 // One LK-tracked corner measured by BOTH operators in the same frame.
-// Only recorded while model_warp is the active refine method: uv_subpix is
-// the baseline the warp measurement overwrote, so a model_warp run also
+// Only recorded while a model-based refine method is active: uv_subpix is
+// the baseline the refined measurement overwrote, so such a run also
 // carries the full subpix measurement for offline comparison.
 struct TrackedRefineSample {
     std::array<double, 2> uv_lk = {0.0, 0.0};      // incoming LK position
@@ -258,10 +258,10 @@ struct CheckerboardDetectorConfig {
 
     // Measurement operator applied to LK-tracked corners before the tracked
     // detection is handed to pose estimation:
-    //   "subpix"     - cv::cornerSubPix snap (default, established behaviour)
-    //   "model_warp" - forward-model template registration for markers with a
-    //                  known surface model (not implemented yet; currently
-    //                  falls back to "subpix" with a one-time warning)
+    //   "subpix"         - cv::cornerSubPix snap (default; also the per-corner
+    //                      fallback for the model-based operator)
+    //   "quadratic_form" - reference-free curve-intersection refinement for
+    //                      markers with a known surface model
     std::string tracked_refine_method = "subpix";
 
     // ---- quadratic_form parameters (see CornerRefinementConfig) ----

@@ -61,7 +61,7 @@ from tracking.hydramarker.model.diagnostics import (
 # skew ~0.4 deg, ~0.2 mm glue/print relief) that barely change reprojection
 # but bias the estimated poses -- measured as +2 mm tool-tip lever error at
 # 180 mm. The exporter still fits cylinder parameters post-hoc from the
-# exported corners (surface_model.fitted) for the runtime model_warp.
+# exported corners (surface_model.fitted) for the runtime pose refinement.
 TOPOLOGY_REGULARIZATION_WEIGHT = 0.5
 CELL_SHAPE_REGULARIZATION_WEIGHT = 0.1
 BA_MAX_ITERATIONS = 100

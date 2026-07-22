@@ -186,17 +186,13 @@ private:
     bool ir_last_fusion_rejected_ = false;
     std::array<double, 3> ir_prev_rvec_{};  // rotation gate on the shear comp.
     bool ir_prev_rvec_valid_ = false;
-    // Last frame's IR fusion quality verdict: gates model_warp (re-)enrollment
-    // (template pose is baked in; never enroll during an untrusted episode).
-    // True while IR is off / has no references (RGB-only unaffected).
-    bool ir_last_fusion_quality_ok_ = true;
 
     TrackerFrameResult processFrameInternal(
         const cv::Mat& frame,
         bool run_detection
     );
     void updateCornerModelInput();
-    void updateModelWarpStateAfterFrame(const TrackerFrameResult& result);
+    void updateCornerAnchorStateAfterFrame(const TrackerFrameResult& result);
     void updatePoseWarmupState(TrackerFrameResult& result);
     void resetPoseWarmup();
     bool posePointUsable(bool predicted, int observed_frames) const;

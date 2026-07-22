@@ -4,7 +4,7 @@ The live recorder runs ``HydraTracker`` against a configured camera stream and w
 the corner observations needed by the SfM model-building pipeline. Alongside the
 observations NPZ it also saves the raw frame behind each saved observation
 (``<observations>_frames/frame_NNNNNN.png``, keyed to the observation frame_id) so the
-geometry can later be rebuilt offline with the model_warp corner operator.
+geometry can later be rebuilt offline with the corner operator.
 """
 
 from __future__ import annotations
@@ -435,7 +435,7 @@ class _FrameWriter:
     The heavy PNG encode runs on a daemon thread so it never blocks the recording
     loop (synchronous encoding caused capture lag in the pivot recorder). Frames
     are written under their observation frame_id (``frame_NNNNNN.png``) so the
-    offline model_warp re-extraction can map each observation back to the exact
+    offline re-extraction can map each observation back to the exact
     image it was measured on. If the writer falls behind, the frame's IMAGE is
     dropped -- never the observation.
     """

@@ -39,7 +39,7 @@ void cornerSubPixChunked(
         });
 }
 
-// --- samplers for the model-warp measurement -------------------------------
+// --- samplers for the corner measurement -------------------------------
 
 // Catmull-Rom bicubic kernel (a = -0.5).
 inline float cubicWeight(float x) {
@@ -1086,7 +1086,7 @@ void CornerRefiner::runQuadraticForm(
     // to a few pixels and a fixed-length profile crosses the neighbour
     // line — the sigmoid then locks onto an arbitrary transition (fb1
     // steep-touch window: reproj 0.56, MAP gate rejects, RGB drifts -7mm;
-    // model_warp survives via its 72-deg incidence cull).
+    // (the saddle snap survives via its 72-deg incidence cull).
     const auto neighborPoint = [&](const QfSegment& seg, double sign) {
         const cv::Point3d mid = surfacePoint(seg, 0.5);
         if (seg.row) {

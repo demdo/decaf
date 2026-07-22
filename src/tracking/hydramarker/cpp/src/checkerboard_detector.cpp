@@ -2897,7 +2897,7 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
 
     // Snap LK-tracked points to current-frame corner measurements before the
     // tracked detection is rebuilt and handed to PnP.  The measurement
-    // operator (cornerSubPix or model-warp) lives in CornerRefiner.
+    // operator (cornerSubPix or quadratic_form) lives in CornerRefiner.
     {
         const auto subpix_t0 = cv::getTickCount();
 
@@ -2940,9 +2940,6 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
             model_ctx.R = corner_model_input_.R;
             model_ctx.t = corner_model_input_.t;
             model_ctx.surface = corner_model_input_.surface;
-            model_ctx.ref_gray = corner_model_input_.ref_gray;
-            model_ctx.R_ref = corner_model_input_.R_ref;
-            model_ctx.t_ref = corner_model_input_.t_ref;
             model_ctx.ray_lut = corner_model_input_.ray_lut;
             model_ctx.anchor_xyz_mm.assign(n, cv::Vec3d(0.0, 0.0, 0.0));
             model_ctx.anchor_valid.assign(n, 0);
@@ -3021,7 +3018,7 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
                 static_cast<double>(subpix_stats.qf_saddle_count);
         }
 
-        // Operator-comparison samples (model_warp runs only): subpix
+        // Operator-comparison samples: subpix
         // baseline + final measurement per tracked point, for run logging.
         const size_t n_pts = validation.visible_points.size();
         if (subpix_stats.input_uv.size() == n_pts &&

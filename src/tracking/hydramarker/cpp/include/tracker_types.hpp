@@ -102,7 +102,7 @@ struct TrackerFrameResult {
 
     // Per-corner operator comparison (LK / subpix baseline / final
     // measurement) of this frame's tracked refinement.  Only populated
-    // while model_warp is the active refine method, so such runs also log
+    // while a model-based refine method is active, so such runs also log
     // the full subpix measurement for offline method comparison.
     std::vector<TrackedRefineSample> tracked_refine_samples;
 

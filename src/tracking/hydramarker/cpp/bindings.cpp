@@ -436,7 +436,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
            py::array_t<uint8_t, py::array::c_style | py::array::forcecast> ref_np,
            std::vector<double> R_ref_flat,           // 9 row-major
            std::vector<double> t_ref_vec,            // 3
-           // model-warp tuning
+           // saddle tuning
            int half_window,
            int max_iters,
            double min_zncc,
@@ -489,12 +489,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 R_flat[3], R_flat[4], R_flat[5],
                 R_flat[6], R_flat[7], R_flat[8]);
             ctx.t = cv::Vec3d(t_vec[0], t_vec[1], t_vec[2]);
-            ctx.R_ref = cv::Matx33d(
-                R_ref_flat[0], R_ref_flat[1], R_ref_flat[2],
-                R_ref_flat[3], R_ref_flat[4], R_ref_flat[5],
-                R_ref_flat[6], R_ref_flat[7], R_ref_flat[8]);
-            ctx.t_ref = cv::Vec3d(t_ref_vec[0], t_ref_vec[1], t_ref_vec[2]);
-            ctx.ref_gray = ref;
+            (void)R_ref_flat; (void)t_ref_vec; (void)ref;
 
             SurfaceModel sm;
             if (surface_type == "cylinder") {

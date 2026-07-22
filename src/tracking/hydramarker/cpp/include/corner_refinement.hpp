@@ -64,14 +64,9 @@ struct MarkerPatternLut {
     }
 };
 
-// Per-frame model context for the quadratic_form corner
-// measurement.  Filled by the tracker engine; the subpix operator ignores it.
-//
-// All poses map marker-frame points X (mm) to camera-frame points R*X + t.
-// The reference template source (A1 "ref-warp") is a full gray frame taken
-// at enrollment together with its pose; template pixels are produced by
-// intersecting current-frame pixel rays with the surface model and
-// projecting the surface points into the reference view.
+// Per-frame model context for the quadratic_form corner measurement.  Filled
+// by the tracker engine; the subpix operator ignores it.  All poses map
+// marker-frame points X (mm) to camera-frame points R*X + t.
 struct CornerModelContext {
     // Camera intrinsics shared by the current and reference view.
     cv::Matx33d K = cv::Matx33d::eye();
@@ -93,12 +88,6 @@ struct CornerModelContext {
     std::vector<cv::Vec3d> anchor_xyz_mm;
     std::vector<uint8_t> anchor_valid;
 
-    // Reference view (A1 template source).  CV_32F preferred (avoids a
-    // per-frame conversion); CV_8U is converted on the fly.
-    cv::Mat ref_gray;
-    cv::Matx33d R_ref = cv::Matx33d::eye();
-    cv::Vec3d t_ref{0.0, 0.0, 0.0};
-
     // Optional pixel->normalized-ray lookup table (CV_32FC2, full frame,
     // undistorted normalized coordinates per pixel centre).  When present it
     // replaces the iterative cv::undistortPoints call per corner window.
@@ -109,13 +98,6 @@ struct CornerModelContext {
     // 4-cell quadrant approximation.
     const MarkerPatternLut* pattern = nullptr;
 
-    bool usable(size_t n_points) const {
-        return surface.valid() &&
-               !ref_gray.empty() &&
-               anchor_xyz_mm.size() == n_points &&
-               anchor_valid.size() == n_points;
-    }
-
     // The quadratic-form operator is reference-free: it only needs the
     // surface model, the pose prediction and the per-point anchors.
     bool usableQuadratic(size_t n_points) const {
@@ -125,7 +107,7 @@ struct CornerModelContext {
     }
 };
 
-// Engine-side per-frame input for the model-warp measurement.  The tracker
+// Engine-side per-frame input for the corner measurement.  The tracker
 // engine fills this before the detector runs; the detector resolves the
 // per-point anchors (matching its tracked points against the previous
 // accepted frame's pose corners by their previous-frame uv) and builds the
@@ -144,11 +126,6 @@ struct CornerModelFrameInput {
 
     SurfaceModel surface;
 
-    // Reference view captured at enrollment (CV_32F preferred).
-    cv::Mat ref_gray;
-    cv::Matx33d R_ref = cv::Matx33d::eye();
-    cv::Vec3d t_ref{0.0, 0.0, 0.0};
-
     // Optional pixel->ray lookup table (see CornerModelContext::ray_lut).
     cv::Mat ray_lut;
 
@@ -161,7 +138,7 @@ struct CornerModelFrameInput {
 
 // Result statistics of refineTrackedCorners, mirrored by the detector into
 // its timing/diagnostic map under the established tracking_subpix_* keys.
-// The model-warp fields stay empty/zero when the subpix operator ran.
+// The corner fields stay empty/zero when the subpix operator ran.
 struct TrackedRefineStats {
     bool enabled = false;
     int refined_count = 0;
@@ -242,10 +219,6 @@ struct CornerRefinementConfig {
 
     // Measurement operator used by refineTrackedCorners on LK-tracked points:
     //   "subpix"     - cv::cornerSubPix snap (default, established behaviour)
-    //   "model_warp" - forward-model template registration against the
-    //                  reference view through the marker surface model;
-    //                  per-point fallback to the subpix measurement when a
-    //                  quality gate fails or no model context is available.
     //   "quadratic_form" - reference-free curve-intersection measurement
     //                  (Wang et al., IEEE TIM 2022): sigmoid edge-profile
     //                  fits along the grid lines, weighted conic/line fits
@@ -336,21 +309,6 @@ private:
         TrackedRefineStats& stats
     ) const;
 
-    // Forward-model measurement pass: for every tracked point with a valid
-    // anchor, predict its local appearance by warping the reference view
-    // through the surface model into the current frame and register the
-    // prediction with translation-only LK (+ gain/bias).  Successful
-    // measurements overwrite the subpix baseline in-place; gated points
-    // keep the baseline.
-    void runModelWarp(
-        const cv::Mat& gray,
-        std::vector<cv::Point2f>& points,
-        const std::vector<bool>& predicted,
-        const CornerRefinementConfig& config,
-        const CornerModelContext& ctx,
-        TrackedRefineStats& stats
-    ) const;
-
     // Reference-free quadratic-form measurement pass: edge points from
     // sigmoid profile fits along the surface grid lines, weighted conic /
     // line fits in undistorted normalized coordinates, corner = row curve
@@ -369,7 +327,7 @@ private:
     // local checkerboard saddle is RENDERED through the surface model
     // (quadrant sign in surface coordinates, dot regions masked) and
     // registered with the same translation-only LK + gain/bias as
-    // model_warp.  Reference-free 2D measurement where 1D edge profiles
+    // Reference-free 2D measurement where 1D edge profiles
     // are geometrically blind.
     void runSaddleWarp(
         const cv::Mat& gray,

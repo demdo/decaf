@@ -106,7 +106,7 @@ public:
     static double elapsedMs(std::int64_t start_tick);
 
     // Per-corner operator comparison of the last detect() call (empty
-    // unless model_warp was active; see TrackedRefineSample).
+    // see TrackedRefineSample).
     const std::vector<TrackedRefineSample>& lastTrackedRefineSamples() const {
         return last_tracked_refine_samples_;
     }
