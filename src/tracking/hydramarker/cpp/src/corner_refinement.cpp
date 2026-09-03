@@ -365,7 +365,16 @@ TrackedRefineStats CornerRefiner::refineTrackedCorners(
     const bool want_quadratic =
         config.tracked_refine_method == "quadratic_form";
 
-    if (!want_quadratic &&
+    // "none" leaves the LK positions untouched. It exists so that the
+    // re-measurement can be ablated on its own: turning it off through
+    // subpix_win_size would also disable the sub-pixel refinement of the
+    // RECOVERY path, which shares that setting, and the ablated run would
+    // then start from a differently seeded grid instead of an identical one.
+    // Not used in production; the default remains "subpix".
+    const bool want_none =
+        config.tracked_refine_method == "none";
+
+    if (!want_quadratic && !want_none &&
         config.tracked_refine_method != "subpix") {
         static bool warned = false;
         if (!warned) {
@@ -379,6 +388,7 @@ TrackedRefineStats CornerRefiner::refineTrackedCorners(
     }
 
     const bool subpix_enabled =
+        !want_none &&
         config.subpix_win_size != 0 &&
         config.subpix_max_iters > 0 &&
         config.subpix_epsilon > 0.0;
@@ -954,6 +964,13 @@ void CornerRefiner::runQuadraticForm(
             sin_sum += std::sin(c.theta);
             cos_sum += std::cos(c.theta);
         } else {
+            // Plane: sm.dir is the surface NORMAL, so the generic
+            // u = rel.dot(axis) above is ~0 for every corner — the row
+            // clustering then collapses into a single group and the grid
+            // segmentation dies (QF ran cylinder-only until the planar
+            // thesis marker exercised this branch). The in-plane u lives
+            // along basis_u, mirroring runSaddleWarp's plane branch.
+            c.u = rel.dot(e1);
             c.rmag = 0.0;
             c.theta = 0.0;
             c.s = rel.dot(e2);
@@ -1091,7 +1108,9 @@ void CornerRefiner::runQuadraticForm(
         const cv::Point3d mid = surfacePoint(seg, 0.5);
         if (seg.row) {
             // rows: neighbour rows sit one pitch along the axis
-            return cv::Point3d(cv::Vec3d(mid) + axis * (sign * pitch));
+            // (cylinder) / along basis_u (plane, where axis is the normal)
+            return cv::Point3d(
+                cv::Vec3d(mid) + (cyl ? axis : e1) * (sign * pitch));
         }
         if (cyl) {
             // columns: neighbour columns one pitch along the arc
@@ -1474,6 +1493,7 @@ void CornerRefiner::runQuadraticForm(
     stats.qf_col_lines = valid_segs;
     stats.qf_mean_edge_pts = valid_segs > 0
         ? prof_sum / static_cast<double>(valid_segs) : 0.0;
+
 }
 
 void CornerRefiner::runSaddleWarp(
