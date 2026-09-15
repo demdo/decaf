@@ -121,7 +121,6 @@ def calibrate_camera_to_xray(
     pose_method: str = "iterative_ransac",
     refine_with_iterative: bool = False,
     refine_rgb_iterative: bool = False,
-    refine_xray_iterative: bool = False,
     ransac_reprojection_error_px: float = 3.0,
     ransac_confidence: float = 0.99,
     ransac_iterations_count: int = 5000,
@@ -129,6 +128,9 @@ def calibrate_camera_to_xray(
     checkerboard_corners_uv: np.ndarray | None = None,
     K_rgb: np.ndarray | None = None,
     steps_per_edge: int = 10,
+    board_thickness_mm: float = 0.0,
+    xray_lattice_uv: np.ndarray | None = None,
+    xray_lattice_xy_mm: np.ndarray | None = None,
 ) -> CameraToXrayCalibrationResult:
     """
     Estimate the rigid camera->xray transform.
@@ -163,6 +165,17 @@ def calibrate_camera_to_xray(
         RGB camera intrinsic matrix. Required for method='ippe_handeye'.
     steps_per_edge : int
         Grid steps per edge for method='ippe_handeye'. Default 10 → 121 points.
+    board_thickness_mm : float
+        Only used for method='ippe_handeye'. Offset between the checkerboard
+        plane seen by the RGB camera and the copper plane seen by the X-ray.
+        See tracking.pose_solvers.solve_pose.
+    xray_lattice_uv, xray_lattice_xy_mm : (M,2), (M,2) or None
+        Only for pose_method='ippe_handeye': all indexed board holes in the
+        X-ray working space (distortion-corrected like points_uv_xray) and
+        their board coordinates in mm. The X-ray-side pose is then refined
+        on the whole board instead of the 121-point patch, which resolves
+        the planar two-fold ambiguity by perspective; see
+        tracking.pose_solvers._solve_pose_ippe_handeye.
 
     Notes
     -----
@@ -173,14 +186,12 @@ def calibrate_camera_to_xray(
     Refinement options
     ------------------
     refine_with_iterative : bool
-        Backward-compatible convenience switch. For pose_method='ippe_handeye',
-        this enables iterative refinement on both RGB and X-ray side.
+        For pose_method='ippe_handeye': LM refinement of the RGB-side pose
+        T_bc. The X-ray-side pose is always refined on the board lattice.
 
     refine_rgb_iterative : bool
-        Only relevant for pose_method='ippe_handeye'. If True, refine T_bc.
+        Same as refine_with_iterative for the RGB side.
 
-    refine_xray_iterative : bool
-        Only relevant for pose_method='ippe_handeye'. If True, refine T_bx.
     """
     K_xray = _as_K(K_xray, "K_xray")
     uv = _as_uv(points_uv_xray, "points_uv_xray")
@@ -212,7 +223,6 @@ def calibrate_camera_to_xray(
         pose_method=pose_method,
         refine_with_iterative=refine_with_iterative,
         refine_rgb_iterative=refine_rgb_iterative,
-        refine_xray_iterative=refine_xray_iterative,
         ransac_reprojection_error_px=ransac_reprojection_error_px,
         ransac_confidence=ransac_confidence,
         ransac_iterations_count=ransac_iterations_count,
@@ -220,6 +230,9 @@ def calibrate_camera_to_xray(
         checkerboard_corners_uv=checkerboard_corners_uv,
         K_rgb=K_rgb,
         steps_per_edge=steps_per_edge,
+        board_thickness_mm=board_thickness_mm,
+        xray_lattice_uv=xray_lattice_uv,
+        xray_lattice_xy_mm=xray_lattice_xy_mm,
     )
 
     T_cx = rvec_tvec_to_transform(pose_result.rvec, pose_result.tvec)

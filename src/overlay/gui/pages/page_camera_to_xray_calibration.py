@@ -25,6 +25,15 @@ from overlay.gui.widgets.widget_zoom_view import ZoomView
 # ============================================================================
 SAVE_CAM2X_RESULTS: bool = False
 
+# ============================================================
+# Calibration target geometry
+# ============================================================
+# The target is a single-sided PCB: the checkerboard is printed on the top
+# face, while the X-ray-visible feature is the hole in the copper on the
+# solder side. The RGB and X-ray sides therefore observe two planes one board
+# thickness apart; without this the offset is absorbed into T_cx.
+PCB_THICKNESS_MM: float = 1.6
+
 
 class CameraToXrayCalibrationPage(StaticImagePage):
     """
@@ -393,6 +402,24 @@ class CameraToXrayCalibrationPage(StaticImagePage):
         try:
             Kx = np.asarray(self.state.K_xray, dtype=np.float64)
             uv_meas = np.asarray(self.state.xray_points_uv, dtype=np.float64).reshape(-1, 2)
+
+            # The intensifier distortion cannot be expressed as dist_coeffs
+            # (see overlay.tools.xray_distortion), so the marker points are
+            # corrected here and the solver sees an ideal pinhole detector.
+            field = getattr(self.state, "xray_dist_field", None)
+            if field is not None:
+                uv_meas = field.undistort_working(uv_meas)
+
+            # Full board lattice for the X-ray-side pose (2026-09-15). Same
+            # space and same correction as the patch points; None keeps the
+            # legacy patch-only path in the solver.
+            lattice_uv = None
+            lattice_xy = None
+            if self.state.xray_lattice_uv is not None and self.state.xray_lattice_xy_mm is not None:
+                lattice_uv = np.asarray(self.state.xray_lattice_uv, dtype=np.float64).reshape(-1, 2)
+                if field is not None:
+                    lattice_uv = field.undistort_working(lattice_uv)
+                lattice_xy = np.asarray(self.state.xray_lattice_xy_mm, dtype=np.float64).reshape(-1, 2)
             xyz_c = np.asarray(self.state.xray_points_xyz_c, dtype=np.float64).reshape(-1, 3)
 
             ransac_thr = 1.5
@@ -418,7 +445,7 @@ class CameraToXrayCalibrationPage(StaticImagePage):
                     points_xyz_camera=xyz_c,
                     points_uv_xray=uv_meas,
                     dist_coeffs=None,
-                    dist_coeffs_rgb=None,
+                    dist_coeffs_rgb=dist_rgb,
                     pose_method="ippe_handeye",
                     refine_with_iterative=True,
                     pitch_mm=2.54,
@@ -427,6 +454,9 @@ class CameraToXrayCalibrationPage(StaticImagePage):
                     ),
                     K_rgb=np.asarray(self.state.K_rgb, dtype=np.float64),
                     steps_per_edge=10,
+                    board_thickness_mm=PCB_THICKNESS_MM,
+                    xray_lattice_uv=lattice_uv,
+                    xray_lattice_xy_mm=lattice_xy,
                 )
             else:
                 calib = calibrate_camera_to_xray(

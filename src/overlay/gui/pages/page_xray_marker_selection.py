@@ -19,10 +19,11 @@ from overlay.tools.blob_detection import HoughCircleParams
 from overlay.tools.xray_marker_selection import (
     run_xray_marker_detection,
     compute_roi_from_grid,
+    index_board_lattice,
 )
 
 
-SAVE_XRAY_MARKER_SELECTION = False
+SAVE_XRAY_MARKER_SELECTION = True
 
 
 class XrayMarkerSelectionPage(StaticImagePage):
@@ -89,6 +90,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self._circles: np.ndarray | None = None       # (N,3), RAW coords
         self._pick_radius_px: float | None = None     # interaction radius
         self._last_roi_uv_raw: np.ndarray | None = None  # local debug/display only
+        self._last_lattice: tuple | None = None          # (uv_working, ij, xy_mm, dbg)
 
         # ======================================================
         # LEFT: replace template image_label with interactive widget
@@ -421,6 +423,23 @@ class XrayMarkerSelectionPage(StaticImagePage):
             self.state.xray_points_uv = roi_uv_final.astype(float)
             self.state.xray_points_confirmed = True
 
+            # Extend the indexed patch to every detected hole of the board.
+            # The X-ray-side pose is refined on this lattice (Cam2X page);
+            # see index_board_lattice for why the patch alone is not enough.
+            lat_uv, lat_ij, lat_xy, lat_dbg = index_board_lattice(
+                np.asarray(self._circles, dtype=np.float64),
+                np.asarray(dbg["points_uv_raw"], dtype=np.float64).reshape(-1, 2),
+                image_width=int(dbg["image_width"]),
+            )
+            self.state.xray_lattice_uv = lat_uv.astype(float)
+            self.state.xray_lattice_xy_mm = lat_xy.astype(float)
+            self._last_lattice = (lat_uv, lat_ij, lat_xy, lat_dbg)
+            print(
+                f"[XrayMarkerSelection] board lattice: {lat_dbg['n_indexed']} of "
+                f"{lat_dbg['n_detections']} detections indexed, j {lat_dbg['j_range']}, "
+                f"i {lat_dbg['i_range']}, homography rms {lat_dbg['homography_resid_rms_px']:.2f} px"
+            )
+
             if "debug_uv_raw" in dbg:
                 self._last_roi_uv_raw = np.asarray(
                     dbg["debug_uv_raw"], dtype=np.float64
@@ -447,6 +466,9 @@ class XrayMarkerSelectionPage(StaticImagePage):
             self.state.xray_points_uv = None
             self.state.xray_points_confirmed = False
             self.state.xray_marker_overlay_bgr = None
+            self.state.xray_lattice_uv = None
+            self.state.xray_lattice_xy_mm = None
+            self._last_lattice = None
             self._last_roi_uv_raw = None
 
             self.marker_widget.clear_selection()
@@ -462,6 +484,9 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.state.xray_points_uv = None
         self.state.xray_points_confirmed = False
         self.state.xray_marker_overlay_bgr = None
+        self.state.xray_lattice_uv = None
+        self.state.xray_lattice_xy_mm = None
+        self._last_lattice = None
 
         self.marker_widget.clear_selection()
         self.marker_widget.set_roi_indices([])
@@ -519,6 +544,20 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
             anchor_indices=np.asarray(selected_idx, dtype=np.int64),
             roi_indices=np.asarray(roi_idx, dtype=np.int64),
+            # Full board lattice (2026-09-15): all indexed holes, working space,
+            # integer lattice coordinates (j, i) and board mm relative to TL.
+            lattice_uv_working=(
+                np.asarray(self._last_lattice[0], dtype=np.float64)
+                if self._last_lattice is not None else np.empty((0, 2))
+            ),
+            lattice_ij=(
+                np.asarray(self._last_lattice[1], dtype=np.int64)
+                if self._last_lattice is not None else np.empty((0, 2), dtype=np.int64)
+            ),
+            lattice_xy_mm=(
+                np.asarray(self._last_lattice[2], dtype=np.float64)
+                if self._last_lattice is not None else np.empty((0, 2))
+            ),
             circles_uvr=(
                 np.asarray(self._circles, dtype=np.float64)
                 if self._circles is not None

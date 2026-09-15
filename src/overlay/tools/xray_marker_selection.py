@@ -357,6 +357,123 @@ def transform_xray_uv_raw_to_working(
     uv_work[:, 0] = float(image_width - 1) - uv_work[:, 0]
     return uv_work
 
+
+def index_board_lattice(
+    circles_uv_raw: np.ndarray,
+    patch_uv_raw: np.ndarray,
+    *,
+    image_width: int,
+    pitch_mm: float = 2.54,
+    nu: int = 10,
+    nv: int = 10,
+    tol_pitch: float = 0.30,
+    n_iter: int = 6,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """
+    Extend the indexed 11x11 patch to ALL detected holes of the board.
+
+    Added 2026-09-15 for the X-ray side of the camera-to-X-ray calibration.
+    The patch (25.4 mm) is what the camera side can see and index; the
+    X-ray image, however, shows the whole board (~100 mm, ~1300 holes), and
+    only that extent carries enough perspective to make the planar pose
+    unambiguous and its tilt measurable (see
+    tracking.pose_solvers._solve_pose_ippe_handeye). This function assigns
+    every detection its integer lattice coordinates (j, i) in the SAME board
+    frame as the patch: origin at the patch's TL hole, j along x_b, i along
+    y_b, so that the patch holes keep their indices 0..nu / 0..nv and the
+    other holes get indices beyond that range (negative or > 10).
+
+    Method (same bootstrap as debug/export_xray_distortion._indexed_holes,
+    which produced the distortion field): a homography from the canonical
+    patch board coordinates to the 121 patch detections is used to map all
+    detections into board coordinates; each detection within `tol_pitch`
+    of an integer site is accepted (one detection per site, the closest
+    wins), the homography is re-fitted on the accepted set and the
+    assignment repeated `n_iter` times. Only the assignment uses the
+    homography; the returned image points are the measured centres.
+
+    Parameters
+    ----------
+    circles_uv_raw : (N, 2) or (N, 3)
+        All detections in RAW detector coordinates (u, v[, r]).
+    patch_uv_raw : (121, 2)
+        The indexed patch in RAW coordinates, canonical row-major order
+        k = (nu+1) * i + j (as compute_roi_from_grid produces it).
+    image_width : int
+        Detector width, for the RAW -> working-space flip.
+
+    Returns
+    -------
+    uv_working : (M, 2)
+        Accepted detections in XRAY_WORKING_FLIPPED_UV (u = W - 1 - u_raw).
+    lattice_ij : (M, 2) int
+        Integer lattice coordinates (j, i) per accepted detection.
+    board_xy_mm : (M, 2)
+        Board coordinates (j * pitch, i * pitch) in mm, z_b = 0 implied.
+    dbg : dict
+        n_detections, n_indexed, lattice ranges, residual of the last
+        homography fit.
+    """
+    circles = np.asarray(circles_uv_raw, dtype=np.float64).reshape(-1, circles_uv_raw.shape[-1])[:, :2]
+    patch = np.asarray(patch_uv_raw, dtype=np.float64).reshape(-1, 2)
+    n_expected = (nu + 1) * (nv + 1)
+    if patch.shape[0] != n_expected:
+        raise ValueError(f"patch_uv_raw must hold {n_expected} points, got {patch.shape[0]}.")
+    if circles.shape[0] < n_expected:
+        raise ValueError("Fewer detections than patch points.")
+
+    board_patch = np.array(
+        [[j * pitch_mm, i * pitch_mm] for i in range(nv + 1) for j in range(nu + 1)],
+        dtype=np.float64,
+    )
+    H, _ = cv2.findHomography(board_patch.reshape(-1, 1, 2), patch.reshape(-1, 1, 2), 0)
+    if H is None:
+        raise RuntimeError("Bootstrap homography of the patch failed.")
+
+    ok = np.zeros(circles.shape[0], dtype=bool)
+    lat = np.zeros((circles.shape[0], 2), dtype=np.int64)
+    for _ in range(int(n_iter)):
+        b = cv2.perspectiveTransform(
+            circles.reshape(-1, 1, 2), np.linalg.inv(H)
+        ).reshape(-1, 2) / float(pitch_mm)
+        lat_f = np.rint(b)
+        err = np.linalg.norm(b - lat_f, axis=1)
+        ok[:] = False
+        seen: set = set()
+        for t in np.argsort(err):
+            if err[t] >= tol_pitch:
+                break
+            key = (int(lat_f[t, 0]), int(lat_f[t, 1]))
+            if key in seen:
+                continue
+            seen.add(key)
+            ok[t] = True
+        lat = lat_f.astype(np.int64)
+        H, _ = cv2.findHomography(
+            (lat[ok].astype(np.float64) * pitch_mm).reshape(-1, 1, 2),
+            circles[ok].reshape(-1, 1, 2),
+            0,
+        )
+        if H is None:
+            raise RuntimeError("Lattice homography re-fit failed.")
+
+    uv_raw_ok = circles[ok]
+    lattice_ij = lat[ok]
+    board_xy_mm = lattice_ij.astype(np.float64) * float(pitch_mm)
+    proj = cv2.perspectiveTransform(board_xy_mm.reshape(-1, 1, 2), H).reshape(-1, 2)
+    resid = np.linalg.norm(proj - uv_raw_ok, axis=1)
+
+    dbg = dict(
+        n_detections=int(circles.shape[0]),
+        n_indexed=int(ok.sum()),
+        j_range=(int(lattice_ij[:, 0].min()), int(lattice_ij[:, 0].max())),
+        i_range=(int(lattice_ij[:, 1].min()), int(lattice_ij[:, 1].max())),
+        homography_resid_rms_px=float(np.sqrt(np.mean(resid ** 2))),
+        homography_resid_max_px=float(resid.max()),
+    )
+    uv_working = transform_xray_uv_raw_to_working(uv_raw_ok, image_width=int(image_width))
+    return uv_working, lattice_ij, board_xy_mm, dbg
+
 # ============================================================
 # Public API
 # ============================================================

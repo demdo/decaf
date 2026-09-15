@@ -13,6 +13,10 @@ class SessionState:
     # --- Camera calibration ---
     K_rgb: Optional[np.ndarray] = None
     dist_rgb: Optional[np.ndarray] = None
+    # overlay.tools.xray_distortion.XrayFieldDistortion, or None.
+    # There is deliberately no Brown-style dist_xray: those coefficients cannot
+    # represent this detector's field, see that module.
+    xray_dist_field: Optional[object] = None
 
     # --- X-ray image for calibration / marker selection ---
     xray_image: Optional[np.ndarray] = None
@@ -24,6 +28,14 @@ class SessionState:
     xray_points_confirmed: bool = False
     xray_marker_overlay_bgr: Optional[np.ndarray] = None
     marker_radius_px: Optional[float] = None
+
+    # --- Full board lattice for the X-ray-side pose (2026-09-15) ---
+    # All indexed holes of the board, XRAY_WORKING_FLIPPED_UV, and their
+    # board coordinates in mm relative to the patch origin (TL hole). The
+    # Cam2X page refines the X-ray pose on these instead of the 121-point
+    # patch; see tools.xray_marker_selection.index_board_lattice.
+    xray_lattice_uv: Optional[np.ndarray] = None       # (M, 2)
+    xray_lattice_xy_mm: Optional[np.ndarray] = None    # (M, 2)
 
     # --- Plane fitting result (interactive -> confirmed) ---
     xray_points_xyz_c: Optional[np.ndarray] = None
@@ -62,6 +74,13 @@ class SessionState:
     # --- Anatomical X-ray image for preview / live overlay ---
     xray_image_anatomy: Optional[np.ndarray] = None
     xray_image_anatomy_path: Optional[str] = None
+
+    # --- Tool tracking (optional; loaded on the Tool Tracking page) ---
+    # tracking.hydramarker.tool_assets.ToolAssets (kept as object to avoid a
+    # hard import here, same pattern as xray_dist_field above).
+    tool_assets: Optional[object] = None
+    # IR rig calibration npz for stereo-IR pose refinement, or None (RGB only).
+    ir_calibration_path: Optional[str] = None
 
     # ----------------
     # Convenience flags
@@ -117,3 +136,7 @@ class SessionState:
     @property
     def has_H_xc(self) -> bool:
         return self.H_xc is not None
+
+    @property
+    def has_tool(self) -> bool:
+        return self.tool_assets is not None

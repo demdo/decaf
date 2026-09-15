@@ -340,6 +340,13 @@ class PoseSolveResult:
     all_candidates: list[IppeCandidateResult] | None = None
     all_candidates_rgb: list[IppeCandidateResult] | None = None
 
+    # X-ray side only (method 'ippe_handeye' with a board lattice): per
+    # candidate the mean reprojection error over ALL indexed holes after
+    # the LM refinement, and the rotation angle between the two refined
+    # candidates. dR close to zero means both starts reached the same
+    # minimum, i.e. the planar two-fold ambiguity was resolved by the data.
+    xray_lattice_stats: dict | None = None
+
 
 # ============================================================
 # IPPE internals
@@ -439,59 +446,27 @@ def _export_ippe_candidate_result(
 # IPPE candidate selection
 # ============================================================
 
-def _select_ippe_candidate(
-    candidates: list[_IppeCandidate],
-    *,
-    use_xray_ippe_selection_rule: bool = False,
-) -> int:
+def _select_ippe_candidate(candidates: list[_IppeCandidate]) -> int:
+    """
+    Pick the IPPE candidate with the lower mean reprojection error.
+
+    Note (2026-09-15): this function used to carry an X-ray-specific rule
+    (choose the candidate whose board z-axis is closest to antiparallel with
+    the X-ray z-axis). It was removed. On the 11x11 patch the two candidates
+    are mirror images of each other about the viewing ray through the patch
+    centre, so their angles to z_x differ by at most twice the off-axis
+    angle of the patch (0.3-0.8 deg on the calibration sessions) while the
+    true board tilt is unknown to 3-5 deg -- the rule decided on noise. The
+    X-ray side of the camera-to-X-ray calibration now resolves the
+    ambiguity on the full board lattice instead; see
+    _solve_pose_ippe_handeye.
+    """
     if len(candidates) != 2:
         raise ValueError(
             f"Expected exactly 2 IPPE candidates, got {len(candidates)}."
         )
-
-    if not use_xray_ippe_selection_rule:
-        s0, s1 = candidates[0], candidates[1]
-        return 0 if s0.reproj_mean_px <= s1.reproj_mean_px else 1
-
-    infos = []
-    z_b = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-
-    for i, s in enumerate(candidates):
-        R_bx = np.asarray(s.R, dtype=np.float64).reshape(3, 3)
-
-        # X-ray z-axis expressed in board frame.
-        # Columns of R_bx are board axes in xray frame.
-        # Rows / columns of R_xb = R_bx.T give xray axes in board frame.
-        R_xb = R_bx.T
-        z_x_in_b = R_xb[:, 2]
-
-        # dot close to -1 <=> best antiparallel
-        dot_z = float(np.dot(z_b, z_x_in_b))
-
-        infos.append(
-            {
-                "idx": i,
-                "z_x_in_b": z_x_in_b,
-                "dot_z": dot_z,
-                "reproj_mean_px": float(s.reproj_mean_px),
-            }
-        )
-
-    print("\n=== DEBUG XRAY IPPE SELECTION ===")
-    for info in infos:
-        print(f"\nCandidate {info['idx']}:")
-        print(f"  z_x_in_b       = {info['z_x_in_b']}")
-        print(f"  dot(z_b, z_x)  = {info['dot_z']:.6f}")
-        print(f"  reproj mean px = {info['reproj_mean_px']:.6f}")
-
-    # smaller dot => more antiparallel
-    if infos[0]["dot_z"] != infos[1]["dot_z"]:
-        return 0 if infos[0]["dot_z"] < infos[1]["dot_z"] else 1
-
-    # fallback: smaller reprojection error
-    e0 = infos[0]["reproj_mean_px"]
-    e1 = infos[1]["reproj_mean_px"]
-    return 0 if e0 <= e1 else 1
+    s0, s1 = candidates[0], candidates[1]
+    return 0 if s0.reproj_mean_px <= s1.reproj_mean_px else 1
 
 
 def _select_ippe_candidate_rgb(
@@ -757,7 +732,6 @@ def _solve_pose_ippe(
     dist_coeffs: np.ndarray | None = None,
     *,
     refine_with_iterative: bool = True,
-    use_xray_ippe_selection_rule: bool = False,
 ) -> PoseSolveResult:
     object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
     image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
@@ -786,10 +760,7 @@ def _solve_pose_ippe(
         for i, c in enumerate(candidates)
     ]
 
-    best_idx = _select_ippe_candidate(
-        candidates,
-        use_xray_ippe_selection_rule=use_xray_ippe_selection_rule,
-    )
+    best_idx = _select_ippe_candidate(candidates)
 
     best = candidates[best_idx]
 
@@ -851,13 +822,61 @@ def _solve_pose_ippe_handeye(
     checkerboard_corners_uv: np.ndarray,
     K_rgb: np.ndarray,
     *,
+    dist_coeffs: np.ndarray | None = None,
     dist_coeffs_rgb: np.ndarray | None = None,
     pitch_mm: float = 2.54,
     steps_per_edge: int = 10,
+    board_thickness_mm: float = 0.0,
     refine_with_iterative: bool = False,
     refine_rgb_iterative: bool = False,
-    refine_xray_iterative: bool = False,
+    xray_lattice_uv: np.ndarray | None = None,
+    xray_lattice_xy_mm: np.ndarray | None = None,
 ) -> PoseSolveResult:
+    """
+    Camera-to-X-ray calibration from one placement of the planar board:
+    T_cx = T_bx @ inv(T_bc), both board poses solved with IPPE.
+
+    RGB side (unchanged)
+        Three checkerboard corners -> 121 interpolated image points -> IPPE
+        (two candidates) -> the candidate inside the depth-based trust
+        region (Kabsch fit of the reconstructed grid) -> LM refinement.
+        The depth data is what resolves the planar ambiguity here.
+
+    X-ray side (changed 2026-09-15)
+        IPPE on the 121 patch holes still provides the two candidates, but
+        the pose is then refined by LM on ALL indexed holes of the board
+        (`xray_lattice_uv` / `xray_lattice_xy_mm`, ~1300 holes over ~100 mm,
+        board coordinates relative to the same TL origin as the patch),
+        starting from BOTH candidates; the refined pose with the lower mean
+        reprojection error over the lattice is taken.
+
+        Why: the X-ray image has no depth and the C-arm is close to an
+        affine camera (f ~ 4586 px, FOV +-6.4 deg). On the 25-mm patch the
+        perspective signal that separates the two candidates is ~0.1 px
+        (both 0.58 px reprojection), below the residual intensifier
+        distortion (~0.6 px), so the patch cannot decide the ambiguity --
+        and cannot measure the board tilt at all: both candidates lie ~4 deg
+        from the tilt the full board gives. Perspective grows with the
+        square of the target extent; over the full board the affine
+        homography no longer explains the data (Collins & Bartoli 2014,
+        Eq. 38: log-likelihood ratio D = 112-552 vs 1.0-1.1 on the patch)
+        and LM from both starts converges to one pose (dR 0.00 deg on the
+        sessions of 2026-04-29, 2026-08-03 and 2026-09-07; jackknife over
+        random halves +-0.07 deg). IPPE itself is NOT run on the full board:
+        its first-order solution at the centroid is not robust over 100 mm
+        with residual distortion (diverged on 2026-08-03); the patch
+        candidates are good starts.
+
+        Effect on T_cx: the patch-based X-ray pose carried tilt errors of
+        1.6-4.4 deg, i.e. 13-36 mm in the camera centre and a
+        depth-dependent overlay drift of ~0.4 px per mm of distance from
+        the calibration plane. With the lattice, T_cx agrees between two
+        sessions to 10 mm (patch: 16-83 mm).
+
+        The lattice is mandatory: the marker-selection page always produces
+        it (tools.xray_marker_selection.index_board_lattice). The former
+        z-axis selection rule was removed, see _select_ippe_candidate.
+    """
     cam_points_xyz_m = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
     image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
     K_xray = np.asarray(K_xray, dtype=np.float64).reshape(3, 3)
@@ -867,12 +886,14 @@ def _solve_pose_ippe_handeye(
     ).reshape(3, 2)
     K_rgb = np.asarray(K_rgb, dtype=np.float64).reshape(3, 3)
 
-    dist_xray = normalize_dist_coeffs(None)
+    # The image intensifier has real geometric distortion (pincushion), so this
+    # is not optional in the way it used to be treated. Passing None keeps the
+    # previous behaviour exactly.
+    dist_xray = normalize_dist_coeffs(dist_coeffs)
     dist_rgb = normalize_dist_coeffs(dist_coeffs_rgb)
 
     if refine_with_iterative:
         refine_rgb_iterative = True
-        refine_xray_iterative = True
 
     n_pts = (steps_per_edge + 1) ** 2
 
@@ -888,11 +909,21 @@ def _solve_pose_ippe_handeye(
             f"for pose_method='ippe_handeye', got {cam_points_xyz_m.shape}."
         )
 
-    pts3d_board_mm = build_board_xyz_canonical(
+    # The RGB and X-ray sides observe DIFFERENT physical planes of the same
+    # target. On the DeCAF board the checkerboard sits on the top face while
+    # the X-ray-visible feature is the hole in the copper on the bottom face,
+    # one board thickness below. Putting both at z=0 would absorb that offset
+    # into T_cx as a translation along the board normal.
+    #
+    # Board +z points away from the camera, i.e. from the checkerboard towards
+    # the copper, so the X-ray plane sits at +board_thickness_mm.
+    pts3d_board_rgb_mm = build_board_xyz_canonical(
         nu=int(steps_per_edge),
         nv=int(steps_per_edge),
         pitch_mm=float(pitch_mm),
     )
+    pts3d_board_xray_mm = pts3d_board_rgb_mm.copy()
+    pts3d_board_xray_mm[:, 2] += float(board_thickness_mm)
 
     p_tl, p_tr, p_bl = checkerboard_corners_uv
     step_x = (p_tr - p_tl) / float(steps_per_edge)
@@ -907,14 +938,15 @@ def _solve_pose_ippe_handeye(
         dtype=np.float64,
     )
 
+    # the depth points come from the plane fit on the checkerboard face
     cam_points_xyz_mm = cam_points_xyz_m * 1000.0
-    depth_fit = _rigid_fit_kabsch(pts3d_board_mm, cam_points_xyz_mm)
+    depth_fit = _rigid_fit_kabsch(pts3d_board_rgb_mm, cam_points_xyz_mm)
     T_bc_depth = depth_fit["T"]
 
     tr = _trust_region_from_depth_rms(depth_fit["rms_mm"])
 
     candidates_rgb = _build_ippe_candidates(
-        pts3d_board_mm,
+        pts3d_board_rgb_mm,
         pts2d_rgb,
         K_rgb,
         dist_rgb,
@@ -934,7 +966,7 @@ def _solve_pose_ippe_handeye(
 
     if refine_rgb_iterative:
         rvec_bc, tvec_bc = _refine_pose_iterative(
-            pts3d_board_mm,
+            pts3d_board_rgb_mm,
             pts2d_rgb,
             K_rgb,
             dist_rgb,
@@ -946,31 +978,65 @@ def _solve_pose_ippe_handeye(
     T_bc = _make_transform(R_bc, tvec_bc.ravel())
 
     candidates_xray = _build_ippe_candidates(
-        pts3d_board_mm,
+        pts3d_board_xray_mm,
         image_points_uv,
         K_xray,
         dist_xray,
     )
 
-    best_idx_xray = _select_ippe_candidate(
-        candidates_xray,
-        use_xray_ippe_selection_rule=True,
+    if xray_lattice_uv is None or xray_lattice_xy_mm is None:
+        raise ValueError(
+            "pose_method='ippe_handeye' requires the board lattice "
+            "(xray_lattice_uv and xray_lattice_xy_mm); see index_board_lattice."
+        )
+    # The two patch candidates are starts for an LM refinement over all
+    # indexed holes; the data decides (see docstring).
+    lattice_uv = np.asarray(xray_lattice_uv, dtype=np.float64).reshape(-1, 2)
+    lattice_xy = np.asarray(xray_lattice_xy_mm, dtype=np.float64).reshape(-1, 2)
+    if lattice_uv.shape[0] != lattice_xy.shape[0]:
+        raise ValueError(
+            f"Lattice point counts differ: uv={lattice_uv.shape[0]}, "
+            f"xy={lattice_xy.shape[0]}."
+        )
+    if lattice_uv.shape[0] < n_pts:
+        raise ValueError(
+            f"Lattice has fewer points ({lattice_uv.shape[0]}) than the patch ({n_pts})."
+        )
+    pts3d_lattice_mm = np.column_stack(
+        [lattice_xy, np.full(lattice_xy.shape[0], float(board_thickness_mm))]
     )
 
-    best_xray = candidates_xray[best_idx_xray]
-
-    rvec_bx = np.asarray(best_xray.rvec, dtype=np.float64).reshape(3, 1)
-    tvec_bx = np.asarray(best_xray.tvec, dtype=np.float64).reshape(3, 1)
-
-    if refine_xray_iterative:
-        rvec_bx, tvec_bx = _refine_pose_iterative(
-            pts3d_board_mm,
-            image_points_uv,
+    refined: list[tuple[np.ndarray, np.ndarray, float]] = []
+    for cand in candidates_xray:
+        rv, tv = _refine_pose_iterative(
+            pts3d_lattice_mm,
+            lattice_uv,
             K_xray,
             dist_xray,
-            rvec_bx,
-            tvec_bx,
+            np.asarray(cand.rvec, dtype=np.float64).reshape(3, 1),
+            np.asarray(cand.tvec, dtype=np.float64).reshape(3, 1),
         )
+        _, lat_mean_px, _, _, _ = compute_reprojection_error_px(
+            pts3d_lattice_mm, lattice_uv, rv, tv, K_xray, dist_xray,
+        )
+        refined.append((rv, tv, float(lat_mean_px)))
+
+    best_idx_xray = int(np.argmin([r[2] for r in refined]))
+    rvec_bx, tvec_bx, _ = refined[best_idx_xray]
+
+    R0, _ = cv2.Rodrigues(refined[0][0])
+    R1, _ = cv2.Rodrigues(refined[1][0])
+    xray_lattice_stats = {
+        "n_lattice_points": int(lattice_uv.shape[0]),
+        "lattice_reproj_mean_px": [r[2] for r in refined],
+        "refined_candidates_dR_deg": float(_rotation_deviation_deg(R0, R1)),
+        "selected_candidate": int(best_idx_xray),
+    }
+    print("\n=== XRAY POSE: LM ON BOARD LATTICE ===")
+    print(f"  lattice points         = {xray_lattice_stats['n_lattice_points']}")
+    print(f"  reproj mean px (c0/c1) = {refined[0][2]:.4f} / {refined[1][2]:.4f}")
+    print(f"  dR between refined     = {xray_lattice_stats['refined_candidates_dR_deg']:.4f} deg")
+    print(f"  selected candidate     = {best_idx_xray}")
 
     R_bx, _ = cv2.Rodrigues(rvec_bx)
     T_bx = _make_transform(R_bx, tvec_bx.ravel())
@@ -981,7 +1047,7 @@ def _solve_pose_ippe_handeye(
     rvec, tvec = transform_to_rvec_tvec(T_cx)
 
     uv_proj, _, _, _, per_point_px = compute_reprojection_error_px(
-        pts3d_board_mm,
+        pts3d_board_xray_mm,
         image_points_uv,
         rvec_bx,
         tvec_bx,
@@ -998,7 +1064,7 @@ def _solve_pose_ippe_handeye(
     all_candidates_rgb = [
         _export_ippe_candidate_result(
             c,
-            pts3d_board_mm,
+            pts3d_board_rgb_mm,
             pts2d_rgb,
             K_rgb,
             dist_rgb,
@@ -1010,7 +1076,7 @@ def _solve_pose_ippe_handeye(
     all_candidates_xray = [
         _export_ippe_candidate_result(
             c,
-            pts3d_board_mm,
+            pts3d_board_xray_mm,
             image_points_uv,
             K_xray,
             dist_xray,
@@ -1028,12 +1094,8 @@ def _solve_pose_ippe_handeye(
         candidate_index=None,
         candidate_index_rgb=int(best_idx_rgb),
         candidate_index_xray=int(best_idx_xray),
-        refined_with_iterative=bool(refine_rgb_iterative or refine_xray_iterative),
-        refinement_pnp_flag=(
-            int(cv2.SOLVEPNP_ITERATIVE)
-            if (refine_rgb_iterative or refine_xray_iterative)
-            else None
-        ),
+        refined_with_iterative=True,   # X-ray side is always LM-refined on the lattice
+        refinement_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE),
         inliers=None,
         inlier_idx=inlier_idx,
         uv_proj=uv_proj,
@@ -1043,6 +1105,7 @@ def _solve_pose_ippe_handeye(
         reproj_max_px=max_px,
         all_candidates=all_candidates_xray,
         all_candidates_rgb=all_candidates_rgb,
+        xray_lattice_stats=xray_lattice_stats,
     )
 
 
@@ -1063,8 +1126,6 @@ def solve_pose(
     use_extrinsic_guess: bool = False,
     refine_with_iterative: bool = True,
     refine_rgb_iterative: bool = False,
-    refine_xray_iterative: bool = False,
-    use_xray_ippe_selection_rule: bool = False,
     ransac_reprojection_error_px: float = 8.0,
     ransac_confidence: float = 0.99,
     ransac_iterations_count: int = 100,
@@ -1072,6 +1133,9 @@ def solve_pose(
     checkerboard_corners_uv: np.ndarray | None = None,
     K_rgb: np.ndarray | None = None,
     steps_per_edge: int = 10,
+    board_thickness_mm: float = 0.0,
+    xray_lattice_uv: np.ndarray | None = None,
+    xray_lattice_xy_mm: np.ndarray | None = None,
 ) -> PoseSolveResult:
     """
     Dispatch pose estimation by method name.
@@ -1098,9 +1162,6 @@ def solve_pose(
         RGB camera distortion coefficients. Only used for method='ippe_handeye'.
     pose_method : str
         One of 'iterative', 'iterative_ransac', 'ippe', 'ippe_handeye'.
-    use_xray_ippe_selection_rule : bool
-        Only used for method='ippe'. If True, use the setup-specific
-        source-location rule in the object frame for candidate selection.
     checkerboard_corners_uv : (3, 2) or None
         The three extreme checkerboard corners [TL, TR, BL] in the RGB
         image. Required for method='ippe_handeye'.
@@ -1108,17 +1169,29 @@ def solve_pose(
         RGB camera intrinsic matrix. Required for method='ippe_handeye'.
     steps_per_edge : int
         Grid steps per edge for method='ippe_handeye'. Default 10 -> 121 points.
+    board_thickness_mm : float
+        Only used for method='ippe_handeye'. Distance between the plane the RGB
+        camera observes (checkerboard, top face) and the plane the X-ray
+        observes (copper, bottom face) of the calibration target. Board +z
+        points from the checkerboard towards the copper, so the X-ray points are
+        placed at +board_thickness_mm. Default 0.0 keeps both on one plane.
+    xray_lattice_uv, xray_lattice_xy_mm : (M,2), (M,2) or None
+        Only for pose_method='ippe_handeye'. All indexed holes of the board
+        in the X-ray working space (same space as image_points_uv, already
+        distortion-corrected) and their board coordinates in mm relative to
+        the patch origin (TL hole). When given, the X-ray-side pose is refined
+        on these points from both IPPE candidates and the candidate with the
+        lower lattice reprojection error is taken; the z-axis selection rule
+        is bypassed. See _solve_pose_ippe_handeye for the rationale.
 
     Refinement options for ippe_handeye
     -----------------------------------
     refine_with_iterative : bool
-        Backward-compatible switch. If True, refine both T_bc and T_bx.
+        For 'ippe_handeye': if True, refine the RGB-side pose T_bc with LM
+        (the X-ray-side pose is always refined on the board lattice).
 
     refine_rgb_iterative : bool
-        If True, refine only the RGB-side pose T_bc.
-
-    refine_xray_iterative : bool
-        If True, refine only the X-ray-side pose T_bx.
+        Same as refine_with_iterative for the RGB side.
     """
     method = str(pose_method).lower().strip()
 
@@ -1153,7 +1226,6 @@ def solve_pose(
             K=K,
             dist_coeffs=dist_coeffs,
             refine_with_iterative=refine_with_iterative,
-            use_xray_ippe_selection_rule=use_xray_ippe_selection_rule,
         )
 
     if method == "ippe_handeye":
@@ -1169,12 +1241,15 @@ def solve_pose(
             K_xray=K,
             checkerboard_corners_uv=checkerboard_corners_uv,
             K_rgb=K_rgb,
+            dist_coeffs=dist_coeffs,
             dist_coeffs_rgb=dist_coeffs_rgb,
             pitch_mm=pitch_mm,
             steps_per_edge=steps_per_edge,
+            board_thickness_mm=board_thickness_mm,
             refine_with_iterative=refine_with_iterative,
             refine_rgb_iterative=refine_rgb_iterative,
-            refine_xray_iterative=refine_xray_iterative,
+            xray_lattice_uv=xray_lattice_uv,
+            xray_lattice_xy_mm=xray_lattice_xy_mm,
         )
 
     raise ValueError(
