@@ -119,6 +119,7 @@ class RealSenseCameraSource(CameraSource):
         self._profile = None
         self._stereo_sensor_cache = None
         self._ir_exposure_us = None
+        self._live_frames = None  # newest poll() frameset (keeps views alive)
 
     @property
     def pipeline(self):
@@ -135,11 +136,14 @@ class RealSenseCameraSource(CameraSource):
         cfg = rs.config()
         if self.config.serial:
             cfg.enable_device(str(self.config.serial))
+        color_format = str(
+            getattr(self.config, "realsense_color_format", "bgr8")
+        ).strip().lower()
         cfg.enable_stream(
             rs.stream.color,
             int(self.config.width),
             int(self.config.height),
-            rs.format.bgr8,
+            rs.format.bgra8 if color_format == "bgra8" else rs.format.bgr8,
             int(self.config.fps),
         )
         self._ir_enabled = bool(getattr(self.config, "realsense_enable_ir", False))
@@ -184,12 +188,23 @@ class RealSenseCameraSource(CameraSource):
                         pass
         realsense_details = _configure_realsense_color_sensor(profile, self.config, rs)
 
+        queue_size = getattr(self.config, "realsense_frames_queue_size", None)
+        if queue_size is not None:
+            for sensor in profile.get_device().query_sensors():
+                try:
+                    if sensor.supports(rs.option.frames_queue_size):
+                        sensor.set_option(
+                            rs.option.frames_queue_size, float(int(queue_size))
+                        )
+                except Exception:
+                    pass
+
         color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
         self.actual_width = int(getattr(intr, "width", self.config.width))
         self.actual_height = int(getattr(intr, "height", self.config.height))
         self.actual_fps = int(color_stream.fps())
-        self.pixel_format = "bgr8"
+        self.pixel_format = color_format
         _validate_active_stream(self.config, self.actual_width, self.actual_height, self.actual_fps)
 
         self._pipeline = pipeline
@@ -256,6 +271,50 @@ class RealSenseCameraSource(CameraSource):
             self._ir_exposure_us = float(exposure_us)
         return ok
 
+    def poll(self) -> CameraFrame | None:
+        """Non-blocking read: return the newest complete frameset, or None.
+
+        For GUI frame loops (oversampled QTimer) where blocking
+        ``wait_for_frames`` would stall the event loop. Unlike ``read``,
+        the returned arrays are ZERO-COPY views into the SDK buffers; the
+        source keeps the frameset alive until the next ``poll``/``stop``,
+        so the views are valid only until then. Callers must copy (or
+        finish using) the data within the current tick — the overlay live
+        loop copies into its persistent frame buffer immediately.
+
+        With ``realsense_color_format="bgra8"`` the ``image_bgr`` field
+        carries a 4-channel BGRA image (field name kept for compatibility).
+        """
+        if self._pipeline is None:
+            raise RuntimeError("RealSense camera is not started.")
+        frames = self._pipeline.poll_for_frames()
+        if not frames:
+            return None
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            return None
+        image = np.asanyarray(color_frame.get_data())
+        if image.size == 0:
+            return None
+        ir_left = ir_right = None
+        if getattr(self, "_ir_enabled", False):
+            irl = frames.get_infrared_frame(1)
+            irr = frames.get_infrared_frame(2)
+            if irl and irr:
+                ir_left = np.asanyarray(irl.get_data())
+                ir_right = np.asanyarray(irr.get_data())
+        # Keep the composite frameset referenced so the zero-copy views
+        # above stay valid until the next poll() replaces it.
+        self._live_frames = frames
+        return CameraFrame(
+            image_bgr=image,
+            frame_index=self._next_frame_index(),
+            timestamp_s=time.time(),
+            metadata={"backend": "realsense"},
+            ir_left=ir_left,
+            ir_right=ir_right,
+        )
+
     def read(self) -> CameraFrame | None:
         if self._pipeline is None:
             raise RuntimeError("RealSense camera is not started.")
@@ -285,6 +344,7 @@ class RealSenseCameraSource(CameraSource):
             if self._pipeline is not None:
                 self._pipeline.stop()
         finally:
+            self._live_frames = None
             self._pipeline = None
             self._profile = None
             super().stop()

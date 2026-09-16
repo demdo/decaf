@@ -217,6 +217,14 @@ class TrackerResult:
     confidence: float = 0.0
     pose_source: PoseSource = PoseSource.NONE
 
+    # Output-filter warmup latch: False while the pose Kalman set is still
+    # settling after (re)acquisition — consumers can show "initializing".
+    # Latched True once quiet; reset when tracking is lost.
+    pose_converged: bool = False
+    # 6x6 covariance of the output pose filter (rvec, tvec ordering), or
+    # None when the filter did not run this frame.
+    pose_covariance: Optional[np.ndarray] = None
+
     debug_counters: Dict[str, float] = field(default_factory=dict)
     timings_ms: Dict[str, float] = field(default_factory=dict)
 
@@ -584,6 +592,11 @@ class HydraTracker:
             num_inliers=int(getattr(cpp_result, "num_inliers", 0)),
             confidence=float(getattr(cpp_result, "confidence", 0.0)),
             pose_source=pose_source,
+            pose_converged=bool(getattr(cpp_result, "pose_converged", False)),
+            pose_covariance=self._cpp_vector_to_array(
+                getattr(cpp_result, "pose_covariance", []),
+                (6, 6),
+            ),
             debug_counters=debug_counters,
             timings_ms=timings,
         )

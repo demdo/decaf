@@ -31,7 +31,7 @@ from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 # ============================================================
 # Save config
 # ============================================================
-SAVE_SNAPSHOTS = False
+SAVE_SNAPSHOTS = True
 
 # ============================================================
 # Where debug snapshots are saved
@@ -540,6 +540,7 @@ class PlaneFittingPage(LiveImagePage):
         self.state.xray_points_xyz_c = None
         self.state.plane_confirmed = False
         self.state.checkerboard_corners_uv = None
+        self.state.checkerboard_corners_uv_9 = None
         self.state.checkerboard_corners_confirmed = False
 
         self._plane_kf.reset()
@@ -721,6 +722,7 @@ class PlaneFittingPage(LiveImagePage):
             self._stats = []
             self._last_stats_rows = None
             self.state.checkerboard_corners_uv = None
+            self.state.checkerboard_corners_uv_9 = None
             self.state.checkerboard_corners_confirmed = False
             self.set_viewport_background(active=True)
             self.start_timer(self.FPS)
@@ -735,6 +737,9 @@ class PlaneFittingPage(LiveImagePage):
         self._seed = 0
 
         self.state.checkerboard_corners_uv = ext_uv
+        self.state.checkerboard_corners_uv_9 = np.asarray(
+            corners, dtype=np.float64
+        ).reshape(-1, 2)
         self.state.checkerboard_corners_confirmed = True
 
         self._collect_fits()
@@ -922,7 +927,7 @@ class PlaneFittingPage(LiveImagePage):
                 self._ext_uv,
                 self.state.K_rgb,
                 plane,
-                None,
+                self.state.dist_rgb,
             )
             return rpf.interpolate_marker_grid(
                 corner_xyz,

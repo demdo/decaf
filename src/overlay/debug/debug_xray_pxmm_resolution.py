@@ -111,9 +111,9 @@ def main() -> None:
 
     print("\nSanity expectation")
     print("------------------")
-    print("Expected range if correct:")
-    print("  px/mm ≈ 5.5 – 6.0")
-    print("  f ≈ 5400 – 5900 px")
+    print("Expected range if correct (calibrated f = 4586.3 px):")
+    print("  px/mm ≈ 4.5 – 4.9")
+    print("  f ≈ 4400 – 4800 px")
 
 
 if __name__ == "__main__":

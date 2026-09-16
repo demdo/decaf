@@ -100,6 +100,15 @@ public:
     bool markerAssetsLoaded() const;
     const TrackerConfig& config() const;
 
+    // Opt-in per-corner capture of the frame-to-frame propagation, for
+    // documentation figures. Off by default; see CheckerboardTrackingDebug.
+    void setTrackingDebugEnabled(bool enabled) {
+        checkerboard_detector_.setTrackingDebugEnabled(enabled);
+    }
+    const CheckerboardTrackingDebug& lastTrackingDebug() const {
+        return checkerboard_detector_.lastTrackingDebug();
+    }
+
 private:
     TrackerConfig config_;
     cv::Matx33d K_;

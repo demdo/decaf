@@ -68,13 +68,17 @@ MapFuseResult mapPoseFuse(const std::vector<cv::Vec3d>& X,
 struct IrPoseRefinerConfig {
     bool enabled = false;
 
-    // IR corner measurement operator. "quadratic_form" (the only measurement
-    // path): reference-free — the model grid curves are projected into each IR
-    // view and the corners are measured directly (same QF machinery as the RGB
-    // tracking path, incl. the saddle-warp layer). Any other value passes the
-    // RGB pose through unchanged; the saturation measurement for the exposure
-    // controller still runs.
-    std::string corner_method = "quadratic_form";
+    // IR corner measurement operator. "subpix" (the default since 2026-07-29):
+    // plain cornerSubPix snap on the rig-transferred seeds. "quadratic_form":
+    // reference-free — the model grid curves are projected into each IR view and
+    // the corners are measured directly (same QF machinery as the RGB tracking
+    // path, incl. the saddle-warp layer). Any other value passes the RGB pose
+    // through unchanged; the saturation measurement for the exposure controller
+    // still runs.
+    // NOTE: fit_gate_rms_mm and the engine's covariance-inflation reference are
+    // SCALE-BOUND to this choice (they compare against fit_rms). Changing the
+    // operator without re-deriving both silently halves the fusion coverage.
+    std::string corner_method = "subpix";
     // QF acceptance gate vs the seed for the IR views: the seeds are
     // rig-transferred RGB pixels (1-3 px transfer error), so the gate is
     // looser than the RGB-path 2.5 px.
@@ -298,20 +302,21 @@ public:
     };
     const IrPairDump& lastPairDump() const { return pair_dump_; }
 
-    // Reference-free quadratic-form measurement in ONE IR view under an
-    // EXPLICIT pose. Public for the offline model-refinement post-pass
-    // (refine_model_ir): observation stills have no tracking context, the
-    // pose comes from solvePnP on the stored correspondences.
-    void measureViewQf(const cv::Mat& gray,
-                       const cv::Matx33d& K,
-                       const std::vector<double>& dist,
-                       const cv::Matx33d& R_view,
-                       const cv::Vec3d& t_view,
-                       const std::vector<cv::Vec3d>& xyz,
-                       const std::vector<cv::Point2f>& seeds,
-                       std::vector<cv::Point2f>& uv_out,
-                       std::vector<uint8_t>& ok_out,
-                       std::vector<float>& q_out) const;
+    // Reference-free corner measurement in ONE IR view under an EXPLICIT pose,
+    // with the operator selected by config.corner_method. Public for the offline
+    // model-refinement post-pass (refine_model_ir): observation stills have no
+    // tracking context, the pose comes from solvePnP on the stored
+    // correspondences.
+    void measureView(const cv::Mat& gray,
+                     const cv::Matx33d& K,
+                     const std::vector<double>& dist,
+                     const cv::Matx33d& R_view,
+                     const cv::Vec3d& t_view,
+                     const std::vector<cv::Vec3d>& xyz,
+                     const std::vector<cv::Point2f>& seeds,
+                     std::vector<cv::Point2f>& uv_out,
+                     std::vector<uint8_t>& ok_out,
+                     std::vector<float>& q_out) const;
 
     const IrCameraCalibration& calibration() const { return calib_; }
 

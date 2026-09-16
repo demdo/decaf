@@ -311,6 +311,9 @@ def make_live_tracker_config() -> TrackerConfig:
         dot_commit_frames=1,
         dot_revoke_frames=5,
         persistence_max_frames=8,
+        # Overlay GUI only: aggregated dropout log (cause + counter per
+        # tracking loss after lock). The engine and this runner ignore it.
+        failure_log_enabled=True,
     )
 
 

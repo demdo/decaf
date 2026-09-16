@@ -16,6 +16,16 @@ rotation, so ``R_i @ p_tip + t_i = c`` for every frame. Stacking
 gives p_tip; wide rotation makes all three axes -- including depth along the
 tool axis -- well observed.
 
+The marker sits on the drill's cylindrical body, so the fitted cylinder axis
+(``surface_model.fitted``) IS the drill axis, and the physical tip must lie ON
+it. The final tip is therefore solved CONSTRAINED to that axis
+(``p_tip = p0 + s*d``, one axial unknown): the well-fitted axis (long lever,
+sub-0.15 mm) supplies the two lateral coordinates, and pivoting only fixes the
+depth ``s``. This removes the weakly-observed off-axis DoF that dominates the
+monocular pivot error. The robust free solve above still runs -- it supplies
+the inlier set and the off-axis diagnostic. Pass ``--free`` for the plain
+unconstrained tip.
+
 Outputs (individually in ``calib/``):
     pivot_session.npz       the raw recording (marker->camera poses + K/dist)
     pivot_session_frames/   raw frames (one per logged pose) for the OFFLINE
@@ -144,6 +154,12 @@ def _set_axes_equal_3d(ax) -> None:
     ax.set_xlim3d([x_middle - radius, x_middle + radius])
     ax.set_ylim3d([y_middle - radius, y_middle + radius])
     ax.set_zlim3d([z_middle - radius, z_middle + radius])
+    # Equal ranges only look equal if the 3D box itself is cubic; matplotlib's
+    # default box is not, which squashes the round cross-section into an ellipse.
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass  # matplotlib < 3.3 has no set_box_aspect
 
 
 def _cylinder_wireframe_points(surface_model_json: str) -> tuple[np.ndarray, ...] | None:
@@ -180,6 +196,35 @@ def _cylinder_wireframe_points(surface_model_json: str) -> tuple[np.ndarray, ...
                     + np.sin(T)[..., None] * e2[None, None, :])
     )
     return pts[..., 0], pts[..., 1], pts[..., 2]
+
+
+def _drill_axis_from_surface(
+    surface_model_json: str,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return (axis_point_mm, unit axis_dir) of the fitted cylinder = drill axis.
+
+    The marker sits on the drill's cylindrical body, so ``surface_model.fitted``
+    (from the SfM model) gives the drill axis directly in the marker frame.
+    Returns None when the marker JSON carries no fitted cylinder.
+    """
+    if not surface_model_json:
+        return None
+    try:
+        surface = json.loads(surface_model_json)
+    except (TypeError, ValueError):
+        return None
+    fitted = surface.get("fitted") if isinstance(surface, dict) else None
+    if not isinstance(fitted, dict):
+        return None
+    try:
+        p0 = np.asarray(fitted["axis_point_mm"], dtype=np.float64).reshape(3)
+        d = np.asarray(fitted["axis_dir"], dtype=np.float64).reshape(3)
+    except (KeyError, TypeError, ValueError):
+        return None
+    norm = float(np.linalg.norm(d))
+    if norm < 1e-9:
+        return None
+    return p0, d / norm
 
 
 
@@ -380,6 +425,92 @@ def solve_pivot_robust(
     )
 
 
+@dataclass(frozen=True)
+class AxisConstrainedTip:
+    """Pivot tip constrained onto a known axis: p_tip = axis_point + s*axis_dir."""
+    p_tip: np.ndarray            # (3,) tip on the axis, marker frame, mm
+    axial_pos_mm: float          # s: signed offset from axis_point along axis_dir
+    pivot_camera: np.ndarray     # (3,) pivot point in the camera frame, mm
+    residual_rms_mm: float       # inlier per-frame residual RMS (constrained fit)
+    sigma_axial_mm: float        # std of the single axial DoF
+    axis_point: np.ndarray       # (3,) point on the axis (from the model)
+    axis_dir: np.ndarray         # (3,) unit axis direction (from the model)
+    p_tip_free: np.ndarray       # (3,) the unconstrained tip, for reference
+    tip_offset_mm: float         # perpendicular distance of the free tip to axis
+    n_inliers: int
+
+
+def solve_pivot_on_axis(
+    T_tc: np.ndarray,
+    inlier_mask: np.ndarray,
+    axis_point: np.ndarray,
+    axis_dir: np.ndarray,
+    p_tip_free: np.ndarray,
+) -> AxisConstrainedTip:
+    """Pivot solve with the tip constrained to a known axis line.
+
+    The marker sits on the drill's cylindrical body, so the physical tip lies on
+    the fitted cylinder axis. Substituting ``p_tip = p0 + s*d`` into the pivot
+    equation ``R_i p_tip + t_i = c`` leaves a single axial unknown ``s`` and the
+    pivot ``c``:  ``[R_i d | -I] [s; c] = -(R_i p0 + t_i)``. The well-fitted axis
+    supplies the two lateral tip coordinates (the weakly observed off-axis DoF
+    that dominates the monocular pivot error), pivoting only fixes the depth s.
+
+    Runs on the free solve's inlier set. Raises on degenerate input.
+    """
+    T = np.asarray(T_tc, dtype=np.float64).reshape(-1, 4, 4)
+    p0 = np.asarray(axis_point, dtype=np.float64).reshape(3)
+    d = np.asarray(axis_dir, dtype=np.float64).reshape(3)
+    d = d / max(float(np.linalg.norm(d)), 1e-12)
+
+    idx = np.flatnonzero(np.asarray(inlier_mask, dtype=bool))
+    if idx.size < 3:
+        raise ValueError("Axis-constrained pivot needs at least 3 inlier frames.")
+    R = T[idx, :3, :3]
+    t = T[idx, :3, 3]
+    m = idx.size
+
+    Rd = np.einsum("nij,j->ni", R, d)      # (m, 3)
+    Rp0 = np.einsum("nij,j->ni", R, p0)    # (m, 3)
+    A = np.zeros((3 * m, 4), dtype=np.float64)
+    A[:, 0] = Rd.reshape(3 * m)
+    A[:, 1:] = np.tile(-np.eye(3), (m, 1))
+    b = -(Rp0 + t).reshape(3 * m)
+
+    x, *_ = np.linalg.lstsq(A, b, rcond=None)
+    s = float(x[0])
+    c = x[1:4]
+    p_tip = p0 + s * d
+
+    res = np.linalg.norm(np.einsum("nij,j->ni", R, p_tip) + t - c, axis=1)
+    rms = float(np.sqrt(np.mean(res * res)))
+
+    try:
+        ata_inv = np.linalg.inv(A.T @ A)
+    except np.linalg.LinAlgError:
+        ata_inv = np.linalg.pinv(A.T @ A)
+    dof = max(3 * m - 4, 1)
+    sigma2 = float(np.sum(res * res)) / dof
+    sigma_s = float(np.sqrt(max(sigma2 * float(ata_inv[0, 0]), 0.0)))
+
+    pf = np.asarray(p_tip_free, dtype=np.float64).reshape(3)
+    foot = p0 + float(np.dot(pf - p0, d)) * d
+    tip_offset = float(np.linalg.norm(pf - foot))
+
+    return AxisConstrainedTip(
+        p_tip=p_tip.reshape(3),
+        axial_pos_mm=s,
+        pivot_camera=c.reshape(3),
+        residual_rms_mm=rms,
+        sigma_axial_mm=sigma_s,
+        axis_point=p0.reshape(3),
+        axis_dir=d.reshape(3),
+        p_tip_free=pf.reshape(3),
+        tip_offset_mm=tip_offset,
+        n_inliers=int(m),
+    )
+
+
 
 
 
@@ -443,14 +574,23 @@ class PivotRecorder:
         self._last_pivot: PivotResult | None = None
 
         # --ir runs: only log frames whose reported pose actually went through
-        # the IR refinement (timings ir_applied). The IR reference enrolls only
-        # while the tool is QUIET; during a continuous sweep it can go stale and
-        # the refinement silently gates off - the pivot solve would then mix
-        # RGB-only poses into an "IR" calibration (exactly the weak-mode bias
-        # the IR channel exists to remove).
+        # the IR refinement (timings ir_applied). The reference-free QF-IR fusion
+        # applies from frame 1 at any orientation, but it still gates off on
+        # glare / adverse geometry / a rejected MAP fit - on those frames the
+        # reported pose is RGB-only, and mixing that into an "IR" calibration
+        # would reintroduce exactly the weak-mode bias the IR channel removes.
         self.require_ir = bool(require_ir)
         self.ir_applied_count = 0
         self.ir_skipped_count = 0
+        # Latest IR pair, stashed by the process_frame wrapper (see
+        # cmd_calibrate's after_tracker_created) so the same-frame IR images are
+        # saved next to the RGB frame for offline analysis / re-pivoting.
+        self._last_ir_left: np.ndarray | None = None
+        self._last_ir_right: np.ndarray | None = None
+
+    def set_last_ir(self, ir_left, ir_right) -> None:
+        self._last_ir_left = ir_left
+        self._last_ir_right = ir_right
 
     def set_camera(self, K: np.ndarray, dist: np.ndarray) -> None:
         self.K = np.asarray(K, dtype=np.float64).reshape(3, 3)
@@ -525,9 +665,10 @@ class PivotRecorder:
         if self.require_ir:
             timings = getattr(result, "timings_ms", None) or {}
             if not bool(timings.get("ir_applied", 0.0)):
-                # IR gated off for this frame (stale reference / gates): do NOT
-                # feed an RGB-only pose into the IR pivot solve. The interval
-                # counter is not advanced so the next IR-refined frame samples.
+                # IR gated off for this frame (glare / adverse geometry / MAP
+                # reject): do NOT feed the RGB-only pose into the IR pivot solve.
+                # The interval counter is not advanced so the next IR-refined
+                # frame samples.
                 self.ir_skipped_count += 1
                 return
             self.ir_applied_count += 1
@@ -558,10 +699,22 @@ class PivotRecorder:
                         pass
                 self._ensure_writer()
                 self._frames_dir_ready = True
+            stem = f"frame_{int(frame_idx):06d}"
             try:
                 self._img_queue.put_nowait(
-                    (str(self.frames_dir / f"frame_{int(frame_idx):06d}.png"), raw_frame.copy())
+                    (str(self.frames_dir / f"{stem}.png"), raw_frame.copy())
                 )
+                # Save the same-frame IR pair (global-shutter) alongside the RGB
+                # frame so the pivot sweep can be replayed / re-analysed offline
+                # exactly like the tip-test --save-frames triplets.
+                if self._last_ir_left is not None:
+                    self._img_queue.put_nowait(
+                        (str(self.frames_dir / f"{stem}_irL.png"),
+                         self._last_ir_left.copy()))
+                if self._last_ir_right is not None:
+                    self._img_queue.put_nowait(
+                        (str(self.frames_dir / f"{stem}_irR.png"),
+                         self._last_ir_right.copy()))
             except queue.Full:
                 # writer fell behind (slow disk): drop this frame's IMAGE only, the
                 # pose is still logged. Better a sparse image set than reintroducing lag.
@@ -637,7 +790,7 @@ class PivotRecorder:
             rate = 100.0 * self.ir_applied_count / total if total else 0.0
             lines.append(
                 f"IR refine: applied {self.ir_applied_count} | skipped {self.ir_skipped_count} "
-                f"({rate:.0f}%) - HOLD STILL 2-3 s every ~10 deg so the reference re-enrolls"
+                f"({rate:.0f}%) - sweep continuously & slowly; IR is reference-free (frame 1)"
             )
         if self._last_pivot is not None:
             pv = self._last_pivot
@@ -714,8 +867,15 @@ def _show_pivot_3d(
     corner_ids: np.ndarray,
     surface_model_json: str,
     save_path: Path,
+    *,
+    axis_tip: "AxisConstrainedTip | None" = None,
 ) -> None:
-    """3D figure in the marker frame: SfM corner cloud + fitted cylinder + tip."""
+    """3D figure in the marker frame: SfM corner cloud + fitted cylinder + tip.
+
+    When ``axis_tip`` is given, the drill axis is drawn (cylinder centre -> 10 mm
+    past the tip), the constrained tip sits ON it, and the unconstrained tip is
+    shown with its perpendicular offset to the axis.
+    """
     import matplotlib.pyplot as plt
 
     fig = plt.figure("Tip Calibration - 3D geometry (marker frame)", figsize=(11, 9))
@@ -747,21 +907,48 @@ def _show_pivot_3d(
         ax.text(direction[0] * 1.25, direction[1] * 1.25, direction[2] * 1.25,
                 label, color=color, fontsize=10, weight="bold")
 
-    tip = np.asarray(result.p_tip, dtype=np.float64).reshape(3)
-    centroid = corners_xyz.mean(axis=0)
-    ax.plot(
-        [centroid[0], tip[0]], [centroid[1], tip[1]], [centroid[2], tip[2]],
-        color="crimson", linewidth=2.0, label="Model centre -> tip",
-    )
-    ax.scatter(
-        [tip[0]], [tip[1]], [tip[2]], color="crimson", marker="*", s=220,
-        label=f"Tip p_tip  |r|={result.radius_mm:.1f} mm",
-    )
+    tip_free = np.asarray(result.p_tip, dtype=np.float64).reshape(3)
+    if axis_tip is not None:
+        p0 = np.asarray(axis_tip.axis_point, dtype=np.float64).reshape(3)
+        d = np.asarray(axis_tip.axis_dir, dtype=np.float64).reshape(3)
+        tip = np.asarray(axis_tip.p_tip, dtype=np.float64).reshape(3)
+
+        # Drill axis: from the cylinder centre along the axis out to 10 mm past
+        # the tip (NOT a centre-to-tip chord). The constrained tip sits ON it.
+        along = corners_xyz @ d
+        along_mid = 0.5 * (float(along.min()) + float(along.max()))
+        t_tip = float(np.dot(tip - p0, d))
+        sgn = 1.0 if t_tip >= along_mid else -1.0
+        a0 = p0 + along_mid * d
+        a1 = p0 + (t_tip + 10.0 * sgn) * d
+        ax.plot([a0[0], a1[0]], [a0[1], a1[1]], [a0[2], a1[2]],
+                color="navy", linewidth=2.2, label="drill axis (cylinder)")
+        ax.scatter([tip[0]], [tip[1]], [tip[2]], color="crimson", marker="*", s=240,
+                   label=f"tip on axis  |r|={float(np.linalg.norm(tip)):.1f} mm")
+
+        # Where the unconstrained solve landed + its perpendicular offset.
+        foot = p0 + float(np.dot(tip_free - p0, d)) * d
+        ax.plot([tip_free[0], foot[0]], [tip_free[1], foot[1]], [tip_free[2], foot[2]],
+                color="darkorange", linewidth=1.8, linestyle="--",
+                label=f"free-tip offset = {axis_tip.tip_offset_mm:.2f} mm")
+        ax.scatter([tip_free[0]], [tip_free[1]], [tip_free[2]],
+                   color="0.4", marker="x", s=60, label="free tip (unconstrained)")
+        title = (
+            f"SfM model + tip on drill axis  (constrained residual "
+            f"{axis_tip.residual_rms_mm:.2f} mm, free-tip offset "
+            f"{axis_tip.tip_offset_mm:.2f} mm)"
+        )
+    else:
+        ax.scatter(
+            [tip_free[0]], [tip_free[1]], [tip_free[2]], color="crimson", marker="*", s=220,
+            label=f"Tip p_tip  |r|={result.radius_mm:.1f} mm",
+        )
+        title = (
+            f"SfM model + tool tip  (residual {result.residual_rms_mm:.2f} mm, "
+            f"sigma_norm {result.sigma_norm_mm:.3f} mm)"
+        )
     ax.set_xlabel("x [mm]"); ax.set_ylabel("y [mm]"); ax.set_zlabel("z [mm]")
-    ax.set_title(
-        f"SfM model + tool tip  (residual {result.residual_rms_mm:.2f} mm, "
-        f"sigma_norm {result.sigma_norm_mm:.3f} mm)"
-    )
+    ax.set_title(title)
     ax.legend(loc="upper left", fontsize=8)
     _set_axes_equal_3d(ax)
     fig.tight_layout()
@@ -773,7 +960,131 @@ def _show_pivot_3d(
     plt.show()
 
 
-def cmd_calibrate(_args: argparse.Namespace, enable_ir: bool = False) -> int:
+def _finalize_pivot(
+    T_tc: np.ndarray,
+    marker_corners_xyz: np.ndarray,
+    marker_corner_ids: np.ndarray,
+    surface_json: str,
+    marker_json_path: str,
+    out_dir: Path,
+    *,
+    axis_constrained: bool = True,
+) -> tuple[PivotResult, "AxisConstrainedTip | None"]:
+    """Solve (robust free + optional axis-constrained), report, save, show figure.
+
+    Shared by the live calibration and the offline re-solve. Writes
+    ``pivot_calibration.npz`` and ``pivot_tip_3d.png`` into ``out_dir``.
+    """
+    T_tc = np.asarray(T_tc, dtype=np.float64).reshape(-1, 4, 4)
+    out_dir = Path(out_dir)
+    n = T_tc.shape[0]
+    print(f"\n[calib_tool_tip] Solving pivot over {n} frames (robust solver) ...")
+    result = solve_pivot_robust(T_tc)
+
+    p = result.p_tip
+    s = result.sigma_axis_mm
+    print("\n===== Tip calibration (free solve) =====")
+    print(
+        f"p_tip (sphere centre, marker frame) = "
+        f"({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}) mm, Radius {result.radius_mm:.3f} mm"
+    )
+    print(f"sigma per axis = ({s[0]:.3f}, {s[1]:.3f}, {s[2]:.3f}) mm, norm {result.sigma_norm_mm:.3f} mm")
+    print(
+        f"Residual RMS = {result.residual_rms_mm:.3f} mm | inliers "
+        f"{result.n_inliers}/{result.n_frames} | condition number {result.cond_number:.1f}"
+    )
+    wd = result.weak_dir_marker
+    print(
+        f"Weakest axis: sigma {result.weak_sigma_mm:.3f} mm along "
+        f"({wd[0]:+.2f},{wd[1]:+.2f},{wd[2]:+.2f}) [marker frame]"
+    )
+    if result.weak_sigma_mm > 3.0 * float(np.median(result.sigma_axis_mm) + 1e-9):
+        print("  -> WARNING: one direction poorly observed - rotate further / more evenly.")
+
+    # --- Constrain the tip to the known drill (cylinder) axis --------------
+    axis = _drill_axis_from_surface(surface_json)
+    axis_tip: "AxisConstrainedTip | None" = None
+    if axis is None:
+        print("[calib_tool_tip] No fitted cylinder axis in the marker JSON - "
+              "cannot constrain the tip; keeping the free solve.")
+    elif not axis_constrained:
+        print("[calib_tool_tip] --free: keeping the UNCONSTRAINED tip "
+              "(not projected onto the drill axis).")
+    else:
+        try:
+            axis_tip = solve_pivot_on_axis(
+                T_tc, result.inlier_mask, axis[0], axis[1], result.p_tip
+            )
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            print(f"[calib_tool_tip] axis-constrained solve failed ({exc}); "
+                  "keeping the free tip.")
+
+    if axis_tip is not None:
+        at = axis_tip
+        print("\n----- Tip constrained to the drill axis -----")
+        print(f"free tip was {at.tip_offset_mm:.3f} mm off the axis (removed by the constraint).")
+        print(
+            f"p_tip (on axis, marker frame) = "
+            f"({at.p_tip[0]:.3f}, {at.p_tip[1]:.3f}, {at.p_tip[2]:.3f}) mm, "
+            f"Radius {float(np.linalg.norm(at.p_tip)):.3f} mm"
+        )
+        print(
+            f"axial position s = {at.axial_pos_mm:.3f} mm (+-{at.sigma_axial_mm:.3f} mm) | "
+            f"constrained residual RMS = {at.residual_rms_mm:.3f} mm "
+            f"(free {result.residual_rms_mm:.3f} mm)"
+        )
+
+    final_tip = axis_tip.p_tip if axis_tip is not None else result.p_tip
+
+    result_path = out_dir / PIVOT_RESULT_FILENAME
+    save_kw: dict[str, Any] = dict(
+        p_tip=final_tip,
+        p_tip_pose_level=final_tip,
+        p_tip_free=result.p_tip,
+        axis_constrained=np.bool_(axis_tip is not None),
+        method="pivot_sphere_axis" if axis_tip is not None else "pivot_sphere",
+        sigma_norm_mm=np.float64(
+            axis_tip.sigma_axial_mm if axis_tip is not None else result.sigma_norm_mm
+        ),
+        sigma_axis_mm=result.sigma_axis_mm,
+        pivot_camera=(axis_tip.pivot_camera if axis_tip is not None else result.pivot_camera),
+        residual_rms_mm=np.float64(
+            axis_tip.residual_rms_mm if axis_tip is not None else result.residual_rms_mm
+        ),
+        residual_rms_free_mm=np.float64(result.residual_rms_mm),
+        n_frames=np.int32(result.n_frames),
+        n_inliers=np.int32(result.n_inliers),
+        inlier_mask=result.inlier_mask,
+        weak_dir_marker=result.weak_dir_marker,
+        weak_sigma_mm=np.float64(result.weak_sigma_mm),
+        cond_number=np.float64(result.cond_number),
+        radius_mm=np.float64(float(np.linalg.norm(final_tip))),
+        marker_json_path=str(marker_json_path),
+        created_utc=_utc_now_str(),
+    )
+    if axis_tip is not None:
+        save_kw.update(
+            axis_point_mm=axis_tip.axis_point,
+            axis_dir=axis_tip.axis_dir,
+            axial_pos_mm=np.float64(axis_tip.axial_pos_mm),
+            sigma_axial_mm=np.float64(axis_tip.sigma_axial_mm),
+            tip_offset_mm=np.float64(axis_tip.tip_offset_mm),
+        )
+    np.savez(result_path, **save_kw)
+    print(f"\n[calib_tool_tip] Result saved: {result_path}")
+
+    _show_pivot_3d(
+        result, marker_corners_xyz, marker_corner_ids, surface_json,
+        out_dir / "pivot_tip_3d.png", axis_tip=axis_tip,
+    )
+    return result, axis_tip
+
+
+def cmd_calibrate(
+    _args: argparse.Namespace,
+    enable_ir: bool = False,
+    axis_constrained: bool = True,
+) -> int:
     """Streamlined default: record a pivot sweep, close the camera on SPACE,
     solve the tip, save everything into calib/, and show the 3D SfM+tip figure.
     No sub-commands or options -- just run the file.
@@ -833,6 +1144,20 @@ def cmd_calibrate(_args: argparse.Namespace, enable_ir: bool = False) -> int:
     def render_frame(vis, result, _tracker, _frame_idx, _logging_active):
         return recorder.render(vis, result)
 
+    def after_tracker_created(tracker) -> None:
+        # --ir: capture the per-frame IR pair (process_frame's ir_left/ir_right
+        # kwargs) so the recorder can save the same-frame IR images next to the
+        # RGB frame. RGB-only runs skip this (no IR to store).
+        if not enable_ir:
+            return
+        _orig_process = tracker.process_frame
+
+        def _process_capture_ir(image_bgr, *args, **kwargs):
+            recorder.set_last_ir(kwargs.get("ir_left"), kwargs.get("ir_right"))
+            return _orig_process(image_bgr, *args, **kwargs)
+
+        tracker.process_frame = _process_capture_ir
+
     config = LiveTrackerConfig(
         tracker=rt.make_live_tracker_config(),
         logging=LoggingConfig(enabled=False, start_mode="disabled"),
@@ -862,6 +1187,7 @@ def cmd_calibrate(_args: argparse.Namespace, enable_ir: bool = False) -> int:
             window_name=PIVOT_WINDOW_NAME,
             console_prefix="[calib_tool_tip]",
             after_camera_ready=after_camera_ready,
+            after_tracker_created=after_tracker_created,
             on_frame=on_frame,
             on_key=on_key,
             render_frame=render_frame,
@@ -886,62 +1212,97 @@ def cmd_calibrate(_args: argparse.Namespace, enable_ir: bool = False) -> int:
         )
 
     T_tc = np.stack([f["T_tc"] for f in recorder.frames]).astype(np.float64)
-    print(f"\n[calib_tool_tip] Solving pivot over {n} frames (robust solver) ...")
-    result = solve_pivot_robust(T_tc)
+    _finalize_pivot(
+        T_tc, marker_corners_xyz, marker_corner_ids, surface_json,
+        str(marker_json_path), CALIB_DIR, axis_constrained=axis_constrained,
+    )
 
-    p = result.p_tip
-    s = result.sigma_axis_mm
-    print("\n===== Tip calibration =====")
-    print(
-        f"p_tip (sphere centre, marker frame) = "
-        f"({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}) mm, Radius {result.radius_mm:.3f} mm"
-    )
-    print(f"sigma per axis = ({s[0]:.3f}, {s[1]:.3f}, {s[2]:.3f}) mm, norm {result.sigma_norm_mm:.3f} mm")
-    print(
-        f"Residual RMS = {result.residual_rms_mm:.3f} mm | inliers "
-        f"{result.n_inliers}/{result.n_frames} | condition number {result.cond_number:.1f}"
-    )
-    wd = result.weak_dir_marker
-    print(
-        f"Weakest axis: sigma {result.weak_sigma_mm:.3f} mm along "
-        f"({wd[0]:+.2f},{wd[1]:+.2f},{wd[2]:+.2f}) [marker frame]"
-    )
-    if result.weak_sigma_mm > 3.0 * float(np.median(result.sigma_axis_mm) + 1e-9):
-        print("  -> WARNING: one direction poorly observed - rotate further / more evenly.")
-
-    result_path = CALIB_DIR / PIVOT_RESULT_FILENAME
-    np.savez(
-        result_path,
-        p_tip=result.p_tip,
-        p_tip_pose_level=result.p_tip,
-        method="pivot_sphere",
-        sigma_norm_mm=np.float64(result.sigma_norm_mm),
-        sigma_axis_mm=result.sigma_axis_mm,
-        pivot_camera=result.pivot_camera,
-        residual_rms_mm=np.float64(result.residual_rms_mm),
-        n_frames=np.int32(result.n_frames),
-        n_inliers=np.int32(result.n_inliers),
-        inlier_mask=result.inlier_mask,
-        weak_dir_marker=result.weak_dir_marker,
-        weak_sigma_mm=np.float64(result.weak_sigma_mm),
-        cond_number=np.float64(result.cond_number),
-        radius_mm=np.float64(result.radius_mm),
-        marker_json_path=str(marker_json_path),
-        created_utc=_utc_now_str(),
-    )
-    n_imgs = len(list((CALIB_DIR / PIVOT_FRAMES_DIRNAME).glob("frame_*.png"))) \
-        if (CALIB_DIR / PIVOT_FRAMES_DIRNAME).is_dir() else 0
+    _fd = CALIB_DIR / PIVOT_FRAMES_DIRNAME
+    n_imgs = len(list(_fd.glob("frame_??????.png"))) if _fd.is_dir() else 0
+    n_ir = len(list(_fd.glob("frame_*_irL.png"))) if _fd.is_dir() else 0
     print(f"\n[calib_tool_tip] Files in {CALIB_DIR}:")
     print(f"  - {PIVOT_SESSION_FILENAME}  (recording + K/dist)")
     if n_imgs:
-        print(f"  - {PIVOT_FRAMES_DIRNAME}/  ({n_imgs} raw frames for offline collar calibration)")
+        _ir_note = f" + {n_ir} IR pairs" if n_ir else ""
+        print(f"  - {PIVOT_FRAMES_DIRNAME}/  ({n_imgs} raw RGB frames{_ir_note} for offline analysis)")
     print(f"  - {PIVOT_RESULT_FILENAME}  (result, overlay-compatible)")
-
-    _show_pivot_3d(
-        result, marker_corners_xyz, marker_corner_ids, surface_json,
-        CALIB_DIR / "pivot_tip_3d.png",
-    )
     print("  - pivot_tip_3d.png  (3D figure SfM + tip)")
+    return 0
+
+
+def cmd_solve_offline(
+    session_path: str | Path | None = None,
+    *,
+    axis_constrained: bool = True,
+) -> int:
+    """Re-solve the pivot tip OFFLINE from a saved ``pivot_session.npz``.
+
+    No camera / recording needed: the stored per-frame poses (T_tc) are re-run
+    through the same (by default axis-constrained) solver. The drill axis is
+    loaded from the marker JSON referenced by the session (its
+    ``surface_model.fitted``); the result NPZ + 3D figure are written next to the
+    session file. Pass ``--free`` to skip the axis constraint.
+    """
+    if session_path is None:
+        from tracking.hydramarker import run_tracker as rt
+        session_path = rt.choose_file_qt(
+            "Select pivot_session.npz", "NPZ files (*.npz)"
+        )
+    session_path = Path(session_path)
+    if not session_path.is_file():
+        print(f"[calib_tool_tip] Session not found: {session_path}")
+        return 1
+
+    data = np.load(session_path, allow_pickle=True)
+    if "T_tc" not in data.files:
+        print(f"[calib_tool_tip] {session_path.name} has no 'T_tc' poses.")
+        return 1
+    T_tc = np.asarray(data["T_tc"], dtype=np.float64).reshape(-1, 4, 4)
+    marker_corners_xyz = np.asarray(
+        data["marker_corners_xyz_mm"], dtype=np.float64
+    ).reshape(-1, 3) if "marker_corners_xyz_mm" in data.files else np.zeros((0, 3))
+    marker_corner_ids = np.asarray(
+        data["marker_corner_ids"], dtype=np.int64
+    ).reshape(-1) if "marker_corner_ids" in data.files else np.zeros((0,), dtype=np.int64)
+    marker_json_path = (
+        str(data["marker_json_path"]) if "marker_json_path" in data.files else ""
+    )
+
+    # The drill axis lives in the marker JSON (surface_model.fitted); load it.
+    surface_json = ""
+    if marker_json_path and Path(marker_json_path).is_file():
+        _ids, _xyz, surface_json = load_marker_geometry(Path(marker_json_path))
+    else:
+        from tracking.hydramarker import run_tracker as rt
+        print("[calib_tool_tip] Marker JSON referenced by the session is missing "
+              "- please pick the marker .json (needs surface_model.fitted).")
+        marker_json_path = rt.choose_file_qt("Select marker .json", "Marker JSON (*.json)")
+        _ids, _xyz, surface_json = load_marker_geometry(Path(marker_json_path))
+    # Prefer the marker JSON's corner cloud for the figure if the session lacks it.
+    if marker_corners_xyz.shape[0] == 0 and _xyz.shape[0]:
+        marker_corners_xyz, marker_corner_ids = _xyz, _ids
+
+    # If the constraint is wanted but this JSON has no fitted axis (e.g. the
+    # session referenced the planar marker), let the user point to one that does.
+    if axis_constrained and _drill_axis_from_surface(surface_json) is None:
+        from tracking.hydramarker import run_tracker as rt
+        print("[calib_tool_tip] The session's marker JSON has no surface_model.fitted "
+              "axis - pick a marker JSON with the fitted cylinder (or run --free).")
+        alt = rt.choose_file_qt("Select marker .json with fitted axis", "Marker JSON (*.json)")
+        _ids2, _xyz2, surface_json = load_marker_geometry(Path(alt))
+        marker_json_path = str(alt)
+        if marker_corners_xyz.shape[0] == 0 and _xyz2.shape[0]:
+            marker_corners_xyz, marker_corner_ids = _xyz2, _ids2
+
+    n = T_tc.shape[0]
+    print(f"[calib_tool_tip] OFFLINE re-solve from {session_path} ({n} frames).")
+    if n < PIVOT_MIN_FRAMES:
+        print(f"[calib_tool_tip] Note: only {n} frames (< {PIVOT_MIN_FRAMES}).")
+
+    _finalize_pivot(
+        T_tc, marker_corners_xyz, marker_corner_ids, surface_json,
+        marker_json_path, session_path.parent, axis_constrained=axis_constrained,
+    )
     return 0
 
 
@@ -951,10 +1312,26 @@ def cmd_calibrate(_args: argparse.Namespace, enable_ir: bool = False) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Running the script IS the tip (pivot) calibration. Optional: --ir
-    calibrates on the IR-refined pose channel (see cmd_calibrate)."""
+    """Running the script IS the tip (pivot) calibration.
+
+    Options:
+      --ir       calibrate on the IR-refined pose channel (see cmd_calibrate).
+      --offline [pivot_session.npz]
+                 skip the camera and re-solve from a saved session (a file
+                 dialog opens if no path is given).
+      --free     keep the plain unconstrained tip (do NOT project it onto the
+                 drill axis). Default: the tip is constrained to the axis.
+    """
     args = list(sys.argv[1:] if argv is None else argv)
-    return int(cmd_calibrate(None, enable_ir="--ir" in args))
+    axis_constrained = "--free" not in args
+    if "--offline" in args:
+        i = args.index("--offline")
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        path = nxt if (nxt and not nxt.startswith("-")) else None
+        return int(cmd_solve_offline(path, axis_constrained=axis_constrained))
+    return int(
+        cmd_calibrate(None, enable_ir="--ir" in args, axis_constrained=axis_constrained)
+    )
 
 
 if __name__ == "__main__":

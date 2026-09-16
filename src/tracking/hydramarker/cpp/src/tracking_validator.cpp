@@ -26,9 +26,18 @@ TrackingValidationResult TrackingValidator::validate(
     const CheckerboardDetection& previous,
     const LKTrackingResult& lk,
     const cv::Size& image_size,
-    const CheckerboardDetectorConfig& config
+    const CheckerboardDetectorConfig& config,
+    std::vector<std::uint8_t>* verdicts
 ) const {
     TrackingValidationResult result;
+
+    // Diagnostic only; every write below is guarded so that a nullptr caller
+    // sees exactly the previous behaviour.
+    const auto mark = [verdicts](int k, TrackVerdict v) {
+        if (verdicts != nullptr) {
+            (*verdicts)[static_cast<size_t>(k)] = static_cast<std::uint8_t>(v);
+        }
+    };
 
     if (!previous.valid()) {
         return result;
@@ -54,6 +63,12 @@ TrackingValidationResult TrackingValidator::validate(
         return result;
     }
 
+    if (verdicts != nullptr) {
+        verdicts->assign(
+            previous.corners.size(),
+            static_cast<std::uint8_t>(TrackVerdict::Accepted));
+    }
+
     std::vector<cv::Point2f> prev_good;
     std::vector<cv::Point2f> curr_good;
     std::vector<int> good_indices;
@@ -64,10 +79,12 @@ TrackingValidationResult TrackingValidator::validate(
 
     for (int k = 0; k < n; ++k) {
         if (!lk.status[k]) {
+            mark(k, TrackVerdict::FlowFailed);
             continue;
         }
 
         if (lk.error[k] > config.max_lk_error) {
+            mark(k, TrackVerdict::FlowResidual);
             continue;
         }
 
@@ -75,10 +92,12 @@ TrackingValidationResult TrackingValidator::validate(
         // If p_old -> p_new cannot be tracked back close to p_old,
         // the forward LK result is probably a drift / wrong local match.
         if (!lk.fb_status[k]) {
+            mark(k, TrackVerdict::ForwardBackward);
             continue;
         }
 
         if (lk.fb_error[k] > config.max_lk_forward_backward_error_px) {
+            mark(k, TrackVerdict::ForwardBackward);
             continue;
         }
 
@@ -88,10 +107,12 @@ TrackingValidationResult TrackingValidator::validate(
         // LK patches close to the image border are incomplete and drift easily.
         // Such corners are treated as not currently visible.
         if (!isInsideImageSafe(old_p, image_size, kBorderMarginPx)) {
+            mark(k, TrackVerdict::Border);
             continue;
         }
 
         if (!isInsideImageSafe(new_p, image_size, kBorderMarginPx)) {
+            mark(k, TrackVerdict::Border);
             continue;
         }
 
@@ -169,6 +190,7 @@ TrackingValidationResult TrackingValidator::validate(
         const cv::Point2f measured = lk.curr_points[k];
 
         if (local_support[m] <= 0) {
+            mark(k, TrackVerdict::NoNeighbourSupport);
             continue;
         }
 
@@ -204,6 +226,9 @@ TrackingValidationResult TrackingValidator::validate(
 
         for (size_t m = 0; m < good_indices.size(); ++m) {
             const int k = good_indices[m];
+            // The relaxation reinstates every forward-backward-checked track,
+            // so the neighbour-support verdicts recorded above no longer hold.
+            mark(k, TrackVerdict::Accepted);
             result.visible_indices.push_back(k);
             result.visible_points.push_back(curr_good[m]);
             result.visible_predicted.push_back(false);

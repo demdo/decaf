@@ -103,6 +103,16 @@ class CameraConfig:
     # fast motion; needs enough scene brightness (or realsense_ir_gain).
     realsense_ir_exposure_us: Optional[float] = None
     realsense_ir_gain: Optional[float] = None
+    # Colour pixel format delivered by the SDK. "bgr8" is the tracking
+    # default; "bgra8" is Qt's native 32-bit layout (QImage.Format_RGB32
+    # wraps it without any per-pixel conversion) and is what the overlay
+    # live view requests. The tracker core accepts both (4-channel input
+    # is converted via COLOR_BGRA2GRAY in C++).
+    realsense_color_format: str = "bgr8"
+    # When set, applies rs.option.frames_queue_size to every sensor after
+    # start (1 = lowest latency: the SDK keeps only the newest frame).
+    # None keeps the SDK default — the behaviour of all existing callers.
+    realsense_frames_queue_size: Optional[int] = None
 
     def validate_common(self) -> None:
         backend = str(self.backend).strip().lower()
@@ -158,6 +168,18 @@ class CameraConfig:
             value = getattr(self, name, None)
             if value is not None and float(value) <= 0.0:
                 raise ValueError(f"camera {name} must be positive when set; got {value}.")
+        color_format = getattr(self, "realsense_color_format", "bgr8")
+        if str(color_format).strip().lower() not in ("bgr8", "bgra8"):
+            raise ValueError(
+                f"camera realsense_color_format must be 'bgr8' or 'bgra8'; "
+                f"got {color_format!r}."
+            )
+        queue_size = getattr(self, "realsense_frames_queue_size", None)
+        if queue_size is not None and int(queue_size) <= 0:
+            raise ValueError(
+                "camera realsense_frames_queue_size must be positive when set; "
+                f"got {queue_size}."
+            )
 
     def calibration_path_obj(self) -> Optional[Path]:
         if self.calibration_path is None or str(self.calibration_path).strip() == "":
@@ -249,7 +271,17 @@ class TrackerConfig:
     # Measurement operator for LK-tracked corners: "quadratic_form" =
     # reference-free curve-intersection refinement, "subpix" = cornerSubPix snap
     # (also the fallback for unknown values / corners QF cannot measure).
-    checker_tracked_refine_method: str = "quadratic_form"
+    #
+    # "subpix" since 2026-07-29. The curve-intersection refinement was measured
+    # against subpix on the RGB path and showed no accuracy gain: on the fb run
+    # (board frame, common origin) subpix reached p95|x| 0.91 vs 1.07 mm and
+    # still-plateau noise 0.055 vs 0.079 mm, i.e. equal or better, and on a
+    # static drill frame QF moved corners ~0.5-1.6 px AWAY from the position
+    # that subpix and the projected model anchor agree on (anchor sat 0.1-0.5 px
+    # from subpix). Consistent with the earlier tip-error finding (subpix 1.05
+    # vs model_warp 1.07 mm): the corner operator was never the dominant error.
+    # The QF code stays in place (it is still selectable) but is no longer used.
+    checker_tracked_refine_method: str = "subpix"
 
     # quadratic_form corner measurement (reference-free curve intersection;
     # active when checker_tracked_refine_method == "quadratic_form").
@@ -273,9 +305,21 @@ class TrackerConfig:
 
     # IR corner measurement operator: "quadratic_form" = reference-free direct
     # measurement of the projected model grid curves in each IR view (no
-    # reference library, no enrollment, works at any orientation from frame 1).
-    # Any other value disables the IR fusion (RGB pose passes through).
-    ir_corner_method: str = "quadratic_form"
+    # reference library, no enrollment, works at any orientation from frame 1);
+    # "subpix" = plain cornerSubPix snap on the rig-transferred seeds. Any other
+    # value disables the IR fusion (RGB pose passes through).
+    #
+    # "subpix" since 2026-07-29, for consistency with the RGB path. Requires the
+    # re-calibrated ir_fit_gate_rms_mm / ir_cov_inflate_ref_rms_mm below (both
+    # compare against fit_rms and are operator-bound) AND a marker model whose
+    # IR post-pass was built with subpix (refine_model_ir.py --corner-method
+    # subpix -> *_ir3d_subpix.json; the QF-built model made subpix look 1.1 mm
+    # worse in z purely by self-consistency). HONEST LIMIT: with all of that in
+    # place subpix matches quadratic_form on systematic error and lateral noise
+    # and beats it laterally, but its z RANDOM noise stays ~2x higher (fb board
+    # frame: p95|z| 1.05 vs 0.55 mm) -- z is the weakly observable direction on
+    # the cylinder, where the finer measurement on the ~11 px IR cells pays off.
+    ir_corner_method: str = "subpix"
     ir_qf_max_dev_px: float = 4.0
 
     # Pose-set stabilisation (2026-07-05). The cylinder pose is nearly blind
@@ -369,12 +413,27 @@ class TrackerConfig:
     # the fusion exactly when it was needed most (z spikes to -4.4). 1.8/6.0
     # validated across fb1_22/fb4/fb5/fb1_21/fb_rl (p95|z| 10.8->2.4) with only
     # a small robust-std cost on fb_rl2 (0.87->1.15); divot ABS unchanged.
-    ir_fit_gate_rms_mm: float = 1.8
+    #
+    # RE-CALIBRATED 2026-07-29 for the subpix corner measurement. Both values
+    # below are SCALE-BOUND TO THE OPERATOR: they compare against fit_rms, whose
+    # distribution differs per operator (fb run: quadratic_form median 0.80 /
+    # max 1.41, subpix median 1.83 / max 2.50). The old 1.8 therefore never
+    # fired for quadratic_form but rejected 52% of the subpix frames, and the
+    # old 0.10 reference inflated the surviving subpix frames ~5x harder
+    # ((1.83/0.10)^2 = 335 vs (0.80/0.10)^2 = 64), damping the fusion the
+    # filter was supposed to use. Percentile-equivalent gate = 2.5, median-ratio
+    # reference = 0.23; that pair restores 100% fusion coverage AND lands the
+    # median cov_scale on 63.3, exactly the quadratic_form value. Validated on
+    # the fb run in the board frame: return-to-origin dz +0.35 -> -0.04 mm and
+    # lateral still-noise 0.048 mm (best of all arms). ==> IF THE IR OPERATOR
+    # CHANGES, RE-DERIVE BOTH from its fit_rms distribution.
+    ir_fit_gate_rms_mm: float = 2.5
     ir_fit_gate_max_trans_jump_mm: float = 6.0
     # Weak-evidence honesty: inflate the MAP covariance handed to the temporal
     # filter by the reduced chi-square (fit_rms / this)^2 so the filter damps
     # poor-fit frames instead of following them. 0 disables.
-    ir_cov_inflate_ref_rms_mm: float = 0.10
+    # Operator-bound, see ir_fit_gate_rms_mm above (0.10 for quadratic_form).
+    ir_cov_inflate_ref_rms_mm: float = 0.23
     ir_enroll_max_rot_deg: float = 3.0
     ir_enroll_max_trans_mm: float = 8.0
     ir_ref_tile_deg: float = 12.0
@@ -523,6 +582,12 @@ class TrackerConfig:
     # tracker_log.py records these values but does not make tracking decisions.
     visual_corner_max_reprojection_error_px: float = 3.0
     visual_corner_min_count: int = 6
+
+    # Python-side only (the engine ignores it): aggregated dropout logging in
+    # the overlay live page. Records the cause of every tracking loss AFTER a
+    # successful lock, deduplicated per cause with a counter, written once
+    # when tracking stops. No effect on the frame loop.
+    failure_log_enabled: bool = True
 
 
 __all__ = [

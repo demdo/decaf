@@ -43,6 +43,53 @@ struct CheckerboardRecoveryDebug {
     cv::Mat response;    // saddle response after NMS+threshold (CV_32F)
 };
 
+// Per-corner record of ONE frame-to-frame propagation step, for documenting
+// the tracking path the way CheckerboardRecoveryDebug documents the recovery
+// path. All vectors are parallel and follow the order of the corner set held
+// from the previous frame.
+//
+// This is captured only while setTrackingDebugEnabled(true) and is never read
+// by the tracker; with the flag off (the default) nothing here is written and
+// the propagation behaves exactly as before.
+struct CheckerboardTrackingDebug {
+    std::vector<int> i;                      // grid indices of the corner
+    std::vector<int> j;
+    std::vector<cv::Point2f> prev_uv;        // position held in frame t-1
+    std::vector<cv::Point2f> predicted_uv;   // warm start handed to the flow
+    std::vector<uchar> prediction_used;      // 0 = flow started at prev_uv
+    std::vector<cv::Point2f> lk_uv;          // raw flow result in frame t,
+                                             // BEFORE sub-pixel re-measurement
+                                             // and before the Kalman update
+    std::vector<uchar> status;               // flow's own success flag
+    std::vector<float> error;                // aligned-window residual
+    std::vector<uchar> fb_status;            // backward pass succeeded
+    std::vector<float> fb_error;             // distance back to prev_uv
+    std::vector<cv::Point2f> back_uv;        // where the backward pass returned
+                                             // to; fb_error is its distance
+                                             // from prev_uv
+    std::vector<std::uint8_t> verdict;       // TrackVerdict, see tracking_validator.hpp
+
+    // Photometric visibility of the same frame, captured where the score is
+    // computed - that is, BEFORE the eviction rule can act on it, so that the
+    // last score of a corner being evicted is recorded as well. These arrays
+    // are indexed independently of the ones above: they follow the persistent
+    // corner set, not the propagation input.
+    std::vector<int> vis_i;
+    std::vector<int> vis_j;
+    std::vector<float> vis_score;      // raw score of this frame
+    std::vector<float> vis_smoothed;   // EMA the eviction rule also reads
+    std::vector<int> vis_low_frames;   // consecutive frames counting against
+                                       // the corner, after this frame
+
+    // The thresholds the verdicts were produced with, so a figure quoting them
+    // cannot drift away from the configuration that produced the data.
+    float max_lk_error = 0.0f;
+    float max_fb_error_px = 0.0f;
+
+    int frame_index = -1;
+    bool valid = false;
+};
+
 // Simplified persistent corner — no quadrant scoring.
 // The quadrant test is only used at recovery time to filter raw candidates.
 // During tracking, LK + forward-backward + spacing filter are sufficient
@@ -98,6 +145,17 @@ public:
     void setCornerModelInput(const CornerModelFrameInput& input);
 
     CheckerboardRecoveryDebug debugRecoveryStages(const cv::Mat& image) const;
+
+    // Opt-in capture of the per-corner propagation record of every following
+    // detect() that runs on the tracking path. Off by default; while off the
+    // tracker allocates nothing extra and behaves identically.
+    void setTrackingDebugEnabled(bool enabled) {
+        tracking_debug_enabled_ = enabled;
+    }
+    bool trackingDebugEnabled() const { return tracking_debug_enabled_; }
+    const CheckerboardTrackingDebug& lastTrackingDebug() const {
+        return last_tracking_debug_;
+    }
 
     void resetTracking();
     bool isTracking() const;
@@ -170,6 +228,10 @@ private:
     GridBuilder grid_builder_;
     LKTracker lk_tracker_;
     TrackingValidator tracking_validator_;
+
+    // Documentation capture, see setTrackingDebugEnabled.
+    bool tracking_debug_enabled_ = false;
+    CheckerboardTrackingDebug last_tracking_debug_;
 
     struct RecoveryRegionCache {
         int frame_index = -1;

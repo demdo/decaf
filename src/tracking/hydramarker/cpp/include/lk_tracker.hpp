@@ -19,6 +19,12 @@ struct LKTrackingResult {
     std::vector<uchar> fb_status;
     std::vector<float> fb_error;
 
+    // The returned positions themselves, i.e. curr_points tracked back into
+    // the previous frame. fb_error is their distance to prev_points; the
+    // positions are kept as well so that the round trip can be drawn, not
+    // only measured.
+    std::vector<cv::Point2f> back_points;
+
     bool valid = false;
 };
 

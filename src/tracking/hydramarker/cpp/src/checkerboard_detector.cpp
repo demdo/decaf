@@ -2858,10 +2858,54 @@ CheckerboardDetector::trackFromPreviousFrame(const cv::Mat& gray) {
     }
 
     const auto validate_t0 = cv::getTickCount();
+    std::vector<std::uint8_t> track_verdicts;
     TrackingValidationResult validation =
         tracking_validator_.validate(
-            last_detection_, lk, gray.size(), config_);
+            last_detection_, lk, gray.size(), config_,
+            tracking_debug_enabled_ ? &track_verdicts : nullptr);
     addTimingMs("tracking_validate_ms", elapsedMs(validate_t0));
+
+    // Documentation capture of this propagation step. Deliberately placed
+    // before the validity check, so that frames on which the propagation
+    // fails are recorded too. Reads only what has already been computed.
+    if (tracking_debug_enabled_) {
+        CheckerboardTrackingDebug& dbg = last_tracking_debug_;
+        const size_t n_corners = last_detection_.corners.size();
+        dbg = CheckerboardTrackingDebug{};
+        dbg.frame_index = frame_index_;
+        dbg.max_lk_error = config_.max_lk_error;
+        dbg.max_fb_error_px = config_.max_lk_forward_backward_error_px;
+        dbg.i.reserve(n_corners);
+        dbg.j.reserve(n_corners);
+        for (const auto& c : last_detection_.corners) {
+            dbg.i.push_back(c.i);
+            dbg.j.push_back(c.j);
+        }
+        dbg.prev_uv = prev_points;
+        dbg.predicted_uv =
+            initial_curr_points.size() == n_corners
+                ? initial_curr_points
+                : prev_points;
+        dbg.prediction_used.assign(n_corners, 0);
+        if (initial_flow_used.size() == n_corners) {
+            for (size_t k = 0; k < n_corners; ++k) {
+                dbg.prediction_used[k] =
+                    initial_flow_used[k] ? uchar(1) : uchar(0);
+            }
+        }
+        if (lk.curr_points.size() == n_corners) {
+            dbg.lk_uv = lk.curr_points;
+            dbg.status = lk.status;
+            dbg.error = lk.error;
+            dbg.fb_status = lk.fb_status;
+            dbg.fb_error = lk.fb_error;
+            if (lk.back_points.size() == n_corners) {
+                dbg.back_uv = lk.back_points;
+            }
+            dbg.verdict = track_verdicts;
+            dbg.valid = true;
+        }
+    }
 
     if (!validation.valid) return std::nullopt;
 
@@ -3583,6 +3627,13 @@ void CheckerboardDetector::updateTrackingState(
         const float spacing = estimateMedianSpacing(measured_detection);
         if (spacing >= config_.visibility_min_spacing) {
             const float alpha = config_.visibility_smoothing_alpha;
+            if (tracking_debug_enabled_) {
+                last_tracking_debug_.vis_i.clear();
+                last_tracking_debug_.vis_j.clear();
+                last_tracking_debug_.vis_score.clear();
+                last_tracking_debug_.vis_smoothed.clear();
+                last_tracking_debug_.vis_low_frames.clear();
+            }
             for (auto& pc : persistent_corners_) {
                 if (pc.missed_frames != 0) continue;
                 if (pc.corner.predicted) continue;
@@ -3606,6 +3657,19 @@ void CheckerboardDetector::updateTrackingState(
                 } else if (pc.visibility_score >
                            config_.visibility_evict_threshold * 1.25f) {
                     pc.low_visibility_frames = 0;
+                }
+
+                // Documentation capture, taken here so that the last score of
+                // a corner the rule is about to evict is recorded too; the
+                // run log only ever contains corners that survived the frame.
+                if (tracking_debug_enabled_) {
+                    last_tracking_debug_.vis_i.push_back(pc.corner.i);
+                    last_tracking_debug_.vis_j.push_back(pc.corner.j);
+                    last_tracking_debug_.vis_score.push_back(pc.visibility_score);
+                    last_tracking_debug_.vis_smoothed.push_back(
+                        pc.smoothed_visibility_score);
+                    last_tracking_debug_.vis_low_frames.push_back(
+                        pc.low_visibility_frames);
                 }
 
                 const bool sustained_raw_invisible =

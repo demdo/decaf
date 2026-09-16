@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
 from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 
+from overlay.tools.xray_distortion import load_xray_distortion
+
 
 def _hide_widget(w: QWidget | None) -> None:
     if w is None:
@@ -110,20 +112,24 @@ class XrayIntrinsicsPage(StaticImagePage):
     def refresh(self) -> None:
         if self.is_complete():
             K = self.state.K_xray
-        
+
             lines = [
                 " ".join(f"{v:.2f}" for v in row)
                 for row in K
             ]
-            
+
             K_str = "\n".join(["np.array (3×3)"] + lines)
-            
+
+            field = getattr(self.state, "xray_dist_field", None)
+
             self.set_stats_rows([
                 ("K_xray", K_str),
+                ("dist_xray", "-" if field is None else field.describe()),
             ])
         else:
             self.set_stats_rows([
                 ("K_xray", "-"),
+                ("dist_xray", "-"),
             ])
 
         try:
@@ -201,16 +207,19 @@ class XrayIntrinsicsPage(StaticImagePage):
         try:
             suffix = Path(path).suffix.lower()
 
+            field = None
             if suffix == ".json":
                 K = self._load_K_from_json(path)
             elif suffix == ".npz":
                 K = self._load_K_from_npz(path)
+                field = load_xray_distortion(path)
             else:
                 raise ValueError(
                     "Unsupported file type. Please select a .json or .npz file."
                 )
 
             self.state.K_xray = K
+            self.state.xray_dist_field = field
 
             self.refresh()
             self.on_complete_changed()

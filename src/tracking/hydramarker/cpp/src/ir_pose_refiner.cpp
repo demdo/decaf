@@ -419,16 +419,23 @@ double qfEpipolarRefineX(const cv::Mat& irL, const cv::Mat& irR,
 
 }  // namespace
 
-void IrPoseRefiner::measureViewQf(const cv::Mat& gray,
-                                  const cv::Matx33d& K,
-                                  const std::vector<double>& dist,
-                                  const cv::Matx33d& R_view,
-                                  const cv::Vec3d& t_view,
-                                  const std::vector<cv::Vec3d>& xyz,
-                                  const std::vector<cv::Point2f>& seeds,
-                                  std::vector<cv::Point2f>& uv_out,
-                                  std::vector<uint8_t>& ok_out,
-                                  std::vector<float>& q_out) const
+// Measures one IR view with the operator named by config_.corner_method.
+// The two operators are NESTED, not parallel: refineTrackedCorners always runs
+// the subpix snap first (it pulls the rig-transferred seed onto the nearest IR
+// saddle and is the per-corner fallback), and "quadratic_form" then adds the
+// curve measurement + saddle registration ON TOP, overriding subpix wherever
+// they succeed. Hence only the method string and the acceptance readout differ
+// here; the dispatch itself lives in the corner refiner.
+void IrPoseRefiner::measureView(const cv::Mat& gray,
+                                const cv::Matx33d& K,
+                                const std::vector<double>& dist,
+                                const cv::Matx33d& R_view,
+                                const cv::Vec3d& t_view,
+                                const std::vector<cv::Vec3d>& xyz,
+                                const std::vector<cv::Point2f>& seeds,
+                                std::vector<cv::Point2f>& uv_out,
+                                std::vector<uint8_t>& ok_out,
+                                std::vector<float>& q_out) const
 {
     const size_t n = xyz.size();
     uv_out = seeds;
@@ -446,13 +453,16 @@ void IrPoseRefiner::measureViewQf(const cv::Mat& gray,
     ctx.surface = surface_;
     ctx.anchor_xyz_mm = xyz;
     ctx.anchor_valid.assign(n, 1);
-    // no ref_gray: the QF path is reference-free (usableQuadratic).
+    // no ref_gray: both operators are reference-free (usableQuadratic).
     if (pattern_.valid()) {
         ctx.pattern = &pattern_;
     }
 
+    const bool subpix_mode = config_.corner_method == "subpix";
+
     CornerRefinementConfig cfg;
-    cfg.tracked_refine_method = "quadratic_form";
+    cfg.tracked_refine_method =
+        subpix_mode ? "subpix" : "quadratic_form";
     cfg.qf_max_dev_px = config_.qf_max_dev_px;
     // IR views: engage the synthetic saddle registration for EVERY corner,
     // not only grazing ones. On the ~11 px IR cells the 1D-profile residual
@@ -468,11 +478,37 @@ void IrPoseRefiner::measureViewQf(const cv::Mat& gray,
     cfg.saddle_min_zncc = 0.30;
     // The subpix snap inside refineTrackedCorners first pulls the
     // rig-transferred seeds onto the nearest IR saddle (fixing most of the
-    // 1-3 px transfer error), then QF measures on the anchored curves and
-    // the saddle-warp layer covers high-incidence corners.
+    // 1-3 px transfer error). Under "quadratic_form" that is then overridden
+    // where QF measures on the anchored curves and where the saddle-warp layer
+    // covers high-incidence corners; under "subpix" the snap IS the result.
     const std::vector<bool> predicted(n, false);
     const TrackedRefineStats stats = refiner_.refineTrackedCorners(
         gray, uv_out, predicted, cfg, &ctx);
+
+    if (subpix_mode) {
+        // "subpix" measures every corner with the plain cornerSubPix snap on
+        // the rig-transferred seed. runSubpixSnap reports no per-corner flags,
+        // so acceptance is derived here: finite, inside the image, and within
+        // the same seed-deviation gate the QF path uses.
+        const float border = 8.0f;
+        for (size_t i = 0; i < n; ++i) {
+            const cv::Point2f& p = uv_out[i];
+            if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+            if (p.x < border || p.y < border ||
+                p.x >= static_cast<float>(gray.cols) - border ||
+                p.y >= static_cast<float>(gray.rows) - border) {
+                continue;
+            }
+            const cv::Point2f d = p - seeds[i];
+            if (std::sqrt(d.x * d.x + d.y * d.y) >
+                config_.qf_max_dev_px) {
+                continue;
+            }
+            ok_out[i] = 1;
+            q_out[i] = 1.0f;
+        }
+        return;
+    }
 
     if (stats.corner_ok.size() != n) {
         uv_out = seeds;
@@ -570,21 +606,24 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
         out.saturated_frac = static_cast<double>(n_sat) / static_cast<double>(n);
     }
 
-    // ---- Reference-free path: measure both IR views directly with the
-    // quadratic-form operator and run the SAME MAP once.  No reference
-    // library, no enrollment, no selection — the measurement exists at any
-    // orientation and from the very first frame. A non-quadratic corner_method
-    // has no measurement path left, so the RGB pose passes through unchanged.
-    const bool qf_mode = config_.corner_method == "quadratic_form";
-    if (qf_mode) {
+    // ---- Reference-free path: measure both IR views directly and run the
+    // SAME MAP once.  No reference library, no enrollment, no selection — the
+    // measurement exists at any orientation and from the very first frame.
+    // "quadratic_form" measures the projected model grid curves (incl. the
+    // saddle-warp layer); "subpix" is the plain cornerSubPix snap on the
+    // rig-transferred seeds. Any other corner_method has no measurement path
+    // left, so the RGB pose passes through unchanged.
+    const bool has_measurement = config_.corner_method == "quadratic_form" ||
+                                 config_.corner_method == "subpix";
+    if (has_measurement) {
         ++out.refs_measured;
         std::vector<cv::Point2f> ptsL, ptsR;
         std::vector<uint8_t> okL, okR;
         std::vector<float> qL, qR;
-        measureViewQf(ir_left, calib_.K_left, calib_.dist_left, R_A, t_A,
-                      xyz, seedL, ptsL, okL, qL);
-        measureViewQf(ir_right, calib_.K_right, calib_.dist_right, R_B, t_B,
-                      xyz, seedR, ptsR, okR, qR);
+        measureView(ir_left, calib_.K_left, calib_.dist_left, R_A, t_A,
+                    xyz, seedL, ptsL, okL, qL);
+        measureView(ir_right, calib_.K_right, calib_.dist_right, R_B, t_B,
+                    xyz, seedR, ptsR, okR, qR);
         // Stereo self-calibration: correct the measured right-view x for
         // the field-dependent disparity warp of the factory calibration
         // (fitted offline from marker runs; the reference-photo path was

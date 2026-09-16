@@ -262,6 +262,11 @@ struct CheckerboardDetectorConfig {
     //                      fallback for the model-based operator)
     //   "quadratic_form" - reference-free curve-intersection refinement for
     //                      markers with a known surface model
+    //   "none"           - no measurement at all; the LK positions are handed
+    //                      on unchanged. Documentation/ablation only, so that
+    //                      the effect of the re-measurement can be isolated
+    //                      without also disabling the recovery-path refinement
+    //                      that shares saddle_subpix_win_size.
     std::string tracked_refine_method = "subpix";
 
     // ---- quadratic_form parameters (see CornerRefinementConfig) ----

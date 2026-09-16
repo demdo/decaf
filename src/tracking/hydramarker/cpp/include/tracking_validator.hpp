@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -8,6 +9,20 @@
 #include "lk_tracker.hpp"
 
 namespace hydramarker {
+
+// Why a tracked corner did or did not survive the propagation filters of
+// TrackingValidator::validate, in the order the tests are applied. Recorded
+// only when the caller passes a verdict buffer; the default nullptr keeps the
+// hot path free of the extra write and leaves behaviour unchanged. Used for
+// documentation figures, not by the tracker itself.
+enum class TrackVerdict : std::uint8_t {
+    Accepted = 0,
+    FlowFailed = 1,          // optical flow itself reported failure
+    FlowResidual = 2,        // aligned-window residual above max_lk_error
+    ForwardBackward = 3,     // backward track did not return to the origin
+    Border = 4,              // in the border margin, flow window truncated
+    NoNeighbourSupport = 5   // no grid neighbour kept a plausible edge length
+};
 
 struct TrackingValidationResult {
     // Only directly confirmed, currently visible corners.
@@ -38,11 +53,15 @@ class TrackingValidator {
 public:
     TrackingValidator();
 
+    // `verdicts`, when given, receives one TrackVerdict per corner of
+    // `previous`, in the same order. Purely diagnostic: passing nullptr (the
+    // default) reproduces the previous behaviour exactly.
     TrackingValidationResult validate(
         const CheckerboardDetection& previous,
         const LKTrackingResult& lk,
         const cv::Size& image_size,
-        const CheckerboardDetectorConfig& config
+        const CheckerboardDetectorConfig& config,
+        std::vector<std::uint8_t>* verdicts = nullptr
     ) const;
 
 private:

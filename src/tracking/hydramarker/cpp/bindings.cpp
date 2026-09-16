@@ -447,7 +447,9 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
            int subpix_win_size,
            int subpix_max_iters,
            double subpix_epsilon,
-           int saddle_radius) -> py::dict
+           int saddle_radius,
+           double qf_max_dev_px,
+           double qf_saddle_min_incidence_deg) -> py::dict
         {
             const size_t n = points_flat.size() / 2;
             if (predicted.size() != n ||
@@ -545,6 +547,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             config.saddle_max_iters = max_iters;
             config.saddle_min_zncc = min_zncc;
             config.saddle_max_shift_px = max_shift_px;
+            config.qf_max_dev_px = qf_max_dev_px;
+            config.qf_saddle_min_incidence_deg = qf_saddle_min_incidence_deg;
             (void)half_window;
             (void)max_incidence_deg;
             (void)min_valid_frac;
@@ -571,6 +575,17 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             result["corner_zncc"] = stats.corner_zncc;
             result["subpix_count"] = stats.refined_count;
             result["subpix_mean_shift_px"] = stats.mean_shift_px;
+            result["qf_count"] = stats.qf_count;
+            // Per-corner subpix baseline (the measurement QF overwrote) so the
+            // caller can show subpix -> QF; empty unless the operator ran.
+            {
+                py::list sub;
+                for (const cv::Point2f& p : stats.subpix_uv) {
+                    sub.append(py::make_tuple(static_cast<double>(p.x),
+                                              static_cast<double>(p.y)));
+                }
+                result["subpix_uv"] = sub;
+            }
             return result;
         },
         py::arg("gray"),
@@ -603,7 +618,12 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         py::arg("subpix_win_size") = -1,
         py::arg("subpix_max_iters") = 20,
         py::arg("subpix_epsilon") = 0.05,
-        py::arg("saddle_radius") = 5
+        py::arg("saddle_radius") = 5,
+        // QF tuning the IR path overrides (defaults = struct defaults, so
+        // existing callers are unaffected): the IR views run a looser seed gate
+        // and engage the 2D saddle registration for every corner.
+        py::arg("qf_max_dev_px") = 2.5,
+        py::arg("qf_saddle_min_incidence_deg") = 55.0
     );
 
     // Offline drive of the depth-only IR fusion stage: same IrPoseRefiner
@@ -632,7 +652,9 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                double mw_min_zncc,
                double mw_max_shift_px,
                double mw_max_incidence_deg,
-               double mw_min_valid_frac)
+               double mw_min_valid_frac,
+               const std::string& corner_method,
+               double fit_gate_rms_mm)
             {
                 const MarkerGeometry geometry =
                     MarkerGeometry::loadFromJson(marker_json_path);
@@ -660,6 +682,11 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 cfg.zncc_weight_floor = zncc_weight_floor;
                 cfg.dtz_clamp_mm = dtz_clamp_mm;
                 cfg.depth_scale = depth_scale;
+                // Operator + its scale-bound fit gate. Explicit here so the
+                // offline verification replays can pin the historical
+                // quadratic_form reference regardless of the struct default.
+                cfg.corner_method = corner_method;
+                cfg.fit_gate_rms_mm = fit_gate_rms_mm;
                 (void)mw_half_window; (void)mw_min_zncc; (void)mw_max_shift_px;
                 (void)mw_max_incidence_deg; (void)mw_min_valid_frac;
                 self.configure(cfg, geometry.surfaceModel(), cloud);
@@ -680,7 +707,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("mw_min_zncc") = 0.35,
             py::arg("mw_max_shift_px") = 6.0,
             py::arg("mw_max_incidence_deg") = 80.0,
-            py::arg("mw_min_valid_frac") = 0.4
+            py::arg("mw_min_valid_frac") = 0.4,
+            // Defaults mirror the IrPoseRefinerConfig struct defaults.
+            py::arg("corner_method") = "subpix",
+            py::arg("fit_gate_rms_mm") = 1.50
         )
         .def(
             "set_calibration",
@@ -1823,7 +1853,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def("reset_ir_references", &TrackerEngine::resetIrReferences)
         .def("set_ir_selfcal", &TrackerEngine::setIrSelfCal)
         .def("set_ir_selfcal_corners", &TrackerEngine::setIrSelfCalCorners)
-        .def("measure_ir_view_qf", [](
+        .def("measure_ir_view", [](
                  const TrackerEngine& self,
                  py::array_t<uint8_t,
                              py::array::c_style | py::array::forcecast> gray,
@@ -1832,9 +1862,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                  const std::vector<double>& tvec,
                  const std::vector<double>& flat_xyz,
                  const std::vector<double>& flat_seeds) {
-            // Offline model refinement: reference-free QF measurement of
-            // the given marker corners in ONE IR view under an explicit
-            // marker->view pose (rvec/tvec, mm). Returns per corner
+            // Offline model refinement: reference-free measurement of the given
+            // marker corners in ONE IR view under an explicit marker->view pose
+            // (rvec/tvec, mm), with the operator taken from the engine config
+            // (ir_corner_method). Returns per corner
             // (u, v, ok, quality).
             const cv::Mat img = numpyToMat(gray);
             const IrPoseRefiner& ref = self.irPoseRefiner();
@@ -1861,8 +1892,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             std::vector<cv::Point2f> uv;
             std::vector<uint8_t> ok;
             std::vector<float> q;
-            ref.measureViewQf(img, K, dist, R_view, t_view, xyz, seeds,
-                              uv, ok, q);
+            ref.measureView(img, K, dist, R_view, t_view, xyz, seeds,
+                            uv, ok, q);
             py::list out;
             for (size_t i = 0; i < n; ++i) {
                 out.append(py::make_tuple(uv[i].x, uv[i].y,
@@ -1887,6 +1918,11 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             out["uvR"] = uvr;
             return out;
         })
+        .def("set_tracking_debug_enabled",
+             &TrackerEngine::setTrackingDebugEnabled)
+        .def("last_tracking_debug",
+             &TrackerEngine::lastTrackingDebug,
+             py::return_value_policy::copy)
         .def("frame_index", &TrackerEngine::frameIndex)
         .def("mode", &TrackerEngine::mode)
         .def("marker_assets_loaded", &TrackerEngine::markerAssetsLoaded)
@@ -2211,6 +2247,41 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_property_readonly("response", [](const CheckerboardRecoveryDebug& d) {
             return debugMatToNumpy(d.response); });
 
+    py::enum_<TrackVerdict>(m, "TrackVerdict")
+        .value("Accepted", TrackVerdict::Accepted)
+        .value("FlowFailed", TrackVerdict::FlowFailed)
+        .value("FlowResidual", TrackVerdict::FlowResidual)
+        .value("ForwardBackward", TrackVerdict::ForwardBackward)
+        .value("Border", TrackVerdict::Border)
+        .value("NoNeighbourSupport", TrackVerdict::NoNeighbourSupport);
+
+    py::class_<CheckerboardTrackingDebug>(m, "CheckerboardTrackingDebug")
+        .def(py::init<>())
+        .def_readonly("i", &CheckerboardTrackingDebug::i)
+        .def_readonly("j", &CheckerboardTrackingDebug::j)
+        .def_readonly("prev_uv", &CheckerboardTrackingDebug::prev_uv)
+        .def_readonly("predicted_uv", &CheckerboardTrackingDebug::predicted_uv)
+        .def_readonly("prediction_used",
+                      &CheckerboardTrackingDebug::prediction_used)
+        .def_readonly("lk_uv", &CheckerboardTrackingDebug::lk_uv)
+        .def_readonly("status", &CheckerboardTrackingDebug::status)
+        .def_readonly("error", &CheckerboardTrackingDebug::error)
+        .def_readonly("fb_status", &CheckerboardTrackingDebug::fb_status)
+        .def_readonly("fb_error", &CheckerboardTrackingDebug::fb_error)
+        .def_readonly("back_uv", &CheckerboardTrackingDebug::back_uv)
+        .def_readonly("verdict", &CheckerboardTrackingDebug::verdict)
+        .def_readonly("vis_i", &CheckerboardTrackingDebug::vis_i)
+        .def_readonly("vis_j", &CheckerboardTrackingDebug::vis_j)
+        .def_readonly("vis_score", &CheckerboardTrackingDebug::vis_score)
+        .def_readonly("vis_smoothed", &CheckerboardTrackingDebug::vis_smoothed)
+        .def_readonly("vis_low_frames",
+                      &CheckerboardTrackingDebug::vis_low_frames)
+        .def_readonly("max_lk_error", &CheckerboardTrackingDebug::max_lk_error)
+        .def_readonly("max_fb_error_px",
+                      &CheckerboardTrackingDebug::max_fb_error_px)
+        .def_readonly("frame_index", &CheckerboardTrackingDebug::frame_index)
+        .def_readonly("valid", &CheckerboardTrackingDebug::valid);
+
     py::class_<CheckerboardDetector>(m, "CheckerboardDetector")
         .def(py::init<>())
         .def(py::init<CheckerboardDetectorConfig>())
@@ -2236,7 +2307,14 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         )
         .def("last_timings_ms", &CheckerboardDetector::lastTimingsMs)
         .def("reset_tracking", &CheckerboardDetector::resetTracking)
-        .def("is_tracking", &CheckerboardDetector::isTracking);
+        .def("is_tracking", &CheckerboardDetector::isTracking)
+        .def("set_tracking_debug_enabled",
+             &CheckerboardDetector::setTrackingDebugEnabled)
+        .def("tracking_debug_enabled",
+             &CheckerboardDetector::trackingDebugEnabled)
+        .def("last_tracking_debug",
+             &CheckerboardDetector::lastTrackingDebug,
+             py::return_value_policy::copy);
 
     py::class_<DotDetector>(m, "DotDetector")
         .def(py::init<>())

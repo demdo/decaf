@@ -74,10 +74,13 @@ struct TrackerConfig {
     // bit-identical acceptance replays; the live config enables it).
     double ir_reject_cov_inflate = 1.0;
 
-    // IR corner measurement operator. "quadratic_form" = reference-free direct
-    // measurement (the only measurement path); anything else passes the RGB
-    // pose through unchanged (no IR fusion).
-    std::string ir_corner_method = "quadratic_form";
+    // IR corner measurement operator. "subpix" (default since 2026-07-29) =
+    // cornerSubPix snap on the rig-transferred seeds; "quadratic_form" =
+    // reference-free direct measurement of the projected model grid curves;
+    // anything else passes the RGB pose through unchanged (no IR fusion).
+    // The IR fit gate and the covariance-inflation reference are scale-bound to
+    // this choice — see config.py ir_fit_gate_rms_mm.
+    std::string ir_corner_method = "subpix";
     double ir_qf_max_dev_px = 4.0;
 
     // Pose-set stabilisation. On the cylinder marker the pose is nearly

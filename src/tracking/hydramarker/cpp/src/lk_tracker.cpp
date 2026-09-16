@@ -148,6 +148,7 @@ LKTrackingResult LKTracker::track(
     result.error = std::move(error);
     result.fb_status = std::move(fb_status);
     result.fb_error = std::move(fb_error);
+    result.back_points = std::move(back_points);
     result.valid = true;
 
     return result;

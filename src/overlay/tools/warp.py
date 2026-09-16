@@ -182,13 +182,126 @@ class WarpedOverlay:
 
 
 # ============================================================
+# Live overlay - prepared once, then only the covered pixels
+# ============================================================
+
+@dataclass
+class LiveOverlay:
+    """
+    Overlay prepared for repeated blending into a BGRA frame.
+
+    Everything that does not change between frames is done once: the warp, the
+    FOV mask, the colour expansion, and the bounding box of the covered area.
+    Per frame only the pixels the overlay actually covers are touched - on a
+    1920x1080 frame that is about 6 % of the image.
+
+    Deliberately separate from WarpedOverlay: that one stays byte-for-byte as
+    it was so the preview page and the offline analyses keep reproducing.
+    """
+
+    box: tuple[int, int, int, int]      # y0, y1, x0, x1
+    xray_roi: np.ndarray                # (h, w, 4) BGRA
+    mask_roi: np.ndarray                # (h, w) uint8, 0/255
+    _scratch: np.ndarray
+
+    def blend_into(self, dst_bgra: np.ndarray, alpha: float) -> None:
+        """Blend in place. dst_bgra is modified, nothing is allocated."""
+        alpha = _validate_alpha(alpha)
+        y0, y1, x0, x1 = self.box
+        roi = dst_bgra[y0:y1, x0:x1]
+        cv2.addWeighted(roi, alpha, self.xray_roi, 1.0 - alpha, 0.0, dst=self._scratch)
+        cv2.copyTo(self._scratch, self.mask_roi, roi)
+
+
+def prepare_live_overlay(
+    xray_gray_u8: np.ndarray,
+    H_xc: np.ndarray,
+    camera_size_wh: tuple[int, int],
+) -> LiveOverlay | None:
+    """
+    Build a LiveOverlay. Returns None when the warp lands outside the frame.
+
+    Uses the same FOV detection and warp as warp_xray_to_camera, so the result
+    is visually identical to the preview path.
+    """
+    xray_gray_u8 = np.asarray(xray_gray_u8)
+    H_xc = _as_homography(H_xc, name="H_xc")
+    Wc, Hc = int(camera_size_wh[0]), int(camera_size_wh[1])
+
+    fov = _detect_xray_fov_mask(xray_gray_u8)
+    masked = cv2.bitwise_and(xray_gray_u8, xray_gray_u8, mask=fov)
+
+    warped = cv2.warpPerspective(masked, H_xc, (Wc, Hc), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask = cv2.warpPerspective(fov, H_xc, (Wc, Hc), flags=cv2.INTER_NEAREST,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask = (mask > 0).astype(np.uint8) * 255
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+
+    xray_roi = cv2.cvtColor(warped[y0:y1, x0:x1], cv2.COLOR_GRAY2BGRA)
+    xray_roi[:, :, 3] = 255
+
+    return LiveOverlay(
+        box=(y0, y1, x0, x1),
+        xray_roi=np.ascontiguousarray(xray_roi),
+        mask_roi=np.ascontiguousarray(mask[y0:y1, x0:x1]),
+        _scratch=np.empty_like(xray_roi),
+    )
+
+
+# ============================================================
 # Public API
 # ============================================================
+
+def _distortion_aware_maps(
+    H_xc: np.ndarray,
+    K_camera: np.ndarray,
+    dist_coeffs: np.ndarray,
+    camera_size_wh: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build remap tables for  xray px --H_xc--> ideal px --distort--> observed px.
+
+    H_xc maps X-ray pixels to IDEAL pinhole camera pixels, but the camera image
+    is distorted. Warping with H_xc alone therefore places the X-ray content
+    where a distortion-free camera would have imaged it.
+
+    The remap runs backwards: for every observed output pixel, undistort it to
+    the ideal pixel, then apply H_xc^-1 to find the X-ray source pixel.
+    """
+    Wc, Hc = int(camera_size_wh[0]), int(camera_size_wh[1])
+
+    uu, vv = np.meshgrid(
+        np.arange(Wc, dtype=np.float32),
+        np.arange(Hc, dtype=np.float32),
+    )
+    observed = np.stack([uu.ravel(), vv.ravel()], axis=1).reshape(-1, 1, 2)
+
+    ideal = cv2.undistortPoints(
+        observed, K_camera, dist_coeffs, P=K_camera
+    ).reshape(-1, 2)
+
+    q = (np.linalg.inv(H_xc) @ np.hstack([ideal, np.ones((len(ideal), 1))]).T).T
+    src = q[:, :2] / q[:, 2:3]
+
+    map_x = np.ascontiguousarray(src[:, 0].reshape(Hc, Wc).astype(np.float32))
+    map_y = np.ascontiguousarray(src[:, 1].reshape(Hc, Wc).astype(np.float32))
+    return map_x, map_y
+
 
 def warp_xray_to_camera(
     xray_gray_u8: np.ndarray,
     H_xc: np.ndarray,
     camera_size_wh: tuple[int, int],
+    *,
+    K_camera: np.ndarray | None = None,
+    dist_coeffs: np.ndarray | None = None,
 ) -> WarpedOverlay:
     """
     Warp a grayscale X-ray image and its detected FOV mask into camera coordinates.
@@ -205,6 +318,12 @@ def warp_xray_to_camera(
 
     camera_size_wh : (Wc,Hc)
         Output size in camera image coordinates.
+
+    K_camera, dist_coeffs : optional
+        RGB intrinsics and distortion coefficients. If both are given and the
+        coefficients are non-zero, the lens distortion is modelled in the warp
+        (see _distortion_aware_maps). Otherwise the plain projective warp is
+        used, which assumes an undistorted camera.
 
     Returns
     -------
@@ -235,25 +354,48 @@ def warp_xray_to_camera(
     # restrict X-ray to valid FOV only
     xray_masked = cv2.bitwise_and(xray_gray_u8, xray_gray_u8, mask=xray_fov_mask)
 
-    # warp masked X-ray image into camera image coordinates
-    warped_xray_gray = cv2.warpPerspective(
-        xray_masked,
-        H_xc,
-        dsize=(Wc, Hc),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+    use_distortion = (
+        K_camera is not None
+        and dist_coeffs is not None
+        and np.any(np.asarray(dist_coeffs, dtype=np.float64))
     )
 
-    # warp FOV mask -> actual overlay region in camera image
-    overlay_mask = cv2.warpPerspective(
-        xray_fov_mask,
-        H_xc,
-        dsize=(Wc, Hc),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
+    if use_distortion:
+        map_x, map_y = _distortion_aware_maps(
+            H_xc,
+            np.asarray(K_camera, dtype=np.float64).reshape(3, 3),
+            np.asarray(dist_coeffs, dtype=np.float64).reshape(-1),
+            (Wc, Hc),
+        )
+        warped_xray_gray = cv2.remap(
+            xray_masked, map_x, map_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        overlay_mask = cv2.remap(
+            xray_fov_mask, map_x, map_y, cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+    else:
+        # warp masked X-ray image into camera image coordinates
+        warped_xray_gray = cv2.warpPerspective(
+            xray_masked,
+            H_xc,
+            dsize=(Wc, Hc),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        # warp FOV mask -> actual overlay region in camera image
+        overlay_mask = cv2.warpPerspective(
+            xray_fov_mask,
+            H_xc,
+            dsize=(Wc, Hc),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
     overlay_mask = (overlay_mask > 0).astype(np.uint8) * 255
 
     return WarpedOverlay(
@@ -267,6 +409,9 @@ def blend_xray_overlay(
     xray_gray_u8: np.ndarray,
     H_xc: np.ndarray,
     alpha: float,
+    *,
+    K_camera: np.ndarray | None = None,
+    dist_coeffs: np.ndarray | None = None,
 ) -> tuple[np.ndarray, WarpedOverlay]:
     """
     Convenience function:
@@ -315,6 +460,8 @@ def blend_xray_overlay(
         xray_gray_u8=xray_gray_u8,
         H_xc=H_xc,
         camera_size_wh=(Wc, Hc),
+        K_camera=K_camera,
+        dist_coeffs=dist_coeffs,
     )
 
     out_bgr = cache.blend(camera_bgr, alpha=alpha)

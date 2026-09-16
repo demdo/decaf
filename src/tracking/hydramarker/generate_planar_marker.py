@@ -587,8 +587,14 @@ class GeneratePlanarMarkerUI(QWidget):
             surface_model = {
                 "type": "cylinder",
                 "axis": "row",
-                "regularize_columns_z": True,
-                "note": "Marker is mounted on a cylinder; SfM regularizes Z per column only.",
+                "note": (
+                    "Marker is mounted on a cylinder whose axis is identical to the "
+                    "drill axis. SfM is shape-agnostic (no cylinder regularization: "
+                    "real label skew and surface relief must survive into the model). "
+                    "The exporter fits the cylinder post-hoc from the exported corners "
+                    "into surface_model.fitted, which is the drill-axis calibration "
+                    "(axis_dir/axis_point in the marker frame)."
+                ),
             }
 
         pad_mm = padding_rel * square_size_mm

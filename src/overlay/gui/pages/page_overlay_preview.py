@@ -345,6 +345,7 @@ class OverlayPreviewPage(LiveImagePage):
             # Calibration / pose
             # -------------------------------------------------
             K_rgb=self.state.K_rgb,
+            dist_rgb=self.state.dist_rgb,
             K_xray=self.state.K_xray,
             T_cx=self.state.T_cx,
             T_xc=self.state.T_xc,
@@ -563,13 +564,24 @@ class OverlayPreviewPage(LiveImagePage):
             # H_xc and K_xray are defined in XRAY_WORKING_FLIPPED_UV space.
             # The loaded anatomy image is RAW, so flip the image before warping.
             # Do NOT modify H_xc.
-            self._xray_gray_working_u8 = _flip_xray_raw_to_working(self._xray_gray_u8)
+            # The pose was estimated on corrected marker points, so H_xc maps
+            # IDEAL X-ray pixels. The image has to be brought into that same
+            # frame, otherwise pose and image disagree.
+            working = _flip_xray_raw_to_working(self._xray_gray_u8)
+            field = self.state.xray_dist_field
+            if field is not None:
+                working = field.undistort_image_working(working)
+            self._xray_gray_working_u8 = working
 
+            # H_xc maps onto IDEAL pinhole pixels; the snapshot is distorted,
+            # so the lens model has to be part of the warp.
             out_bgr, cache = blend_xray_overlay(
                 camera_bgr=self._snapshot_rgb_bgr,
                 xray_gray_u8=self._xray_gray_working_u8,
                 H_xc=self.state.H_xc,
                 alpha=self._alpha,
+                K_camera=self.state.K_rgb,
+                dist_coeffs=self.state.dist_rgb,
             )
 
             out_bgr = self._draw_tip_on_top(out_bgr)

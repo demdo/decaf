@@ -2,7 +2,7 @@
 #
 # Wizard runner (Mode A):
 #   1) X-ray intrinsics
-#   2) Camera Calibration
+#   2) Camera intrinsics
 #   3) Plane Fitting
 #   4) X-ray Marker Selection
 #   5) Camera -> X-ray Calibration (PnP)
@@ -28,12 +28,13 @@ from PySide6.QtWidgets import (
 
 from overlay.gui.state import SessionState
 from overlay.gui.pages.page_xray_intrinsics import XrayIntrinsicsPage
-from overlay.gui.pages.page_camera_calibration import CameraCalibrationPage
+from overlay.gui.pages.page_camera_intrinsics import CameraIntrinsicsPage
 from overlay.gui.pages.page_plane_fitting import PlaneFittingPage
 from overlay.gui.pages.page_xray_marker_selection import XrayMarkerSelectionPage
 from overlay.gui.pages.page_camera_to_xray_calibration import CameraToXrayCalibrationPage
 from overlay.gui.pages.page_pointer_tool_depth import PointerToolDepthPage
 from overlay.gui.pages.page_overlay_preview import OverlayPreviewPage
+from overlay.gui.pages.page_tool_tracking import ToolTrackingPage
 from overlay.gui.pages.page_overlay_live import OverlayLivePage
 
 
@@ -75,7 +76,8 @@ class MainWindow(QMainWindow):
         self.IDX_CAM2XRAY = 4
         self.IDX_PTR_DEPTH = 5
         self.IDX_OVERLAY_PREVIEW = 6
-        self.IDX_OVERLAY_LIVE = 7
+        self.IDX_TOOL_TRACKING = 7
+        self.IDX_OVERLAY_LIVE = 8
 
         self.mode_a_indices = [
             self.IDX_XRAY,
@@ -88,6 +90,7 @@ class MainWindow(QMainWindow):
         self.mode_b_indices = [
             self.IDX_PTR_DEPTH,
             self.IDX_OVERLAY_PREVIEW,
+            self.IDX_TOOL_TRACKING,
             self.IDX_OVERLAY_LIVE,
         ]
 
@@ -125,7 +128,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.step_list, stretch=1)
 
         self.item_xray = QListWidgetItem("1) Load X-ray intrinsics")
-        self.item_rgb = QListWidgetItem("2) Camera Calibration")
+        self.item_rgb = QListWidgetItem("2) Load camera intrinsics")
         self.item_plane = QListWidgetItem("3) Plane fitting")
         self.item_markers = QListWidgetItem("4) X-ray marker selection")
         self.item_cam2xray = QListWidgetItem("5) Camera → X-ray (PnP)")
@@ -149,8 +152,19 @@ class MainWindow(QMainWindow):
         self.item_overlay_preview = QListWidgetItem("Overlay Preview")
         self.runtime_list.addItem(self.item_overlay_preview)
 
+        self.item_tool_tracking = QListWidgetItem("Tool Tracking")
+        self.runtime_list.addItem(self.item_tool_tracking)
+
         self.item_overlay_live = QListWidgetItem("Overlay Live")
         self.runtime_list.addItem(self.item_overlay_live)
+
+        # The QListWidget default size hint is a fixed 256x192 regardless of
+        # content — with four entries that clips "Overlay Live" and grows
+        # scrollbars. Scrollbars off here; the height is set after the QSS
+        # is applied (see below), because the item padding comes from it.
+        self.runtime_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.runtime_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.step_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         settings_btn = QPushButton("Settings")
         settings_btn.setEnabled(False)
@@ -172,12 +186,13 @@ class MainWindow(QMainWindow):
 
         # Pages
         self.page_xray = XrayIntrinsicsPage(self.state, self.on_complete_changed)
-        self.page_cam_calib = CameraCalibrationPage(self.state, self.on_complete_changed)
+        self.page_cam_calib = CameraIntrinsicsPage(self.state, self.on_complete_changed)
         self.page_plane = PlaneFittingPage(self.state, self.on_complete_changed)
         self.page_markers = XrayMarkerSelectionPage(self.state, self.on_complete_changed)
         self.page_cam2xray = CameraToXrayCalibrationPage(self.state, self.on_complete_changed)
         self.page_ptr_depth = PointerToolDepthPage(self.state, self.on_complete_changed)
         self.page_overlay_preview = OverlayPreviewPage(self.state, self.on_complete_changed)
+        self.page_tool_tracking = ToolTrackingPage(self.state, self.on_complete_changed)
         self.page_overlay_live = OverlayLivePage(self.state, self.on_complete_changed)
 
         self.pages.addWidget(self.page_xray)
@@ -187,6 +202,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.page_cam2xray)
         self.pages.addWidget(self.page_ptr_depth)
         self.pages.addWidget(self.page_overlay_preview)
+        self.pages.addWidget(self.page_tool_tracking)
         self.pages.addWidget(self.page_overlay_live)
 
         self._wire_nav(self.page_xray, idx=self.IDX_XRAY)
@@ -196,6 +212,7 @@ class MainWindow(QMainWindow):
         self._wire_nav(self.page_cam2xray, idx=self.IDX_CAM2XRAY)
         self._wire_nav(self.page_ptr_depth, idx=self.IDX_PTR_DEPTH)
         self._wire_nav(self.page_overlay_preview, idx=self.IDX_OVERLAY_PREVIEW)
+        self._wire_nav(self.page_tool_tracking, idx=self.IDX_TOOL_TRACKING)
         self._wire_nav(self.page_overlay_live, idx=self.IDX_OVERLAY_LIVE)
 
         self.root_layout.addWidget(self.sidebar)
@@ -203,6 +220,17 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
         self.setStyleSheet(QSS)
+
+        # Size the runtime list to its four items. Must happen after the QSS
+        # is applied: the 10px item padding comes from the stylesheet and
+        # only then shows up in sizeHintForRow.
+        rows_h = sum(
+            self.runtime_list.sizeHintForRow(i)
+            for i in range(self.runtime_list.count())
+        )
+        # + per-item QSS margin (4px top/bottom) + frame + slack
+        rows_h += self.runtime_list.count() * 8 + 2 * self.runtime_list.frameWidth() + 4
+        self.runtime_list.setFixedHeight(rows_h)
 
         self.pages.setCurrentIndex(self.IDX_XRAY)
         self._call_page_enter(self.IDX_XRAY)
@@ -227,8 +255,15 @@ class MainWindow(QMainWindow):
             return self.state.has_d_x
         if idx == self.IDX_OVERLAY_PREVIEW:
             return self.state.has_H_xc and self.state.has_xray_image_anatomy
+        if idx == self.IDX_TOOL_TRACKING:
+            return self.state.has_tool
         if idx == self.IDX_OVERLAY_LIVE:
-            return self.state.has_H_xc and self.state.has_xray_image_anatomy
+            # Checked only once the Tool Tracking step before it is done.
+            return (
+                self.state.has_H_xc
+                and self.state.has_xray_image_anatomy
+                and self.state.has_tool
+            )
         return False
 
     def can_enter_step(self, idx: int) -> bool:
@@ -355,7 +390,7 @@ class MainWindow(QMainWindow):
             if idx == self.IDX_XRAY:
                 _set_item_text(self.item_xray, done_a[pos], locked, "1) Load X-ray intrinsics")
             elif idx == self.IDX_CAM_CALIB:
-                _set_item_text(self.item_rgb, done_a[pos], locked, "2) Camera Calibration")
+                _set_item_text(self.item_rgb, done_a[pos], locked, "2) Load camera intrinsics")
             elif idx == self.IDX_PLANE:
                 _set_item_text(self.item_plane, done_a[pos], locked, "3) Plane fitting")
             elif idx == self.IDX_MARKERS:
@@ -372,13 +407,15 @@ class MainWindow(QMainWindow):
                 _set_item_text(self.item_ptr_depth, done_b[pos], locked, "Pointer Tool Depth")
             elif idx == self.IDX_OVERLAY_PREVIEW:
                 _set_item_text(self.item_overlay_preview, done_b[pos], locked, "Overlay Preview")
+            elif idx == self.IDX_TOOL_TRACKING:
+                _set_item_text(self.item_tool_tracking, done_b[pos], locked, "Tool Tracking")
             elif idx == self.IDX_OVERLAY_LIVE:
                 _set_item_text(self.item_overlay_live, done_b[pos], locked, "Overlay Live")
 
         if self.current_step == self.IDX_XRAY:
             self.lbl_step_title.setText("Step 1 — Load X-ray intrinsics")
         elif self.current_step == self.IDX_CAM_CALIB:
-            self.lbl_step_title.setText("Step 2 — Camera Calibration")
+            self.lbl_step_title.setText("Step 2 — Load camera intrinsics")
         elif self.current_step == self.IDX_PLANE:
             self.lbl_step_title.setText("Step 3 — Plane fitting")
         elif self.current_step == self.IDX_MARKERS:
@@ -389,6 +426,8 @@ class MainWindow(QMainWindow):
             self.lbl_step_title.setText("Mode B — Pointer Tool Depth")
         elif self.current_step == self.IDX_OVERLAY_PREVIEW:
             self.lbl_step_title.setText("Mode B — Overlay Preview")
+        elif self.current_step == self.IDX_TOOL_TRACKING:
+            self.lbl_step_title.setText("Mode B — Tool Tracking")
         elif self.current_step == self.IDX_OVERLAY_LIVE:
             self.lbl_step_title.setText("")
         else:

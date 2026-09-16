@@ -2,6 +2,7 @@
 hydramarker/debug/
 hydramarker/data/
 hydramarker/tests/
+hydramarker/docs/
 
 # Generated calibration outputs stay local; calibration scripts remain tracked.
 hydramarker/calib/camera_calibration*.npz

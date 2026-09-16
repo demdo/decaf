@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 from PySide6.QtCore import QTimer
 import pyrealsense2 as rs
 import numpy as np
-import cv2
 
 from overlay.gui.pages.templates.templ_base_image import BaseImagePage
 
@@ -31,18 +30,10 @@ class LiveImagePage(BaseImagePage):
         
     # ---------------- RGB helper ----------------
 
-    def _apply_rgb_rotation(self, img: np.ndarray) -> np.ndarray:
-        state = getattr(self, "state", None)
-        rotate_rgb = bool(getattr(state, "rotate_rgb", False))
-        if not rotate_rgb:
-            return img
-        return cv2.rotate(img, cv2.ROTATE_180)
-
     def color_frame_to_bgr(self, cf) -> Optional[np.ndarray]:
         if cf is None:
             return None
-        img = np.asanyarray(cf.get_data())
-        return self._apply_rgb_rotation(img)
+        return np.asanyarray(cf.get_data())
 
     # ---------------- Timer ----------------
 

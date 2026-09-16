@@ -2,9 +2,10 @@
 
 Refines the SfM marker model with the reference-free IR stereo measurement:
 per observation still, the pose comes from solvePnP on the stored
-correspondences, the marker corners are measured in BOTH IR views
-(quadratic-form + synthetic saddle, via the tracker engine), triangulated
-over the metric baseline and compared against the model. The per-corner 3D
+correspondences, the marker corners are measured in BOTH IR views (via the
+tracker engine, operator per --corner-method: quadratic-form + synthetic saddle,
+or the plain subpix snap), triangulated over the metric baseline and compared
+against the model. The per-corner 3D
 median residual (marker frame) corrects the corner coordinates — exactly
 the radial/depth information the monocular RGB SfM cannot observe.
 
@@ -138,6 +139,15 @@ def main() -> None:
     ap.add_argument("--depth-scale", type=float, default=1.00197)
     ap.add_argument("--max-reproj-px", type=float, default=1.0)
     ap.add_argument("--epipolar-max-dv-px", type=float, default=2.5)
+    # IR corner operator used to MEASURE the two views. Must match the operator
+    # the RUNTIME uses, otherwise the model is self-consistent with the wrong one
+    # (measured 2026-07-29: a QF-built model made the subpix runtime look 1.1 mm
+    # worse in z purely by that mismatch). "subpix" is the runtime default since
+    # 2026-07-29, so it is the default here too.
+    ap.add_argument("--corner-method", choices=("subpix", "quadratic_form"),
+                    default="subpix")
+    # Output suffix, so variants do not overwrite each other.
+    ap.add_argument("--out-suffix", default="_ir3d")
     args = ap.parse_args()
 
     # Ohne CLI-Argumente: dieselben Qt-Dialoge wie Recorder/Pipeline.
@@ -192,7 +202,8 @@ def main() -> None:
     # (surface model + full-pattern template + IR intrinsics).
     cfg = TrackerConfig()
     cfg.ir_refine_enabled = True
-    cfg.ir_corner_method = "quadratic_form"
+    cfg.ir_corner_method = args.corner_method
+    print(f"[refine-ir] IR corner method: {cfg.ir_corner_method}")
     tracker = make_tracker(args.field, args.model_json, K_cam, dist_cam,
                            config=cfg)
     tracker.set_ir_calibration(args.ir_calib_npz)
@@ -250,11 +261,11 @@ def main() -> None:
 
         rvec_a = cv2.Rodrigues(R_A)[0].reshape(3)
         rvec_b = cv2.Rodrigues(R_B)[0].reshape(3)
-        mL = eng.measure_ir_view_qf(
+        mL = eng.measure_ir_view(
             irl, False, [float(x) for x in rvec_a],
             [float(x) for x in t_A], [float(x) for x in obj.ravel()],
             [float(x) for x in seedL.ravel()])
-        mR = eng.measure_ir_view_qf(
+        mR = eng.measure_ir_view(
             irr, True, [float(x) for x in rvec_b],
             [float(x) for x in t_B], [float(x) for x in obj.ravel()],
             [float(x) for x in seedR.ravel()])
@@ -417,9 +428,10 @@ def main() -> None:
         "median_dx_mm": float(np.median(dmag)),
         "odd_even_split_med_mm": float(np.median(splits)),
         "depth_scale": args.depth_scale,
+        "corner_method": args.corner_method,
     }
     out_path = Path(args.model_json).with_name(
-        Path(args.model_json).stem + "_ir3d.json")
+        Path(args.model_json).stem + args.out_suffix + ".json")
     out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"[refine-ir] geschrieben: {out_path}")
 
