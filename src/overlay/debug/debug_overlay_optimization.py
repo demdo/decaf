@@ -58,6 +58,8 @@ from overlay.tools.ransac_plane_fitting import (
 )
 from overlay.tools.warp import blend_xray_overlay, _detect_xray_fov_mask
 from overlay.calib.calib_camera_to_xray import calibrate_camera_to_xray
+from overlay.tools.xray_distortion import load_xray_distortion
+from overlay.tools.xray_marker_selection import index_board_lattice
 from overlay.gui.pages.page_camera_to_xray_calibration import PCB_THICKNESS_MM
 
 # Private solver internals. The production ippe_handeye path is replicated
@@ -787,7 +789,7 @@ def solve_ippe_handeye(
     T_bc = _make_transform(cv2.Rodrigues(rvec_bc)[0], tvec_bc.ravel())
 
     cand_x = _build_ippe_candidates(board_mm, uv_xray, K_xray, dist_xray)
-    i_x = _select_ippe_candidate(cand_x, use_xray_ippe_selection_rule=True)
+    i_x = _select_ippe_candidate(cand_x)  # z-axis rule removed 2026-09-15 (5d164fd); legacy variant
     rvec_bx = np.asarray(cand_x[i_x].rvec, dtype=np.float64).reshape(3, 1)
     tvec_bx = np.asarray(cand_x[i_x].tvec, dtype=np.float64).reshape(3, 1)
     if refine:
@@ -880,7 +882,7 @@ def solve_with_board_offset(data: EvalData, offset_mm: float) -> np.ndarray:
     T_bc = _make_transform(cv2.Rodrigues(rvec_bc)[0], tvec_bc.ravel())
 
     cand_x = _build_ippe_candidates(board_xray, uv_xray, data.K_xray, dist_xray)
-    i_x = _select_ippe_candidate(cand_x, use_xray_ippe_selection_rule=True)
+    i_x = _select_ippe_candidate(cand_x)  # z-axis rule removed 2026-09-15 (5d164fd); legacy variant
     rvec_bx = np.asarray(cand_x[i_x].rvec, dtype=np.float64).reshape(3, 1)
     tvec_bx = np.asarray(cand_x[i_x].tvec, dtype=np.float64).reshape(3, 1)
     rvec_bx, tvec_bx = _refine_pose_iterative(
@@ -902,6 +904,14 @@ def _board_offset_variant(offset_mm: float):
 
 XRAY_DIST: XrayDistortion | None = None       # filled in main()
 
+# The shipped distortion field (data/K_xray.npz, what the intrinsics page
+# loads) and the switch that makes the undistort helpers use it. Set per
+# variant in main(); None -> the harness' own fit above (legacy variants).
+PRODUCTION_KXRAY = Path(__file__).resolve().parents[1] / "data" / "K_xray.npz"
+PROD_FIELD = load_xray_distortion(str(PRODUCTION_KXRAY))
+_ACTIVE_FIELD = None
+VARIANT_XRAY_FIELD = {"production": PROD_FIELD}
+
 
 def undistort_xray_points_working(uv_work: np.ndarray) -> np.ndarray:
     """
@@ -916,6 +926,8 @@ def undistort_xray_points_working(uv_work: np.ndarray) -> np.ndarray:
 
 def undistort_xray_image_working(img: np.ndarray) -> np.ndarray:
     """Undistort a WORKING-space X-ray image, so it matches the corrected points."""
+    if _ACTIVE_FIELD is not None:
+        return _ACTIVE_FIELD.undistort_image_working(img)
     h, w = img.shape[:2]
     uu, vv = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
     ideal_work = np.stack([uu.ravel(), vv.ravel()], axis=1)
@@ -984,10 +996,35 @@ def variant_production(data: EvalData) -> tuple[np.ndarray, float]:
     """
     xyz = recompute_grid_with_distortion(data)
 
+    # 2026-09-15/16 pipeline: patch points corrected with the shipped field,
+    # X-ray-side pose refined on the whole board lattice (page_xray_marker_
+    # selection builds it from the raw detections, page_camera_to_xray_
+    # calibration corrects it with the same field).
+    uv = data.xray_points_uv
+    if PROD_FIELD is not None:
+        uv = PROD_FIELD.undistort_working(uv)
+
+    lattice_uv = lattice_xy = None
+    sel = _find_marker_selection(data.path.parent)
+    if sel is not None:
+        lat_uv, _lat_ij, lat_xy, lat_dbg = index_board_lattice(
+            np.asarray(sel["circles_uvr"], dtype=np.float64)[:, :2],
+            np.asarray(sel["points_uv_raw"], dtype=np.float64).reshape(-1, 2),
+            image_width=int(sel["image_width"]),
+        )
+        lattice_uv = PROD_FIELD.undistort_working(lat_uv) if PROD_FIELD is not None else lat_uv
+        lattice_xy = lat_xy
+        print(f"  production: board lattice {lat_dbg['n_indexed']} of "
+              f"{lat_dbg['n_detections']} detections, homography rms "
+              f"{lat_dbg['homography_resid_rms_px']:.2f} px; field "
+              f"{'on' if PROD_FIELD is not None else 'OFF'}")
+    else:
+        print("  production: no marker-selection NPZ -> patch-only pose (legacy)")
+
     calib = calibrate_camera_to_xray(
         K_xray=data.K_xray,
         points_xyz_camera=xyz,
-        points_uv_xray=data.xray_points_uv,
+        points_uv_xray=uv,
         dist_coeffs=None,
         dist_coeffs_rgb=data.dist_rgb,
         pose_method="ippe_handeye",
@@ -997,8 +1034,19 @@ def variant_production(data: EvalData) -> tuple[np.ndarray, float]:
         K_rgb=data.K_rgb,
         steps_per_edge=STEPS_PER_EDGE,
         board_thickness_mm=PCB_THICKNESS_MM,
+        xray_lattice_uv=lattice_uv,
+        xray_lattice_xy_mm=lattice_xy,
     )
     return calib.T_xc, d_x_from_pose(calib.T_cx, data.tip_xyz_c)
+
+
+def _find_marker_selection(eval_dir: Path):
+    """The marker-selection NPZ of the same session (raw detections + patch)."""
+    for f in sorted(eval_dir.glob("xray_marker_selection_*.npz")):
+        d = np.load(str(f), allow_pickle=True)
+        if "circles_uvr" in d.files and "points_uv_raw" in d.files and len(d["circles_uvr"]) > 200:
+            return d
+    return None
 
 
 def variant_all(data: EvalData) -> tuple[np.ndarray, float]:
@@ -1063,7 +1111,7 @@ VARIANTS: dict[str, Callable[[EvalData], tuple[np.ndarray, float]]] = {
 DISTORTED_WARP = {"dist_rgb", "all", "production", "xray_pose", "xray_full", "xray_k1"}
 
 # Variants that additionally undistort the X-ray image before warping.
-UNDISTORT_XRAY = {"xray_full"}
+UNDISTORT_XRAY = {"xray_full", "production"}
 
 # Variants that need the X-ray distortion model and are skipped without it.
 NEEDS_XRAY_DIST = {"xray_pose", "xray_full"}
@@ -1447,9 +1495,11 @@ def main() -> None:
     print(f"  reference housings detected in the RGB snapshot: {len(housings)}\n")
 
     results: dict[str, tuple] = {}
+    global _ACTIVE_FIELD
     for name, fn in VARIANTS.items():
         if name in NEEDS_XRAY_DIST and XRAY_DIST is None:
             continue
+        _ACTIVE_FIELD = VARIANT_XRAY_FIELD.get(name)
         T_xc, d_x = fn(data)
         stored = name in ("baseline", "recomputed")
         rendered[name] = render_and_save(data, name, T_xc, d_x, alphas, out_dir, roi,
