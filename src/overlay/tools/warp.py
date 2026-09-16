@@ -217,25 +217,31 @@ def prepare_live_overlay(
     xray_gray_u8: np.ndarray,
     H_xc: np.ndarray,
     camera_size_wh: tuple[int, int],
+    *,
+    K_camera: np.ndarray | None = None,
+    dist_coeffs: np.ndarray | None = None,
 ) -> LiveOverlay | None:
     """
     Build a LiveOverlay. Returns None when the warp lands outside the frame.
 
-    Uses the same FOV detection and warp as warp_xray_to_camera, so the result
-    is visually identical to the preview path.
+    The warp itself is warp_xray_to_camera, the same call the preview page
+    makes, so both paths are pixel-identical by construction. With K_camera
+    and dist_coeffs given, the backward map runs through the lens distortion
+    of the colour camera: H_xc places X-ray content on IDEAL pixels, the live
+    frame is the OBSERVED (distorted) image, and without the lens model the
+    overlay sits beside the anatomy by the local lens displacement - zero at
+    the principal point, several pixels towards the edge of the field. This
+    is a one-off cost per homography; per frame nothing changes.
     """
-    xray_gray_u8 = np.asarray(xray_gray_u8)
-    H_xc = _as_homography(H_xc, name="H_xc")
-    Wc, Hc = int(camera_size_wh[0]), int(camera_size_wh[1])
-
-    fov = _detect_xray_fov_mask(xray_gray_u8)
-    masked = cv2.bitwise_and(xray_gray_u8, xray_gray_u8, mask=fov)
-
-    warped = cv2.warpPerspective(masked, H_xc, (Wc, Hc), flags=cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    mask = cv2.warpPerspective(fov, H_xc, (Wc, Hc), flags=cv2.INTER_NEAREST,
-                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    mask = (mask > 0).astype(np.uint8) * 255
+    warped_full = warp_xray_to_camera(
+        xray_gray_u8=xray_gray_u8,
+        H_xc=H_xc,
+        camera_size_wh=camera_size_wh,
+        K_camera=K_camera,
+        dist_coeffs=dist_coeffs,
+    )
+    warped = warped_full.warped_xray_gray
+    mask = warped_full.overlay_mask
 
     ys, xs = np.nonzero(mask)
     if len(xs) == 0:
@@ -259,6 +265,37 @@ def prepare_live_overlay(
 # Public API
 # ============================================================
 
+# observed -> ideal pixel grid, keyed by (K, dist, size). It depends on the
+# camera model only, not on the homography, so it is built once per session;
+# per homography only H^-1 is applied. Without the cache every change of the
+# reference depth cost ~145 ms in cv2.undistortPoints over the full frame.
+_IDEAL_GRID_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _ideal_pixel_grid_h(
+    K_camera: np.ndarray,
+    dist_coeffs: np.ndarray,
+    camera_size_wh: tuple[int, int],
+) -> np.ndarray:
+    """(N, 3) homogeneous IDEAL pixel coordinates of every observed pixel."""
+    Wc, Hc = int(camera_size_wh[0]), int(camera_size_wh[1])
+    key = (K_camera.tobytes(), dist_coeffs.tobytes(), Wc, Hc)
+    grid = _IDEAL_GRID_CACHE.get(key)
+    if grid is None:
+        uu, vv = np.meshgrid(
+            np.arange(Wc, dtype=np.float32),
+            np.arange(Hc, dtype=np.float32),
+        )
+        observed = np.stack([uu.ravel(), vv.ravel()], axis=1).reshape(-1, 1, 2)
+        ideal = cv2.undistortPoints(
+            observed, K_camera, dist_coeffs, P=K_camera
+        ).reshape(-1, 2)
+        grid = np.hstack([ideal, np.ones((len(ideal), 1))])
+        _IDEAL_GRID_CACHE.clear()   # one camera model at a time is enough
+        _IDEAL_GRID_CACHE[key] = grid
+    return grid
+
+
 def _distortion_aware_maps(
     H_xc: np.ndarray,
     K_camera: np.ndarray,
@@ -273,21 +310,18 @@ def _distortion_aware_maps(
     where a distortion-free camera would have imaged it.
 
     The remap runs backwards: for every observed output pixel, undistort it to
-    the ideal pixel, then apply H_xc^-1 to find the X-ray source pixel.
+    the ideal pixel (cached grid), then apply H_xc^-1 to find the X-ray source
+    pixel.
     """
     Wc, Hc = int(camera_size_wh[0]), int(camera_size_wh[1])
 
-    uu, vv = np.meshgrid(
-        np.arange(Wc, dtype=np.float32),
-        np.arange(Hc, dtype=np.float32),
+    ideal_h = _ideal_pixel_grid_h(
+        np.ascontiguousarray(K_camera, dtype=np.float64),
+        np.ascontiguousarray(dist_coeffs, dtype=np.float64),
+        (Wc, Hc),
     )
-    observed = np.stack([uu.ravel(), vv.ravel()], axis=1).reshape(-1, 1, 2)
 
-    ideal = cv2.undistortPoints(
-        observed, K_camera, dist_coeffs, P=K_camera
-    ).reshape(-1, 2)
-
-    q = (np.linalg.inv(H_xc) @ np.hstack([ideal, np.ones((len(ideal), 1))]).T).T
+    q = ideal_h @ np.linalg.inv(H_xc).T
     src = q[:, :2] / q[:, 2:3]
 
     map_x = np.ascontiguousarray(src[:, 0].reshape(Hc, Wc).astype(np.float32))

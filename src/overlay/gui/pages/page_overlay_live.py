@@ -992,10 +992,15 @@ class OverlayLivePage(QWidget):
                 # H_xc itself is never modified.
                 t = time.perf_counter()
                 h, w = frame_bgra.shape[:2]
+                # K_rgb/dist_rgb: the warp routes through the lens model so
+                # the X-ray lands where the observed frame shows the anatomy,
+                # consistent with the tracker's tip/axis projection.
                 self._overlay_cache = prepare_live_overlay(
                     xray_gray_u8=self._xray_working_u8,
                     H_xc=H_xc,
                     camera_size_wh=(w, h),
+                    K_camera=self.state.K_rgb,
+                    dist_coeffs=self.state.dist_rgb,
                 )
                 if prof:
                     prof.add("prepare*", time.perf_counter() - t)

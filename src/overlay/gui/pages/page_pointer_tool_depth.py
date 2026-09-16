@@ -257,7 +257,9 @@ class PointerToolDepthPage(LiveImagePage):
         translation_f = tvec_f.copy()
 
         K = np.asarray(self.state.K_rgb, dtype=np.float64)
-        dist = np.zeros((5, 1), dtype=np.float64)
+        # Project WITH the lens model: tip_uv_c is drawn on the observed
+        # (distorted) frame, like the tracker's tip and the warped X-ray.
+        dist = self.state.dist_rgb
 
         tip_uv_f, _ = cv2.projectPoints(
             np.zeros((1, 3), dtype=np.float64),  # tip origin in tip frame
@@ -396,10 +398,13 @@ class PointerToolDepthPage(LiveImagePage):
             )
 
             try:
+                # dist_rgb: the ArUco corners are observed in the distorted
+                # frame; solving with the lens model gives T_cp against the
+                # ideal camera, the frame T_xc is defined in.
                 raw_result = calibrate_camera_to_pointer(
                     image_bgr=img,
                     camera_intrinsics=self.state.K_rgb,
-                    dist_coeffs=None,
+                    dist_coeffs=self.state.dist_rgb,
                     pointer_model=self.pointer_model,
                     rvec_init=None,
                     tvec_init=None,
