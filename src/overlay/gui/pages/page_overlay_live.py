@@ -770,6 +770,7 @@ class OverlayLivePage(QWidget):
         self._track_frames = 0             # frames since tracking start
         self._track_stale = 0              # consecutive frames without fresh pose
         self._tool_overlay: TrackingOverlay | None = None
+        self._last_pose_result = None      # last TrackerResult with a fresh pose
         self._has_fresh_pose = None        # tracker_log.has_fresh_pose (lazy)
         self._tracker_log_module = None    # tracking.hydramarker.tracker_log (lazy)
         # Created in _make_tracker iff TrackerConfig.failure_log_enabled.
@@ -1275,6 +1276,7 @@ class OverlayLivePage(QWidget):
             self._track_fail_log.flush(reason, self._track_frames)
         if self._tool_overlay is not None:
             self._tool_overlay.clear()
+        self._last_pose_result = None
         if self._tracker is not None:
             try:
                 self._tracker.reset()
@@ -1296,10 +1298,12 @@ class OverlayLivePage(QWidget):
                     "tracking" if converged else "tracking (settling…)"
                 )
             self._tool_overlay.update(result)
+            self._last_pose_result = result
             return
 
         self._track_stale += 1
         self._tool_overlay.clear()
+        self._last_pose_result = None
 
         if not self._track_locked:
             if self._track_frames >= self.TRACK_ACQUIRE_TIMEOUT_FRAMES:
@@ -1353,6 +1357,15 @@ class OverlayLivePage(QWidget):
             02_rgb_overlay.png        + X-ray overlay at the current alpha
             03_rgb_overlay_drill.png  + drill tip and axis (only while a
                                         tracked pose is on screen)
+            snapshot.json             the numbers behind the layers: alpha,
+                                        d_x and its offset, H_xc, camera
+                                        model, reference-plane point, and
+                                        while tracking the projected tip/
+                                        axis pixels with the pose they came
+                                        from - so a thesis figure can redraw
+                                        the marks from the bare camera frame
+                                        instead of recovering them from the
+                                        burnt-in pixels
 
         Runs in the click handler between two timer ticks, so the zero-copy
         camera view is stable for the duration; the live loop just skips a
@@ -1400,6 +1413,10 @@ class OverlayLivePage(QWidget):
                 )
                 written.append("03_rgb_overlay_drill")
 
+            with open(out_dir / "snapshot.json", "w", encoding="utf-8") as f:
+                json.dump(self._snapshot_record(out_dir.name), f, indent=2)
+            written.append("snapshot.json")
+
             QMessageBox.information(
                 self,
                 "Save snapshot",
@@ -1407,6 +1424,62 @@ class OverlayLivePage(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "Save snapshot", f"Saving failed.\n\n{e}")
+
+    def _snapshot_record(self, name: str) -> dict:
+        """Everything a figure needs to rebuild the layers from 01_rgb.png."""
+
+        def arr(v):
+            return None if v is None else np.asarray(v, dtype=np.float64).tolist()
+
+        h, w = self._live_color.shape[:2]
+        rec = {
+            "snapshot": name,
+            "frame_wh": [int(w), int(h)],
+            "alpha": float(self._alpha),
+            "d_x_mm": self._current_d_x_mm,
+            "d_x_base_mm": self._base_d_x_mm,
+            "d_x_offset_mm": int(self._dx_offset_mm),
+            "H_xc": arr(self.state.H_xc),
+            "K_rgb": arr(self.state.K_rgb),
+            "dist_rgb": arr(self.state.dist_rgb),
+            "K_xray": arr(self.state.K_xray),
+            "T_xc": arr(self.state.T_xc),
+            # the live warp runs through the colour lens (prepare_live_overlay
+            # with K_rgb/dist_rgb); recorded so an offline re-render knows
+            "warp_through_lens": True,
+            "xray_image_path": self.state.xray_image_path,
+            "reference_plane_point_uv": arr(self.state.tip_uv_c),
+            "reference_plane_point_xyz_c_mm": arr(self.state.tip_xyz_c),
+            "show_tip": bool(self._show_tip),
+            "show_axis": bool(self._show_axis),
+            "tracking_active": bool(self._tracking_active),
+            "tool": None,
+        }
+
+        if self._tool_overlay is not None and self._tool_overlay.has_pose:
+            tool = self._tool_overlay.snapshot_record()
+            res = self._last_pose_result
+            tool["pose"] = None if res is None else {
+                "rvec": arr(res.rvec),
+                "tvec": arr(res.tvec),
+                "rvec_prefusion": arr(res.rvec_prefusion),
+                "tvec_prefusion": arr(res.tvec_prefusion),
+                "pose_source": getattr(res.pose_source, "name", str(res.pose_source)),
+                "pose_converged": bool(getattr(res, "pose_converged", False)),
+                "mean_reprojection_error_px": float(res.mean_reprojection_error_px),
+                "num_points": int(res.num_points),
+                "num_inliers": int(res.num_inliers),
+            }
+            if self._tool is not None:
+                tool["assets"] = {
+                    "name": self._tool.name,
+                    "field_path": str(self._tool.field_path),
+                    "marker_json_path": str(self._tool.marker_json_path),
+                    "pivot_npz_path": str(self._tool.pivot_npz_path),
+                }
+            rec["tool"] = tool
+
+        return rec
 
     # --------------------------------------------------------
     # Lifecycle

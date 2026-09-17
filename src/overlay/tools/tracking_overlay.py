@@ -63,6 +63,10 @@ class TrackingOverlay:
 
         self._tip_uv: Optional[np.ndarray] = None
         self._back_uv: Optional[np.ndarray] = None
+        # The blended camera-frame points behind the pixels (mm), kept for
+        # the snapshot record; not needed for drawing.
+        self._tip_cam: Optional[np.ndarray] = None
+        self._back_cam: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # Per-frame state
@@ -94,15 +98,45 @@ class TrackingOverlay:
             return
         self._tip_uv = uv[0]
         self._back_uv = uv[1]
+        self._tip_cam = tip_cam
+        self._back_cam = back_cam
 
     def clear(self) -> None:
         self._tip_uv = None
         self._back_uv = None
+        self._tip_cam = None
+        self._back_cam = None
 
     @property
     def has_pose(self) -> bool:
         """True while draw_into would actually draw (fresh projected pose)."""
         return self._tip_uv is not None
+
+    def snapshot_record(self) -> Optional[dict]:
+        """The numbers behind the current drawing, JSON-ready; None without a pose.
+
+        tip_uv/back_uv are the exact float pixels draw_into rounds from,
+        tip_cam/back_cam the blended camera-frame points (mm) they were
+        projected from, p_tip/axis_dir/axis_back_mm the tool geometry.
+        """
+        if self._tip_uv is None:
+            return None
+        return {
+            "tip_uv": [float(v) for v in self._tip_uv],
+            "back_uv": [float(v) for v in self._back_uv],
+            "tip_cam_mm": [float(v) for v in self._tip_cam],
+            "back_cam_mm": [float(v) for v in self._back_cam],
+            "p_tip_mm": [float(v) for v in self._p_tip],
+            "axis_dir": [float(v) for v in self._axis],
+            "axis_back_mm": float(self.AXIS_BACK_MM),
+            "style": {
+                "tip_radius_px": int(self.TIP_RADIUS),
+                "tip_cross_px": int(self.TIP_CROSS),
+                "thickness_px": int(self.THICKNESS),
+                "dash_pieces": int(self.DASH_PIECES),
+                "colour_bgra": [int(c) for c in self.AXIS_COLOR],
+            },
+        }
 
     # ------------------------------------------------------------------
     # Drawing
