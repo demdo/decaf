@@ -306,6 +306,11 @@ class CameraIntrinsicsPage(StaticImagePage):
         if not path:
             return
 
+        self.load_from_path(path)
+
+    def load_from_path(self, path: str) -> bool:
+        """Load K_rgb / dist_rgb from a file; also used by the
+        evaluation-mode auto-load. Returns True on success."""
         try:
             suffix = Path(path).suffix.lower()
 
@@ -323,6 +328,8 @@ class CameraIntrinsicsPage(StaticImagePage):
 
             self.refresh()
             self.on_complete_changed()
+            return True
 
         except Exception as e:
             QMessageBox.critical(self, "Failed to load camera intrinsics", str(e))
+            return False

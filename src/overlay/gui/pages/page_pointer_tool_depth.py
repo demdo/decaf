@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import cv2
 import numpy as np
 
@@ -201,6 +203,16 @@ class PointerToolDepthPage(LiveImagePage):
 
         self._last_valid_result = None
         self._last_proposed_result = None
+        # the unfiltered solve behind _last_valid_result (evaluation save)
+        self._last_raw_result = None
+        self._last_proposed_raw_result = None
+
+        # Evaluation mode: per-frame time series while recording
+        self._recording: bool = False
+        self._rec_rows: list[dict] = []
+        self._rec_t0: float = 0.0
+        self._rec_frame_dir = None
+        self._rec_n_frames: int = 0
 
         self._stats: list[str] = []
         self._last_stats_rows: list[tuple[str, str]] | None = None
@@ -298,6 +310,15 @@ class PointerToolDepthPage(LiveImagePage):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(12)
         row.addWidget(self.btn_start, 0, Qt.AlignTop)
+
+        # Evaluation mode only: record the raw vs filtered tip per frame
+        self.btn_record = QPushButton("Record series")
+        self.btn_record.clicked.connect(self._on_record_clicked)
+        self.btn_record.setFocusPolicy(Qt.NoFocus)
+        self.btn_record.setMinimumHeight(44)
+        self.btn_record.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.btn_record.setVisible(self.state.eval is not None)
+        row.addWidget(self.btn_record, 0, Qt.AlignTop)
         row.addStretch(1)
 
         self.controls_content.addWidget(wrap)
@@ -416,8 +437,12 @@ class PointerToolDepthPage(LiveImagePage):
                 # apply Kalman filtering to tip position / translation
                 result = self._filter_pointer_result(raw_result)
 
+                self._last_raw_result = raw_result
                 self._last_valid_result = result
                 self._found = True
+
+                if self._recording:
+                    self._record_frame(img, raw_result, result)
 
                 return self._build_tracking_vis(
                     img,
@@ -430,7 +455,10 @@ class PointerToolDepthPage(LiveImagePage):
 
             except Exception:
                 self._last_valid_result = None
+                self._last_raw_result = None
                 self._found = False
+                if self._recording:
+                    self._record_frame(img, None, None)
 
                 vis = img.copy()
                 vis = _draw_text_box(
@@ -503,7 +531,10 @@ class PointerToolDepthPage(LiveImagePage):
             return
 
         self.stop_timer()
+        if self._recording:
+            self._stop_recording()
         self._last_proposed_result = self._last_valid_result
+        self._last_proposed_raw_result = self._last_raw_result
 
         frozen_vis = self._build_tracking_vis(
             self._live_color.copy(),
@@ -563,6 +594,9 @@ class PointerToolDepthPage(LiveImagePage):
                 f"Reprojection error: {self._last_proposed_result.reproj_mean_px:.3f} px",
                 f"d_x: {res.d_x_mm:.3f} mm",
             ]
+
+            if self.state.eval is not None:
+                self._save_evaluation(d_x_mm=float(res.d_x_mm))
             self._last_stats_rows = None
 
             self._mode = "frozen"
@@ -610,6 +644,178 @@ class PointerToolDepthPage(LiveImagePage):
 
     def _update_buttons(self) -> None:
         self.btn_start.setEnabled(self._mode in ("idle", "preview"))
+        if hasattr(self, "btn_record"):
+            self.btn_record.setEnabled(self._mode == "tracking")
+            self.btn_record.setText("Stop recording" if self._recording else "Record series")
+
+    # ---------------------------------------------------------
+    # Evaluation mode
+    # ---------------------------------------------------------
+
+    def _save_evaluation(self, *, d_x_mm: float) -> None:
+        """<label>_depth.npz: the accepted pointer frame with everything
+        behind d_x - detected corners and ids (so the pose can be re-solved
+        offline, e.g. without the lens model), the raw and the filtered
+        tip, T_tc, T_xc, K_rgb, dist_rgb."""
+        ev = self.state.eval
+        res = self._last_proposed_result
+        raw = self._last_proposed_raw_result
+
+        def opt(a, dtype=np.float64):
+            return None if a is None else np.asarray(a, dtype=dtype)
+
+        arrays = dict(
+            rgb_image=self._live_color,
+            K_rgb=opt(self.state.K_rgb),
+            dist_rgb=opt(self.state.dist_rgb),
+            T_xc=opt(self.state.T_xc),
+            # pointer solve (raw = unfiltered, as it left calibrate_camera_to_pointer)
+            marker_ids_used=opt(getattr(res, "marker_ids_used", None), np.int64),
+            object_points_xyz_mm=opt(getattr(res, "object_points_xyz", None)),
+            image_points_uv=opt(getattr(res, "image_points_uv", None)),
+            rvec=opt(getattr(res, "rvec", None)),
+            tvec_raw=opt(getattr(raw, "tvec", None)),
+            tvec_filtered=opt(getattr(res, "tvec", None)),
+            reproj_errors_px=opt(getattr(res, "reproj_errors_px", None)),
+            reproj_mean_px=np.array(float(getattr(res, "reproj_mean_px", np.nan))),
+            pose_method=np.array(str(getattr(res, "pose_method", ""))),
+            tip_xyz_c_raw_mm=opt(getattr(raw, "tip_point_camera_mm", None)),
+            tip_xyz_c_filtered_mm=opt(self.state.tip_xyz_c),
+            tip_uv_c=opt(self.state.tip_uv_c),
+            T_tc=opt(self.state.T_tc),
+            T_tc_raw=opt(getattr(raw, "T_4x4", None)),
+            d_x_mm=np.array(float(d_x_mm)),
+        )
+        d_x_raw = np.nan
+        try:
+            if raw is not None:
+                d_x_raw = float(extract_depth(T_xc=self.state.T_xc, T_tc=raw.T_4x4).d_x_mm)
+        except Exception:
+            pass
+        arrays["d_x_raw_mm"] = np.array(d_x_raw)
+
+        try:
+            ev.save_npz(
+                "depth",
+                arrays,
+                page="pointer_depth",
+                summary={
+                    "d_x_mm": float(d_x_mm),
+                    "d_x_raw_mm": d_x_raw,
+                    "reproj_px": float(getattr(res, "reproj_mean_px", np.nan)),
+                },
+            )
+        except Exception as e:
+            print(f"[WARN] Could not save pointer depth capture: {e}")
+
+    def _on_record_clicked(self) -> None:
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+        self._update_buttons()
+
+    def _start_recording(self) -> None:
+        if self.state.eval is None or self._mode != "tracking":
+            return
+        self._rec_rows = []
+        self._rec_t0 = time.perf_counter()
+        self._rec_n_frames = 0
+        self._rec_frame_dir = self.state.eval.subdir("depth_frames")
+        self._recording = True
+        print("[EVAL] pointer series: recording")
+
+    def _record_frame(self, img: np.ndarray, raw, filt) -> None:
+        """One row per processed frame; every 30th frame also as PNG."""
+        t = time.perf_counter() - self._rec_t0
+        row: dict = {"t_s": t, "found": raw is not None}
+        if raw is not None:
+            d_raw = d_filt = np.nan
+            try:
+                d_raw = float(extract_depth(T_xc=self.state.T_xc, T_tc=raw.T_4x4).d_x_mm)
+                d_filt = float(extract_depth(T_xc=self.state.T_xc, T_tc=filt.T_4x4).d_x_mm)
+            except Exception:
+                pass
+            row.update(
+                rvec=np.asarray(raw.rvec, dtype=np.float64).reshape(3),
+                tvec_raw=np.asarray(raw.tvec, dtype=np.float64).reshape(3),
+                tip_raw=np.asarray(raw.tip_point_camera_mm, dtype=np.float64).reshape(3),
+                tip_filt=np.asarray(filt.tip_point_camera_mm, dtype=np.float64).reshape(3),
+                d_x_raw=d_raw,
+                d_x_filt=d_filt,
+                reproj_mean_px=float(raw.reproj_mean_px),
+                marker_ids=np.asarray(raw.marker_ids_used, dtype=np.int64).reshape(-1),
+                image_points_uv=np.asarray(raw.image_points_uv, dtype=np.float64).reshape(-1, 2),
+            )
+        self._rec_rows.append(row)
+        if self._rec_n_frames % 30 == 0 and self._rec_frame_dir is not None:
+            try:
+                cv2.imwrite(
+                    str(self._rec_frame_dir / f"frame_{self._rec_n_frames:05d}.png"), img
+                )
+            except Exception:
+                pass
+        self._rec_n_frames += 1
+
+    def _stop_recording(self) -> None:
+        self._recording = False
+        rows = self._rec_rows
+        self._rec_rows = []
+        if not rows or self.state.eval is None:
+            return
+
+        n = len(rows)
+        nan3 = np.full(3, np.nan)
+
+        def col(key, default):
+            return np.asarray([r.get(key, default) for r in rows])
+
+        # corners: variable count per frame -> object arrays
+        ids = np.empty(n, dtype=object)
+        uvs = np.empty(n, dtype=object)
+        for i, r in enumerate(rows):
+            ids[i] = r.get("marker_ids", np.empty(0, dtype=np.int64))
+            uvs[i] = r.get("image_points_uv", np.empty((0, 2)))
+
+        arrays = dict(
+            t_s=col("t_s", np.nan).astype(np.float64),
+            found=col("found", False).astype(bool),
+            rvec=np.stack([r.get("rvec", nan3) for r in rows]),
+            tvec_raw=np.stack([r.get("tvec_raw", nan3) for r in rows]),
+            tip_xyz_c_raw_mm=np.stack([r.get("tip_raw", nan3) for r in rows]),
+            tip_xyz_c_filtered_mm=np.stack([r.get("tip_filt", nan3) for r in rows]),
+            d_x_raw_mm=col("d_x_raw", np.nan).astype(np.float64),
+            d_x_filtered_mm=col("d_x_filt", np.nan).astype(np.float64),
+            reproj_mean_px=col("reproj_mean_px", np.nan).astype(np.float64),
+            marker_ids=ids,
+            image_points_uv=uvs,
+            K_rgb=np.asarray(self.state.K_rgb, dtype=np.float64),
+            dist_rgb=(
+                np.asarray(self.state.dist_rgb, dtype=np.float64)
+                if self.state.dist_rgb is not None else None
+            ),
+            T_xc=np.asarray(self.state.T_xc, dtype=np.float64),
+            fps=np.array(int(self.FPS)),
+            frames_every=np.array(30),
+            frames_dir=np.array(str(self._rec_frame_dir.name) if self._rec_frame_dir else ""),
+        )
+        d = arrays["d_x_filtered_mm"]
+        dr = arrays["d_x_raw_mm"]
+        try:
+            self.state.eval.save_npz(
+                "depth_series",
+                arrays,
+                page="pointer_depth",
+                summary={
+                    "frames": n,
+                    "found": int(np.count_nonzero(arrays["found"])),
+                    "d_x_raw_std_mm": float(np.nanstd(dr)) if np.isfinite(dr).any() else np.nan,
+                    "d_x_filt_std_mm": float(np.nanstd(d)) if np.isfinite(d).any() else np.nan,
+                },
+            )
+        except Exception as e:
+            print(f"[WARN] Could not save pointer series: {e}")
+        self._rec_frame_dir = None
 
     # ---------------------------------------------------------
     # Lifecycle (Wizard)
@@ -653,4 +859,6 @@ class PointerToolDepthPage(LiveImagePage):
         self.update_view()
 
     def on_leave(self) -> None:
+        if self._recording:
+            self._stop_recording()
         super().on_leave()

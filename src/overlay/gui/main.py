@@ -9,6 +9,13 @@
 #
 # Uses the per-page template navigation buttons (btn_back / btn_next).
 # Sidebar is display-only (wizard gating), no click navigation.
+#
+# Two modes, chosen in a dialog before the window opens (gui/evaluation.py):
+#   Normal      - nothing is written to disk.
+#   Evaluation  - every capture is saved into one session folder under a
+#                 label from the bar at the top; the calibration files can
+#                 be loaded automatically and "New board capture" returns
+#                 to step 3 without restarting the GUI.
 
 import sys
 from PySide6.QtCore import Qt
@@ -27,6 +34,12 @@ from PySide6.QtWidgets import (
 )
 
 from overlay.gui.state import SessionState
+from overlay.gui.evaluation import (
+    EvalBar,
+    EvaluationSession,
+    StartupChoice,
+    StartupDialog,
+)
 from overlay.gui.pages.page_xray_intrinsics import XrayIntrinsicsPage
 from overlay.gui.pages.page_camera_intrinsics import CameraIntrinsicsPage
 from overlay.gui.pages.page_plane_fitting import PlaneFittingPage
@@ -57,14 +70,26 @@ QPushButton:disabled { background: #a6c8ff; color: #f8f9fa; }
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, choice: StartupChoice | None = None):
         super().__init__()
 
-        self.setWindowTitle("DeCAF Calibration — Mode A (Wizard)")
-        self.resize(1200, 700)
+        self.choice = choice if choice is not None else StartupChoice()
 
         self.state = SessionState()
         self.state.steps_per_edge = 10
+
+        self.eval_session: EvaluationSession | None = None
+        if self.choice.evaluation:
+            self.eval_session = EvaluationSession(
+                self.choice.eval_root, self.choice.session_name, self.choice.notes
+            )
+            self.state.eval = self.eval_session
+
+        title = "DeCAF Calibration — Mode A (Wizard)"
+        if self.eval_session is not None:
+            title += f"  [EVALUATION: {self.eval_session.name}]"
+        self.setWindowTitle(title)
+        self.resize(1200, 700)
 
         # ----------------------------
         # Page indices / workflow modes
@@ -177,6 +202,12 @@ class MainWindow(QMainWindow):
         self.content_layout.setContentsMargins(*self._normal_content_margins)
         self.content_layout.setSpacing(12)
 
+        self.eval_bar: EvalBar | None = None
+        if self.eval_session is not None:
+            self.eval_bar = EvalBar(self.eval_session)
+            self.eval_bar.btn_new_capture.clicked.connect(self.new_board_capture)
+            self.content_layout.addWidget(self.eval_bar)
+
         self.lbl_step_title = QLabel("")
         self.lbl_step_title.setObjectName("ContentTitle")
         self.content_layout.addWidget(self.lbl_step_title)
@@ -234,6 +265,64 @@ class MainWindow(QMainWindow):
 
         self.pages.setCurrentIndex(self.IDX_XRAY)
         self._call_page_enter(self.IDX_XRAY)
+        self.update_ui()
+
+        if self.eval_session is not None and self.choice.autoload_calibration:
+            self._autoload_calibration()
+
+    # ------------------------------------------------------------------
+    # Evaluation mode helpers
+    # ------------------------------------------------------------------
+
+    def _autoload_calibration(self) -> None:
+        """Steps 1 and 2 from the files chosen in the startup dialog; the
+        wizard then starts on step 3 (plane fitting)."""
+        ok_x = self.page_xray.load_from_path(str(self.choice.xray_calib_path))
+        ok_c = self.page_cam_calib.load_from_path(str(self.choice.camera_calib_path))
+        if ok_x:
+            self.eval_session.record_calibration_file("K_xray", self.choice.xray_calib_path)
+        if ok_c:
+            self.eval_session.record_calibration_file("K_rgb", self.choice.camera_calib_path)
+        if ok_x and ok_c:
+            self._switch_to_page(self.IDX_PLANE)
+
+    def new_board_capture(self) -> None:
+        """Evaluation mode: next board placement. Keeps the intrinsics,
+        clears everything the wizard derives from one board capture and
+        returns to step 3, also from Mode B."""
+        s = self.state
+        s.xray_image = None
+        s.xray_image_path = None
+        s.xray_points_uv = None
+        s.xray_points_confirmed = False
+        s.xray_marker_overlay_bgr = None
+        s.marker_radius_px = None
+        s.xray_lattice_uv = None
+        s.xray_lattice_xy_mm = None
+        s.xray_points_xyz_c = None
+        s.plane_confirmed = False
+        s.checkerboard_corners_uv = None
+        s.checkerboard_corners_uv_9 = None
+        s.checkerboard_corners_confirmed = False
+        s.pnp_ransac_threshold_px = None
+        s.T_cx = None
+        s.T_xc = None
+        s.tip_uv_c = None
+        s.tip_xyz_c = None
+        s.T_tc = None
+        s.d_x = None
+        s.H_xc = None
+
+        self.page_markers.on_reset_selection()
+        self.page_markers.refresh()
+        self.page_cam2xray.reset_results()
+
+        self.mode_b_active = False
+        if self.current_step != self.IDX_PLANE:
+            self._switch_to_page(self.IDX_PLANE)
+        # after _switch_to_page / on_enter so the page ends up idle with
+        # Start enabled, whatever state the previous capture left it in
+        self.page_plane.reset_for_new_capture()
         self.update_ui()
 
     # ------------------------------------------------------------------
@@ -536,7 +625,13 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    win = MainWindow()
+    app.setStyleSheet(QSS)
+
+    dlg = StartupDialog()
+    if dlg.exec() != StartupDialog.Accepted:
+        sys.exit(0)
+
+    win = MainWindow(dlg.choice())
     win.showFullScreen()
     sys.exit(app.exec())
 

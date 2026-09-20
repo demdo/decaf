@@ -82,6 +82,12 @@ class SessionState:
     # IR rig calibration npz for stereo-IR pose refinement, or None (RGB only).
     ir_calibration_path: Optional[str] = None
 
+    # --- Evaluation mode ---
+    # overlay.gui.evaluation.EvaluationSession, or None in Normal mode. The
+    # pages write to disk only through this object (kept as object to avoid
+    # a Qt import here).
+    eval: Optional[object] = None
+
     # ----------------
     # Convenience flags
     # ----------------

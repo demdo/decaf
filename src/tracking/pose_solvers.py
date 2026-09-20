@@ -347,6 +347,14 @@ class PoseSolveResult:
     # minimum, i.e. the planar two-fold ambiguity was resolved by the data.
     xray_lattice_stats: dict | None = None
 
+    # 'ippe_handeye' only: everything the console prints during the solve,
+    # as data - the depth reference T_bc_depth and its Kabsch fit, the
+    # trust region, per-candidate dR/dt/score/feasible on the RGB side,
+    # the refined RGB pose T_bc, both lattice-refined X-ray candidates and
+    # the chosen T_bx. Recorded so an evaluation can be written from the
+    # calibration file instead of the console.
+    diagnostics: dict | None = None
+
 
 # ============================================================
 # IPPE internals
@@ -475,9 +483,11 @@ def _select_ippe_candidate_rgb(
     *,
     gamma_t_mm: float,
     gamma_r_deg: float,
+    diag_out: dict | None = None,
 ) -> int:
     """
     Select the RGB-side IPPE candidate using a depth-based trust region.
+    If diag_out is given, the per-candidate scores are stored in it.
     """
     if len(candidates) != 2:
         raise ValueError(f"Expected exactly 2 IPPE candidates, got {len(candidates)}.")
@@ -494,6 +504,9 @@ def _select_ippe_candidate_rgb(
                 gamma_r_deg=gamma_r_deg,
             )
         )
+
+    if diag_out is not None:
+        diag_out["candidate_scores"] = [dict(s) for s in scores]
 
     print("\n=== DEBUG RGB IPPE SELECTION ===")
 
@@ -945,6 +958,16 @@ def _solve_pose_ippe_handeye(
 
     tr = _trust_region_from_depth_rms(depth_fit["rms_mm"])
 
+    diagnostics: dict = {
+        "T_bc_depth": np.asarray(T_bc_depth, dtype=np.float64),
+        "depth_fit": {
+            k: v for k, v in depth_fit.items() if k not in ("R", "t", "T")
+        },
+        "trust_region": dict(tr),
+        "pts3d_board_rgb_mm": np.asarray(pts3d_board_rgb_mm, dtype=np.float64),
+        "pts2d_rgb": np.asarray(pts2d_rgb, dtype=np.float64),
+    }
+
     candidates_rgb = _build_ippe_candidates(
         pts3d_board_rgb_mm,
         pts2d_rgb,
@@ -957,6 +980,7 @@ def _solve_pose_ippe_handeye(
         T_bc_depth=T_bc_depth,
         gamma_t_mm=tr["gamma_t_mm"],
         gamma_r_deg=tr["gamma_r_deg"],
+        diag_out=diagnostics,
     )
 
     best_rgb = candidates_rgb[best_idx_rgb]
@@ -976,6 +1000,8 @@ def _solve_pose_ippe_handeye(
 
     R_bc, _ = cv2.Rodrigues(rvec_bc)
     T_bc = _make_transform(R_bc, tvec_bc.ravel())
+    diagnostics["T_bc"] = np.asarray(T_bc, dtype=np.float64)
+    diagnostics["rgb_refined_iterative"] = bool(refine_rgb_iterative)
 
     candidates_xray = _build_ippe_candidates(
         pts3d_board_xray_mm,
@@ -1040,6 +1066,17 @@ def _solve_pose_ippe_handeye(
 
     R_bx, _ = cv2.Rodrigues(rvec_bx)
     T_bx = _make_transform(R_bx, tvec_bx.ravel())
+    diagnostics["T_bx"] = np.asarray(T_bx, dtype=np.float64)
+    diagnostics["xray_refined_candidates"] = [
+        {
+            "rvec": np.asarray(rv, dtype=np.float64).reshape(3),
+            "tvec": np.asarray(tv, dtype=np.float64).reshape(3),
+            "lattice_reproj_mean_px": float(m),
+        }
+        for (rv, tv, m) in refined
+    ]
+    diagnostics["pts3d_lattice_mm"] = np.asarray(pts3d_lattice_mm, dtype=np.float64)
+    diagnostics["lattice_uv"] = np.asarray(lattice_uv, dtype=np.float64)
 
     T_cx = T_bx @ invert_transform(T_bc)
     T_cx[:3, 3] *= 1e-3  # mm -> m
@@ -1106,6 +1143,7 @@ def _solve_pose_ippe_handeye(
         all_candidates=all_candidates_xray,
         all_candidates_rgb=all_candidates_rgb,
         xray_lattice_stats=xray_lattice_stats,
+        diagnostics=diagnostics,
     )
 
 

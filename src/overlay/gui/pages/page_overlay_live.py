@@ -45,14 +45,14 @@ from tracking.hydramarker.config import CameraConfig
 PROFILE_LIVE = True
 PROFILE_EVERY = 30          # frames between summary lines
 
-# Absolute, so the file is always in the same place regardless of the working
-# directory the GUI happens to be started from: overlay/data/
-PROFILE_LOG_PATH = str(
-    Path(__file__).resolve().parents[2] / "data" / "live_overlay_profile.log"
-)
+# The profile log is only written in Evaluation mode, into the session
+# folder (live_profile.log); in Normal mode nothing is written.
+PROFILE_LOG_NAME = "live_profile.log"
 
 # Presentation snapshots (Save snapshot button): one timestamped folder per
-# press with pixel-aligned PNG layers of the current live frame.
+# press with pixel-aligned PNG layers of the current live frame. Normal
+# mode: overlay/data/snapshots/; Evaluation mode: <label>_live/ in the
+# session folder.
 SNAPSHOT_DIR = Path(__file__).resolve().parents[2] / "data" / "snapshots"
 
 
@@ -66,10 +66,9 @@ SNAPSHOT_DIR = Path(__file__).resolve().parents[2] / "data" / "snapshots"
 # take a one-time detail snapshot per distinct cause); the file write
 # happens exclusively in _stop_tracking, outside the steady-state path.
 # On/off switch: TrackerConfig.failure_log_enabled (set in
-# run_tracker.make_live_tracker_config, like every other tracking setting).
-TRACK_FAILURE_LOG_PATH = str(
-    Path(__file__).resolve().parents[2] / "data" / "tracking_failure_log.jsonl"
-)
+# run_tracker.make_live_tracker_config, like every other tracking setting);
+# the file itself only exists in Evaluation mode (session folder).
+TRACK_FAILURE_LOG_NAME = "tracking_failure_log.jsonl"
 
 
 class _TrackFailureLog:
@@ -179,9 +178,9 @@ class _FrameProfile:
     being starved rather than the processing being slow.
     """
 
-    def __init__(self, fps: int):
+    def __init__(self, fps: int, log_path: Path | None):
         self.budget_ms = 1000.0 / float(fps)
-        self.log_path = Path(PROFILE_LOG_PATH).resolve()
+        self.log_path = None if log_path is None else Path(log_path).resolve()
         self.reset()
 
     def emit(self, line: str) -> None:
@@ -795,7 +794,10 @@ class OverlayLivePage(QWidget):
 
         self._H_xc_lookup: dict[int, np.ndarray] = {}
 
-        self._profile = _FrameProfile(self.FPS) if PROFILE_LIVE else None
+        # Profiling lines go to a file only in Evaluation mode (see
+        # PROFILE_LOG_NAME); the session is attached later, so the profile
+        # is created in on_enter.
+        self._profile: _FrameProfile | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -1209,10 +1211,14 @@ class OverlayLivePage(QWidget):
         self._tracker_log_module = tracker_log
 
         # JSONL run logs (if ever enabled) must land in a fixed absolute
-        # location, not in whatever cwd the GUI was started from.
-        tracker_log.set_run_log_dir(
-            str(Path(PROFILE_LOG_PATH).parent / "hydramarker_tracker_runs")
+        # location, not in whatever cwd the GUI was started from: the
+        # session folder in Evaluation mode, overlay/data/ otherwise.
+        ev = self.state.eval
+        log_root = (
+            ev.dir if ev is not None
+            else Path(__file__).resolve().parents[2] / "data"
         )
+        tracker_log.set_run_log_dir(str(log_root / "hydramarker_tracker_runs"))
 
         if self._tracker is not None:
             self._tracker.reset()
@@ -1223,7 +1229,10 @@ class OverlayLivePage(QWidget):
         config.ir_refine_enabled = bool(ir_path)
 
         if getattr(config, "failure_log_enabled", False):
-            self._track_fail_log = _TrackFailureLog(TRACK_FAILURE_LOG_PATH)
+            ev = self.state.eval
+            self._track_fail_log = _TrackFailureLog(
+                None if ev is None else str(ev.dir / TRACK_FAILURE_LOG_NAME)
+            )
         else:
             self._track_fail_log = None
 
@@ -1378,8 +1387,12 @@ class OverlayLivePage(QWidget):
             return
 
         try:
-            out_dir = SNAPSHOT_DIR / time.strftime("snapshot_%Y%m%d_%H%M%S")
-            out_dir.mkdir(parents=True, exist_ok=True)
+            ev = self.state.eval
+            if ev is not None:
+                out_dir = ev.subdir("live")
+            else:
+                out_dir = SNAPSHOT_DIR / time.strftime("snapshot_%Y%m%d_%H%M%S")
+                out_dir.mkdir(parents=True, exist_ok=True)
             written = []
 
             if self._xray_gray_u8 is not None:
@@ -1416,6 +1429,13 @@ class OverlayLivePage(QWidget):
             with open(out_dir / "snapshot.json", "w", encoding="utf-8") as f:
                 json.dump(self._snapshot_record(out_dir.name), f, indent=2)
             written.append("snapshot.json")
+
+            if ev is not None:
+                ev.log("overlay_live", out_dir.name + "/", {
+                    "layers": len(written),
+                    "d_x_mm": self._current_d_x_mm,
+                    "tracking": bool(self._tracking_active),
+                })
 
             QMessageBox.information(
                 self,
@@ -1516,6 +1536,11 @@ class OverlayLivePage(QWidget):
             self._precompute_H_xc_lookup()
             self._invalidate_overlay_cache()
 
+            ev = self.state.eval
+            self._profile = (
+                _FrameProfile(self.FPS, None if ev is None else ev.dir / PROFILE_LOG_NAME)
+                if (PROFILE_LIVE and ev is not None) else None
+            )
             if self._profile is not None:
                 self._profile.reset()
                 h, w = self._xray_gray_u8.shape[:2]

@@ -723,37 +723,6 @@ def compute_roi_from_grid(
     else:
         roi_idx = map_back[roi_idx_local].astype(np.int64)
 
-    debug_npz_path = "xray_marker_selection_debug_uv.npz"
-    debug_npz_saved = False
-    debug_npz_error = None
-
-    try:
-        np.savez(
-            debug_npz_path,
-            uv_raw=uv_raw,
-            uv_final=uv_final,
-            points_uv_raw=uv_raw,
-            points_uv_working=uv_final,
-            roi_idx_raw=roi_idx,
-            roi_idx_final=roi_idx,
-            anchor_idx=np.asarray(anchor_idx, dtype=int),
-            anchor_idx_effective=np.asarray(idx_eff, dtype=int),
-            grid_i_raw=grid_i_raw,
-            grid_j_raw=grid_j_raw,
-            grid_i_final=grid_i_raw,
-            grid_j_final=grid_j_raw,
-            semantic_reordering=np.array(False, dtype=bool),
-            no_j_xray_reordering=np.array(True, dtype=bool),
-            image_width=np.array(image_width, dtype=np.int32),
-            uv_space=np.array("XRAY_WORKING_FLIPPED_UV", dtype="<U64"),
-            raw_uv_space=np.array("XRAY_RAW_CANONICAL_BOARD_ORDER", dtype="<U64"),
-            uv_transform=np.array("horizontal_flip", dtype="<U32"),
-            uv_transform_formula=np.array("u_work = W - 1 - u_raw, v_work = v_raw", dtype="<U64"),
-        )
-        debug_npz_saved = True
-    except Exception as e:
-        debug_npz_error = str(e)
-
     dbg = dict(
         pitch=float(pitch),
         Lu=float(Lu),
@@ -806,10 +775,6 @@ def compute_roi_from_grid(
         uv_transform="horizontal_flip",
         uv_transform_formula="u_work = W - 1 - u_raw, v_work = v_raw",
         image_width=int(image_width),
-
-        debug_npz_path=debug_npz_path,
-        debug_npz_saved=bool(debug_npz_saved),
-        debug_npz_error=debug_npz_error,
     )
 
     return uv_final, roi_idx, dbg

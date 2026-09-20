@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import os
-from datetime import datetime
-
 import cv2
 import numpy as np
 import pydicom
@@ -22,8 +19,6 @@ from overlay.tools.xray_marker_selection import (
     index_board_lattice,
 )
 
-
-SAVE_XRAY_MARKER_SELECTION = True
 
 
 class XrayMarkerSelectionPage(StaticImagePage):
@@ -452,11 +447,12 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
             self.state.xray_marker_overlay_bgr = self._render_roi_overlay_bgr()
 
-            self._save_xray_marker_selection(
-                selected_idx=selected_idx,
-                roi_idx=roi_idx,
-                dbg=dbg,
-            )
+            if self.state.eval is not None:
+                self._save_evaluation(
+                    selected_idx=selected_idx,
+                    roi_idx=roi_idx,
+                    dbg=dbg,
+                )
 
             self.refresh()
             self.on_complete_changed()
@@ -495,32 +491,32 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.refresh()
         self.on_complete_changed()
 
-    # ---------------- Save ----------------
+    # ---------------- Evaluation mode ----------------
 
-    def _save_xray_marker_selection(
+    def _save_evaluation(
         self,
         selected_idx: list[int] | np.ndarray,
         roi_idx: np.ndarray,
         dbg: dict,
     ) -> None:
-        if not SAVE_XRAY_MARKER_SELECTION:
-            return
-
+        """<label>_xray.<ext>: copy of the X-ray file; <label>_markers.npz:
+        the patch points (working + raw), the full board lattice and every
+        Hough detection, i.e. all X-ray-side inputs of Cam2X."""
         if self.state.xray_points_uv is None:
             return
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+        ev = self.state.eval
         xray_path = self.state.xray_image_path
-        if xray_path:
-            xray_stem = os.path.splitext(os.path.basename(xray_path))[0]
-        else:
-            xray_stem = "xray"
+        try:
+            if xray_path:
+                ev.copy_file("xray", xray_path, page="marker_selection")
+        except Exception as e:
+            print(f"[WARN] Could not copy X-ray image: {e}")
 
-        out_name = f"xray_marker_selection_{timestamp}_{xray_stem}.npz"
+        lat = self._last_lattice
+        lat_dbg = lat[3] if lat is not None else {}
 
-        np.savez(
-            out_name,
+        arrays = dict(
             # Main points used by the rest of the pipeline:
             # XRAY_WORKING_FLIPPED_UV
             points_uv=np.asarray(self.state.xray_points_uv, dtype=np.float64),
@@ -580,9 +576,28 @@ class XrayMarkerSelectionPage(StaticImagePage):
             orientation_cond_cross=np.array(bool(dbg.get("orientation_cond_cross", False)), dtype=bool),
             margin_px=np.array(1.1 * float(self._pick_radius_px), dtype=np.float64),
             pick_radius_px=np.array(float(self._pick_radius_px), dtype=np.float64),
+            xray_image_raw=np.asarray(self.state.xray_image),
+            lattice_n_indexed=np.array(int(lat_dbg.get("n_indexed", -1)), dtype=np.int32),
+            lattice_n_detections=np.array(int(lat_dbg.get("n_detections", -1)), dtype=np.int32),
+            lattice_homography_rms_px=np.array(
+                float(lat_dbg.get("homography_resid_rms_px", np.nan)), dtype=np.float64
+            ),
         )
 
-        print(f"[SAVE] X-ray marker selection saved to: {out_name}")
+        try:
+            ev.save_npz(
+                "markers",
+                arrays,
+                page="marker_selection",
+                summary={
+                    "patch": int(len(self.state.xray_points_uv)),
+                    "lattice": int(lat_dbg.get("n_indexed", -1)),
+                    "lattice_rms_px": float(lat_dbg.get("homography_resid_rms_px", np.nan)),
+                    "orientation_ok": bool(dbg.get("orientation_ok", True)),
+                },
+            )
+        except Exception as e:
+            print(f"[WARN] Could not save marker selection: {e}")
 
     # ---------------- Helpers ----------------
 

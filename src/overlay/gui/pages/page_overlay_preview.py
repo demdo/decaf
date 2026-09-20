@@ -3,7 +3,6 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import pydicom
-from datetime import datetime
 
 from pathlib import Path
 
@@ -30,7 +29,6 @@ from overlay.gui.widgets.widget_flow_layout import FlowLayout
 # Save config
 # ============================================================
 
-SAVE_OVERLAY_PREVIEW_RESULTS = True
 
 
 # ============================================================
@@ -302,25 +300,17 @@ class OverlayPreviewPage(LiveImagePage):
 
         self.state.H_xc = None
 
-    def _save_overlay_results(self) -> Path | None:
-        if not SAVE_OVERLAY_PREVIEW_RESULTS:
-            return None
-
-        if not self._overlay_done or self._overlay_bgr is None:
-            return None
-
-        out_dir = Path.cwd()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"overlay_preview_{stamp}.npz"
-
+    def _overlay_arrays(self) -> dict:
+        """Everything an offline overlay-error evaluation needs from this
+        capture: the bare camera frame, the X-ray (raw + working), H_xc,
+        the camera model, d_x and the reference point."""
         xray_image_path = (
             self.state.xray_image_anatomy_path
             if self.state.xray_image_anatomy_path is not None
             else ""
         )
 
-        np.savez(
-            out_path,
+        return dict(
 
             # -------------------------------------------------
             # Main result images
@@ -380,7 +370,32 @@ class OverlayPreviewPage(LiveImagePage):
             overlay_done=np.array(self._overlay_done, dtype=bool),
         )
 
-        return out_path
+    def _save_overlay_results(self, out_path: Path | None = None) -> Path | None:
+        """Evaluation mode: <label>_overlay.npz in the session folder.
+        Normal mode: only on request (Save Image button) to a path the
+        user picks - nothing is written otherwise."""
+        if not self._overlay_done or self._overlay_bgr is None:
+            return None
+
+        arrays = {k: v for k, v in self._overlay_arrays().items() if v is not None}
+
+        ev = self.state.eval
+        if ev is not None:
+            return ev.save_npz(
+                "overlay",
+                arrays,
+                page="overlay_preview",
+                summary={
+                    "d_x_mm": self.state.d_x,
+                    "alpha": float(self._alpha),
+                    "xray": Path(str(arrays.get("xray_image_path", ""))).name,
+                },
+            )
+
+        if out_path is None:
+            return None
+        np.savez(str(out_path), **arrays)
+        return Path(out_path)
 
     # ---------------------------------------------------------
     # Template hooks
@@ -598,6 +613,12 @@ class OverlayPreviewPage(LiveImagePage):
             if callable(self.on_complete_changed):
                 self.on_complete_changed()
 
+            if self.state.eval is not None:
+                try:
+                    self._save_overlay_results()
+                except Exception as e:
+                    print(f"[WARN] Could not save overlay capture: {e}")
+
         except Exception as e:
             QMessageBox.critical(
                 self,
@@ -615,13 +636,22 @@ class OverlayPreviewPage(LiveImagePage):
             return
 
         try:
-            out_path = self._save_overlay_results()
+            out_path = None
+            if self.state.eval is None:
+                chosen, _ = QFileDialog.getSaveFileName(
+                    self, "Save overlay results", "overlay_preview.npz", "NPZ (*.npz)"
+                )
+                if not chosen:
+                    return
+                out_path = Path(chosen)
+
+            out_path = self._save_overlay_results(out_path)
 
             if out_path is None:
                 QMessageBox.information(
                     self,
                     "Save Overlay Results",
-                    "Saving is disabled.",
+                    "Nothing to save.",
                 )
                 return
 

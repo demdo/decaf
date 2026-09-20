@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import datetime
-
 import numpy as np
 
 from PySide6.QtWidgets import (
@@ -19,11 +16,6 @@ from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 from overlay.calib.calib_camera_to_xray import calibrate_camera_to_xray
 from overlay.gui.widgets.widget_zoom_view import ZoomView
 
-
-# ============================================================================
-# Global save switch
-# ============================================================================
-SAVE_CAM2X_RESULTS: bool = False
 
 # ============================================================
 # Calibration target geometry
@@ -77,6 +69,7 @@ class CameraToXrayCalibrationPage(StaticImagePage):
         self._n_inliers: int | None = None
         self._R_cx: np.ndarray | None = None
         self._t_cx: np.ndarray | None = None
+        self._last_calib = None  # CameraToXrayCalibrationResult of the last run
 
         # ======================================================
         # LEFT: replace template image_label with zoomable view
@@ -324,68 +317,148 @@ class CameraToXrayCalibrationPage(StaticImagePage):
         zoomed = self.zoom_view.has_zoom()
         self.btn_reset_zoom.setEnabled(bool(self._calibration_done and zoomed))
 
-    # ---------------- Save ----------------
+    # ---------------- Reset (evaluation: next board capture) ----------------
 
-    def _save_results(
+    def reset_results(self) -> None:
+        """Forget the last calibration so the page shows a clean state for
+        the next board capture. The pose method selection is kept."""
+        self._calibration_done = False
+        self._uv_projected = None
+        self._inlier_idx = None
+        self._reproj_errors_px = None
+        self._reproj_mean_px = None
+        self._reproj_median_px = None
+        self._reproj_p95_in_px = None
+        self._n_points = None
+        self._n_inliers = None
+        self._R_cx = None
+        self._t_cx = None
+        self._last_calib = None
+        self.zoom_view.reset_zoom()
+        self.refresh()
+
+    # ---------------- Evaluation mode ----------------
+
+    def _save_evaluation(
         self,
+        *,
+        calib,
         Kx: np.ndarray,
         uv_meas: np.ndarray,
-        xyz_c: np.ndarray | None,
+        xyz_c: np.ndarray,
+        lattice_uv: np.ndarray | None,
+        lattice_xy: np.ndarray | None,
     ) -> None:
-        if not SAVE_CAM2X_RESULTS:
-            return
+        """<label>_cam2x.npz: the INPUTS of calibrate_camera_to_xray (so the
+        solve can be repeated offline: patch only, without LM, held-out
+        halves, ...) and its OUTPUTS (T_cx, T_xc, residuals); <label>_cam2x.json:
+        the solver diagnostics the console prints - RGB candidates against
+        the depth reference, trust region, X-ray lattice refinement."""
+        ev = self.state.eval
+        pr = getattr(calib, "pose_result", None)
+        field = getattr(self.state, "xray_dist_field", None)
 
-        out_dir = Path("debug_cam2x")
-        out_dir.mkdir(parents=True, exist_ok=True)
+        def opt(a, dtype=np.float64):
+            return None if a is None else np.asarray(a, dtype=dtype)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        method_tag = self._pose_method.replace(" ", "_")
-        out_path = out_dir / f"cam2x_calibration_{timestamp}_{method_tag}.npz"
+        uv_raw = opt(self.state.xray_points_uv)
+        lattice_uv_raw = opt(self.state.xray_lattice_uv)
 
-        img = None
-        if self.state.xray_image is not None:
-            img = np.asarray(self.state.xray_image)
-
-        np.savez(
-            out_path,
+        arrays = dict(
             pose_method=np.array(self._pose_method),
+            # ---- inputs (camera side) ----
+            points_xyz_camera_m=opt(xyz_c),
+            checkerboard_corners_uv=opt(self.state.checkerboard_corners_uv),
+            checkerboard_corners_uv_9=opt(self.state.checkerboard_corners_uv_9),
+            K_rgb=opt(self.state.K_rgb),
+            dist_rgb=opt(self.state.dist_rgb),
+            # ---- inputs (X-ray side; working space, u = W-1-u_raw) ----
+            K_xray=opt(Kx),
+            points_uv_xray=opt(uv_meas),           # field-corrected, as solved
+            points_uv_xray_uncorrected=uv_raw,     # before the distortion field
+            lattice_uv_xray=opt(lattice_uv),
+            lattice_uv_xray_uncorrected=lattice_uv_raw,
+            lattice_xy_mm=opt(lattice_xy),
+            distortion_field_applied=np.array(field is not None, dtype=bool),
+            pitch_mm=np.array(2.54, dtype=np.float64),
+            board_thickness_mm=np.array(float(PCB_THICKNESS_MM), dtype=np.float64),
+            steps_per_edge=np.array(10, dtype=np.int32),
             ransac_threshold_px=np.array(
                 self.state.pnp_ransac_threshold_px
                 if self.state.pnp_ransac_threshold_px is not None else np.nan,
                 dtype=np.float64,
             ),
-            T_cx=np.asarray(self.state.T_cx, dtype=np.float64),
-            T_xc=np.asarray(self.state.T_xc, dtype=np.float64),
-            R_cx=np.asarray(self._R_cx, dtype=np.float64) if self._R_cx is not None else np.empty((0,)),
-            t_cx=np.asarray(self._t_cx, dtype=np.float64) if self._t_cx is not None else np.empty((0,)),
-            reproj_errors_px=np.asarray(self._reproj_errors_px, dtype=np.float64)
-            if self._reproj_errors_px is not None else np.empty((0,)),
+            # ---- outputs ----
+            T_cx=opt(self.state.T_cx),
+            T_xc=opt(self.state.T_xc),
+            R_cx=opt(self._R_cx),
+            t_cx=opt(self._t_cx),
+            reproj_errors_px=opt(self._reproj_errors_px),
             reproj_mean_px=np.array(
-                self._reproj_mean_px if self._reproj_mean_px is not None else np.nan,
-                dtype=np.float64,
+                self._reproj_mean_px if self._reproj_mean_px is not None else np.nan
             ),
             reproj_median_px=np.array(
-                self._reproj_median_px if self._reproj_median_px is not None else np.nan,
-                dtype=np.float64,
+                self._reproj_median_px if self._reproj_median_px is not None else np.nan
             ),
             reproj_p95_in_px=np.array(
-                self._reproj_p95_in_px if self._reproj_p95_in_px is not None else np.nan,
-                dtype=np.float64,
+                self._reproj_p95_in_px if self._reproj_p95_in_px is not None else np.nan
             ),
-            inlier_idx=np.asarray(self._inlier_idx, dtype=np.int64)
-            if self._inlier_idx is not None else np.empty((0,), dtype=np.int64),
-            n_inliers=np.array(self._n_inliers if self._n_inliers is not None else -1, dtype=np.int64),
-            n_points=np.array(self._n_points if self._n_points is not None else -1, dtype=np.int64),
-            K_xray=np.asarray(Kx, dtype=np.float64),
-            points_uv_xray=np.asarray(uv_meas, dtype=np.float64),
-            points_xyz_camera=np.asarray(xyz_c, dtype=np.float64)
-            if xyz_c is not None else np.empty((0, 3)),
-            uv_projected=np.asarray(self._uv_projected, dtype=np.float64)
-            if self._uv_projected is not None else np.empty((0, 2)),
-            xray_image=img if img is not None else np.empty((0,)),
+            inlier_idx=opt(self._inlier_idx, np.int64),
+            uv_projected=opt(self._uv_projected),
         )
 
-        print(f"[INFO] Saved Camera→X-ray calibration to: {out_path}")
+        diag: dict = {}
+        if pr is not None:
+            diag = {
+                "method": pr.method,
+                "candidate_index_rgb": pr.candidate_index_rgb,
+                "candidate_index_xray": pr.candidate_index_xray,
+                "reproj_mean_px": pr.reproj_mean_px,
+                "reproj_median_px": pr.reproj_median_px,
+                "reproj_max_px": pr.reproj_max_px,
+                "xray_lattice_stats": pr.xray_lattice_stats,
+                "rgb_candidates": [
+                    {
+                        "index": c.candidate_index,
+                        "rvec": c.rvec, "tvec": c.tvec,
+                        "reproj_mean_px": c.reproj_mean_px,
+                        "reproj_max_px": c.reproj_max_px,
+                    }
+                    for c in (pr.all_candidates_rgb or [])
+                ],
+                "xray_patch_candidates": [
+                    {
+                        "index": c.candidate_index,
+                        "rvec": c.rvec, "tvec": c.tvec,
+                        "reproj_mean_px": c.reproj_mean_px,
+                        "reproj_max_px": c.reproj_max_px,
+                    }
+                    for c in (pr.all_candidates or [])
+                ],
+                "solver": pr.diagnostics,
+            }
+            # the solver arrays also go into the npz (T_bc_depth, T_bc, T_bx)
+            sd = pr.diagnostics or {}
+            for k in ("T_bc_depth", "T_bc", "T_bx"):
+                if k in sd:
+                    arrays[k] = np.asarray(sd[k], dtype=np.float64)
+
+        summary = {
+            "method": self._pose_method,
+            "n": self._n_points,
+            "reproj_mean_px": self._reproj_mean_px,
+        }
+        stats = diag.get("xray_lattice_stats") or {}
+        if stats:
+            summary["lattice_dR_deg"] = stats.get("refined_candidates_dR_deg")
+            summary["lattice_mean_px"] = stats.get("lattice_reproj_mean_px")
+
+        try:
+            ev.save_npz("cam2x", arrays, page="cam2x", summary=summary)
+            if diag:
+                ev.save_json("cam2x", diag, page="cam2x")
+        except Exception as e:
+            print(f"[WARN] Could not save Cam2X calibration: {e}")
 
     # ---------------- Action ----------------
 
@@ -498,8 +571,17 @@ class CameraToXrayCalibrationPage(StaticImagePage):
                         self._reproj_p95_in_px = float(np.percentile(e_in, 95))
 
             self._uv_projected = np.asarray(calib.uv_proj, dtype=np.float64).reshape(-1, 2)
+            self._last_calib = calib
 
-            self._save_results(Kx=Kx, uv_meas=uv_meas, xyz_c=xyz_c)
+            if self.state.eval is not None:
+                self._save_evaluation(
+                    calib=calib,
+                    Kx=Kx,
+                    uv_meas=uv_meas,
+                    xyz_c=xyz_c,
+                    lattice_uv=lattice_uv,
+                    lattice_xy=lattice_xy,
+                )
 
             self.zoom_view.reset_zoom()
             self.refresh()
