@@ -45,3 +45,9 @@ CMakeFiles/
 *.lastbuildstate
 *.vcxproj.user
 .vs/
+
+# Stray GUI outputs (pre-evaluation-mode era); the wizard now writes only
+# into overlay/data/Evaluation/<session>/ (covered by data/ above)
+src/debug_snapshots/
+src/debug_cam2x/
+src/*.npz
