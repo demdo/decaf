@@ -828,6 +828,59 @@ def _solve_pose_ippe(
     )
 
 
+def _interpolate_patch_homography(
+    checkerboard_corners_uv_9: np.ndarray,
+    checkerboard_corners_uv: np.ndarray,
+    K_rgb: np.ndarray,
+    dist_rgb: np.ndarray,
+    pts3d_board_rgb_mm: np.ndarray,
+    edge_mm: float,
+) -> tuple[np.ndarray, dict]:
+    """
+    The 121 RGB image points of the patch from the perspective homography of
+    the nine detected checkerboard corners (3 x 3, half-edge spacing).
+
+    Returns the points in UNDISTORTED pixel coordinates (the corners are
+    undistorted with the lens model first, so the caller must solve the RGB
+    pose with zero distortion), plus diagnostics.
+
+    The detector does not return the nine corners in a fixed order, so each
+    corner's board position is read off its affine coordinates in the
+    TL/TR/BL frame and rounded to the half-edge grid; nine distinct
+    positions are required.
+    """
+    c9 = np.asarray(checkerboard_corners_uv_9, dtype=np.float64).reshape(9, 2)
+    p_tl, p_tr, p_bl = np.asarray(checkerboard_corners_uv, dtype=np.float64).reshape(3, 2)
+    basis = np.column_stack([p_tr - p_tl, p_bl - p_tl])  # (2,2)
+    ab = np.linalg.lstsq(basis, (c9 - p_tl).T, rcond=None)[0].T  # (9,2) in edge units
+    board_9 = np.round(ab * 2.0) / 2.0 * float(edge_mm)
+    if len({tuple(np.round(r, 6)) for r in board_9}) != 9:
+        raise ValueError(
+            "checkerboard_corners_uv_9 do not form a 3 x 3 grid in the TL/TR/BL frame."
+        )
+    c9_und = cv2.undistortPoints(c9.reshape(-1, 1, 2), K_rgb, dist_rgb, P=K_rgb).reshape(-1, 2)
+    H, _ = cv2.findHomography(board_9, c9_und)
+    if H is None:
+        raise ValueError("Homography from the nine checkerboard corners failed.")
+    pts2d = cv2.perspectiveTransform(
+        pts3d_board_rgb_mm[:, :2].reshape(-1, 1, 2).astype(np.float64), H
+    ).reshape(-1, 2)
+    resid = np.linalg.norm(
+        cv2.perspectiveTransform(board_9.reshape(-1, 1, 2), H).reshape(-1, 2) - c9_und, axis=1
+    )
+    diag = {
+        "rgb_interpolation": "homography9",
+        "rgb_homography": np.asarray(H, dtype=np.float64),
+        "rgb_corners9_board_mm": np.asarray(board_9, dtype=np.float64),
+        "rgb_corners9_undistorted_uv": np.asarray(c9_und, dtype=np.float64),
+        "rgb_homography_residual_px": {
+            "mean": float(resid.mean()),
+            "max": float(resid.max()),
+        },
+    }
+    return pts2d, diag
+
+
 def _solve_pose_ippe_handeye(
     object_points_xyz: np.ndarray,
     image_points_uv: np.ndarray,
@@ -844,16 +897,34 @@ def _solve_pose_ippe_handeye(
     refine_rgb_iterative: bool = False,
     xray_lattice_uv: np.ndarray | None = None,
     xray_lattice_xy_mm: np.ndarray | None = None,
+    checkerboard_corners_uv_9: np.ndarray | None = None,
 ) -> PoseSolveResult:
     """
     Camera-to-X-ray calibration from one placement of the planar board:
     T_cx = T_bx @ inv(T_bc), both board poses solved with IPPE.
 
-    RGB side (unchanged)
-        Three checkerboard corners -> 121 interpolated image points -> IPPE
-        (two candidates) -> the candidate inside the depth-based trust
-        region (Kabsch fit of the reconstructed grid) -> LM refinement.
-        The depth data is what resolves the planar ambiguity here.
+    RGB side (changed 2026-09-21)
+        Nine checkerboard corners -> perspective homography -> 121 image
+        points -> IPPE (two candidates) -> the candidate inside the
+        depth-based trust region (Kabsch fit of the reconstructed grid) ->
+        LM refinement. The depth data is what resolves the planar ambiguity
+        here.
+
+        Why the homography: the former affine interpolation from the three
+        extreme corners (tl + a*sx + b*sy) draws a parallelogram, but a
+        square tilted ~20 deg images as a trapezoid. On the 73-px patch the
+        neglected perspective reaches 1.4 px at the patch corners, and since
+        the board tilt is observable only through the foreshortening
+        (~0.4 px per degree), the parallelogram costs ~2 deg of tilt and up
+        to 5 mm of depth, in a direction that rotates with the in-plane
+        orientation of the board (synthetic, noise-free: 1.65-2.0 deg).
+        This made T_cx depend on how the board was placed: on the five
+        captures of 2026-09-19 the camera-side normals of three boards lying
+        on the same table differed by 2.2-4.1 deg, with the homography by
+        0.24-0.94 deg, and T_cx between captures by 0.6-4.1 deg vs
+        0.3-1.8 deg. The nine corners are undistorted first, so the RGB
+        pose is solved with zero distortion. If `checkerboard_corners_uv_9`
+        is not given the affine path is used (legacy).
 
     X-ray side (changed 2026-09-15)
         IPPE on the 121 patch holes still provides the two candidates, but
@@ -938,18 +1009,37 @@ def _solve_pose_ippe_handeye(
     pts3d_board_xray_mm = pts3d_board_rgb_mm.copy()
     pts3d_board_xray_mm[:, 2] += float(board_thickness_mm)
 
-    p_tl, p_tr, p_bl = checkerboard_corners_uv
-    step_x = (p_tr - p_tl) / float(steps_per_edge)
-    step_y = (p_bl - p_tl) / float(steps_per_edge)
+    if checkerboard_corners_uv_9 is not None:
+        # perspective interpolation; points are undistorted -> zero lens
+        # distortion for the RGB pose from here on
+        pts2d_rgb, interp_diag = _interpolate_patch_homography(
+            checkerboard_corners_uv_9,
+            checkerboard_corners_uv,
+            K_rgb,
+            dist_rgb,
+            pts3d_board_rgb_mm,
+            edge_mm=float(pitch_mm) * float(steps_per_edge),
+        )
+        dist_rgb_pose = normalize_dist_coeffs(None)
+    else:
+        print(
+            "[ippe_handeye] WARNING: no checkerboard_corners_uv_9 given -- "
+            "affine interpolation from three corners (biases the tilt by ~2 deg)."
+        )
+        p_tl, p_tr, p_bl = checkerboard_corners_uv
+        step_x = (p_tr - p_tl) / float(steps_per_edge)
+        step_y = (p_bl - p_tl) / float(steps_per_edge)
 
-    pts2d_rgb = np.array(
-        [
-            p_tl + alpha * step_x + beta * step_y
-            for beta in range(steps_per_edge + 1)
-            for alpha in range(steps_per_edge + 1)
-        ],
-        dtype=np.float64,
-    )
+        pts2d_rgb = np.array(
+            [
+                p_tl + alpha * step_x + beta * step_y
+                for beta in range(steps_per_edge + 1)
+                for alpha in range(steps_per_edge + 1)
+            ],
+            dtype=np.float64,
+        )
+        interp_diag = {"rgb_interpolation": "affine3"}
+        dist_rgb_pose = dist_rgb
 
     # the depth points come from the plane fit on the checkerboard face
     cam_points_xyz_mm = cam_points_xyz_m * 1000.0
@@ -967,12 +1057,13 @@ def _solve_pose_ippe_handeye(
         "pts3d_board_rgb_mm": np.asarray(pts3d_board_rgb_mm, dtype=np.float64),
         "pts2d_rgb": np.asarray(pts2d_rgb, dtype=np.float64),
     }
+    diagnostics.update(interp_diag)
 
     candidates_rgb = _build_ippe_candidates(
         pts3d_board_rgb_mm,
         pts2d_rgb,
         K_rgb,
-        dist_rgb,
+        dist_rgb_pose,
     )
 
     best_idx_rgb = _select_ippe_candidate_rgb(
@@ -993,7 +1084,7 @@ def _solve_pose_ippe_handeye(
             pts3d_board_rgb_mm,
             pts2d_rgb,
             K_rgb,
-            dist_rgb,
+            dist_rgb_pose,
             rvec_bc,
             tvec_bc,
         )
@@ -1104,7 +1195,7 @@ def _solve_pose_ippe_handeye(
             pts3d_board_rgb_mm,
             pts2d_rgb,
             K_rgb,
-            dist_rgb,
+            dist_rgb_pose,
             i,
         )
         for i, c in enumerate(candidates_rgb)
@@ -1174,6 +1265,7 @@ def solve_pose(
     board_thickness_mm: float = 0.0,
     xray_lattice_uv: np.ndarray | None = None,
     xray_lattice_xy_mm: np.ndarray | None = None,
+    checkerboard_corners_uv_9: np.ndarray | None = None,
 ) -> PoseSolveResult:
     """
     Dispatch pose estimation by method name.
@@ -1201,6 +1293,11 @@ def solve_pose(
     pose_method : str
         One of 'iterative', 'iterative_ransac', 'ippe', 'ippe_handeye'.
     checkerboard_corners_uv : (3, 2) or None
+    checkerboard_corners_uv_9 : (9, 2) or None
+        All nine checkerboard corners (any order). For 'ippe_handeye' the
+        121 RGB points are then interpolated with the perspective homography
+        of the nine corners instead of affinely from the three extreme ones;
+        see _solve_pose_ippe_handeye.
         The three extreme checkerboard corners [TL, TR, BL] in the RGB
         image. Required for method='ippe_handeye'.
     K_rgb : (3, 3) or None
@@ -1288,6 +1385,7 @@ def solve_pose(
             refine_rgb_iterative=refine_rgb_iterative,
             xray_lattice_uv=xray_lattice_uv,
             xray_lattice_xy_mm=xray_lattice_xy_mm,
+            checkerboard_corners_uv_9=checkerboard_corners_uv_9,
         )
 
     raise ValueError(

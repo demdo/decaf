@@ -525,6 +525,11 @@ class CameraToXrayCalibrationPage(StaticImagePage):
                     checkerboard_corners_uv=np.asarray(
                         self.state.checkerboard_corners_uv, dtype=np.float64
                     ),
+                    checkerboard_corners_uv_9=(
+                        None
+                        if self.state.checkerboard_corners_uv_9 is None
+                        else np.asarray(self.state.checkerboard_corners_uv_9, dtype=np.float64)
+                    ),
                     K_rgb=np.asarray(self.state.K_rgb, dtype=np.float64),
                     steps_per_edge=10,
                     board_thickness_mm=PCB_THICKNESS_MM,

@@ -131,6 +131,7 @@ def calibrate_camera_to_xray(
     board_thickness_mm: float = 0.0,
     xray_lattice_uv: np.ndarray | None = None,
     xray_lattice_xy_mm: np.ndarray | None = None,
+    checkerboard_corners_uv_9: np.ndarray | None = None,
 ) -> CameraToXrayCalibrationResult:
     """
     Estimate the rigid camera->xray transform.
@@ -169,6 +170,11 @@ def calibrate_camera_to_xray(
         Only used for method='ippe_handeye'. Offset between the checkerboard
         plane seen by the RGB camera and the copper plane seen by the X-ray.
         See tracking.pose_solvers.solve_pose.
+    checkerboard_corners_uv_9 : (9,2) or None
+        All nine checkerboard corners. With them the RGB-side patch points
+        are interpolated by a perspective homography (recommended); without
+        them affinely from the three extreme corners, which biases the board
+        tilt by ~2 deg. See tracking.pose_solvers._solve_pose_ippe_handeye.
     xray_lattice_uv, xray_lattice_xy_mm : (M,2), (M,2) or None
         Only for pose_method='ippe_handeye': all indexed board holes in the
         X-ray working space (distortion-corrected like points_uv_xray) and
@@ -233,6 +239,7 @@ def calibrate_camera_to_xray(
         board_thickness_mm=board_thickness_mm,
         xray_lattice_uv=xray_lattice_uv,
         xray_lattice_xy_mm=xray_lattice_xy_mm,
+        checkerboard_corners_uv_9=checkerboard_corners_uv_9,
     )
 
     T_cx = rvec_tvec_to_transform(pose_result.rvec, pose_result.tvec)
