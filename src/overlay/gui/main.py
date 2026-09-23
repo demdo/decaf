@@ -7,16 +7,23 @@
 #   4) X-ray Marker Selection
 #   5) Camera -> X-ray Calibration (PnP)
 #
+# Steps 3-5 run once per table height (N_HEIGHTS board placements, title
+# counter "(k/3)"); 'Next height' on step 5 returns to step 3, and after the
+# last height step 5 pools all placements into T_cx / T_xc. Next to the
+# title (steps 3-5): 'Redo height' (current height only) and 'New series'.
+#
 # Uses the per-page template navigation buttons (btn_back / btn_next).
 # Sidebar is display-only (wizard gating), no click navigation.
 #
 # Two modes, chosen in a dialog before the window opens (gui/evaluation.py):
 #   Normal      - nothing is written to disk.
 #   Evaluation  - every capture is saved into one session folder under a
-#                 label from the bar at the top; the calibration files can
-#                 be loaded automatically and "New board capture" returns
-#                 to step 3 without restarting the GUI.
+#                 label from the bar at the top (plus the height, "_h2",
+#                 during steps 3-5); the calibration files can be loaded
+#                 automatically and "New series" returns to step 3
+#                 without restarting the GUI.
 
+import re
 import sys
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -31,6 +38,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QFrame,
     QPushButton,
+    QMessageBox,
+    QInputDialog,
 )
 
 from overlay.gui.state import SessionState
@@ -44,7 +53,10 @@ from overlay.gui.pages.page_xray_intrinsics import XrayIntrinsicsPage
 from overlay.gui.pages.page_camera_intrinsics import CameraIntrinsicsPage
 from overlay.gui.pages.page_plane_fitting import PlaneFittingPage
 from overlay.gui.pages.page_xray_marker_selection import XrayMarkerSelectionPage
-from overlay.gui.pages.page_camera_to_xray_calibration import CameraToXrayCalibrationPage
+from overlay.gui.pages.page_camera_to_xray_calibration import (
+    CameraToXrayCalibrationPage,
+    N_HEIGHTS,
+)
 from overlay.gui.pages.page_pointer_tool_depth import PointerToolDepthPage
 from overlay.gui.pages.page_overlay_preview import OverlayPreviewPage
 from overlay.gui.pages.page_tool_tracking import ToolTrackingPage
@@ -121,6 +133,13 @@ class MainWindow(QMainWindow):
 
         self.current_step = self.IDX_XRAY
         self.mode_b_active = False
+        # 1 for the first capture of the current height, 2.. after 'Redo height'
+        # (Evaluation file names h2, h2b, h2c, ...)
+        self._height_attempt = 1
+        # Evaluation: positions in EvaluationSession.used_labels where the
+        # current attempt / series started (names what gets discarded)
+        self._attempt_mark = 0
+        self._series_mark = 0
 
         self._normal_content_margins = (16, 16, 16, 16)
         self._normal_root_margins = (16, 16, 16, 16)
@@ -205,12 +224,40 @@ class MainWindow(QMainWindow):
         self.eval_bar: EvalBar | None = None
         if self.eval_session is not None:
             self.eval_bar = EvalBar(self.eval_session)
-            self.eval_bar.btn_new_capture.clicked.connect(self.new_board_capture)
+            self.eval_bar.btn_new_capture.clicked.connect(self.new_series)
             self.content_layout.addWidget(self.eval_bar)
 
         self.lbl_step_title = QLabel("")
         self.lbl_step_title.setObjectName("ContentTitle")
-        self.content_layout.addWidget(self.lbl_step_title)
+
+        # Cam2X series controls next to the title (steps 3-5). 'New series'
+        # only in Normal mode: Evaluation mode has it in its bar, where it
+        # also works from Mode B.
+        self.btn_redo_height = QPushButton("Redo height")
+        self.btn_redo_height.setObjectName("SecondaryBtn")
+        self.btn_redo_height.setToolTip(
+            "Capture a height again from step 3: the current one or a finished one "
+            "(e.g. the outlier of the pooled table); the other heights stay."
+        )
+        self.btn_redo_height.clicked.connect(lambda: self.redo_height())
+        self.btn_series_new = QPushButton("New series")
+        self.btn_series_new.setObjectName("SecondaryBtn")
+        self.btn_series_new.setToolTip("Discard all heights of this series and start again at step 3.")
+        self.btn_series_new.clicked.connect(lambda: self.new_series())
+        for b in (self.btn_redo_height, self.btn_series_new):
+            # NoFocus: SPACE captures / accepts on the pages and must not
+            # re-click the button; compact, so the title row keeps its height
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setStyleSheet("padding: 2px 10px; border-radius: 6px;")
+
+        self.title_row = QWidget()
+        title_lay = QHBoxLayout(self.title_row)
+        title_lay.setContentsMargins(0, 0, 0, 0)
+        title_lay.setSpacing(8)
+        title_lay.addWidget(self.lbl_step_title, stretch=1)
+        title_lay.addWidget(self.btn_redo_height)
+        title_lay.addWidget(self.btn_series_new)
+        self.content_layout.addWidget(self.title_row)
 
         self.pages = QStackedWidget()
         self.content_layout.addWidget(self.pages, stretch=1)
@@ -245,6 +292,11 @@ class MainWindow(QMainWindow):
         self._wire_nav(self.page_overlay_preview, idx=self.IDX_OVERLAY_PREVIEW)
         self._wire_nav(self.page_tool_tracking, idx=self.IDX_TOOL_TRACKING)
         self._wire_nav(self.page_overlay_live, idx=self.IDX_OVERLAY_LIVE)
+
+        self.page_cam2xray.btn_next_height.clicked.connect(self.next_height)
+        self.page_plane.on_redo_height = lambda: self.redo_height(confirm=False)
+        if self.eval_session is not None:
+            self.eval_session.tag_provider = self._eval_tag
 
         self.root_layout.addWidget(self.sidebar)
         self.root_layout.addWidget(self.content_card, stretch=1)
@@ -286,10 +338,153 @@ class MainWindow(QMainWindow):
         if ok_x and ok_c:
             self._switch_to_page(self.IDX_PLANE)
 
-    def new_board_capture(self) -> None:
-        """Evaluation mode: next board placement. Keeps the intrinsics,
-        clears everything the wizard derives from one board capture and
-        returns to step 3, also from Mode B."""
+    def _eval_tag(self) -> str:
+        """Height tag for Evaluation file names: "h<k>" in steps 3-5."""
+        in_series = (
+            not self.mode_b_active
+            and self.current_step in (self.IDX_PLANE, self.IDX_MARKERS, self.IDX_CAM2XRAY)
+        )
+        if not in_series:
+            return ""
+        tag = f"h{self.page_cam2xray.current_height()}"
+        if self._height_attempt > 1:
+            tag += chr(ord("a") + self._height_attempt - 1)   # h2b, h2c: height redone
+        return tag
+
+    def next_height(self) -> None:
+        """Step 5 'Next height': keep the solved placement and capture the
+        next one (steps 3-5 again)."""
+        if not self.page_cam2xray.commit_height():
+            return
+        self._clear_board_capture()
+        self._fresh_attempt()
+
+    def _fresh_attempt(self) -> None:
+        """Start capturing the current height: the attempt letter makes its
+        Evaluation files share no name with earlier ones (h2, h2b, ...).
+        Call on step 3, after _clear_board_capture."""
+        self._height_attempt = 1
+        ev = self.eval_session
+        if ev is not None:
+            while (
+                self._eval_tag()
+                and self._height_attempt < 26
+                and any(ev.dir.glob(f"{ev.file_label()}_*"))
+            ):
+                self._height_attempt += 1
+            self._attempt_mark = len(ev.used_labels)
+        self.update_ui()
+
+    def _series_labels_since(self, mark: int) -> list[str]:
+        """File labels of series captures ("cal_h2b") saved since mark."""
+        ev = self.eval_session
+        out: list[str] = []
+        for lab in ([] if ev is None else ev.used_labels[mark:]):
+            if re.search(r"_h\d+[a-z]?$", lab) and lab not in out:
+                out.append(lab)
+        return out
+
+    def _height_has_data(self) -> bool:
+        s = self.state
+        return bool(
+            s.plane_confirmed
+            or s.checkerboard_corners_confirmed
+            or s.xray_image is not None
+            or self.page_cam2xray.solved_heights() > len(s.cam2x_heights)
+        )
+
+    def redo_height(self, confirm: bool = True) -> None:
+        """Capture a height again from step 3: the current one (plane fit,
+        X-ray, its solve) or, chosen from a list, a finished one - e.g. the
+        outlier of the pooled table. The other heights stay. Also brings a
+        stuck plane page back to 'Start'."""
+        P = self.page_cam2xray
+        k = P.current_height()
+        drop = None   # index of a finished height to capture again
+        if confirm and self.state.cam2x_heights:
+            items = P.finished_height_items() + [f"h{k}  (current)"]
+            item, ok = QInputDialog.getItem(
+                self,
+                "Redo height",
+                "Capture which height again from step 3? The other finished heights "
+                "stay; an unfinished current capture is discarded.",
+                items,
+                len(items) - 1,
+                False,
+            )
+            if not ok:
+                return
+            i = items.index(item)
+            drop = i if i < len(items) - 1 else None
+        elif confirm and self._height_has_data():
+            ans = QMessageBox.question(
+                self,
+                "Redo height",
+                f"Discard the plane fit and X-ray of height {k} and capture it again "
+                "from step 3? The finished heights stay.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+
+        # what is discarded, by the names its files were written under
+        # (they stay on disk; the next attempt gets names of its own, h2b)
+        current = self._series_labels_since(self._attempt_mark)
+        discarded = current
+        if drop is not None:
+            current_solved = P.solved_heights() > len(self.state.cam2x_heights)
+            h = P.drop_height(drop)   # a solved current height stays as finished
+            discarded = [h.eval_label or f"h{drop + 1}"] + ([] if current_solved else current)
+        ev = self.eval_session
+        if ev is not None and discarded:
+            ev.log("series", "-", {"discarded_height": ",".join(discarded)}, tagged=False)
+        self._clear_board_capture()
+        self._fresh_attempt()
+
+    def new_series(self) -> None:
+        """Start the Cam2X series over: all heights are discarded. From step
+        5 and, in Evaluation mode, from the bar (also from Mode B)."""
+        n = self.page_cam2xray.solved_heights()
+        if n > 0:
+            ans = QMessageBox.question(
+                self,
+                "New series",
+                f"Discard the {n} height(s) captured so far and start again at step 3?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+        ev = self.eval_session
+        if ev is not None:
+            series = self._series_labels_since(self._series_mark)
+            if series:
+                ended = sorted({re.sub(r"_h\d+[a-z]?$", "", lab) for lab in series})
+                ev.log("series", "-", {
+                    "ended_series": ",".join(ended),
+                    "heights_solved": n,
+                    "pooled": self.state.T_xc is not None,
+                }, tagged=False)
+            # the new series gets a label nothing was saved under yet (cal ->
+            # cal_2, cal1 -> cal2, '' -> capture_2), so its files share no
+            # name with earlier captures (also Mode B ones like plane07_depth)
+            base = ev.sanitize_label(ev.label)
+            if any(ev.dir.glob(f"{base}_*")):
+                lab = ev.next_label(base)
+                while any(ev.dir.glob(f"{ev.sanitize_label(lab)}_*")):
+                    lab = ev.next_label(lab)
+                ev.set_label(lab)
+        self.state.cam2x_heights.clear()
+        self._clear_board_capture()
+        self._fresh_attempt()
+        if ev is not None:
+            self._series_mark = len(ev.used_labels)
+
+    def _clear_board_capture(self) -> None:
+        """Keeps the intrinsics and the finished heights, clears everything
+        the wizard derives from one board capture and returns to step 3,
+        also from Mode B."""
         s = self.state
         s.xray_image = None
         s.xray_image_path = None
@@ -304,7 +499,6 @@ class MainWindow(QMainWindow):
         s.checkerboard_corners_uv = None
         s.checkerboard_corners_uv_9 = None
         s.checkerboard_corners_confirmed = False
-        s.pnp_ransac_threshold_px = None
         s.T_cx = None
         s.T_xc = None
         s.tip_uv_c = None
@@ -421,7 +615,7 @@ class MainWindow(QMainWindow):
 
         if is_live:
             self.sidebar.hide()
-            self.lbl_step_title.hide()
+            self.title_row.hide()
 
             self.root_layout.setContentsMargins(0, 0, 0, 0)
             self.root_layout.setSpacing(0)
@@ -431,7 +625,7 @@ class MainWindow(QMainWindow):
             self.content_layout.setSpacing(0)
         else:
             self.sidebar.show()
-            self.lbl_step_title.show()
+            self.title_row.show()
 
             self.root_layout.setContentsMargins(*self._normal_root_margins)
             self.root_layout.setSpacing(16)
@@ -470,6 +664,11 @@ class MainWindow(QMainWindow):
 
         done_a = [self.step_complete(i) for i in self.mode_a_indices]
 
+        # Steps 3-5 run once per height: counter "(k/3)", and a tick only
+        # once the whole series is done (step 5 = pooled pose exists).
+        k = f"({self.page_cam2xray.current_height()}/{N_HEIGHTS})"
+        series_done = self.step_complete(self.IDX_CAM2XRAY)
+
         for pos, idx in enumerate(self.mode_a_indices):
             if self.mode_b_active:
                 locked = True
@@ -481,11 +680,11 @@ class MainWindow(QMainWindow):
             elif idx == self.IDX_CAM_CALIB:
                 _set_item_text(self.item_rgb, done_a[pos], locked, "2) Load camera intrinsics")
             elif idx == self.IDX_PLANE:
-                _set_item_text(self.item_plane, done_a[pos], locked, "3) Plane fitting")
+                _set_item_text(self.item_plane, done_a[pos] and series_done, locked, f"3) Plane fitting {k}")
             elif idx == self.IDX_MARKERS:
-                _set_item_text(self.item_markers, done_a[pos], locked, "4) X-ray marker selection")
+                _set_item_text(self.item_markers, done_a[pos] and series_done, locked, f"4) X-ray marker selection {k}")
             elif idx == self.IDX_CAM2XRAY:
-                _set_item_text(self.item_cam2xray, done_a[pos], locked, "5) Camera → X-ray (PnP)")
+                _set_item_text(self.item_cam2xray, done_a[pos], locked, f"5) Camera → X-ray {k}")
 
         done_b = [self.step_complete(i) for i in self.mode_b_indices]
 
@@ -506,11 +705,11 @@ class MainWindow(QMainWindow):
         elif self.current_step == self.IDX_CAM_CALIB:
             self.lbl_step_title.setText("Step 2 — Load camera intrinsics")
         elif self.current_step == self.IDX_PLANE:
-            self.lbl_step_title.setText("Step 3 — Plane fitting")
+            self.lbl_step_title.setText(f"Step 3 — Plane fitting {k}")
         elif self.current_step == self.IDX_MARKERS:
-            self.lbl_step_title.setText("Step 4 — X-ray marker selection")
+            self.lbl_step_title.setText(f"Step 4 — X-ray marker selection {k}")
         elif self.current_step == self.IDX_CAM2XRAY:
-            self.lbl_step_title.setText("Step 5 — Camera → X-ray (PnP)")
+            self.lbl_step_title.setText(f"Step 5 — Camera → X-ray {k}")
         elif self.current_step == self.IDX_PTR_DEPTH:
             self.lbl_step_title.setText("Mode B — Pointer Tool Depth")
         elif self.current_step == self.IDX_OVERLAY_PREVIEW:
@@ -521,6 +720,17 @@ class MainWindow(QMainWindow):
             self.lbl_step_title.setText("")
         else:
             self.lbl_step_title.setText("")
+
+        in_series = (
+            not self.mode_b_active
+            and self.current_step in (self.IDX_PLANE, self.IDX_MARKERS, self.IDX_CAM2XRAY)
+        )
+        self.btn_redo_height.setVisible(in_series)
+        self.btn_series_new.setVisible(in_series and self.eval_bar is None)
+        self.btn_series_new.setEnabled(self.page_cam2xray.solved_heights() > 0)
+
+        if self.eval_bar is not None:
+            self.eval_bar.set_tag(self._eval_tag())
 
         self._update_page_nav_buttons()
 

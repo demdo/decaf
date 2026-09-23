@@ -35,7 +35,7 @@ T_CX = np.array(
     dtype=np.float64,
 )
 
-POSE_METHOD = "iterative_ransac"
+POSE_METHOD = "ippe"  # as the live pointer (overlay/tools/pointer_depth.py)
 REFINE_WITH_ITERATIVE = True
 USE_EXTRINSIC_GUESS = False
 

@@ -63,6 +63,8 @@ class PlaneFittingPage(LiveImagePage):
     def __init__(self, state: SessionState, on_complete_changed=None, parent=None):
         self.state = state
         self.on_complete_changed = on_complete_changed
+        # set by main.py: discard the current Cam2X height, capture it again
+        self.on_redo_height = None
 
         # ---------------- detection ----------------
         self.pattern_size = (3, 3)
@@ -874,6 +876,44 @@ class PlaneFittingPage(LiveImagePage):
                 median_mm=session_median_mm,
                 p95_mm=session_p95_mm,
             )
+
+        self._warn_if_table_not_moved()
+
+    # ------------------------------------------------------------------ #
+    # Cam2X series: was the table moved since the last height?
+    # ------------------------------------------------------------------ #
+
+    # The heights are ~100 mm apart; closer than this is most likely the
+    # same placement again (table not raised).
+    MIN_HEIGHT_STEP_MM: float = 50.0
+
+    def _warn_if_table_not_moved(self) -> None:
+        """Compares the new patch centre with those of the finished heights
+        (state.cam2x_heights); if too close, the user decides: redo the
+        height (on_redo_height) or keep the fit."""
+        xyz = self.state.xray_points_xyz_c
+        if xyz is None or len(xyz) == 0 or not self.state.cam2x_heights:
+            return
+        c = np.asarray(xyz, dtype=np.float64).reshape(-1, 3).mean(axis=0) * 1000.0
+        d = [
+            float(np.linalg.norm(c - np.asarray(h.board_centre_c_mm, dtype=np.float64)))
+            for h in self.state.cam2x_heights
+        ]
+        i = int(np.argmin(d))
+        if d[i] < self.MIN_HEIGHT_STEP_MM:
+            ans = QMessageBox.question(
+                self,
+                "Table not raised?",
+                f"The board is only {d[i]:.0f} mm from where it was at height {i + 1}.\n\n"
+                "The calibration pools several table heights and needs them apart "
+                "(raise the table ~100 mm per height).\n\n"
+                "Discard this plane fit and redo the height? "
+                "(Raise the table first, then press Start.)",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ans == QMessageBox.Yes and callable(self.on_redo_height):
+                self.on_redo_height()
 
     # ------------------------------------------------------------------ #
     # Helper: plane -> marker grid

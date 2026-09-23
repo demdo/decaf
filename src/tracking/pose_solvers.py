@@ -328,7 +328,8 @@ class PoseSolveResult:
     refined_with_iterative: bool
     refinement_pnp_flag: int | None
 
-    inliers: np.ndarray | None
+    # all points (no robust estimator any more); kept: the Cam2X page
+    # computes its P95 over it and writes it to the evaluation npz
     inlier_idx: np.ndarray
 
     uv_proj: np.ndarray
@@ -633,100 +634,6 @@ def _solve_pose_iterative(
         candidate_index_xray=None,
         refined_with_iterative=bool(refine_with_iterative),
         refinement_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE) if refine_with_iterative else None,
-        inliers=None,
-        inlier_idx=inlier_idx,
-        uv_proj=uv_proj,
-        reproj_errors_px=per_point_px,
-        reproj_mean_px=mean_px,
-        reproj_median_px=median_px,
-        reproj_max_px=max_px,
-        all_candidates=None,
-        all_candidates_rgb=None,
-    )
-
-
-def _solve_pose_iterative_ransac(
-    object_points_xyz: np.ndarray,
-    image_points_uv: np.ndarray,
-    K: np.ndarray,
-    dist_coeffs: np.ndarray | None = None,
-    *,
-    refine_with_iterative: bool = True,
-    ransac_reprojection_error_px: float = 8.0,
-    ransac_confidence: float = 0.99,
-    ransac_iterations_count: int = 100,
-) -> PoseSolveResult:
-    object_points_xyz = np.asarray(object_points_xyz, dtype=np.float64).reshape(-1, 3)
-    image_points_uv = np.asarray(image_points_uv, dtype=np.float64).reshape(-1, 2)
-    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
-    dist = normalize_dist_coeffs(dist_coeffs)
-
-    if object_points_xyz.shape[0] < 4:
-        raise ValueError("At least 4 correspondences are required.")
-
-    success, rvec, tvec, inliers = cv2.solvePnPRansac(
-        objectPoints=object_points_xyz,
-        imagePoints=image_points_uv,
-        cameraMatrix=K,
-        distCoeffs=dist,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-        reprojectionError=float(ransac_reprojection_error_px),
-        confidence=float(ransac_confidence),
-        iterationsCount=int(ransac_iterations_count),
-    )
-
-    if not success:
-        raise RuntimeError("SOLVEPNP_ITERATIVE_RANSAC failed.")
-
-    rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
-    tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
-    inliers = None if inliers is None else np.asarray(inliers, dtype=np.int64)
-
-    if refine_with_iterative:
-        inlier_idx_for_refine = _compute_inlier_idx(
-            inliers,
-            num_points=len(image_points_uv),
-        )
-
-        object_refine = object_points_xyz[inlier_idx_for_refine]
-        image_refine = image_points_uv[inlier_idx_for_refine]
-
-        rvec, tvec = _refine_pose_iterative(
-            object_refine,
-            image_refine,
-            K,
-            dist,
-            rvec,
-            tvec,
-        )
-
-    uv_proj, _, _, _, per_point_px = compute_reprojection_error_px(
-        object_points_xyz,
-        image_points_uv,
-        rvec,
-        tvec,
-        K,
-        dist,
-    )
-
-    inlier_idx = _compute_inlier_idx(inliers, num_points=len(image_points_uv))
-    mean_px, median_px, max_px = _compute_reprojection_stats_from_subset(
-        per_point_px,
-        inlier_idx,
-    )
-
-    return PoseSolveResult(
-        rvec=rvec,
-        tvec=tvec,
-        method="iterative_ransac",
-        raw_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE),
-        used_extrinsic_guess=False,
-        candidate_index=None,
-        candidate_index_rgb=None,
-        candidate_index_xray=None,
-        refined_with_iterative=bool(refine_with_iterative),
-        refinement_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE) if refine_with_iterative else None,
-        inliers=inliers,
         inlier_idx=inlier_idx,
         uv_proj=uv_proj,
         reproj_errors_px=per_point_px,
@@ -816,7 +723,6 @@ def _solve_pose_ippe(
         candidate_index_xray=None,
         refined_with_iterative=bool(refine_with_iterative),
         refinement_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE) if refine_with_iterative else None,
-        inliers=None,
         inlier_idx=inlier_idx,
         uv_proj=uv_proj,
         reproj_errors_px=per_point_px,
@@ -915,7 +821,7 @@ def _solve_pose_ippe_handeye(
         square tilted ~20 deg images as a trapezoid. On the 73-px patch the
         neglected perspective reaches 1.4 px at the patch corners, and since
         the board tilt is observable only through the foreshortening
-        (~0.4 px per degree), the parallelogram costs ~2 deg of tilt and up
+        (about half a pixel per degree), the parallelogram costs ~2 deg of tilt and up
         to 5 mm of depth, in a direction that rotates with the in-plane
         orientation of the board (synthetic, noise-free: 1.65-2.0 deg).
         This made T_cx depend on how the board was placed: on the five
@@ -1224,7 +1130,6 @@ def _solve_pose_ippe_handeye(
         candidate_index_xray=int(best_idx_xray),
         refined_with_iterative=True,   # X-ray side is always LM-refined on the lattice
         refinement_pnp_flag=int(cv2.SOLVEPNP_ITERATIVE),
-        inliers=None,
         inlier_idx=inlier_idx,
         uv_proj=uv_proj,
         reproj_errors_px=per_point_px,
@@ -1255,9 +1160,6 @@ def solve_pose(
     use_extrinsic_guess: bool = False,
     refine_with_iterative: bool = True,
     refine_rgb_iterative: bool = False,
-    ransac_reprojection_error_px: float = 8.0,
-    ransac_confidence: float = 0.99,
-    ransac_iterations_count: int = 100,
     pitch_mm: float = 2.54,
     checkerboard_corners_uv: np.ndarray | None = None,
     K_rgb: np.ndarray | None = None,
@@ -1286,20 +1188,20 @@ def solve_pose(
         Camera / X-ray intrinsic matrix.
     dist_coeffs : array-like or None
         Distortion coefficients for the main imaging system represented by K.
-        For iterative / iterative_ransac / ippe this is the distortion used
+        For iterative / ippe this is the distortion used
         directly in the solve.
     dist_coeffs_rgb : array-like or None
         RGB camera distortion coefficients. Only used for method='ippe_handeye'.
     pose_method : str
-        One of 'iterative', 'iterative_ransac', 'ippe', 'ippe_handeye'.
+        One of 'iterative', 'ippe', 'ippe_handeye'.
     checkerboard_corners_uv : (3, 2) or None
+        The three extreme checkerboard corners [TL, TR, BL] in the RGB
+        image. Required for method='ippe_handeye'.
     checkerboard_corners_uv_9 : (9, 2) or None
         All nine checkerboard corners (any order). For 'ippe_handeye' the
         121 RGB points are then interpolated with the perspective homography
         of the nine corners instead of affinely from the three extreme ones;
         see _solve_pose_ippe_handeye.
-        The three extreme checkerboard corners [TL, TR, BL] in the RGB
-        image. Required for method='ippe_handeye'.
     K_rgb : (3, 3) or None
         RGB camera intrinsic matrix. Required for method='ippe_handeye'.
     steps_per_edge : int
@@ -1311,13 +1213,13 @@ def solve_pose(
         points from the checkerboard towards the copper, so the X-ray points are
         placed at +board_thickness_mm. Default 0.0 keeps both on one plane.
     xray_lattice_uv, xray_lattice_xy_mm : (M,2), (M,2) or None
-        Only for pose_method='ippe_handeye'. All indexed holes of the board
-        in the X-ray working space (same space as image_points_uv, already
-        distortion-corrected) and their board coordinates in mm relative to
-        the patch origin (TL hole). When given, the X-ray-side pose is refined
-        on these points from both IPPE candidates and the candidate with the
-        lower lattice reprojection error is taken; the z-axis selection rule
-        is bypassed. See _solve_pose_ippe_handeye for the rationale.
+        Required for pose_method='ippe_handeye'. All indexed holes of the
+        board in the X-ray working space (same space as image_points_uv,
+        already distortion-corrected) and their board coordinates in mm
+        relative to the patch origin (TL hole). The X-ray-side pose is
+        refined on these points from both IPPE candidates and the candidate
+        with the lower lattice reprojection error is taken. See
+        _solve_pose_ippe_handeye for the rationale.
 
     Refinement options for ippe_handeye
     -----------------------------------
@@ -1340,18 +1242,6 @@ def solve_pose(
             tvec_init=tvec_init,
             use_extrinsic_guess=use_extrinsic_guess,
             refine_with_iterative=refine_with_iterative,
-        )
-
-    if method == "iterative_ransac":
-        return _solve_pose_iterative_ransac(
-            object_points_xyz=object_points_xyz,
-            image_points_uv=image_points_uv,
-            K=K,
-            dist_coeffs=dist_coeffs,
-            refine_with_iterative=refine_with_iterative,
-            ransac_reprojection_error_px=ransac_reprojection_error_px,
-            ransac_confidence=ransac_confidence,
-            ransac_iterations_count=ransac_iterations_count,
         )
 
     if method == "ippe":
@@ -1390,5 +1280,5 @@ def solve_pose(
 
     raise ValueError(
         f"Unknown pose_method '{pose_method}'. "
-        f"Expected 'iterative', 'iterative_ransac', 'ippe', or 'ippe_handeye'."
+        f"Expected 'iterative', 'ippe', or 'ippe_handeye'."
     )

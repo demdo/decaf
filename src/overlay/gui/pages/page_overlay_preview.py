@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-import pydicom
 
 from pathlib import Path
 
@@ -22,6 +21,7 @@ from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 
 from overlay.tools.homography import estimate_plane_induced_homography
 from overlay.tools.warp import blend_xray_overlay
+from overlay.tools.xray_io import read_xray_gray_u8
 from overlay.gui.widgets.widget_flow_layout import FlowLayout
 
 
@@ -516,16 +516,7 @@ class OverlayPreviewPage(LiveImagePage):
             return
 
         try:
-            if path.lower().endswith((".dcm", ".ima")):
-                ds = pydicom.dcmread(path)
-                img = ds.pixel_array.astype(np.float32)
-                img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-                img = img.astype(np.uint8)
-            else:
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-
-            if img is None:
-                raise ValueError("Could not read image.")
+            img = read_xray_gray_u8(path)
 
             self._xray_gray_u8 = img
             self._xray_gray_working_u8 = None

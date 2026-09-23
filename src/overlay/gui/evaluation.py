@@ -5,7 +5,10 @@
 # None); in Evaluation mode every capture lands in one session folder as
 # <label>_<kind>.<ext> with a line in log.md. The label comes from the bar
 # at the top of the window, so a file always says which board placement or
-# test it belongs to.
+# test it belongs to. While a Cam2X series runs (steps 3-5) the main window
+# appends the height, <label>_h1_<kind> .. <label>_h3_<kind> (a height
+# captured again: h2b, h2c, ...); the pooled result of the series is
+# <label>_h3_cam2x_pooled.json (tag of the last height).
 #
 # Folder:
 #   overlay/data/Evaluation/<session>/
@@ -125,6 +128,14 @@ class EvaluationSession:
         self.label = ""
         self.last_saved: Path | None = None
         self.on_saved: Callable[[Path], None] | None = None
+        # set by the EvalBar so a page can change the label (set_label)
+        self.on_label_set: Callable[[str], None] | None = None
+        # set by the main window: the height of a Cam2X series ("h1"..) while
+        # steps 3-5 run, "" otherwise; appended to the label in file names
+        self.tag_provider: Callable[[], str] | None = None
+        # every file label a file was saved under, in order (the main window
+        # names discarded / ended series from it, whatever the bar shows now)
+        self.used_labels: list[str] = []
         self._session_json = self.dir / "session.json"
         self._log = self.dir / "log.md"
         self._meta: dict = {
@@ -164,8 +175,32 @@ class EvaluationSession:
         s = re.sub(r"[^A-Za-z0-9_\-]+", "_", text.strip()).strip("_")
         return s or "capture"
 
-    def path_for(self, kind: str, suffix: str = ".npz") -> Path:
-        base = f"{self.sanitize_label(self.label)}_{kind}"
+    def set_label(self, text: str) -> None:
+        """Change the label from a page; the bar's field follows."""
+        self.label = text
+        if self.on_label_set is not None:
+            self.on_label_set(text)
+
+    @staticmethod
+    def next_label(label: str) -> str:
+        """plane03 -> plane04 (width kept), h10_on -> h10_on_2, "" -> "2"."""
+        m = re.match(r"^(.*?)(\d+)$", label.strip())
+        if m:
+            head, num = m.groups()
+            return f"{head}{int(num) + 1:0{len(num)}d}"
+        return f"{label.strip()}_2" if label.strip() else "2"
+
+    def file_label(self, tagged: bool = True) -> str:
+        """The label as it goes into file names: sanitized, plus the
+        series height ("cal_h2") unless tagged is False."""
+        base = self.sanitize_label(self.label)
+        tag = self.tag_provider() if (tagged and self.tag_provider is not None) else ""
+        return f"{base}_{tag}" if tag else base
+
+    def path_for(self, kind: str, suffix: str = ".npz", tagged: bool = True) -> Path:
+        label = self.file_label(tagged)
+        self.used_labels.append(label)
+        base = f"{label}_{kind}"
         p = self.dir / f"{base}{suffix}"
         n = 2
         while p.exists():
@@ -175,9 +210,9 @@ class EvaluationSession:
 
     # ---------------- saving ----------------
 
-    def _done(self, path: Path, page: str, summary: dict | None) -> Path:
+    def _done(self, path: Path, page: str, summary: dict | None, tagged: bool = True) -> Path:
         self.last_saved = path
-        self.log(page, path.name, summary or {})
+        self.log(page, path.name, summary or {}, tagged=tagged)
         print(f"[EVAL] saved {path}")
         if self.on_saved is not None:
             self.on_saved(path)
@@ -196,12 +231,21 @@ class EvaluationSession:
         np.savez(str(path), **clean)
         return self._done(path, page, summary)
 
-    def save_json(self, kind: str, data: dict, *, page: str = "", log: bool = False) -> Path:
-        path = self.path_for(kind, ".json")
+    def save_json(
+        self,
+        kind: str,
+        data: dict,
+        *,
+        page: str = "",
+        log: bool = False,
+        summary: dict | None = None,
+        tagged: bool = True,
+    ) -> Path:
+        path = self.path_for(kind, ".json", tagged=tagged)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(_to_jsonable(data), f, indent=2)
         if log:
-            return self._done(path, page, None)
+            return self._done(path, page, summary, tagged=tagged)
         self.last_saved = path
         return path
 
@@ -217,11 +261,11 @@ class EvaluationSession:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    def log(self, page: str, filename: str, summary: dict) -> None:
+    def log(self, page: str, filename: str, summary: dict, tagged: bool = True) -> None:
         nums = ", ".join(f"{k}={_fmt(v)}" for k, v in summary.items())
         row = (
             f"| {time.strftime('%H:%M:%S')} | {page} | "
-            f"{self.sanitize_label(self.label)} | {filename} | {nums} |\n"
+            f"{self.file_label(tagged)} | {filename} | {nums} |\n"
         )
         try:
             with open(self._log, "a", encoding="utf-8") as f:
@@ -341,7 +385,7 @@ class StartupDialog(QDialog):
 
 class EvalBar(QFrame):
     """
-    session name · label field · last saved file · "New board capture".
+    session name · label field (+ series height) · last saved file · "New series".
 
     The label is read by the pages at save time through session.label; the
     bar keeps it in sync on every keystroke.
@@ -363,11 +407,16 @@ class EvalBar(QFrame):
         self.ed_label = QLineEdit()
         self.ed_label.setPlaceholderText("label, e.g. cal1 / raised25 / h10_on")
         self.ed_label.textChanged.connect(self._on_label)
+        self.lbl_tag = QLabel("")
+        self.lbl_tag.setToolTip("Height of the Cam2X series, appended to the label in file names")
+        self.lbl_tag.hide()
         self.lbl_last = QLabel("nothing saved yet")
-        self.btn_new_capture = QPushButton("New board capture")
+        self.btn_new_capture = QPushButton("New series")
+        # NoFocus: SPACE captures / accepts on the pages and must not re-click it
+        self.btn_new_capture.setFocusPolicy(Qt.NoFocus)
         self.btn_new_capture.setToolTip(
-            "Back to step 3 (plane fitting) for the next board placement; "
-            "intrinsics stay loaded, everything after step 2 is cleared."
+            "Back to step 3 (plane fitting) and start the Cam2X series again; "
+            "intrinsics stay loaded, all heights and everything after step 2 are cleared."
         )
 
         lay = QHBoxLayout(self)
@@ -376,13 +425,20 @@ class EvalBar(QFrame):
         lay.addWidget(self.lbl_session)
         lay.addWidget(QLabel("Label"))
         lay.addWidget(self.ed_label)
+        lay.addWidget(self.lbl_tag)
         lay.addWidget(self.lbl_last, stretch=1)
         lay.addWidget(self.btn_new_capture)
 
         session.on_saved = self._on_saved
+        session.on_label_set = self.ed_label.setText
 
     def _on_label(self, text: str) -> None:
         self.session.label = text
 
     def _on_saved(self, path: Path) -> None:
         self.lbl_last.setText(f"saved: {path.name}")
+
+    def set_tag(self, tag: str) -> None:
+        """Show the series height the file names get ("_h2"), or nothing."""
+        self.lbl_tag.setText(f"_{tag}" if tag else "")
+        self.lbl_tag.setVisible(bool(tag))

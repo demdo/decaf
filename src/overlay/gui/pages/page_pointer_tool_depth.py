@@ -16,17 +16,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
 )
 
-from dataclasses import replace
-
 from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 
-from overlay.calib.calib_camera_to_pointer import (
-    calibrate_camera_to_pointer,
-    get_default_pointer_tool_model,
-)
 from overlay.calib.calib_xray_to_pointer import extract_depth
-from tracking.pose_filters import AdaptiveKalmanFilterCV3D
+from overlay.tools.pointer_depth import PointerDepthEstimator, depth_capture_arrays
 
 
 # ============================================================
@@ -184,7 +178,10 @@ class PointerToolDepthPage(LiveImagePage):
         self.state = state
         self.on_complete_changed = on_complete_changed
 
-        self.pointer_model = get_default_pointer_tool_model()
+        # solve + tip Kalman filter, shared with the live page's
+        # "Set reference plane" button
+        self._pointer = PointerDepthEstimator(self.FPS)
+        self.pointer_model = self._pointer.pointer_model
 
         dict_id = getattr(cv2.aruco, self.pointer_model.dictionary_name)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
@@ -206,6 +203,8 @@ class PointerToolDepthPage(LiveImagePage):
         # the unfiltered solve behind _last_valid_result (evaluation save)
         self._last_raw_result = None
         self._last_proposed_raw_result = None
+        # the camera frame the proposed pose was solved on
+        self._last_proposed_frame: np.ndarray | None = None
 
         # Evaluation mode: per-frame time series while recording
         self._recording: bool = False
@@ -216,17 +215,6 @@ class PointerToolDepthPage(LiveImagePage):
 
         self._stats: list[str] = []
         self._last_stats_rows: list[tuple[str, str]] | None = None
-
-        # Match the debug script 1:1
-        self._tip_kf = AdaptiveKalmanFilterCV3D(
-            dt=1.0 / float(self.FPS),
-            q_pos_still=1e-4,
-            q_vel_still=1e-2,
-            r_still=8e-2,
-            q_pos_move=5e-3,
-            q_vel_move=3e-1,
-            r_move=2e-2,
-        )
 
         super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -247,49 +235,6 @@ class PointerToolDepthPage(LiveImagePage):
         self._update_buttons()
         self._update_panels()
         self.update_view()
-
-    # ---------------------------------------------------------
-    # Helpers
-    # ---------------------------------------------------------
-
-    def _filter_pointer_result(self, raw_result):
-        """
-        Apply Kalman filtering to the tip position only.
-        Rotation stays raw; it is only used to adapt the filter noise.
-        """
-        tip_xyz_f_mm = self._tip_kf.filter(
-            measurement_mm=raw_result.tip_point_camera_mm,
-            rotation_camera=raw_result.rotation,
-        ).reshape(3)
-
-        T_tc_f = np.asarray(raw_result.T_4x4, dtype=np.float64).copy()
-        T_tc_f[:3, 3] = tip_xyz_f_mm
-
-        tvec_f = tip_xyz_f_mm.reshape(3, 1)
-        translation_f = tvec_f.copy()
-
-        K = np.asarray(self.state.K_rgb, dtype=np.float64)
-        # Project WITH the lens model: tip_uv_c is drawn on the observed
-        # (distorted) frame, like the tracker's tip and the warped X-ray.
-        dist = self.state.dist_rgb
-
-        tip_uv_f, _ = cv2.projectPoints(
-            np.zeros((1, 3), dtype=np.float64),  # tip origin in tip frame
-            raw_result.rvec,
-            tvec_f,
-            K,
-            dist,
-        )
-        tip_uv_f = tip_uv_f.reshape(2)
-
-        return replace(
-            raw_result,
-            tvec=tvec_f,
-            translation=translation_f,
-            T_4x4=T_tc_f,
-            tip_point_camera_mm=tip_xyz_f_mm,
-            tip_uv=tip_uv_f,
-        )
 
     # ---------------------------------------------------------
     # UI
@@ -419,23 +364,10 @@ class PointerToolDepthPage(LiveImagePage):
             )
 
             try:
-                # dist_rgb: the ArUco corners are observed in the distorted
-                # frame; solving with the lens model gives T_cp against the
-                # ideal camera, the frame T_xc is defined in.
-                raw_result = calibrate_camera_to_pointer(
-                    image_bgr=img,
-                    camera_intrinsics=self.state.K_rgb,
-                    dist_coeffs=self.state.dist_rgb,
-                    pointer_model=self.pointer_model,
-                    rvec_init=None,
-                    tvec_init=None,
-                    use_extrinsic_guess=False,
-                    pose_method="ippe",
-                    refine_with_iterative=True,
+                # raw = unfiltered solve, result = Kalman-filtered tip
+                raw_result, result = self._pointer.solve(
+                    img, self.state.K_rgb, self.state.dist_rgb
                 )
-
-                # apply Kalman filtering to tip position / translation
-                result = self._filter_pointer_result(raw_result)
 
                 self._last_raw_result = raw_result
                 self._last_valid_result = result
@@ -514,7 +446,7 @@ class PointerToolDepthPage(LiveImagePage):
         self._found = False
 
         # reset Kalman filter
-        self._tip_kf.reset()
+        self._pointer.reset()
 
         self._mode = "tracking"
 
@@ -535,6 +467,9 @@ class PointerToolDepthPage(LiveImagePage):
             self._stop_recording()
         self._last_proposed_result = self._last_valid_result
         self._last_proposed_raw_result = self._last_raw_result
+        # Kept here: the update_view() below still runs get_frame() in
+        # tracking mode, which polls the next frame into _live_color.
+        self._last_proposed_frame = self._live_color
 
         frozen_vis = self._build_tracking_vis(
             self._live_color.copy(),
@@ -657,53 +592,18 @@ class PointerToolDepthPage(LiveImagePage):
         behind d_x - detected corners and ids (so the pose can be re-solved
         offline, e.g. without the lens model), the raw and the filtered
         tip, T_tc, T_xc, K_rgb, dist_rgb."""
-        ev = self.state.eval
-        res = self._last_proposed_result
-        raw = self._last_proposed_raw_result
-
-        def opt(a, dtype=np.float64):
-            return None if a is None else np.asarray(a, dtype=dtype)
-
-        arrays = dict(
-            rgb_image=self._live_color,
-            K_rgb=opt(self.state.K_rgb),
-            dist_rgb=opt(self.state.dist_rgb),
-            T_xc=opt(self.state.T_xc),
-            # pointer solve (raw = unfiltered, as it left calibrate_camera_to_pointer)
-            marker_ids_used=opt(getattr(res, "marker_ids_used", None), np.int64),
-            object_points_xyz_mm=opt(getattr(res, "object_points_xyz", None)),
-            image_points_uv=opt(getattr(res, "image_points_uv", None)),
-            rvec=opt(getattr(res, "rvec", None)),
-            tvec_raw=opt(getattr(raw, "tvec", None)),
-            tvec_filtered=opt(getattr(res, "tvec", None)),
-            reproj_errors_px=opt(getattr(res, "reproj_errors_px", None)),
-            reproj_mean_px=np.array(float(getattr(res, "reproj_mean_px", np.nan))),
-            pose_method=np.array(str(getattr(res, "pose_method", ""))),
-            tip_xyz_c_raw_mm=opt(getattr(raw, "tip_point_camera_mm", None)),
-            tip_xyz_c_filtered_mm=opt(self.state.tip_xyz_c),
-            tip_uv_c=opt(self.state.tip_uv_c),
-            T_tc=opt(self.state.T_tc),
-            T_tc_raw=opt(getattr(raw, "T_4x4", None)),
-            d_x_mm=np.array(float(d_x_mm)),
+        arrays, summary = depth_capture_arrays(
+            rgb_image=self._last_proposed_frame,
+            K_rgb=self.state.K_rgb,
+            dist_rgb=self.state.dist_rgb,
+            T_xc=self.state.T_xc,
+            result=self._last_proposed_result,
+            raw_result=self._last_proposed_raw_result,
+            d_x_mm=d_x_mm,
         )
-        d_x_raw = np.nan
         try:
-            if raw is not None:
-                d_x_raw = float(extract_depth(T_xc=self.state.T_xc, T_tc=raw.T_4x4).d_x_mm)
-        except Exception:
-            pass
-        arrays["d_x_raw_mm"] = np.array(d_x_raw)
-
-        try:
-            ev.save_npz(
-                "depth",
-                arrays,
-                page="pointer_depth",
-                summary={
-                    "d_x_mm": float(d_x_mm),
-                    "d_x_raw_mm": d_x_raw,
-                    "reproj_px": float(getattr(res, "reproj_mean_px", np.nan)),
-                },
+            self.state.eval.save_npz(
+                "depth", arrays, page="pointer_depth", summary=summary
             )
         except Exception as e:
             print(f"[WARN] Could not save pointer depth capture: {e}")

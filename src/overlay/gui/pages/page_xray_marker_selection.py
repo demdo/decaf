@@ -13,6 +13,7 @@ from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 from overlay.gui.widgets.widget_xray_marker_selection import XrayMarkerSelectionWidget
 
 from overlay.tools.blob_detection import HoughCircleParams
+from overlay.tools.xray_io import xray_pixel_md5
 from overlay.tools.xray_marker_selection import (
     run_xray_marker_detection,
     compute_roi_from_grid,
@@ -239,6 +240,21 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
             if img is None:
                 raise ValueError("Could not read image.")
+
+            # Cam2X series: every height needs its own exposure. The same
+            # image again (e.g. exported twice) would pair the old hole
+            # positions with the new camera pose.
+            md5 = xray_pixel_md5(img)
+            for i, h in enumerate(self.state.cam2x_heights):
+                if h.xray_md5 == md5:
+                    QMessageBox.warning(
+                        self,
+                        "Same X-ray",
+                        f"This is the X-ray of height {i + 1} (identical pixel data).\n\n"
+                        "Every height needs its own X-ray, taken after raising the "
+                        "table. Please load the new image.",
+                    )
+                    return
 
             self.state.xray_image = img
             self.state.xray_image_path = path

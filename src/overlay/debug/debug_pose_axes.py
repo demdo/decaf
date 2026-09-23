@@ -457,9 +457,6 @@ def main() -> None:
         dist_coeffs=None,
         pose_method=POSE_METHOD,
         refine_with_iterative=REFINE_WITH_ITERATIVE,
-        ransac_reprojection_error_px=8.0,
-        ransac_confidence=0.99,
-        ransac_iterations_count=100,
     )
 
     print(f"method         = {pose.method}")

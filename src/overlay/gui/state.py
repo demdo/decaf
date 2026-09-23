@@ -1,8 +1,25 @@
 # overlay/gui/state.py
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
+
+
+@dataclass(frozen=True)
+class Cam2XHeight:
+    """One finished board placement of the Cam2X series (see
+    SessionState.cam2x_heights)."""
+
+    # overlay.calib.calib_camera_to_xray.Cam2XBoardCapture (kept as object to
+    # avoid a hard import here, same pattern as xray_dist_field below)
+    capture: object
+    T_cx_single: np.ndarray        # (4,4) this placement solved alone, metres (diagnostic)
+    board_centre_c_mm: np.ndarray  # (3,) patch centre in the camera frame (step 3 check)
+    xray_md5: str                  # overlay.tools.xray_io.xray_pixel_md5 (step 4 check)
+    intrinsics_key: str = ""       # K_rgb, dist_rgb, X-ray field it was solved with
+    K_xray: Optional[np.ndarray] = None  # K_xray of T_cx_single (not part of the capture)
+    eval_label: str = ""           # file label of its captures in Evaluation mode ("cal_h2")
+    eval_file: str = ""            # its <label>_cam2x.npz in Evaluation mode
 
 
 @dataclass
@@ -41,15 +58,18 @@ class SessionState:
     xray_points_xyz_c: Optional[np.ndarray] = None
     plane_confirmed: bool = False
 
-    # --- PnP diagnostics / settings ---
-    pnp_ransac_threshold_px: Optional[float] = None
-
     # --- RGB checkerboard corners (for IPPE-based T_cx composition) ---
     checkerboard_corners_uv: Optional[np.ndarray] = None  # (3, 2): TL, TR, BL in RGB pixels
     checkerboard_corners_confirmed: bool = False
 
     # --- Full 3x3 checkerboard corners in RGB ---
     checkerboard_corners_uv_9: Optional[np.ndarray] = None  # (9, 2)
+
+    # --- Cam2X over several board placements (table heights, 2026-09-22) ---
+    # One Cam2XHeight per finished height, in capture order. The Cam2X page
+    # pools them with the current height into T_cx / T_xc once all heights
+    # are in; steps 3 and 4 check a new capture against them.
+    cam2x_heights: list = field(default_factory=list)
 
     # --- Final transformations (homogeneous 4x4) ---
     # Convention:

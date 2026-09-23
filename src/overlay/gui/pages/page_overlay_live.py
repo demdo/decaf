@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, QTimer, QRect
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -24,10 +25,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from overlay.calib.calib_xray_to_pointer import extract_depth
 from overlay.gui.state import SessionState
 from overlay.tools.homography import estimate_plane_induced_homography
+from overlay.tools.pointer_depth import PointerDepthEstimator, depth_capture_arrays
 from overlay.tools.tracking_overlay import TrackingOverlay
 from overlay.tools.warp import prepare_live_overlay
+from overlay.tools.xray_io import read_xray_gray_u8
 
 # The camera is owned by the tracking hardware boundary so the tuned
 # RealSense options (auto_exposure_priority=0 for guaranteed fps, emitter
@@ -322,6 +326,8 @@ class _OverlayControlRail(QFrame):
     PANEL_H = int(round(452 * SCALE))
     # Extra panel height while the tool-tracking card is visible.
     TRACK_EXTRA_H = int(round(150 * SCALE))
+    # Extra panel height while the reference-plane card is visible.
+    PLANE_EXTRA_H = int(round(150 * SCALE))
     GAP = int(round(10 * SCALE))
 
     def __init__(self, parent: QWidget | None = None):
@@ -486,6 +492,36 @@ class _OverlayControlRail(QFrame):
         save_layout.setSpacing(self._s(8))
         save_layout.addWidget(self.btn_save)
 
+        # ---------------- Reference plane (Evaluation mode) ----------------
+        # New X-ray + pointer measurement for the next plane without leaving
+        # the live view (see OverlayLivePage._on_plane_button). NoFocus:
+        # SPACE accepts the pointer pose and must not re-click the button.
+        self.btn_plane = QPushButton("Set reference plane")
+        self.btn_plane.setObjectName("overlayRailTrackBtn")
+        self.btn_plane.setMinimumHeight(self._s(40))
+        self.btn_plane.setFocusPolicy(Qt.NoFocus)
+
+        self.lbl_plane_status = QLabel("")
+        self.lbl_plane_status.setObjectName("overlayRailValue")
+        self.lbl_plane_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.lbl_plane_status.setWordWrap(True)
+
+        self.plane_card = QFrame()
+        self.plane_card.setObjectName("overlayRailGroup")
+        self.plane_card.setAttribute(Qt.WA_StyledBackground, True)
+        plane_layout = QVBoxLayout(self.plane_card)
+        plane_layout.setContentsMargins(
+            self._s(18),
+            self._s(13),
+            self._s(18),
+            self._s(13),
+        )
+        plane_layout.setSpacing(self._s(8))
+        plane_layout.addWidget(self.btn_plane)
+        plane_layout.addWidget(self.lbl_plane_status)
+        self.plane_card.hide()
+        self._plane_visible = False
+
         self.track_card = QFrame()
         self.track_card.setObjectName("overlayRailGroup")
         self.track_card.setAttribute(Qt.WA_StyledBackground, True)
@@ -515,6 +551,7 @@ class _OverlayControlRail(QFrame):
         panel_layout.addWidget(dx_card)
         panel_layout.addWidget(tip_card)
         panel_layout.addWidget(save_card)
+        panel_layout.addWidget(self.plane_card)
         panel_layout.addWidget(self.track_card)
         panel_layout.addStretch(1)
 
@@ -536,8 +573,24 @@ class _OverlayControlRail(QFrame):
         if parent is not None and hasattr(parent, "_position_controls"):
             parent._position_controls()
 
+    def set_plane_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if visible == self._plane_visible:
+            return
+        self._plane_visible = visible
+        self.plane_card.setVisible(visible)
+        self._update_geometry()
+
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "_position_controls"):
+            parent._position_controls()
+
     def _panel_height(self) -> int:
-        return self.PANEL_H + (self.TRACK_EXTRA_H if self._tracking_visible else 0)
+        return (
+            self.PANEL_H
+            + (self.TRACK_EXTRA_H if self._tracking_visible else 0)
+            + (self.PLANE_EXTRA_H if self._plane_visible else 0)
+        )
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
@@ -794,6 +847,20 @@ class OverlayLivePage(QWidget):
 
         self._H_xc_lookup: dict[int, np.ndarray] = {}
 
+        # --- "Set reference plane" (Evaluation mode) ---
+        # While acquiring, every frame runs the pointer solve of the
+        # Pointer Tool Depth page; SPACE + confirm swaps in the new X-ray
+        # and d_x. Nothing in state changes before the confirm.
+        self._pointer: PointerDepthEstimator | None = None
+        self._plane_acquiring = False
+        self._plane_res = None             # filtered solve of the last frame
+        self._plane_raw = None             # unfiltered solve of the same frame
+        self._plane_d_x_mm: float | None = None
+        self._plane_rgb: np.ndarray | None = None   # BGR copy of that frame
+        self._plane_xray: np.ndarray | None = None  # pending X-ray (raw u8)
+        self._plane_xray_path: str | None = None
+        self._planes_set = 0               # accepted since entering the page
+
         # Profiling lines go to a file only in Evaluation mode (see
         # PROFILE_LOG_NAME); the session is attached later, so the profile
         # is created in on_enter.
@@ -852,6 +919,7 @@ class OverlayLivePage(QWidget):
         self.controls.chk_show_axis.toggled.connect(self._on_show_axis_toggled)
         self.controls.btn_track.clicked.connect(self._on_track_button)
         self.controls.btn_save.clicked.connect(self._on_save_snapshot)
+        self.controls.btn_plane.clicked.connect(self._on_plane_button)
 
     # --------------------------------------------------------
     # State / prerequisites
@@ -1126,14 +1194,23 @@ class OverlayLivePage(QWidget):
                     prof.add("track", time.perf_counter() - t)
                 self._update_tracking_state(result)
 
+            if self._plane_acquiring:
+                t = time.perf_counter()
+                self._plane_step(img)
+                if prof:
+                    prof.add("plane", time.perf_counter() - t)
+
             self._live_color = img
             self._display_bgra = self._compose_frame(img)
+            if self._plane_acquiring:
+                self._draw_plane_acquire(self._display_bgra)
             self._update_image_label()
 
             if prof:
                 prof.frame_end(t0)
 
         except Exception as e:
+            self._end_plane_acquire("error")
             self._stop_tracking("error")
             self._stop_timer()
             self._stop_realsense()
@@ -1193,6 +1270,8 @@ class OverlayLivePage(QWidget):
     # stale while tracking, tracking stops and the button re-arms.
 
     def _on_track_button(self) -> None:
+        if self._plane_acquiring:
+            return
         if self._tracking_active:
             self._stop_tracking("stopped")
         else:
@@ -1468,6 +1547,9 @@ class OverlayLivePage(QWidget):
             # with K_rgb/dist_rgb); recorded so an offline re-render knows
             "warp_through_lens": True,
             "xray_image_path": self.state.xray_image_path,
+            # the X-ray actually shown (xray_image_path is Cam2X's board shot)
+            "xray_image_anatomy_path": self.state.xray_image_anatomy_path,
+            "reference_planes_set_live": int(self._planes_set),
             "reference_plane_point_uv": arr(self.state.tip_uv_c),
             "reference_plane_point_xyz_c_mm": arr(self.state.tip_xyz_c),
             "show_tip": bool(self._show_tip),
@@ -1502,6 +1584,228 @@ class OverlayLivePage(QWidget):
         return rec
 
     # --------------------------------------------------------
+    # Reference plane (Evaluation mode)
+    # --------------------------------------------------------
+    #
+    # One overlay-error plane = new X-ray + new pointer d_x + snapshot, with
+    # the object unmoved in between. The button asks for the new X-ray
+    # first, then solves the pointer on every live frame (same solve and
+    # tip filter as the Pointer Tool Depth page); SPACE + confirm swaps both
+    # into state, rebuilds the homographies, advances the evaluation label
+    # (plane03 -> plane04) and saves <label>_depth.npz + <label>_xray.<ext>.
+    # ESC or the button again cancels without touching state.
+
+    def _on_plane_button(self) -> None:
+        if self._plane_acquiring:
+            self._end_plane_acquire("cancelled")
+            return
+
+        if self.camera is None or not self._has_prerequisites():
+            QMessageBox.information(
+                self,
+                "Set reference plane",
+                "The live view is not running.",
+            )
+            return
+
+        path = self._ask_xray_path()
+        if not path:
+            return
+        try:
+            xray = read_xray_gray_u8(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Failed to load X-ray image", str(e))
+            return
+
+        # The drill tracker and the pointer solve do not share the frame
+        # budget; tracking restarts with its button afterwards.
+        if self._tracking_active:
+            self._stop_tracking("paused for reference plane")
+
+        if self._pointer is None:
+            self._pointer = PointerDepthEstimator(self.FPS)
+        self._pointer.reset()
+
+        self._plane_xray = xray
+        self._plane_xray_path = path
+        self._plane_res = None
+        self._plane_raw = None
+        self._plane_d_x_mm = None
+        self._plane_acquiring = True
+
+        self.controls.btn_plane.setText("Cancel")
+        self.controls.btn_track.setEnabled(False)
+        self.controls.lbl_plane_status.setText(
+            f"X-ray: {Path(path).name}\npointer: SPACE accept · ESC cancel"
+        )
+        self.setFocus()
+
+    def _ask_xray_path(self) -> str | None:
+        # Start where the last X-ray came from (the USB-stick copy folder).
+        last = self.state.xray_image_anatomy_path or self.state.xray_image_path
+        start_dir = str(Path(last).parent) if last else ""
+
+        dlg = QFileDialog(self.window(), "Select X-ray image of the new plane", start_dir)
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilter(
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.dcm *.ima);;All Files (*)"
+        )
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        if dlg.exec() != QFileDialog.Accepted:
+            return None
+        files = dlg.selectedFiles()
+        return files[0] if files else None
+
+    def _plane_step(self, img_bgra: np.ndarray) -> None:
+        """Pointer solve on the current frame (BGRA goes straight into the
+        ArUco detection). Only a pose of THIS frame can be accepted."""
+        try:
+            raw, res = self._pointer.solve(img_bgra, self.state.K_rgb, self.state.dist_rgb)
+            d_x = float(extract_depth(T_xc=self.state.T_xc, T_tc=res.T_4x4).d_x_mm)
+        except Exception:
+            self._plane_res = None
+            self._plane_raw = None
+            self._plane_d_x_mm = None
+            return
+
+        self._plane_raw = raw
+        self._plane_res = res
+        self._plane_d_x_mm = d_x
+
+        # The camera frame is a zero-copy view that dies with the next
+        # poll; the accepted capture needs its own copy.
+        h, w = img_bgra.shape[:2]
+        if self._plane_rgb is None or self._plane_rgb.shape[:2] != (h, w):
+            self._plane_rgb = np.empty((h, w, 3), dtype=np.uint8)
+        cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR, dst=self._plane_rgb)
+
+    def _draw_plane_acquire(self, frame_bgra: np.ndarray) -> None:
+        res = self._plane_res
+        if res is None:
+            lines = ["REFERENCE PLANE: pointer NOT FOUND"]
+            color = (0, 0, 255, 255)
+        else:
+            pts = getattr(res, "image_points_uv", None)
+            if pts is not None:
+                for u, v in np.asarray(pts, dtype=np.float64).reshape(-1, 2):
+                    if np.isfinite(u) and np.isfinite(v):
+                        cv2.circle(frame_bgra, (int(round(u)), int(round(v))), 3,
+                                   (0, 255, 255, 255), -1, cv2.LINE_AA)
+            _draw_point_inplace(frame_bgra, res.tip_uv, color=(0, 255, 0, 255))
+            old = self._base_d_x_mm
+            lines = [
+                "REFERENCE PLANE: FOUND (SPACE accept, ESC cancel)",
+                f"new d_x {self._plane_d_x_mm:.1f} mm"
+                + ("" if old is None else f"   (current {old:.1f} mm)"),
+            ]
+            color = (0, 255, 0, 255)
+
+        font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2
+        x, y = 24, 24
+        line_h = 40
+        width = max(cv2.getTextSize(s, font, scale, thick)[0][0] for s in lines)
+        cv2.rectangle(frame_bgra, (x - 12, y - 8),
+                      (x + width + 12, y + line_h * len(lines) + 4),
+                      (0, 0, 0, 255), -1)
+        for i, s in enumerate(lines):
+            cv2.putText(frame_bgra, s, (x, y + 30 + i * line_h), font, scale,
+                        color, thick, cv2.LINE_AA)
+
+    def _confirm_plane(self) -> None:
+        res, raw, d_new = self._plane_res, self._plane_raw, self._plane_d_x_mm
+        if res is None or d_new is None or self._plane_rgb is None:
+            return
+        rgb = self._plane_rgb.copy()
+
+        # Freeze the view on the frame the pose came from while asking.
+        self._stop_timer()
+        old = self._base_d_x_mm
+        delta = "" if old is None else f"\nprevious: {old:.1f} mm  (Δ {d_new - old:+.1f} mm)"
+        ans = QMessageBox.question(
+            self,
+            "Set reference plane",
+            f"New reference plane\n\n"
+            f"d_x: {d_new:.1f} mm{delta}\n"
+            f"reprojection: {float(getattr(res, 'reproj_mean_px', np.nan)):.2f} px\n"
+            f"X-ray: {Path(self._plane_xray_path).name}\n\n"
+            "Use this plane?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ans == QMessageBox.Yes:
+            try:
+                self._apply_plane(res, raw, rgb, d_new)
+            except Exception as e:
+                QMessageBox.critical(self, "Set reference plane", f"Failed.\n\n{e}")
+        else:
+            # keep acquiring; the next found frame can be accepted
+            self._plane_res = None
+        self._start_timer()
+        self.setFocus()
+
+    def _apply_plane(self, res, raw, rgb_bgr: np.ndarray, d_x_mm: float) -> None:
+        ev = self.state.eval
+        if ev is not None:
+            ev.set_label(ev.next_label(ev.label))
+
+        self.state.d_x = float(d_x_mm)
+        self.state.tip_uv_c = np.asarray(res.tip_uv, dtype=np.float64).copy()
+        self.state.tip_xyz_c = np.asarray(res.tip_point_camera_mm, dtype=np.float64).copy()
+        self.state.T_tc = np.asarray(res.T_4x4, dtype=np.float64).copy()
+        self.state.xray_image_anatomy = self._plane_xray
+        self.state.xray_image_anatomy_path = self._plane_xray_path
+
+        self._load_xray_from_state()
+        self._initialize_dx()
+        self._precompute_H_xc_lookup()
+        self._invalidate_overlay_cache()
+        self._planes_set += 1
+
+        if ev is not None:
+            arrays, summary = depth_capture_arrays(
+                rgb_image=rgb_bgr,
+                K_rgb=self.state.K_rgb,
+                dist_rgb=self.state.dist_rgb,
+                T_xc=self.state.T_xc,
+                result=res,
+                raw_result=raw,
+                d_x_mm=d_x_mm,
+            )
+            try:
+                ev.save_npz("depth", arrays, page="overlay_live_plane", summary=summary)
+            except Exception as e:
+                print(f"[WARN] Could not save pointer depth capture: {e}")
+            try:
+                ev.copy_file("xray", self._plane_xray_path, page="overlay_live_plane")
+            except Exception as e:
+                print(f"[WARN] Could not copy X-ray image: {e}")
+
+        label = "" if ev is None else f"{ev.sanitize_label(ev.label)}: "
+        self._end_plane_acquire(f"{label}d_x {d_x_mm:.1f} mm — save snapshot")
+
+    def _end_plane_acquire(self, status: str) -> None:
+        self._plane_acquiring = False
+        self._plane_res = None
+        self._plane_raw = None
+        self._plane_d_x_mm = None
+        self._plane_xray = None
+        self._plane_xray_path = None
+        self.controls.btn_plane.setText("Set reference plane")
+        self.controls.btn_track.setEnabled(True)
+        self.controls.lbl_plane_status.setText(status)
+
+    def keyPressEvent(self, event) -> None:
+        if self._plane_acquiring:
+            if event.key() == Qt.Key_Space:
+                self._confirm_plane()
+                event.accept()
+                return
+            if event.key() == Qt.Key_Escape:
+                self._end_plane_acquire("cancelled")
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    # --------------------------------------------------------
     # Lifecycle
     # --------------------------------------------------------
 
@@ -1512,6 +1816,9 @@ class OverlayLivePage(QWidget):
         self.controls.set_tracking_visible(self._tool is not None)
         self.controls.btn_track.setText("Start tracking")
         self.controls.lbl_track_status.setText("idle")
+        self.controls.set_plane_visible(self.state.eval is not None)
+        self._end_plane_acquire("")
+        self._planes_set = 0
 
         self._load_xray_from_state()
         self._initialize_dx()
@@ -1565,6 +1872,7 @@ class OverlayLivePage(QWidget):
             )
 
     def on_leave(self) -> None:
+        self._end_plane_acquire("")
         if self._tracking_active:
             self._stop_tracking("idle")
         self._tracker = None

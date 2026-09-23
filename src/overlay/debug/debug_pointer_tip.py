@@ -136,7 +136,7 @@ def main():
                     camera_intrinsics=K_RGB,
                     dist_coeffs=DIST_COEFFS,
                     pointer_model=pointer_model,
-                    pose_method="iterative_ransac",  # wichtig!
+                    pose_method="ippe",  # as the live pointer (overlay/tools/pointer_depth.py)
                     refine_with_iterative=True,
                 )
 
