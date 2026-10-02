@@ -319,7 +319,17 @@ class TrackerConfig:
     # and beats it laterally, but its z RANDOM noise stays ~2x higher (fb board
     # frame: p95|z| 1.05 vs 0.55 mm) -- z is the weakly observable direction on
     # the cylinder, where the finer measurement on the ~11 px IR cells pays off.
-    ir_corner_method: str = "subpix"
+    #
+    # Back to "quadratic_form" on 2026-09-28: subpix only works on large IR
+    # cells. Its cornerSubPix window (9x9 px, hard-wired in
+    # IrPoseRefiner::measureView) reaches into the neighbouring cells once a
+    # 6 mm cell is only ~7-8.5 px in the IR image (drill beyond ~45 cm). The
+    # resulting 1-3 px disparity outliers push fit_rms to 3.4-3.9 mm > gate,
+    # so live the fusion applied on only 2-4 % of frames (probe sessions
+    # tests/output/tool_tracking_eval/20260928_*). Replayed offline with
+    # quadratic_form, gates and model unchanged: 96-100 % applied at
+    # 315-535 mm, fit 1.3-2.1 mm (workflow wf_8db0eb66-6d6, scratchpad ir_debug).
+    ir_corner_method: str = "quadratic_form"
     ir_qf_max_dev_px: float = 4.0
 
     # Pose-set stabilisation (2026-07-05). The cylinder pose is nearly blind
