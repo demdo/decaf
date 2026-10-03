@@ -141,9 +141,7 @@ private:
 
     LocalScoreResult evaluateCell(
         const cv::Mat& gray_f32,
-        const GridCell& cell,
-        double frame_mean,
-        double frame_std
+        const GridCell& cell
     ) const;
 
     bool updateTemporalState(

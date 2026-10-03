@@ -67,13 +67,6 @@ DotDetectionResult DotDetector::detect(
     cv::Mat gray_f32;
     gray.convertTo(gray_f32, CV_32F);
 
-    cv::Scalar mean_scalar;
-    cv::Scalar std_scalar;
-    cv::meanStdDev(gray_f32, mean_scalar, std_scalar);
-
-    const double frame_mean = mean_scalar[0];
-    const double frame_std = std::max(std_scalar[0], 1.0);
-
     int max_row = -1;
     int max_col = -1;
 
@@ -90,12 +83,7 @@ DotDetectionResult DotDetector::detect(
         obs.center_uv = cell.center_uv;
         obs.corners_uv = cell.corner_uv;
 
-        const LocalScoreResult score = evaluateCell(
-            gray_f32,
-            cell,
-            frame_mean,
-            frame_std
-        );
+        const LocalScoreResult score = evaluateCell(gray_f32, cell);
 
         obs.raw_score = score.score;
 
@@ -311,14 +299,9 @@ double DotDetector::sampleBilinearClamp(
 
 DotDetector::LocalScoreResult DotDetector::evaluateCell(
     const cv::Mat& gray_f32,
-    const GridCell& cell,
-    double frame_mean,
-    double frame_std
+    const GridCell& cell
 ) const
 {
-    (void)frame_mean;
-    (void)frame_std;
-
     LocalScoreResult result;
 
     const int canonical_size = std::max(config_.canonical_size, 48);

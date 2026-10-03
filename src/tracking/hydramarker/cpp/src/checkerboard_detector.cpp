@@ -1796,7 +1796,12 @@ cv::Mat CheckerboardDetector::toGray8(const cv::Mat& image) {
     else if (image.channels() == 4) cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
     else return {};
 
-    if (gray.type() == CV_8U) return gray.clone();
+    // cvtColor already wrote a fresh buffer (the live app's BGRA input); only
+    // a 1-channel input is a view of the caller's frame and needs the copy,
+    // because updateTrackingState() keeps the result for next frame's LK.
+    if (gray.type() == CV_8U) {
+        return image.channels() == 1 ? gray.clone() : gray;
+    }
 
     cv::Mat gray8;
     double min_val = 0.0, max_val = 0.0;
