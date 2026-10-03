@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <future>
 #include <iostream>
+#include <sstream>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -523,9 +525,12 @@ void IrPoseRefiner::measureView(const cv::Mat& gray,
     if (dbg) {
         int ok_n = 0;
         for (const uint8_t o : ok_out) ok_n += o;
-        std::cerr << "[qfir] n=" << n << " ok=" << ok_n
-                  << " qf=" << stats.qf_count
-                  << " saddle=" << stats.qf_saddle_count << std::endl;
+        // One write per line: fuse() measures the two views concurrently.
+        std::ostringstream line;
+        line << "[qfir] n=" << n << " ok=" << ok_n
+             << " qf=" << stats.qf_count
+             << " saddle=" << stats.qf_saddle_count << '\n';
+        std::cerr << line.str();
     }
 }
 
@@ -620,10 +625,17 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
         std::vector<cv::Point2f> ptsL, ptsR;
         std::vector<uint8_t> okL, okR;
         std::vector<float> qL, qR;
+        // Independent views (measureView is const, one writer per output)
+        // -> the right view runs concurrently; results unchanged. Declared
+        // after its outputs: if the left view throws, the future's destructor
+        // waits for the worker before they go away.
+        auto right_view = std::async(std::launch::async, [&]() {
+            measureView(ir_right, calib_.K_right, calib_.dist_right, R_B,
+                        t_B, xyz, seedR, ptsR, okR, qR);
+        });
         measureView(ir_left, calib_.K_left, calib_.dist_left, R_A, t_A,
                     xyz, seedL, ptsL, okL, qL);
-        measureView(ir_right, calib_.K_right, calib_.dist_right, R_B, t_B,
-                    xyz, seedR, ptsR, okR, qR);
+        right_view.get();
         // Stereo self-calibration: correct the measured right-view x for
         // the field-dependent disparity warp of the factory calibration
         // (fitted offline from marker runs; the reference-photo path was

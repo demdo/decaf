@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <sstream>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -1429,14 +1430,17 @@ void CornerRefiner::runQuadraticForm(
     }
 
     if (qf_debug) {
-        std::cerr << "[qf] corners " << cs.size() << " segs " << segs.size()
-                  << " valid " << valid_segs
-                  << " (corr " << dbg_seg_corr << " short " << dbg_seg_short
-                  << ") prof " << dbg_prof_tried
-                  << " border " << dbg_prof_border
-                  << " contrast " << dbg_prof_contrast
-                  << " fitrej " << dbg_prof_fit
-                  << " edges " << dbg_edges << std::endl;
+        // One write per line: the two IR views run this concurrently.
+        std::ostringstream line;
+        line << "[qf] corners " << cs.size() << " segs " << segs.size()
+             << " valid " << valid_segs
+             << " (corr " << dbg_seg_corr << " short " << dbg_seg_short
+             << ") prof " << dbg_prof_tried
+             << " border " << dbg_prof_border
+             << " contrast " << dbg_prof_contrast
+             << " fitrej " << dbg_prof_fit
+             << " edges " << dbg_edges << '\n';
+        std::cerr << line.str();
     }
 
     // ---- Corner solve: row correction x column correction ----
@@ -1680,16 +1684,19 @@ void CornerRefiner::runSaddleWarp(
 
     int saddle_count = 0;
 
-    cv::parallel_for_(
-        cv::Range(0, static_cast<int>(work.size())),
-        [&](const cv::Range& range) {
+    // Corners are independent: each writes only points[k] and its own stats
+    // entries. parallelChunks (std::async) instead of cv::parallel_for_:
+    // OpenCV runs a parallel_for_ serially while another one is active
+    // anywhere in the process, which is the rule here because the two IR
+    // views are measured concurrently (IrPoseRefiner::fuse).
+    parallelChunks(static_cast<int>(work.size()), 2, [&](int begin, int end) {
 
     std::vector<cv::Point2d> pix(kNpx);
     std::vector<uint8_t> usable(kNpx);
     std::vector<float> templ(kNpx);
     std::vector<float> samples(kNpx);
 
-    for (int wi = range.start; wi < range.end; ++wi) {
+    for (int wi = begin; wi < end; ++wi) {
         const SwWork& w = work[static_cast<size_t>(wi)];
         const size_t k = w.it.k;
         const cv::Point2d& c_uv = w.c_uv;
@@ -1900,7 +1907,7 @@ void CornerRefiner::runSaddleWarp(
         stats.corner_zncc[k] = static_cast<float>(zncc);
     }
 
-        });  // cv::parallel_for_
+    });  // parallelChunks
 
     for (const SwWork& w : work) {
         if (stats.corner_ok[w.it.k]) ++saddle_count;
