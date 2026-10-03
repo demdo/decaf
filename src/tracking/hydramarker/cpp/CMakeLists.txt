@@ -52,6 +52,9 @@ set(HYDRAMARKER_SOURCES
     src/pose_output_filter.cpp
     src/ir_pose_refiner.cpp
     src/tracker_engine.cpp
+
+    # Memory
+    src/mat_allocator.cpp
 )
 
 # ============================================================

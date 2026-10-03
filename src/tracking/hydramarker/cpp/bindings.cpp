@@ -30,6 +30,7 @@
 #include "tracking_validator.hpp"
 
 #include "ir_pose_refiner.hpp"
+#include "mat_allocator.hpp"
 #include "patch_extractor.hpp"
 #include "patch_decoder.hpp"
 #include "pose_output_filter.hpp"
@@ -226,6 +227,11 @@ std::vector<cv::Point2f> numpyToPoint2fVector(
 
 PYBIND11_MODULE(hydramarker_cpp, m) {
     m.doc() = "HydraMarker C++ bindings";
+
+    // Recycle large cv::Mat buffers instead of returning them to the OS every
+    // frame (mat_allocator.hpp). Installed here: import runs once, under the
+    // GIL, before any engine or detector of this module can allocate.
+    installCachingMatAllocator();
 
     m.def(
         "opencv_threading_info",
