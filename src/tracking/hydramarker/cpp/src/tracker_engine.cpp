@@ -2215,7 +2215,12 @@ bool TrackerEngine::tryEmergencyLastPose(
         return false;
     }
 
-    pose_tracker_.setPose(last_accepted_rvec_, last_accepted_tvec_);
+    // After a full loss onTrackingFailure() has reset the pose tracker on
+    // purpose; the emergency output still reports the last accepted pose,
+    // but re-arming it as the prior would seed the next frames with it.
+    if (lost_frames_ <= config_.max_lost_frames) {
+        pose_tracker_.setPose(last_accepted_rvec_, last_accepted_tvec_);
+    }
 
     int match_count = 0;
     std::string align_msg = "no_blue_alignment";
