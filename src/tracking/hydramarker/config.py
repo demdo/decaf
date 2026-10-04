@@ -604,6 +604,9 @@ class TrackerConfig:
     appearance_check_enabled: bool = True
     appearance_min_parity: float = 0.6
     appearance_min_dot: float = 0.6
+    # Below appearance_min_cells sampled cells the check cannot decide. The
+    # dot term also needs 8 cells of each base colour (C++), so a check
+    # passes only with at least 16 cells (8 + 8).
     appearance_min_cells: int = 6
     # Also check every fast / persistent tracking pose (they carry the corner
     # identities over and never re-decode); a rejected fast pose falls back to

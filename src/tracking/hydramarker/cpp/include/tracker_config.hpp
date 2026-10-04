@@ -327,6 +327,9 @@ struct TrackerConfig {
     bool appearance_check_enabled = true;
     double appearance_min_parity = 0.6;
     double appearance_min_dot = 0.6;
+    // Below appearance_min_cells sampled cells the check cannot decide. The
+    // dot term also needs 8 cells of each base colour, so a check passes
+    // only with at least 16 cells (8 + 8).
     int appearance_min_cells = 6;
     // Also check every fast / persistent tracking pose (needs
     // appearance_check_enabled); a rejected fast pose falls back to the

@@ -16,10 +16,11 @@ namespace hydramarker {
 //   parity: expected base colour ((row + col) % 2) vs. the image intensity at
 //           four off-centre points per cell (outside the dot)
 //   dot:    expected centre colour (base XOR field bit) relative to the base
-//           vs. the centre-minus-off-centre intensity
+//           vs. the centre-minus-off-centre intensity, correlated inside each
+//           base colour (needs both colours with enough cells)
 // A correct pose gives both close to +1; a one-cell identity shift flips the
-// parity sign, a two-cell shift keeps the parity but lowers the dot term, a
-// gross pose error gives about 0 for both.
+// parity sign, a two-cell shift keeps the parity but drops the dot term to
+// about 0, a gross pose error gives about 0 for both.
 struct AppearanceCheck {
     double parity = std::numeric_limits<double>::quiet_NaN();
     double dot = std::numeric_limits<double>::quiet_NaN();
@@ -30,7 +31,8 @@ struct AppearanceCheck {
 
 // frame: grey, BGR or BGRA. rvec/tvec: marker -> camera (mm). Fewer than
 // min_cells visible cells never pass and never fail (undecided), nor does
-// a correlation without variance.
+// a correlation without variance. The dot term needs at least 8 cells of
+// each base colour, so a check passes only with 16 cells or more.
 AppearanceCheck checkMarkerAppearance(
     const cv::Mat& frame,
     const MarkerGeometry& geometry,

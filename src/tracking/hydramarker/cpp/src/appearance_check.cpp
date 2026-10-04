@@ -18,6 +18,11 @@ constexpr double kMinFacingCos = 0.35;
 // bilinear neighbour of the outermost samples.
 constexpr double kRoiMarginPx = 4.0;
 
+// Cells per base colour the dot term needs: with dots unrelated to the
+// expected bits, a correlation over a few cells reaches the threshold too
+// often by chance.
+constexpr size_t kMinDotCellsPerColour = 8;
+
 double pearson(const std::vector<double>& x, const std::vector<double>& y)
 {
     const size_t n = x.size();
@@ -46,6 +51,42 @@ double pearson(const std::vector<double>& x, const std::vector<double>& y)
         return std::numeric_limits<double>::quiet_NaN();
     }
     return sxy / std::sqrt(sxx * syy);
+}
+
+// Pearson of the expected vs. the measured dot term inside each base colour,
+// combined weighted by the class sizes. The expected term (base XOR bit) -
+// base carries the sign of the base colour, so pooled over both colours the
+// correlation keeps a between-colour part even for an identity shifted by an
+// even number of cells (parity intact, dots unrelated). NaN unless both
+// colours have kMinDotCellsPerColour cells and a finite correlation.
+double withinColourPearson(
+    const std::vector<double>& base,
+    const std::vector<double>& x,
+    const std::vector<double>& y
+)
+{
+    double weighted = 0.0;
+    size_t count = 0;
+    for (int colour = 0; colour <= 1; ++colour) {
+        std::vector<double> xs;
+        std::vector<double> ys;
+        for (size_t i = 0; i < base.size(); ++i) {
+            if (static_cast<int>(base[i]) == colour) {
+                xs.push_back(x[i]);
+                ys.push_back(y[i]);
+            }
+        }
+        if (xs.size() < kMinDotCellsPerColour) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const double r = pearson(xs, ys);
+        if (!std::isfinite(r)) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        weighted += static_cast<double>(xs.size()) * r;
+        count += xs.size();
+    }
+    return weighted / static_cast<double>(count);
 }
 
 } // namespace
@@ -254,7 +295,7 @@ AppearanceCheck checkMarkerAppearance(
         return out;
     }
     out.parity = pearson(sampled_base, off_centre);
-    out.dot = pearson(dot_expected, dot_measured);
+    out.dot = withinColourPearson(sampled_base, dot_expected, dot_measured);
     out.passed = std::isfinite(out.parity) && std::isfinite(out.dot) &&
                  out.parity >= min_parity && out.dot >= min_dot;
     out.failed = (std::isfinite(out.parity) && out.parity < min_parity) ||
