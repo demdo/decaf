@@ -1410,6 +1410,7 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                             CheckerboardDetection held = last_detection_;
                             held.tracking = true;
                             held.stable = false;
+                            held.held = true;
                             return held;
                         }
                         resetTracking();
@@ -1617,6 +1618,8 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                     if (last_detection_.valid() &&
                         held_output_frames_ < max_held_output_frames) {
                         ++held_output_frames_;
+                        // last_detection_ holds this frame's tracked corners
+                        // here, so this output is a measurement (not held).
                         CheckerboardDetection held = last_detection_;
                         held.tracking = true;
                         held.stable = false;
@@ -1645,6 +1648,7 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
                 if (last_detection_.valid() &&
                     held_output_frames_ < max_held_output_frames) {
                     ++held_output_frames_;
+                    // This frame's tracked corners, as above: not held.
                     CheckerboardDetection held = last_detection_;
                     held.tracking = true;
                     held.stable = false;
@@ -1687,6 +1691,7 @@ std::optional<CheckerboardDetection> CheckerboardDetector::detect(
         CheckerboardDetection held = last_detection_;
         held.tracking = true;
         held.stable = false;
+        held.held = true;
         return held;
     }
 

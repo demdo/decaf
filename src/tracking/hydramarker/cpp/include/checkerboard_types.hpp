@@ -67,6 +67,9 @@ struct CheckerboardDetection {
 
     bool tracking = false;
     bool stable = false;
+    // Re-emitted detection of an earlier frame (the recovery of this frame
+    // failed): not a measurement of this frame.
+    bool held = false;
 
     bool valid() const {
         return !corners.empty() && !cells.empty();

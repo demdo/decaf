@@ -365,6 +365,14 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
         result.timings_ms["checkerboard_" + item.first] = item.second;
     }
 
+    // A held detection repeats an earlier frame's grid: a pose from it would
+    // be a stale measurement reported as fresh, so the frame is one without
+    // a detection.
+    if (detection.has_value() && detection->held) {
+        result.timings_ms["held_detection_count"] = 1.0;
+        detection.reset();
+    }
+
     if (!detection.has_value() || !detection->valid()) {
         if (detection.has_value()) {
             attachDetectionResult(result, *detection);

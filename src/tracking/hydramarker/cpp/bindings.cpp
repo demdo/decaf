@@ -2052,6 +2052,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("rows", &CheckerboardDetection::rows)
         .def_readwrite("tracking", &CheckerboardDetection::tracking)
         .def_readwrite("stable", &CheckerboardDetection::stable)
+        .def_readwrite("held", &CheckerboardDetection::held)
         .def("valid", &CheckerboardDetection::valid);
 
     py::class_<CheckerboardDetectorConfig>(m, "CheckerboardDetectorConfig")
