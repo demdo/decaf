@@ -406,9 +406,16 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
     attachDetectionResult(result, *detection);
     attachRuntimeState(result);
 
-    if (tryFastPersistentPose(*detection, result, frame_t0)) {
+    bool fast_pose_rejected = false;
+    if (tryFastPersistentPose(
+            *detection, result, frame_t0, fast_pose_rejected)) {
         return result;
     }
+    // Every further pose of this frame is an acquisition pose when the frame
+    // re-enters tracking or its fast pose failed the appearance check (the
+    // frame that reveals a slipped identity is often the one with motion
+    // blur or a short decode): it has to pass the check.
+    const bool acquisition = isReentryFrame() || fast_pose_rejected;
 
     const CheckerboardDetection* detection_for_decode = &(*detection);
     std::optional<CheckerboardDetection> propagated_detection;
@@ -469,6 +476,7 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
                 *detection_for_decode,
                 reason,
                 true,
+                acquisition,
                 result,
                 frame_t0
             )) {
@@ -550,6 +558,7 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
                 *detection_for_decode,
                 reason,
                 false,
+                acquisition,
                 result,
                 frame_t0
             )) {
@@ -625,6 +634,7 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
                 *detection_for_decode,
                 reason,
                 false,
+                acquisition,
                 result,
                 frame_t0
             )) {
@@ -672,13 +682,12 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
 
     low_fresh_correspondence_frames_ = 0;
 
-    // A (re)acquisition pose (no pose yet, or the previous frame failed) must
-    // also pass the appearance check: the decode can lock onto a wrong
-    // identity or onto a marker-like pattern elsewhere in the scene, and once
-    // accepted such a pose seeds the tracking of the following frames.
+    // A (re)acquisition pose must also pass the appearance check: the decode
+    // can lock onto a wrong identity or onto a marker-like pattern elsewhere
+    // in the scene, and once accepted such a pose seeds the tracking of the
+    // following frames.
     const bool check_appearance =
-        config_.appearance_check_enabled &&
-        (!pose_tracker_.hasPose() || lost_frames_ > 0);
+        config_.appearance_check_enabled && acquisition;
     const bool had_pose = pose_tracker_.hasPose();
     const std::vector<double> previous_rvec =
         check_appearance ? pose_tracker_.rvec() : std::vector<double>();
@@ -1858,11 +1867,14 @@ AppearanceCheck TrackerEngine::recordAppearanceCheck(
 bool TrackerEngine::trackingPoseFailsAppearance(
     const MapPoseResult& pose,
     const std::string& timing_prefix,
+    bool acquisition,
     TrackerFrameResult& result
 ) const
 {
+    // appearance_check_tracking = false skips the ordinary tracking poses
+    // only; an acquisition pose is always checked.
     if (!config_.appearance_check_enabled ||
-        !config_.appearance_check_tracking) {
+        (!config_.appearance_check_tracking && !acquisition)) {
         return false;
     }
     const AppearanceCheck check =
@@ -1874,12 +1886,17 @@ bool TrackerEngine::trackingPoseFailsAppearance(
     // or a correlation without variance (glare) cannot tell a slipped
     // identity from a correct one. A tracking pose is only rejected on
     // evidence; an acquisition pose still has to pass.
-    if (!check.failed) {
+    if (!check.failed && !acquisition) {
         result.timings_ms[timing_prefix + "_undecided_count"] = 1.0;
         return false;
     }
     result.timings_ms[timing_prefix + "_reject_count"] = 1.0;
     return true;
+}
+
+bool TrackerEngine::isReentryFrame() const
+{
+    return frame_index_ - last_accepted_pose_frame_ > 1;
 }
 
 bool TrackerEngine::fallbackPoseRejectionReason(
@@ -1992,6 +2009,7 @@ bool TrackerEngine::tryPersistentFallbackPose(
     const CheckerboardDetection& detection,
     const std::string& reason,
     bool after_decode_fail,
+    bool acquisition,
     TrackerFrameResult& result,
     std::int64_t frame_t0
 )
@@ -2042,7 +2060,7 @@ bool TrackerEngine::tryPersistentFallbackPose(
     }
 
     if (trackingPoseFailsAppearance(
-            seed.pose, "persistent_appearance", result)) {
+            seed.pose, "persistent_appearance", acquisition, result)) {
         restorePoseTrackerState(had_pose, previous_rvec, previous_tvec);
         return false;
     }
@@ -2332,7 +2350,8 @@ void TrackerEngine::refreshPersistentIdentities(
 bool TrackerEngine::tryFastPersistentPose(
     const CheckerboardDetection& detection,
     TrackerFrameResult& result,
-    std::int64_t frame_t0
+    std::int64_t frame_t0,
+    bool& appearance_rejected
 )
 {
     if (!config_.enable_fast_persistent_path || config_.decode_only_mode) {
@@ -2386,10 +2405,14 @@ bool TrackerEngine::tryFastPersistentPose(
 
     // Fast and persistent poses carry the corner identities over from the
     // previous frame and never re-decode them, so a shifted identity would
-    // be tracked on indefinitely: they are checked too (tracking rule, see
-    // trackingPoseFailsAppearance). A reject falls through to the decode
-    // path.
-    if (trackingPoseFailsAppearance(pose, "fast_appearance", result)) {
+    // be tracked on indefinitely: they are checked too (tracking rule; on a
+    // re-entry frame the acquisition rule, see trackingPoseFailsAppearance).
+    // A reject falls through to the decode path.
+    if (trackingPoseFailsAppearance(
+            pose, "fast_appearance", isReentryFrame(), result)) {
+        result.fast_success = false;
+        result.fast_reason = "Fast pose rejected by the appearance check.";
+        appearance_rejected = true;
         return false;
     }
 

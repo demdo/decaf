@@ -304,14 +304,20 @@ private:
         const std::string& timing_prefix,
         TrackerFrameResult& result
     ) const;
-    // Appearance check of a fast / persistent tracking pose (if enabled);
-    // true = the pose is rejected (<prefix>_reject_count). A check that
-    // cannot decide keeps the pose (<prefix>_undecided_count).
+    // Appearance check of a fast / persistent pose; true = the pose is
+    // rejected (<prefix>_reject_count). A tracking pose is checked only with
+    // appearance_check_tracking, and a check that cannot decide keeps it
+    // (<prefix>_undecided_count). An acquisition pose is always checked
+    // (with appearance_check_enabled) and has to pass.
     bool trackingPoseFailsAppearance(
         const MapPoseResult& pose,
         const std::string& timing_prefix,
+        bool acquisition,
         TrackerFrameResult& result
     ) const;
+    // The previous frame produced no accepted pose (none yet, failed, held,
+    // or solved but not accepted): this frame re-enters tracking.
+    bool isReentryFrame() const;
 
     bool detectionHasDecodeableCellSpan(
         const CheckerboardDetection& detection
@@ -322,10 +328,13 @@ private:
         int image_height
     ) const;
 
+    // acquisition: the pose has to pass the appearance check (see
+    // trackingPoseFailsAppearance).
     bool tryPersistentFallbackPose(
         const CheckerboardDetection& detection,
         const std::string& reason,
         bool after_decode_fail,
+        bool acquisition,
         TrackerFrameResult& result,
         std::int64_t frame_t0
     );
@@ -365,10 +374,13 @@ private:
         int frame_index
     );
 
+    // appearance_rejected: set when the fast pose was solved but failed the
+    // appearance check.
     bool tryFastPersistentPose(
         const CheckerboardDetection& detection,
         TrackerFrameResult& result,
-        std::int64_t frame_t0
+        std::int64_t frame_t0,
+        bool& appearance_rejected
     );
 };
 

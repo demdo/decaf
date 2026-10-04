@@ -609,7 +609,10 @@ class TrackerConfig:
     # identities over and never re-decode); a rejected fast pose falls back to
     # the decode path, a rejected persistent pose to the hold. A tracking pose
     # is only rejected on evidence (enough cells, a correlation below the
-    # minimum); an acquisition pose has to pass.
+    # minimum); an acquisition pose has to pass, and so does every pose of a
+    # frame that re-enters tracking (the previous frame has no accepted pose)
+    # or whose fast pose failed the check. Those poses are checked even with
+    # appearance_check_tracking = False.
     appearance_check_tracking: bool = True
 
     # Logging Output
