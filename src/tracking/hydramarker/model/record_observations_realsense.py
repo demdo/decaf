@@ -423,7 +423,6 @@ def make_sfm_tracker(
             dot_commit_frames=1,
             dot_revoke_frames=5,
             persistence_max_frames=8,
-            pose_hold_max_frames=0,
             emergency_pose_hold_enabled=False,
             # Model recording keeps its plain decode: the appearance check
             # needs the marker model that this recording builds, and the

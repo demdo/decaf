@@ -305,7 +305,6 @@ struct TrackerConfig {
     double pose_propagation_max_reproj_px = 2.0;
     double pose_propagation_border_px = 8.0;
 
-    int pose_hold_max_frames = 45;
     int pose_hold_min_detection_corners = 8;
     bool emergency_pose_hold_enabled = true;
     int emergency_pose_hold_max_frames = -1;

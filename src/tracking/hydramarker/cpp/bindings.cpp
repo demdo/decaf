@@ -1552,7 +1552,6 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("enable_pose_propagation", &TrackerConfig::enable_pose_propagation)
         .def_readwrite("pose_propagation_max_reproj_px", &TrackerConfig::pose_propagation_max_reproj_px)
         .def_readwrite("pose_propagation_border_px", &TrackerConfig::pose_propagation_border_px)
-        .def_readwrite("pose_hold_max_frames", &TrackerConfig::pose_hold_max_frames)
         .def_readwrite("pose_hold_min_detection_corners", &TrackerConfig::pose_hold_min_detection_corners)
         .def_readwrite("emergency_pose_hold_enabled", &TrackerConfig::emergency_pose_hold_enabled)
         .def_readwrite("emergency_pose_hold_max_frames", &TrackerConfig::emergency_pose_hold_max_frames)

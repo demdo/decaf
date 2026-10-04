@@ -2090,10 +2090,10 @@ bool TrackerEngine::tryHoldLastPose(
         return false;
     }
 
-    if (
-        config_.pose_hold_max_frames >= 0 &&
-        low_fresh_correspondence_frames_ > config_.pose_hold_max_frames
-    ) {
+    // A held pose is not a measurement: holds count as lost frames (below)
+    // and end where a run of failures ends, so a long hold escalates to the
+    // full loss instead of bridging it.
+    if (lost_frames_ >= config_.max_lost_frames) {
         return false;
     }
 
@@ -2141,8 +2141,10 @@ bool TrackerEngine::tryHoldLastPose(
     result.correspondence_count =
         static_cast<int>(correspondence_corners.size());
 
-    mode_ = TrackerMode::Tracking;
-    lost_frames_ = 0;
+    // Counted like a failed frame (the mode stays as it is): the run of holds
+    // is bounded by max_lost_frames, and the next solves widen their motion
+    // gates as after any other lost frame.
+    ++lost_frames_;
     finalizeFrameResult(result, frame_t0);
     return true;
 }

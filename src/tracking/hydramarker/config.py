@@ -587,7 +587,6 @@ class TrackerConfig:
     enable_pose_propagation: bool = True
     pose_propagation_max_reproj_px: float = 2.0
     pose_propagation_border_px: float = 8.0
-    pose_hold_max_frames: int = 45
     pose_hold_min_detection_corners: int = 8
     emergency_pose_hold_enabled: bool = True
     emergency_pose_hold_max_frames: int = -1
