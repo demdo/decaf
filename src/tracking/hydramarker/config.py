@@ -587,6 +587,16 @@ class TrackerConfig:
     fallback_pose_max_mean_reprojection_error_px: float = 1.8
     fallback_pose_max_max_reprojection_error_px: float = 4.0
 
+    # Appearance check
+    # Photometric check of a pose, independent of the decode that produced it:
+    # the projected marker cells must show the expected checker parity and dot
+    # pattern (correlations, 1 = perfect). Applied to every (re)acquisition
+    # pose of the decode path; a rejected pose counts as a failed frame.
+    appearance_check_enabled: bool = True
+    appearance_min_parity: float = 0.6
+    appearance_min_dot: float = 0.6
+    appearance_min_cells: int = 6
+
     # Logging Output
     # Controls the corner list that TrackerEngine returns to Python.
     # tracker_log.py records these values but does not make tracking decisions.

@@ -664,9 +664,39 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
 
     low_fresh_correspondence_frames_ = 0;
 
+    // A (re)acquisition pose (no pose yet, or the previous frame failed) must
+    // also pass the appearance check: the decode can lock onto a wrong
+    // identity or onto a marker-like pattern elsewhere in the scene, and once
+    // accepted such a pose seeds the tracking of the following frames.
+    const bool check_appearance =
+        config_.appearance_check_enabled &&
+        (!pose_tracker_.hasPose() || lost_frames_ > 0);
+    const bool had_pose = pose_tracker_.hasPose();
+    const std::vector<double> previous_rvec =
+        check_appearance ? pose_tracker_.rvec() : std::vector<double>();
+    const std::vector<double> previous_tvec =
+        check_appearance ? pose_tracker_.tvec() : std::vector<double>();
+
     const std::int64_t pose_t0 = cv::getTickCount();
     MapPoseResult pose = pose_tracker_.estimatePose(pose_points, lost_frames_);
     result.timings_ms["pnp_ms"] = elapsedMs(pose_t0);
+
+    if (pose.success && check_appearance) {
+        const AppearanceCheck appearance =
+            recordAppearanceCheck(pose, "appearance", result);
+        if (!appearance.passed) {
+            result.timings_ms["appearance_reject_count"] = 1.0;
+            pose.success = false;
+            pose.message =
+                "Appearance check failed (parity=" +
+                formatDouble(appearance.parity, 2) +
+                ", dot=" + formatDouble(appearance.dot, 2) +
+                ", cells=" + std::to_string(appearance.cells) + ")";
+            // estimatePose() has already installed the rejected pose as the
+            // prior of the next frame.
+            restorePoseTrackerState(had_pose, previous_rvec, previous_tvec);
+        }
+    }
 
     std::vector<TrackerCorner> visual_corners;
     if (pose.success) {
@@ -1800,6 +1830,23 @@ void TrackerEngine::restorePoseTrackerState(
     }
 }
 
+AppearanceCheck TrackerEngine::recordAppearanceCheck(
+    const MapPoseResult& pose,
+    const std::string& timing_prefix,
+    TrackerFrameResult& result
+) const
+{
+    const std::int64_t check_t0 = cv::getTickCount();
+    const AppearanceCheck check =
+        checkAppearance(current_frame_, pose.rvec, pose.tvec);
+    result.timings_ms[timing_prefix + "_ms"] = elapsedMs(check_t0);
+    result.timings_ms[timing_prefix + "_parity"] = check.parity;
+    result.timings_ms[timing_prefix + "_dot"] = check.dot;
+    result.timings_ms[timing_prefix + "_cells"] =
+        static_cast<double>(check.cells);
+    return check;
+}
+
 bool TrackerEngine::fallbackPoseRejectionReason(
     const CheckerboardDetection& detection,
     const MapPoseResult& pose,
@@ -2337,6 +2384,26 @@ bool TrackerEngine::markerAssetsLoaded() const
 const TrackerConfig& TrackerEngine::config() const
 {
     return config_;
+}
+
+AppearanceCheck TrackerEngine::checkAppearance(
+    const cv::Mat& frame,
+    const std::vector<double>& rvec,
+    const std::vector<double>& tvec
+) const
+{
+    return checkMarkerAppearance(
+        frame,
+        geometry_,
+        field_,
+        K_,
+        dist_coeffs_,
+        rvec,
+        tvec,
+        config_.appearance_min_parity,
+        config_.appearance_min_dot,
+        config_.appearance_min_cells
+    );
 }
 
 CheckerboardDetectorConfig TrackerEngine::makeCheckerboardConfig(

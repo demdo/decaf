@@ -8,6 +8,7 @@
 
 #include <opencv2/core.hpp>
 
+#include "appearance_check.hpp"
 #include "checkerboard_detector.hpp"
 #include "correspondence_builder.hpp"
 #include "dot_detector.hpp"
@@ -94,6 +95,14 @@ public:
     // IR view (left/right of the configured rig) under an explicit
     // marker->IR-view pose.
     const IrPoseRefiner& irPoseRefiner() const { return ir_pose_refiner_; }
+
+    // Appearance check of a pose on a frame with the configured thresholds
+    // (the check the engine applies to its own poses).
+    AppearanceCheck checkAppearance(
+        const cv::Mat& frame,
+        const std::vector<double>& rvec,
+        const std::vector<double>& tvec
+    ) const;
 
     int frameIndex() const;
     TrackerMode mode() const;
@@ -288,6 +297,13 @@ private:
         const std::vector<double>& rvec,
         const std::vector<double>& tvec
     );
+    // checkAppearance() on the current frame; the values go to
+    // result.timings_ms as <prefix>_ms / _parity / _dot / _cells.
+    AppearanceCheck recordAppearanceCheck(
+        const MapPoseResult& pose,
+        const std::string& timing_prefix,
+        TrackerFrameResult& result
+    ) const;
 
     bool detectionHasDecodeableCellSpan(
         const CheckerboardDetection& detection

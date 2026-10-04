@@ -51,6 +51,7 @@ set(HYDRAMARKER_SOURCES
     src/tracker_geometry.cpp
     src/pose_output_filter.cpp
     src/ir_pose_refiner.cpp
+    src/appearance_check.cpp
     src/tracker_engine.cpp
 
     # Memory

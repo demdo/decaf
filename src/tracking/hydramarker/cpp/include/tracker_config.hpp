@@ -312,6 +312,14 @@ struct TrackerConfig {
     int decode_update_min_visual_corners = 12;
     int decode_update_min_distinct_rows = 3;
     int decode_update_min_distinct_cols = 3;
+
+    // Photometric appearance check (appearance_check.hpp): a decode pose of
+    // a (re)acquisition must show the expected checker parity and dot pattern
+    // in the image, otherwise the frame fails.
+    bool appearance_check_enabled = true;
+    double appearance_min_parity = 0.6;
+    double appearance_min_dot = 0.6;
+    int appearance_min_cells = 6;
 };
 
 } // namespace hydramarker

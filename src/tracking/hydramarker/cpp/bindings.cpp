@@ -1558,7 +1558,11 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("visual_corner_min_count", &TrackerConfig::visual_corner_min_count)
         .def_readwrite("decode_update_min_visual_corners", &TrackerConfig::decode_update_min_visual_corners)
         .def_readwrite("decode_update_min_distinct_rows", &TrackerConfig::decode_update_min_distinct_rows)
-        .def_readwrite("decode_update_min_distinct_cols", &TrackerConfig::decode_update_min_distinct_cols);
+        .def_readwrite("decode_update_min_distinct_cols", &TrackerConfig::decode_update_min_distinct_cols)
+        .def_readwrite("appearance_check_enabled", &TrackerConfig::appearance_check_enabled)
+        .def_readwrite("appearance_min_parity", &TrackerConfig::appearance_min_parity)
+        .def_readwrite("appearance_min_dot", &TrackerConfig::appearance_min_dot)
+        .def_readwrite("appearance_min_cells", &TrackerConfig::appearance_min_cells);
 
     py::class_<PersistentMatcher>(m, "PersistentMatcher")
         .def(py::init<const TrackerConfig&>(), py::arg("config") = TrackerConfig())
@@ -1755,6 +1759,13 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("correspondence_count", &TrackerFrameResult::correspondence_count)
         .def_readwrite("timings_ms", &TrackerFrameResult::timings_ms);
 
+    py::class_<AppearanceCheck>(m, "AppearanceCheck")
+        .def(py::init<>())
+        .def_readwrite("parity", &AppearanceCheck::parity)
+        .def_readwrite("dot", &AppearanceCheck::dot)
+        .def_readwrite("cells", &AppearanceCheck::cells)
+        .def_readwrite("passed", &AppearanceCheck::passed);
+
     py::class_<TrackerEngine>(m, "TrackerEngine")
         .def(
             py::init([](
@@ -1854,6 +1865,19 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("t_rgb_left_mm"),
             py::arg("R_left_right"),
             py::arg("t_left_right_mm")
+        )
+        .def(
+            "check_appearance",
+            [](const TrackerEngine& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> img,
+               const std::vector<double>& rvec,
+               const std::vector<double>& tvec) -> AppearanceCheck
+            {
+                return self.checkAppearance(numpyToMat(img), rvec, tvec);
+            },
+            py::arg("frame"),
+            py::arg("rvec"),
+            py::arg("tvec")
         )
         .def("reset", &TrackerEngine::reset)
         .def("reset_ir_references", &TrackerEngine::resetIrReferences)
