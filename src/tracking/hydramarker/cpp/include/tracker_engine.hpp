@@ -304,6 +304,14 @@ private:
         const std::string& timing_prefix,
         TrackerFrameResult& result
     ) const;
+    // Appearance check of a fast / persistent tracking pose (if enabled);
+    // true = the pose is rejected (<prefix>_reject_count). A check that
+    // cannot decide keeps the pose (<prefix>_undecided_count).
+    bool trackingPoseFailsAppearance(
+        const MapPoseResult& pose,
+        const std::string& timing_prefix,
+        TrackerFrameResult& result
+    ) const;
 
     bool detectionHasDecodeableCellSpan(
         const CheckerboardDetection& detection

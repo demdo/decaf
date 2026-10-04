@@ -329,6 +329,12 @@ struct TrackerConfig {
     double appearance_min_parity = 0.6;
     double appearance_min_dot = 0.6;
     int appearance_min_cells = 6;
+    // Also check every fast / persistent tracking pose (needs
+    // appearance_check_enabled); a rejected fast pose falls back to the
+    // decode path, a rejected persistent pose to the hold. A tracking pose
+    // is only rejected on evidence (enough cells, a correlation below the
+    // minimum); an acquisition pose has to pass.
+    bool appearance_check_tracking = true;
 };
 
 } // namespace hydramarker

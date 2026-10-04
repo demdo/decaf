@@ -606,6 +606,12 @@ class TrackerConfig:
     appearance_min_parity: float = 0.6
     appearance_min_dot: float = 0.6
     appearance_min_cells: int = 6
+    # Also check every fast / persistent tracking pose (they carry the corner
+    # identities over and never re-decode); a rejected fast pose falls back to
+    # the decode path, a rejected persistent pose to the hold. A tracking pose
+    # is only rejected on evidence (enough cells, a correlation below the
+    # minimum); an acquisition pose has to pass.
+    appearance_check_tracking: bool = True
 
     # Logging Output
     # Controls the corner list that TrackerEngine returns to Python.

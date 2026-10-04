@@ -257,6 +257,8 @@ AppearanceCheck checkMarkerAppearance(
     out.dot = pearson(dot_expected, dot_measured);
     out.passed = std::isfinite(out.parity) && std::isfinite(out.dot) &&
                  out.parity >= min_parity && out.dot >= min_dot;
+    out.failed = (std::isfinite(out.parity) && out.parity < min_parity) ||
+                 (std::isfinite(out.dot) && out.dot < min_dot);
     return out;
 }
 

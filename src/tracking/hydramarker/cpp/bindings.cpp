@@ -1569,7 +1569,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("appearance_check_enabled", &TrackerConfig::appearance_check_enabled)
         .def_readwrite("appearance_min_parity", &TrackerConfig::appearance_min_parity)
         .def_readwrite("appearance_min_dot", &TrackerConfig::appearance_min_dot)
-        .def_readwrite("appearance_min_cells", &TrackerConfig::appearance_min_cells);
+        .def_readwrite("appearance_min_cells", &TrackerConfig::appearance_min_cells)
+        .def_readwrite("appearance_check_tracking", &TrackerConfig::appearance_check_tracking);
 
     py::class_<PersistentMatcher>(m, "PersistentMatcher")
         .def(py::init<const TrackerConfig&>(), py::arg("config") = TrackerConfig())
@@ -1771,7 +1772,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("parity", &AppearanceCheck::parity)
         .def_readwrite("dot", &AppearanceCheck::dot)
         .def_readwrite("cells", &AppearanceCheck::cells)
-        .def_readwrite("passed", &AppearanceCheck::passed);
+        .def_readwrite("passed", &AppearanceCheck::passed)
+        .def_readwrite("failed", &AppearanceCheck::failed);
 
     py::class_<TrackerEngine>(m, "TrackerEngine")
         .def(

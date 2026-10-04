@@ -25,10 +25,12 @@ struct AppearanceCheck {
     double dot = std::numeric_limits<double>::quiet_NaN();
     int cells = 0;          // sampled cells
     bool passed = false;    // both correlations finite and above the minimum
+    bool failed = false;    // enough cells and a finite correlation below it
 };
 
 // frame: grey, BGR or BGRA. rvec/tvec: marker -> camera (mm). Fewer than
-// min_cells visible cells never pass.
+// min_cells visible cells never pass and never fail (undecided), nor does
+// a correlation without variance.
 AppearanceCheck checkMarkerAppearance(
     const cv::Mat& frame,
     const MarkerGeometry& geometry,

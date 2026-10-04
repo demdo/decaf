@@ -1847,6 +1847,33 @@ AppearanceCheck TrackerEngine::recordAppearanceCheck(
     return check;
 }
 
+bool TrackerEngine::trackingPoseFailsAppearance(
+    const MapPoseResult& pose,
+    const std::string& timing_prefix,
+    TrackerFrameResult& result
+) const
+{
+    if (!config_.appearance_check_enabled ||
+        !config_.appearance_check_tracking) {
+        return false;
+    }
+    const AppearanceCheck check =
+        recordAppearanceCheck(pose, timing_prefix, result);
+    if (check.passed) {
+        return false;
+    }
+    // Too few cells in view (a strip of the marker, half out of the image)
+    // or a correlation without variance (glare) cannot tell a slipped
+    // identity from a correct one. A tracking pose is only rejected on
+    // evidence; an acquisition pose still has to pass.
+    if (!check.failed) {
+        result.timings_ms[timing_prefix + "_undecided_count"] = 1.0;
+        return false;
+    }
+    result.timings_ms[timing_prefix + "_reject_count"] = 1.0;
+    return true;
+}
+
 bool TrackerEngine::fallbackPoseRejectionReason(
     const CheckerboardDetection& detection,
     const MapPoseResult& pose,
@@ -2002,6 +2029,12 @@ bool TrackerEngine::tryPersistentFallbackPose(
 
     std::string reject_reason;
     if (fallbackPoseRejectionReason(detection, seed.pose, reject_reason)) {
+        restorePoseTrackerState(had_pose, previous_rvec, previous_tvec);
+        return false;
+    }
+
+    if (trackingPoseFailsAppearance(
+            seed.pose, "persistent_appearance", result)) {
         restorePoseTrackerState(had_pose, previous_rvec, previous_tvec);
         return false;
     }
@@ -2333,6 +2366,15 @@ bool TrackerEngine::tryFastPersistentPose(
         pose.rvec.size() != 3 ||
         pose.tvec.size() != 3
     ) {
+        return false;
+    }
+
+    // Fast and persistent poses carry the corner identities over from the
+    // previous frame and never re-decode them, so a shifted identity would
+    // be tracked on indefinitely: they are checked too (tracking rule, see
+    // trackingPoseFailsAppearance). A reject falls through to the decode
+    // path.
+    if (trackingPoseFailsAppearance(pose, "fast_appearance", result)) {
         return false;
     }
 
