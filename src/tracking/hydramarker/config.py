@@ -295,6 +295,16 @@ class TrackerConfig:
     checker_qf_max_fit_rms_px: float = 0.6
     checker_qf_max_dev_px: float = 2.5
 
+    # Quadrant tests of the refined corners (recovery, local completion,
+    # guided refine): boxes on the bisectors of the measured edge lines around
+    # the sub-pixel corner instead of axis-aligned boxes (which fail on a grid
+    # rotated by ~45 deg). Only with appearance_check_enabled (the extra
+    # candidates need the check); False = the axis-aligned tests. The
+    # refiner's diagonal tolerance of the oriented test is relative to the
+    # local range (0-255 scale); the detector keeps its absolute 60 (C++).
+    checker_quadrant_oriented: bool = True
+    checker_quadrant_refiner_max_diagonal_diff: float = 120.0
+
     # Pose-filter distrust for frames where the IR MAP fusion attempted and
     # REJECTED (references existed, gates failed: glare veil, adverse
     # geometry): the surviving RGB-only pose is known-degraded evidence, so

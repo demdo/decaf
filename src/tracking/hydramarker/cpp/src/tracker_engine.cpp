@@ -2447,6 +2447,13 @@ CheckerboardDetectorConfig TrackerEngine::makeCheckerboardConfig(
     checker_config.qf_conic_gain = config.checker_qf_conic_gain;
     checker_config.qf_max_fit_rms_px = config.checker_qf_max_fit_rms_px;
     checker_config.qf_max_dev_px = config.checker_qf_max_dev_px;
+    // The oriented quadrant tests let more corner candidates through and
+    // with them more wrong decodes; only the appearance check keeps those
+    // locks honest, so they never run without it.
+    checker_config.quadrant_oriented =
+        config.checker_quadrant_oriented && config.appearance_check_enabled;
+    checker_config.quadrant_refiner_max_diagonal_diff = static_cast<float>(
+        config.checker_quadrant_refiner_max_diagonal_diff);
     return checker_config;
 }
 

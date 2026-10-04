@@ -426,8 +426,10 @@ def make_sfm_tracker(
             pose_hold_max_frames=0,
             emergency_pose_hold_enabled=False,
             # Model recording keeps its plain decode: the appearance check
-            # needs the marker model that this recording builds.
+            # needs the marker model that this recording builds, and the
+            # quadrant tests stay axis-aligned.
             appearance_check_enabled=False,
+            checker_quadrant_oriented=False,
         ),
     )
 

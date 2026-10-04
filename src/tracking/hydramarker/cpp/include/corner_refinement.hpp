@@ -195,6 +195,10 @@ struct CornerRefinementConfig {
     int   quadrant_half_r = 3;
     float quadrant_min_contrast = 12.0f;       // in [0,255]; internally scaled relative to local range
     float quadrant_max_diagonal_diff = 60.0f;  // in [0,255]; relaxed — relative scaling makes it robust
+    // Boxes on the bisectors of the measured edge lines around the sub-pixel
+    // corner (passesQuadrantOriented) instead of axis-aligned around the
+    // rounded pixel. The detector sets it from its own config.
+    bool  quadrant_oriented = false;
 
     // cv::cornerSubPix window half-size applied after gradient-intersection
     // refinement and before saddle-feature computation.
@@ -299,6 +303,22 @@ public:
         const CornerModelContext* model_context = nullptr
     ) const;
 
+    // Quadrant test with the four boxes on the two bisectors of the measured
+    // edge lines (ledge_angles_deg), sampled bilinearly around the sub-pixel
+    // corner at offset_px * sqrt(2); box half-side box_r. relative = true:
+    // thresholds relative to the local range (refiner); false: absolute grey
+    // levels (detector). gray_f must be CV_32F.
+    static bool passesQuadrantOriented(
+        const cv::Mat& gray_f,
+        const cv::Point2f& uv,
+        const cv::Vec2f& ledge_angles_deg,
+        float offset_px,
+        int box_r,
+        float min_contrast,
+        float max_diagonal_diff,
+        bool relative
+    );
+
 private:
     // cornerSubPix snap on the filtered tracked points (baseline operator).
     void runSubpixSnap(
@@ -369,9 +389,11 @@ private:
     static bool passesQuadrantSymmetry(
         const cv::Mat& gray_f,
         const cv::Point2f& uv,
+        const cv::Vec2f& ledge_angles_deg,
         int half_r,
         float min_contrast,
-        float max_diagonal_diff
+        float max_diagonal_diff,
+        bool oriented
     );
 };
 

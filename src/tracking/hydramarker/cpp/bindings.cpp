@@ -305,7 +305,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
            float quadrant_max_diagonal_diff,
            int subpix_win_size,
            int subpix_max_iters,
-           double subpix_epsilon) -> py::array_t<double>
+           double subpix_epsilon,
+           bool quadrant_oriented) -> py::array_t<double>
         {
             cv::Mat mat = numpyToMat(img);
             cv::Mat gray;
@@ -339,6 +340,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             config.quadrant_half_r = quadrant_half_r;
             config.quadrant_min_contrast = quadrant_min_contrast;
             config.quadrant_max_diagonal_diff = quadrant_max_diagonal_diff;
+            config.quadrant_oriented = quadrant_oriented;
             config.subpix_win_size = subpix_win_size;
             config.subpix_max_iters = subpix_max_iters;
             config.subpix_epsilon = subpix_epsilon;
@@ -382,7 +384,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         py::arg("quadrant_max_diagonal_diff") = 60.0f,
         py::arg("subpix_win_size") = -1,
         py::arg("subpix_max_iters") = 20,
-        py::arg("subpix_epsilon") = 0.05
+        py::arg("subpix_epsilon") = 0.05,
+        // Defaults: the axis-aligned test. The engine's refiner runs the
+        // oriented test with checker_quadrant_refiner_max_diagonal_diff.
+        py::arg("quadrant_oriented") = false
     );
 
     // Debug helper: load a marker geometry JSON and report the parsed
@@ -1398,6 +1403,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("checker_qf_conic_gain", &TrackerConfig::checker_qf_conic_gain)
         .def_readwrite("checker_qf_max_fit_rms_px", &TrackerConfig::checker_qf_max_fit_rms_px)
         .def_readwrite("checker_qf_max_dev_px", &TrackerConfig::checker_qf_max_dev_px)
+        .def_readwrite("checker_quadrant_oriented", &TrackerConfig::checker_quadrant_oriented)
+        .def_readwrite("checker_quadrant_refiner_max_diagonal_diff", &TrackerConfig::checker_quadrant_refiner_max_diagonal_diff)
         .def_readwrite("ir_reject_cov_inflate", &TrackerConfig::ir_reject_cov_inflate)
         .def_readwrite("ir_corner_method", &TrackerConfig::ir_corner_method)
         .def_readwrite("ir_qf_max_dev_px", &TrackerConfig::ir_qf_max_dev_px)
@@ -2107,6 +2114,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("quadrant_half_r", &CheckerboardDetectorConfig::quadrant_half_r)
         .def_readwrite("quadrant_min_contrast", &CheckerboardDetectorConfig::quadrant_min_contrast)
         .def_readwrite("quadrant_max_diagonal_diff", &CheckerboardDetectorConfig::quadrant_max_diagonal_diff)
+        .def_readwrite("quadrant_oriented", &CheckerboardDetectorConfig::quadrant_oriented)
+        .def_readwrite("quadrant_refiner_max_diagonal_diff", &CheckerboardDetectorConfig::quadrant_refiner_max_diagonal_diff)
         .def_readwrite("refresh_corner_loss_ratio", &CheckerboardDetectorConfig::refresh_corner_loss_ratio)
         .def_readwrite("refresh_gain_threshold", &CheckerboardDetectorConfig::refresh_gain_threshold)
         .def_readwrite("tracking_spacing_min_rel", &CheckerboardDetectorConfig::tracking_spacing_min_rel)

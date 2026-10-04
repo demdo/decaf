@@ -66,6 +66,15 @@ struct TrackerConfig {
     double checker_qf_max_fit_rms_px = 0.6;
     double checker_qf_max_dev_px = 2.5;
 
+    // Quadrant tests of the refined corners (recovery, local completion,
+    // guided refine) on the bisectors of the measured edge lines (any grid
+    // rotation), with the refiner's relative diagonal tolerance in [0,255];
+    // the detector's absolute tolerance stays at 60. The oriented tests let
+    // more candidates through, so they run only with
+    // appearance_check_enabled; off = the axis-aligned tests, tolerance 60.
+    bool checker_quadrant_oriented = true;
+    double checker_quadrant_refiner_max_diagonal_diff = 120.0;
+
     // Measurement-covariance inflation for frames where the IR MAP fusion
     // ATTEMPTED and REJECTED (references existed, all gates failed): the
     // surviving RGB-only pose rests on suspect corner evidence (glare

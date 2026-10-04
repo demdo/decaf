@@ -328,9 +328,11 @@ std::vector<RefinedCorner> CornerRefiner::refine(
             if (passesQuadrantSymmetry(
                     gray_f,
                     c.uv,
+                    c.ledge_angles_deg,
                     config.quadrant_half_r,
                     config.quadrant_min_contrast,
-                    config.quadrant_max_diagonal_diff)) {
+                    config.quadrant_max_diagonal_diff,
+                    config.quadrant_oriented)) {
                 quad_filtered.push_back(c);
             }
         }
@@ -2397,6 +2399,10 @@ std::vector<RefinedCorner> CornerRefiner::mergeCloseCorners(
 
         RefinedCorner c;
         c.uv = sum_uv * (1.0f / static_cast<float>(count));
+        // Linear mean of the edge-line angles: for a group whose angles
+        // straddle +-90 deg (an edge close to the image's vertical) it lands
+        // far off the edge, so the oriented quadrant test puts its boxes on
+        // the wrong bisectors and usually rejects the corner.
         c.ledge_angles_deg = sum_ledge * (1.0f / static_cast<float>(count));
         c.correlation = sum_corr / static_cast<float>(count);
         c.angle_bias_deg = sum_bias / static_cast<float>(count);
@@ -2428,20 +2434,35 @@ std::vector<RefinedCorner> CornerRefiner::mergeCloseCorners(
 //
 // The test uses a small axis-aligned box average in each quadrant to be
 // robust against sub-pixel noise.  half_r is the box half-side in pixels.
+//
+// The axis-aligned layout only fits a grid whose edges run close to the
+// image axes; on a grid rotated by 45 deg its boxes sit on the edges. With
+// oriented = true the same test runs with the boxes on the bisectors of the
+// two measured edge lines around the sub-pixel corner
+// (passesQuadrantOriented, same box distance).
 // ------------------------------------------------------------
 
 // static
 bool CornerRefiner::passesQuadrantSymmetry(
     const cv::Mat& gray_f,
     const cv::Point2f& uv,
+    const cv::Vec2f& ledge_angles_deg,
     int half_r,
     float min_contrast,
-    float max_diagonal_diff
+    float max_diagonal_diff,
+    bool oriented
 ) {
     CV_Assert(gray_f.type() == CV_32F);
 
     if (half_r <= 0) {
         return true;
+    }
+
+    const int offset = std::max(1, (half_r + 1) / 2);
+    if (oriented) {
+        return passesQuadrantOriented(
+            gray_f, uv, ledge_angles_deg, static_cast<float>(offset),
+            std::max(1, half_r / 2), min_contrast, max_diagonal_diff, true);
     }
 
     const int margin = half_r + 1;
@@ -2455,8 +2476,6 @@ bool CornerRefiner::passesQuadrantSymmetry(
 
     const int cx = static_cast<int>(std::lround(uv.x));
     const int cy = static_cast<int>(std::lround(uv.y));
-
-    const int offset = std::max(1, (half_r + 1) / 2);
 
     auto boxMean = [&](int qcx, int qcy) -> float {
         const int x0 = std::max(0, qcx - half_r / 2);
@@ -2530,6 +2549,105 @@ bool CornerRefiner::passesQuadrantSymmetry(
     }
 
     return true;
+}
+
+// static
+bool CornerRefiner::passesQuadrantOriented(
+    const cv::Mat& gray_f,
+    const cv::Point2f& uv,
+    const cv::Vec2f& ledge_angles_deg,
+    float offset_px,
+    int box_r,
+    float min_contrast,
+    float max_diagonal_diff,
+    bool relative
+) {
+    CV_Assert(gray_f.type() == CV_32F);
+
+    // The bisectors of the two edge lines point into the quadrant centres.
+    // Only two estimates of the same line (closer than about 0.06 deg) fall
+    // back to the image diagonals, i.e. the axis-aligned layout. Edges that
+    // are merely close to parallel, as after a merge whose angles straddled
+    // +-90 deg (mergeCloseCorners), keep their bisectors; those run along
+    // the edges, and the corner usually fails.
+    const float d2r = static_cast<float>(CV_PI / 180.0);
+    const cv::Point2f e0(std::cos(ledge_angles_deg[0] * d2r),
+                         std::sin(ledge_angles_deg[0] * d2r));
+    const cv::Point2f e1(std::cos(ledge_angles_deg[1] * d2r),
+                         std::sin(ledge_angles_deg[1] * d2r));
+    cv::Point2f b1 = e0 + e1;
+    cv::Point2f b2 = e0 - e1;
+    const float len1 = std::sqrt(b1.dot(b1));
+    const float len2 = std::sqrt(b2.dot(b2));
+    if (len1 < 1e-3f || len2 < 1e-3f) {
+        b1 = cv::Point2f(0.70710678f, 0.70710678f);
+        b2 = cv::Point2f(0.70710678f, -0.70710678f);
+    } else {
+        b1 *= 1.0f / len1;
+        b2 *= 1.0f / len2;
+    }
+
+    // Same box distance as the axis-aligned tests (offset along both axes).
+    const float rho = offset_px * 1.41421356f;
+    const float margin = rho + static_cast<float>(box_r) + 2.0f;
+    if (uv.x < margin ||
+        uv.y < margin ||
+        uv.x >= static_cast<float>(gray_f.cols) - margin ||
+        uv.y >= static_cast<float>(gray_f.rows) - margin) {
+        return true;  // near border — keep
+    }
+
+    auto boxMean = [&](const cv::Point2f& centre) -> float {
+        float sum = 0.0f;
+        int   cnt = 0;
+        for (int dy = -box_r; dy <= box_r; ++dy) {
+            for (int dx = -box_r; dx <= box_r; ++dx) {
+                sum += sampleBilinear(gray_f,
+                                      centre.x + static_cast<float>(dx),
+                                      centre.y + static_cast<float>(dy));
+                ++cnt;
+            }
+        }
+        return sum / static_cast<float>(cnt);
+    };
+
+    // q0/q3 and q1/q2 are opposite sectors (same colour).
+    const float q0 = boxMean(uv + rho * b1);
+    const float q3 = boxMean(uv - rho * b1);
+    const float q1 = boxMean(uv + rho * b2);
+    const float q2 = boxMean(uv - rho * b2);
+
+    if (relative) {
+        // Relative logic of passesQuadrantSymmetry.
+        const float local_min = std::min(std::min(q0, q1), std::min(q2, q3));
+        const float local_max = std::max(std::max(q0, q1), std::max(q2, q3));
+        const float local_range = local_max - local_min;
+        if (local_range < 4.0f) {
+            return false;
+        }
+        const float inv_range = 1.0f / local_range;
+        const float n0 = (q0 - local_min) * inv_range;
+        const float n1 = (q1 - local_min) * inv_range;
+        const float n2 = (q2 - local_min) * inv_range;
+        const float n3 = (q3 - local_min) * inv_range;
+        const float rel_max_diag_diff = max_diagonal_diff / 255.0f;
+        const float rel_min_contrast = min_contrast / 255.0f;
+        if (std::abs(n0 - n3) > rel_max_diag_diff) return false;
+        if (std::abs(n1 - n2) > rel_max_diag_diff) return false;
+        const float max_adj = std::max(
+            std::max(std::abs(n0 - n1), std::abs(n2 - n3)),
+            std::max(std::abs(n0 - n2), std::abs(n1 - n3)));
+        return max_adj >= rel_min_contrast;
+    }
+
+    // Absolute logic of the detector's passesQuadrantTest.
+    if (std::abs(q0 - q3) > max_diagonal_diff) return false;
+    if (std::abs(q1 - q2) > max_diagonal_diff) return false;
+    const bool axis_a = std::abs(q0 - q1) >= min_contrast &&
+                        std::abs(q2 - q3) >= min_contrast;
+    const bool axis_b = std::abs(q0 - q2) >= min_contrast &&
+                        std::abs(q1 - q3) >= min_contrast;
+    return axis_a || axis_b;
 }
 
 } // namespace hydramarker

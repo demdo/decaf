@@ -459,16 +459,28 @@ static std::vector<GridCorner> removeOutlierCorners(
 // Used to filter raw saddle-point candidates during detectRecovery().
 // NOT called during tracking: LK forward-backward + spacing filter
 // are sufficient and far more robust to illumination changes.
+// Axis-aligned boxes around the rounded pixel; with oriented = true the
+// same boxes on the bisectors of the measured edge lines
+// (CornerRefiner::passesQuadrantOriented, absolute thresholds).
 // ============================================================
 
 static bool passesQuadrantTest(
     const cv::Mat& gray_f,   // CV_32F
     const cv::Point2f& uv,
+    const cv::Vec2f& ledge_angles_deg,
     int half_r,
     float min_contrast,
-    float max_diagonal_diff
+    float max_diagonal_diff,
+    bool oriented
 ) {
     if (half_r <= 0 || gray_f.empty()) return true;
+
+    const int box_r  = std::max(1, half_r / 2);
+    const int offset = std::max(box_r + 1, half_r * 3 / 4);
+    if (oriented)
+        return CornerRefiner::passesQuadrantOriented(
+            gray_f, uv, ledge_angles_deg, static_cast<float>(offset), box_r,
+            min_contrast, max_diagonal_diff, false);
 
     const int margin = half_r + 1;
     if (uv.x < static_cast<float>(margin) ||
@@ -479,9 +491,6 @@ static bool passesQuadrantTest(
 
     const int cx = static_cast<int>(std::lround(uv.x));
     const int cy = static_cast<int>(std::lround(uv.y));
-
-    const int box_r  = std::max(1, half_r / 2);
-    const int offset = std::max(box_r + 1, half_r * 3 / 4);
 
     auto boxMean = [&](int qcx, int qcy) -> float {
         const int x0 = std::max(0, qcx - box_r);
@@ -514,6 +523,16 @@ static bool passesQuadrantTest(
     const bool v_axis = (v_left >= min_contrast && v_right >= min_contrast);
 
     return h_axis || v_axis;
+}
+
+// The refiner's wider tolerance belongs to the oriented test; the
+// axis-aligned refiner test keeps quadrant_max_diagonal_diff.
+static float refinerQuadrantMaxDiagonalDiff(
+    const CheckerboardDetectorConfig& config
+) {
+    return config.quadrant_oriented
+        ? config.quadrant_refiner_max_diagonal_diff
+        : config.quadrant_max_diagonal_diff;
 }
 
 
@@ -1730,7 +1749,8 @@ CheckerboardRecoveryDebug CheckerboardDetector::debugRecoveryStages(
     refine_config.merge_radius_px    = std::max(1.0f, config_.duplicate_corner_dist_px * scale);
     refine_config.quadrant_half_r            = config_.quadrant_half_r;
     refine_config.quadrant_min_contrast      = config_.quadrant_min_contrast;
-    refine_config.quadrant_max_diagonal_diff = config_.quadrant_max_diagonal_diff;
+    refine_config.quadrant_max_diagonal_diff = refinerQuadrantMaxDiagonalDiff(config_);
+    refine_config.quadrant_oriented          = config_.quadrant_oriented;
     refine_config.subpix_win_size  = config_.saddle_subpix_win_size;
     refine_config.subpix_max_iters = config_.saddle_subpix_max_iters;
     refine_config.subpix_epsilon   = config_.saddle_subpix_epsilon;
@@ -2062,7 +2082,8 @@ CheckerboardDetector::detectRecoveryInRegion(
     refine_config.merge_radius_px    = std::max(1.0f, config_.duplicate_corner_dist_px * scale);
     refine_config.quadrant_half_r            = config_.quadrant_half_r;
     refine_config.quadrant_min_contrast      = config_.quadrant_min_contrast;
-    refine_config.quadrant_max_diagonal_diff = config_.quadrant_max_diagonal_diff;
+    refine_config.quadrant_max_diagonal_diff = refinerQuadrantMaxDiagonalDiff(config_);
+    refine_config.quadrant_oriented          = config_.quadrant_oriented;
     refine_config.subpix_win_size  = config_.saddle_subpix_win_size;
     refine_config.subpix_max_iters = config_.saddle_subpix_max_iters;
     refine_config.subpix_epsilon   = config_.saddle_subpix_epsilon;
@@ -2104,10 +2125,11 @@ CheckerboardDetector::detectRecoveryInRegion(
 
         // Quadrant test in work-image coordinates.
         if (config_.quadrant_half_r > 0 &&
-            !passesQuadrantTest(work_f, c.uv,
+            !passesQuadrantTest(work_f, c.uv, c.ledge_angles_deg,
                                 config_.quadrant_half_r,
                                 config_.quadrant_min_contrast,
-                                config_.quadrant_max_diagonal_diff))
+                                config_.quadrant_max_diagonal_diff,
+                                config_.quadrant_oriented))
             continue;
 
         quadrant_corners.push_back(full_uv);
@@ -4480,7 +4502,8 @@ CheckerboardDetector::tryCompleteMissingCorners(
     refine_config.quadrant_half_r            = config_.quadrant_half_r;
     refine_config.quadrant_min_contrast      = config_.quadrant_min_contrast;
     refine_config.quadrant_max_diagonal_diff =
-        config_.quadrant_max_diagonal_diff;
+        refinerQuadrantMaxDiagonalDiff(config_);
+    refine_config.quadrant_oriented          = config_.quadrant_oriented;
     refine_config.subpix_win_size  = config_.saddle_subpix_win_size;
     refine_config.subpix_max_iters = config_.saddle_subpix_max_iters;
     refine_config.subpix_epsilon   = config_.saddle_subpix_epsilon;

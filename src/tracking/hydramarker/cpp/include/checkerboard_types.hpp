@@ -291,7 +291,19 @@ struct CheckerboardDetectorConfig {
     // tracking stability matters most.
     int   quadrant_half_r = 3;
     float quadrant_min_contrast = 12.0f;       // in [0,255]; internally scaled relative to local range
-    float quadrant_max_diagonal_diff = 60.0f;  // in [0,255]; relaxed — relative scaling makes it robust
+    float quadrant_max_diagonal_diff = 60.0f;  // in [0,255]; detector test (absolute), refiner when not oriented
+    // Both quadrant tests (refiner and detector) on the bisectors of the
+    // measured edge lines, so they hold at any grid rotation
+    // (CornerRefiner::passesQuadrantOriented). Off by default: the tracker
+    // engine turns it on together with its appearance check
+    // (TrackerConfig::checker_quadrant_oriented), a detector built on its
+    // own keeps the axis-aligned tests. The detector test keeps
+    // quadrant_max_diagonal_diff in absolute grey levels; the refiner's
+    // relative oriented test uses quadrant_refiner_max_diagonal_diff (only
+    // when oriented), because glare and shading on the cylinder compress the
+    // local range.
+    bool  quadrant_oriented = false;
+    float quadrant_refiner_max_diagonal_diff = 120.0f;  // in [0,255], relative
 
     // LK spacing consistency filter.
     float tracking_spacing_min_rel = 0.50f;
