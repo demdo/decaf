@@ -279,12 +279,16 @@ class _FrameProfile:
     Written by the GUI thread only. The tracking thread's numbers arrive with
     its results: 'track' (tracker call in the worker), 'wait' (poll -> start
     of the call), 'lag' (poll -> result), 'pickup' (result -> drained by the
-    GUI); 'age' is poll -> shown, per shown frame.
+    GUI); 'age' is poll -> shown, per shown frame. 'camera lost' counts the
+    colour frames the page never got (gaps in the RealSense frame numbers:
+    the SDK keeps only the newest frame for poll(), or the camera dropped
+    them).
     """
 
     def __init__(self, fps: int, log_path: Path | None):
         self.budget_ms = 1000.0 / float(fps)
         self.log_path = None if log_path is None else Path(log_path).resolve()
+        self._camera_number: int | None = None   # last polled frame number
         self.reset()
 
     def emit(self, line: str) -> None:
@@ -314,6 +318,14 @@ class _FrameProfile:
     def count(self, name: str, n: int = 1) -> None:
         """Event counters of the window (tracking thread hand-off, display)."""
         self._c[name] += n
+
+    def note_camera_frame(self, number: int | None) -> None:
+        """RealSense frame number of a polled colour frame (None: unknown)."""
+        if number is None:
+            return
+        last, self._camera_number = self._camera_number, number
+        if last is not None and number > last + 1:
+            self._c["camera_lost"] += number - last - 1
 
     def frame_start(self) -> float:
         now = time.perf_counter()
@@ -367,9 +379,14 @@ class _FrameProfile:
             if c[name]:
                 track += f"{name} {c[name]}  "
 
+        camera = ""
+        if self._camera_number is not None:
+            camera = f"camera lost {c['camera_lost']}  "
+
         self.emit(
             f"[live] {time.strftime('%H:%M:%S')}  {fps:5.1f} fps "
             f"(budget {self.budget_ms:.1f} ms)  polls empty {empty_pct:4.0f}%  "
+            + camera
             + track
             + "|  mean/max ms: " + "  ".join(parts)
         )
@@ -1371,6 +1388,7 @@ class OverlayLivePage(QWidget):
                 t_frame = time.perf_counter()
                 if prof:
                     prof.add("poll", t_frame - t_poll)
+                    prof.note_camera_frame(self._camera_frame_number())
                 worker = self._track_worker
                 if worker is not None:
                     n_dry = worker.n_pool_exhausted
@@ -1430,6 +1448,18 @@ class OverlayLivePage(QWidget):
     # --------------------------------------------------------
     # Display
     # --------------------------------------------------------
+
+    def _camera_frame_number(self) -> int | None:
+        """RealSense frame number of the colour frame behind the last poll()
+        (the source keeps that frameset until the next poll), for the
+        profile's count of camera frames the page never got."""
+        frames = getattr(self.camera, "_live_frames", None)
+        if frames is None:
+            return None
+        try:
+            return int(frames.get_color_frame().get_frame_number())
+        except Exception:
+            return None
 
     def _choose_frame(self, frame, t_frame: float):
         """
