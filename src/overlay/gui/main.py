@@ -22,9 +22,17 @@
 #                 during steps 3-5); the calibration files can be loaded
 #                 automatically and "New series" returns to step 3
 #                 without restarting the GUI.
+#
+# Tracking test (Evaluation only, a check box in the start dialog): the
+# camera intrinsics (step 2) are loaded from the dialog's file and the window
+# opens on Tool Tracking - no X-ray calibration. Tool Tracking -> Overlay Live
+# (camera image + drill) and back; Mode A and the other Mode B pages stay
+# locked. Should the camera file not load, step 2 stays open to load one by
+# hand, and its Next leads to Tool Tracking.
 
 import re
 import sys
+from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
@@ -96,8 +104,12 @@ class MainWindow(QMainWindow):
                 self.choice.eval_root, self.choice.session_name, self.choice.notes
             )
             self.state.eval = self.eval_session
+        # tool tracking without the X-ray calibration (Evaluation only)
+        self.tracking_test = self.eval_session is not None and self.choice.tracking_test
 
         title = "DeCAF Calibration — Mode A (Wizard)"
+        if self.tracking_test:
+            title = "DeCAF — Tracking test (no X-ray calibration)"
         if self.eval_session is not None:
             title += f"  [EVALUATION: {self.eval_session.name}]"
         self.setWindowTitle(title)
@@ -161,7 +173,10 @@ class MainWindow(QMainWindow):
         logo_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #212529; margin-left: 8px;")
         sidebar_layout.addWidget(logo_label)
 
-        steps_title = QLabel("Calibration (Mode A)")
+        steps_title = QLabel(
+            "Calibration (Mode A) — camera intrinsics only" if self.tracking_test
+            else "Calibration (Mode A)"
+        )
         steps_title.setStyleSheet("color: #495057; font-weight: 600; margin-left: 8px;")
         sidebar_layout.addWidget(steps_title)
 
@@ -180,7 +195,9 @@ class MainWindow(QMainWindow):
         for it in (self.item_xray, self.item_rgb, self.item_plane, self.item_markers, self.item_cam2xray):
             self.step_list.addItem(it)
 
-        runtime_title = QLabel("Runtime (Mode B)")
+        runtime_title = QLabel(
+            "Runtime (Mode B) — tracking test" if self.tracking_test else "Runtime (Mode B)"
+        )
         runtime_title.setStyleSheet("color: #495057; font-weight: 600; margin-left: 8px;")
         sidebar_layout.addWidget(runtime_title)
 
@@ -225,6 +242,9 @@ class MainWindow(QMainWindow):
         if self.eval_session is not None:
             self.eval_bar = EvalBar(self.eval_session)
             self.eval_bar.btn_new_capture.clicked.connect(self.new_series)
+            if self.tracking_test:
+                # no Cam2X series to start over
+                self.eval_bar.set_mode("TRACKING TEST")
             self.content_layout.addWidget(self.eval_bar)
 
         self.lbl_step_title = QLabel("")
@@ -272,6 +292,8 @@ class MainWindow(QMainWindow):
         self.page_overlay_preview = OverlayPreviewPage(self.state, self.on_complete_changed)
         self.page_tool_tracking = ToolTrackingPage(self.state, self.on_complete_changed)
         self.page_overlay_live = OverlayLivePage(self.state, self.on_complete_changed)
+        # camera image + drill without the X-ray chain only in the tracking test
+        self.page_overlay_live.tracking_test = self.tracking_test
 
         self.pages.addWidget(self.page_xray)
         self.pages.addWidget(self.page_cam_calib)
@@ -319,7 +341,9 @@ class MainWindow(QMainWindow):
         self._call_page_enter(self.IDX_XRAY)
         self.update_ui()
 
-        if self.eval_session is not None and self.choice.autoload_calibration:
+        if self.tracking_test:
+            self._start_tracking_test()
+        elif self.eval_session is not None and self.choice.autoload_calibration:
             self._autoload_calibration()
 
     # ------------------------------------------------------------------
@@ -337,6 +361,43 @@ class MainWindow(QMainWindow):
             self.eval_session.record_calibration_file("K_rgb", self.choice.camera_calib_path)
         if ok_x and ok_c:
             self._switch_to_page(self.IDX_PLANE)
+
+    def _start_tracking_test(self) -> None:
+        """Tracking test: step 2 from the camera file of the startup dialog,
+        then straight to Tool Tracking. If the file does not load, step 2
+        stays open (its Next leads to Tool Tracking)."""
+        ev = self.eval_session
+        path = self.choice.camera_calib_path
+        ev.set_meta("tracking_test", True)
+        if self.page_cam_calib.load_from_path(str(path)):
+            self._enter_tracking_test()
+            return
+        ev.log("tracking_test", "-", {
+            "camera_intrinsics": "not loaded",
+            "start_file": path.name,
+        }, tagged=False)
+        self._switch_to_page(self.IDX_CAM_CALIB)
+
+    def _enter_tracking_test(self, by_hand: bool = False) -> None:
+        """Records the camera intrinsics the test runs with (the dialog's
+        file, or one loaded by hand on step 2), then Tool Tracking."""
+        ev = self.eval_session
+        path = self.page_cam_calib.loaded_path
+        if path is not None:
+            ev.record_calibration_file("K_rgb", path)
+        numbers = {"camera_intrinsics": Path(path).name if path else "?"}
+        if by_hand:
+            numbers["loaded"] = "by hand (step 2)"
+        ev.log("tracking_test", "-", numbers, tagged=False)
+        self.mode_b_active = True
+        self._switch_to_page(self.IDX_TOOL_TRACKING)
+
+    def _b_sequence(self) -> list[int]:
+        """The Mode B pages Back / Next walk through; the tracking test has
+        only Tool Tracking and Overlay Live."""
+        if self.tracking_test:
+            return [self.IDX_TOOL_TRACKING, self.IDX_OVERLAY_LIVE]
+        return self.mode_b_indices
 
     def _eval_tag(self) -> str:
         """Height tag for Evaluation file names: "h<k>" in steps 3-5."""
@@ -541,6 +602,9 @@ class MainWindow(QMainWindow):
         if idx == self.IDX_TOOL_TRACKING:
             return self.state.has_tool
         if idx == self.IDX_OVERLAY_LIVE:
+            if self.tracking_test:
+                # camera image + drill: no H_xc, X-ray or d_x
+                return self.state.has_rgb_intrinsics and self.state.has_tool
             # Checked only once the Tool Tracking step before it is done.
             return (
                 self.state.has_H_xc
@@ -573,27 +637,36 @@ class MainWindow(QMainWindow):
 
     def _handle_back(self, idx: int) -> None:
         if idx in self.mode_a_indices:
+            if self.tracking_test:
+                # step 2 is where the tracking test starts
+                return
             self.go_to(idx - 1)
             return
 
-        if idx in self.mode_b_indices:
-            b_pos = self.mode_b_indices.index(idx)
+        seq = self._b_sequence()
+        if idx in seq:
+            b_pos = seq.index(idx)
             if b_pos > 0:
-                self.go_to(self.mode_b_indices[b_pos - 1])
+                self.go_to(seq[b_pos - 1])
             return
 
     def _handle_next(self, idx: int) -> None:
         if idx in self.mode_a_indices:
+            if self.tracking_test:
+                if idx == self.IDX_CAM_CALIB and self.state.has_rgb_intrinsics:
+                    self._enter_tracking_test(by_hand=True)
+                return
             if idx == self.IDX_CAM2XRAY:
                 self.go_to(self.IDX_PTR_DEPTH)
             else:
                 self.go_to(idx + 1)
             return
 
-        if idx in self.mode_b_indices:
-            b_pos = self.mode_b_indices.index(idx)
-            if b_pos < len(self.mode_b_indices) - 1:
-                self.go_to(self.mode_b_indices[b_pos + 1])
+        seq = self._b_sequence()
+        if idx in seq:
+            b_pos = seq.index(idx)
+            if b_pos < len(seq) - 1:
+                self.go_to(seq[b_pos + 1])
             return
 
     # ------------------------------------------------------------------
@@ -667,11 +740,16 @@ class MainWindow(QMainWindow):
         # Steps 3-5 run once per height: counter "(k/3)", and a tick only
         # once the whole series is done (step 5 = pooled pose exists).
         k = f"({self.page_cam2xray.current_height()}/{N_HEIGHTS})"
+        # the tracking test has no series: steps 3-5 without the counter
+        k_item = "" if self.tracking_test else f" {k}"
         series_done = self.step_complete(self.IDX_CAM2XRAY)
 
         for pos, idx in enumerate(self.mode_a_indices):
             if self.mode_b_active:
                 locked = True
+            elif self.tracking_test:
+                # only step 2 belongs to the tracking test
+                locked = idx != self.IDX_CAM_CALIB
             else:
                 locked = (not self.can_enter_step(idx)) and (not done_a[pos])
 
@@ -680,16 +758,19 @@ class MainWindow(QMainWindow):
             elif idx == self.IDX_CAM_CALIB:
                 _set_item_text(self.item_rgb, done_a[pos], locked, "2) Load camera intrinsics")
             elif idx == self.IDX_PLANE:
-                _set_item_text(self.item_plane, done_a[pos] and series_done, locked, f"3) Plane fitting {k}")
+                _set_item_text(self.item_plane, done_a[pos] and series_done, locked, f"3) Plane fitting{k_item}")
             elif idx == self.IDX_MARKERS:
-                _set_item_text(self.item_markers, done_a[pos] and series_done, locked, f"4) X-ray marker selection {k}")
+                _set_item_text(self.item_markers, done_a[pos] and series_done, locked, f"4) X-ray marker selection{k_item}")
             elif idx == self.IDX_CAM2XRAY:
-                _set_item_text(self.item_cam2xray, done_a[pos], locked, f"5) Camera → X-ray {k}")
+                _set_item_text(self.item_cam2xray, done_a[pos], locked, f"5) Camera → X-ray{k_item}")
 
         done_b = [self.step_complete(i) for i in self.mode_b_indices]
 
         for pos, idx in enumerate(self.mode_b_indices):
-            locked = not (self.mode_b_active or self.can_enter_mode_b())
+            if self.tracking_test:
+                locked = not self.mode_b_active or idx not in self._b_sequence()
+            else:
+                locked = not (self.mode_b_active or self.can_enter_mode_b())
 
             if idx == self.IDX_PTR_DEPTH:
                 _set_item_text(self.item_ptr_depth, done_b[pos], locked, "Pointer Tool Depth")
@@ -703,7 +784,10 @@ class MainWindow(QMainWindow):
         if self.current_step == self.IDX_XRAY:
             self.lbl_step_title.setText("Step 1 — Load X-ray intrinsics")
         elif self.current_step == self.IDX_CAM_CALIB:
-            self.lbl_step_title.setText("Step 2 — Load camera intrinsics")
+            self.lbl_step_title.setText(
+                "Tracking test — Load camera intrinsics" if self.tracking_test
+                else "Step 2 — Load camera intrinsics"
+            )
         elif self.current_step == self.IDX_PLANE:
             self.lbl_step_title.setText(f"Step 3 — Plane fitting {k}")
         elif self.current_step == self.IDX_MARKERS:
@@ -715,7 +799,10 @@ class MainWindow(QMainWindow):
         elif self.current_step == self.IDX_OVERLAY_PREVIEW:
             self.lbl_step_title.setText("Mode B — Overlay Preview")
         elif self.current_step == self.IDX_TOOL_TRACKING:
-            self.lbl_step_title.setText("Mode B — Tool Tracking")
+            self.lbl_step_title.setText(
+                "Tracking test — Tool Tracking" if self.tracking_test
+                else "Mode B — Tool Tracking"
+            )
         elif self.current_step == self.IDX_OVERLAY_LIVE:
             self.lbl_step_title.setText("")
         else:
@@ -737,6 +824,14 @@ class MainWindow(QMainWindow):
     def _update_page_nav_buttons(self) -> None:
         p = self.pages.currentWidget()
 
+        if self.tracking_test and self.current_step in self.mode_a_indices:
+            # step 2, only when the camera file did not load: Next -> Tool Tracking
+            if hasattr(p, "btn_back"):
+                p.btn_back.setEnabled(False)
+            if hasattr(p, "btn_next"):
+                p.btn_next.setEnabled(self.state.has_rgb_intrinsics)
+            return
+
         if self.current_step in self.mode_a_indices:
             if hasattr(p, "btn_back"):
                 p.btn_back.setEnabled(self.current_step > self.IDX_XRAY)
@@ -753,14 +848,19 @@ class MainWindow(QMainWindow):
                     p.btn_next.setEnabled(bool(allow))
             return
 
-        if self.current_step in self.mode_b_indices:
-            b_pos = self.mode_b_indices.index(self.current_step)
+        seq = self._b_sequence()
+        if self.current_step in seq:
+            b_pos = seq.index(self.current_step)
 
             if hasattr(p, "btn_back"):
                 p.btn_back.setEnabled(b_pos > 0)
 
             if hasattr(p, "btn_next"):
-                p.btn_next.setEnabled(b_pos < len(self.mode_b_indices) - 1)
+                allow = b_pos < len(seq) - 1
+                if allow and self.tracking_test:
+                    # Overlay Live needs the camera intrinsics and the tool
+                    allow = self.step_complete(seq[b_pos + 1])
+                p.btn_next.setEnabled(allow)
             return
 
     # ------------------------------------------------------------------
@@ -790,6 +890,11 @@ class MainWindow(QMainWindow):
                     return
 
         elif target_in_b:
+            if self.tracking_test and (
+                idx not in self._b_sequence()
+                or (idx == self.IDX_OVERLAY_LIVE and not self.step_complete(idx))
+            ):
+                return
             if not self.mode_b_active:
                 if self.current_step != self.IDX_CAM2XRAY:
                     return

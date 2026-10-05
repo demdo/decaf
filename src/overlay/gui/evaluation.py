@@ -10,6 +10,13 @@
 # captured again: h2b, h2c, ...); the pooled result of the series is
 # <label>_h3_cam2x_pooled.json (tag of the last height).
 #
+# Tracking test (Evaluation only, a check box in the start dialog): no X-ray
+# calibration - the main window loads the camera intrinsics and opens Tool
+# Tracking at once, then Overlay Live shows the camera image with the drill.
+# session.json says "tracking_test": true (and K_rgb); log.md has a
+# tracking_test row with the camera intrinsics and, per Overlay Live entry,
+# an overlay_live row with the drill files and the IR calibration.
+#
 # Folder:
 #   overlay/data/Evaluation/<session>/
 #     session.json      mode, calibration files (path + md5), notes
@@ -105,6 +112,9 @@ class StartupChoice:
     camera_calib_path: Path = DEFAULT_CAMERA_CALIB
     xray_calib_path: Path = DEFAULT_XRAY_CALIB
     notes: str = ""
+    # Evaluation only: straight to Tool Tracking, no X-ray calibration (the
+    # camera intrinsics from camera_calib_path are loaded in any case)
+    tracking_test: bool = False
 
 
 # ============================================================
@@ -159,6 +169,11 @@ class EvaluationSession:
     def _write_session_json(self) -> None:
         with open(self._session_json, "w", encoding="utf-8") as f:
             json.dump(_to_jsonable(self._meta), f, indent=2)
+
+    def set_meta(self, key: str, value) -> None:
+        """One more field of session.json (e.g. "tracking_test": True)."""
+        self._meta[key] = value
+        self._write_session_json()
 
     def record_calibration_file(self, role: str, path: Path | str) -> None:
         p = Path(path)
@@ -297,6 +312,14 @@ class StartupDialog(QDialog):
         self.btn_root.setFixedWidth(36)
         self.btn_root.clicked.connect(self._browse_root)
 
+        self.chk_tracking_test = QCheckBox(
+            "Tracking test — go straight to tool tracking (no X-ray calibration)"
+        )
+        self.chk_tracking_test.setToolTip(
+            "Loads the camera intrinsics below and opens Tool Tracking; Overlay Live "
+            "then shows the camera image with the drill only. The X-ray file is not used."
+        )
+
         self.chk_autoload = QCheckBox("Load calibration files automatically (steps 1 and 2)")
         self.chk_autoload.setChecked(True)
         self.ed_cam = QLineEdit(str(DEFAULT_CAMERA_CALIB))
@@ -320,15 +343,16 @@ class StartupDialog(QDialog):
         g.addWidget(QLabel("Output folder"), 1, 0)
         g.addWidget(self.ed_root, 1, 1)
         g.addWidget(self.btn_root, 1, 2)
-        g.addWidget(self.chk_autoload, 2, 0, 1, 3)
-        g.addWidget(QLabel("Camera"), 3, 0)
-        g.addWidget(self.ed_cam, 3, 1)
-        g.addWidget(self.btn_cam, 3, 2)
-        g.addWidget(QLabel("X-ray"), 4, 0)
-        g.addWidget(self.ed_xray, 4, 1)
-        g.addWidget(self.btn_xray, 4, 2)
-        g.addWidget(QLabel("Notes"), 5, 0)
-        g.addWidget(self.ed_notes, 5, 1, 1, 2)
+        g.addWidget(self.chk_tracking_test, 2, 0, 1, 3)
+        g.addWidget(self.chk_autoload, 3, 0, 1, 3)
+        g.addWidget(QLabel("Camera"), 4, 0)
+        g.addWidget(self.ed_cam, 4, 1)
+        g.addWidget(self.btn_cam, 4, 2)
+        g.addWidget(QLabel("X-ray"), 5, 0)
+        g.addWidget(self.ed_xray, 5, 1)
+        g.addWidget(self.btn_xray, 5, 2)
+        g.addWidget(QLabel("Notes"), 6, 0)
+        g.addWidget(self.ed_notes, 6, 1, 1, 2)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -346,14 +370,37 @@ class StartupDialog(QDialog):
 
         self.rb_eval.toggled.connect(self._sync)
         self.chk_autoload.toggled.connect(self._sync)
+        self.chk_tracking_test.toggled.connect(self._sync)
+        # the user's auto-load tick, kept while the tracking test holds the
+        # box ticked (None: test not ticked)
+        self._autoload_user: bool | None = None
         self._sync()
+
+    def _set_autoload(self, on: bool) -> None:
+        self.chk_autoload.blockSignals(True)
+        self.chk_autoload.setChecked(on)
+        self.chk_autoload.blockSignals(False)
 
     def _sync(self) -> None:
         ev = self.rb_eval.isChecked()
         self.eval_box.setEnabled(ev)
+        # the tracking test always loads the camera file and never the X-ray
+        # one: auto-load shows ticked and greyed, unticking the test gives
+        # the user's tick back
+        test = self.chk_tracking_test.isChecked()
+        if test:
+            if self._autoload_user is None:
+                self._autoload_user = self.chk_autoload.isChecked()
+            self._set_autoload(True)
+        elif self._autoload_user is not None:
+            self._set_autoload(self._autoload_user)
+            self._autoload_user = None
+        self.chk_autoload.setEnabled(not test)
         auto = self.chk_autoload.isChecked()
-        for w in (self.ed_cam, self.ed_xray, self.btn_cam, self.btn_xray):
+        for w in (self.ed_cam, self.btn_cam):
             w.setEnabled(ev and auto)
+        for w in (self.ed_xray, self.btn_xray):
+            w.setEnabled(ev and auto and not test)
 
     def _browse_root(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Output folder", self.ed_root.text())
@@ -376,6 +423,7 @@ class StartupDialog(QDialog):
             camera_calib_path=Path(self.ed_cam.text()),
             xray_calib_path=Path(self.ed_xray.text()),
             notes=self.ed_notes.text(),
+            tracking_test=self.rb_eval.isChecked() and self.chk_tracking_test.isChecked(),
         )
 
 
@@ -437,6 +485,12 @@ class EvalBar(QFrame):
 
     def _on_saved(self, path: Path) -> None:
         self.lbl_last.setText(f"saved: {path.name}")
+
+    def set_mode(self, mode: str) -> None:
+        """A session without the Cam2X series (e.g. "TRACKING TEST"): named
+        in the bar, no "New series"."""
+        self.lbl_session.setText(f"EVALUATION · {mode} · {self.session.name}")
+        self.btn_new_capture.hide()
 
     def set_tag(self, tag: str) -> None:
         """Show the series height the file names get ("_h2"), or nothing."""

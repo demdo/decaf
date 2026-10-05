@@ -124,6 +124,8 @@ class CameraIntrinsicsPage(StaticImagePage):
 
         self.state = state
         self.on_complete_changed = on_complete_changed
+        # the file K_rgb / dist_rgb came from (recorded by the tracking test)
+        self.loaded_path: str | None = None
 
         # ======================================================
         # RIGHT: controls
@@ -325,6 +327,7 @@ class CameraIntrinsicsPage(StaticImagePage):
 
             self.state.K_rgb = K
             self.state.dist_rgb = dist
+            self.loaded_path = str(path)
 
             self.refresh()
             self.on_complete_changed()
