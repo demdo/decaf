@@ -233,6 +233,11 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
     // GIL, before any engine or detector of this module can allocate.
     installCachingMatAllocator();
 
+    // TrackerEngine.process_frame(_ir) run without the GIL (see there). The
+    // Live page checks this flag and warns when it loads an older build,
+    // which would hold the GUI thread for the whole frame.
+    m.attr("PROCESS_FRAME_RELEASES_GIL") = true;
+
     m.def(
         "opencv_threading_info",
         []() -> py::dict {
@@ -1804,6 +1809,17 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                bool run_detection) -> TrackerFrameResult
             {
                 cv::Mat mat = numpyToMat(img);
+                // The engine touches no Python object, and img (the caller's
+                // array, or its forcecast copy) lives until this lambda
+                // returns, so other Python threads - the Live page's GUI -
+                // run while the frame is processed. The guard sits after the
+                // conversion on purpose: request() needs the GIL, which is
+                // why py::call_guard<py::gil_scoped_release> cannot be used.
+                // Without the GIL two engines can also run at the same time
+                // in two threads: the one process-wide object a frame
+                // changes, the CLAHE of corner detection, is per thread
+                // (corner_detection.cpp), and the Mat allocator is locked.
+                py::gil_scoped_release release;
                 return self.processFrame(mat, run_detection);
             },
             py::arg("frame"),
@@ -1820,6 +1836,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                 cv::Mat mat = numpyToMat(img);
                 cv::Mat irl = numpyToMat(ir_left);
                 cv::Mat irr = numpyToMat(ir_right);
+                // As in process_frame: no GIL while the engine runs.
+                py::gil_scoped_release release;
                 return self.processFrame(mat, irl, irr, run_detection);
             },
             py::arg("frame"),

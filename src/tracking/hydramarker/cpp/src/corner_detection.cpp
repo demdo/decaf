@@ -81,7 +81,11 @@ cv::Mat localNormalizeCLAHE(const cv::Mat& gray8) {
 
     cv::Mat clahe_img;
 
-    static cv::Ptr<cv::CLAHE> clahe =
+    // One per thread: apply() works in the object's own buffers, and
+    // process_frame runs without the GIL, so engines in two threads (say a
+    // hung Live-page worker and another page's tracker) must not share
+    // it. Same parameters, same output.
+    thread_local cv::Ptr<cv::CLAHE> clahe =
         cv::createCLAHE(2.5, cv::Size(8, 8));
 
     clahe->apply(denoised, clahe_img);
