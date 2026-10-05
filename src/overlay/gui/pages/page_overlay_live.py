@@ -64,55 +64,93 @@ SNAPSHOT_DIR = Path(__file__).resolve().parents[2] / "data" / "snapshots"
 # Tracking failure log
 # ============================================================
 
-# Aggregated dropout causes per tracking run, written as one JSONL record
-# when tracking stops. Costs nothing in the live loop: fresh-pose frames do
-# no logging work at all, stale frames only update an in-memory dict (and
+# Aggregated dropout causes per lock episode (lock -> stop after a loss, or
+# Stop), written as one JSONL record when the episode ends. Costs next to
+# nothing in the live loop: fresh results only look up the
+# appearance-check keys, stale results only update an in-memory dict (and
 # take a one-time detail snapshot per distinct cause); the file write
-# happens exclusively in _stop_tracking, outside the steady-state path.
+# happens only when an episode ends, in _stop_tracking.
 # On/off switch: TrackerConfig.failure_log_enabled (set in
 # run_tracker.make_live_tracker_config, like every other tracking setting);
 # the file itself only exists in Evaluation mode (session folder).
 TRACK_FAILURE_LOG_NAME = "tracking_failure_log.jsonl"
+# tracker_log timing key of the engine's current_pose_accepted (1.0 / 0.0):
+# its re-entry rule for the appearance check (previous frame not accepted)
+_TRACK_ACCEPTED_KEY = "cpp_tracker_engine_current_pose_accepted_count"
 
 
 class _TrackFailureLog:
-    """Dropout causes of one tracking run, deduplicated by (stage, reason).
+    """Dropout causes of one tracking run, one record per lock episode,
+    deduplicated by (stage, reason).
 
-    note() is only called for stale frames AFTER the first fresh pose
-    (acquisition failures are not logged). Repeats of the same cause bump a
-    counter instead of producing new entries; the full diagnostic snapshot
-    is taken once, at the first occurrence of each cause.
+    note() is only called for stale results AFTER a lock (search failures
+    are not logged). Repeats of the same cause bump a counter instead of
+    producing new entries; the full diagnostic snapshot is taken once, at
+    the first occurrence of each cause. Frame numbers (*_frame_idx) are the
+    camera's frame_index of the processed frame.
+
+    note_appearance() counts every appearance check that rejected a pose or
+    could not decide, on fresh results and while searching too - the safety
+    of every (re)lock rests on that check. A record carries the counts since
+    the previous record (the search before its lock included), so the
+    records of a run add up; what is left at the end of the run is written
+    as "appearance_checks".
+
+    log_version 2. Version 1 (no log_version field) wrote one record per
+    run: frames_total = processed frames of the run,
+    causes[].first_frame/last_frame = processed-frame counter.
     """
+
+    LOG_VERSION = 2
 
     def __init__(self, path: str):
         self._path: Path | None = Path(path).resolve()
         self._tracker_log = None            # tracking.hydramarker.tracker_log
         self._causes: dict[tuple[str, str], dict] = {}
         self._t0 = 0.0
+        self._episode = 0
+        self._episode_frame0 = -1
+        self._t_episode = 0.0
+        self._appearance: dict = {}
+
+    @staticmethod
+    def _no_appearance() -> dict:
+        return {"reentry": {}, "tracking": {}, "undecided": {}, "first": {}}
 
     def start(self, tracker_log_module) -> None:
         """Arm for a new tracking run (called from _start_tracking)."""
         self._tracker_log = tracker_log_module
         self._causes = {}
         self._t0 = time.perf_counter()
+        self._episode = 0
+        self._episode_frame0 = -1
+        self._appearance = self._no_appearance()
+
+    def begin_episode(self, episode: int, frame_idx: int) -> None:
+        """A (re)lock starts a new episode."""
+        self._episode = int(episode)
+        self._episode_frame0 = int(frame_idx)
+        self._t_episode = time.perf_counter()
+        self._causes = {}
 
     def note(self, result, frame_idx: int, stale: int) -> None:
-        """Record one stale frame. Dict-only work; never raises."""
+        """Record one stale result. Dict-only work; never raises."""
         try:
             tl = self._tracker_log
             if tl is None:
                 return
             if getattr(result, "success", False):
                 # Held pose: success without a fresh pose is its own cause,
-                # classify_failure would report it as "OK".
-                key = ("POSE_HELD", tl.pose_source_value(result))
+                # classify_failure would report it as "OK"; the key names
+                # what the engine held through.
+                key = tl.classify_hold(result)
             else:
                 key = tl.classify_failure(result)
 
             entry = self._causes.get(key)
             if entry is not None:
                 entry["count"] += 1
-                entry["last_frame"] = frame_idx
+                entry["last_frame_idx"] = frame_idx
                 entry["last_t_s"] = round(time.perf_counter() - self._t0, 3)
                 return
 
@@ -121,8 +159,8 @@ class _TrackFailureLog:
                 "stage": key[0],
                 "reason": key[1],
                 "count": 1,
-                "first_frame": frame_idx,
-                "last_frame": frame_idx,
+                "first_frame_idx": frame_idx,
+                "last_frame_idx": frame_idx,
                 "first_t_s": round(time.perf_counter() - self._t0, 3),
                 "last_t_s": round(time.perf_counter() - self._t0, 3),
                 "first": {
@@ -150,22 +188,78 @@ class _TrackFailureLog:
         except Exception:
             pass
 
-    def flush(self, stop_reason: str, total_frames: int) -> None:
-        """Write one JSONL record if any dropout was recorded. Never raises."""
-        causes, self._causes = self._causes, {}
-        if not causes or self._path is None:
-            return
+    def note_appearance(self, result, frame_idx: int, reentry: bool) -> None:
+        """Count the appearance checks of one result that rejected a pose or
+        could not decide (every result of the current epoch comes here).
+        Dict-only work; never raises."""
         try:
+            tl = self._tracker_log
+            if tl is None:
+                return
+            rejects = tl.appearance_rejects(result)
+            undecided = tl.appearance_undecided(result)
+            if not rejects and not undecided:
+                return
+            app = self._appearance
+            group = app["reentry" if reentry else "tracking"]
+            for kind in rejects:
+                group[kind] = group.get(kind, 0) + 1
+            for kind in undecided:
+                app["undecided"][kind] = app["undecided"].get(kind, 0) + 1
+            for kind in rejects:
+                if kind not in app["first"]:
+                    app["first"][kind] = {
+                        "frame_idx": frame_idx,
+                        "reentry": bool(reentry),
+                        "message": str(getattr(result, "message", "") or ""),
+                        **tl.appearance_values(result, kind),
+                    }
+        except Exception:
+            pass
+
+    def flush(self, stop_reason: str, frame_idx: int, n_results: int,
+              final: bool = False) -> None:
+        """End the current episode (n_results: its processed results, the
+        locking one included): write one JSONL record if any dropout was
+        recorded. final (end of the run): without such a record, the
+        appearance counts not written yet go out on their own. Never
+        raises."""
+        causes, self._causes = self._causes, {}
+        episode, self._episode = self._episode, 0
+        if self._path is None:
+            return
+        appearance = {k: v for k, v in self._appearance.items() if v}
+        if causes and episode:
             record = {
                 "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "event": "tracking_dropout",
+                "log_version": self.LOG_VERSION,
                 "stop_reason": stop_reason,
-                "frames_total": total_frames,
+                "episode": episode,
+                "frames_episode": int(n_results),
+                "frames_stale": sum(c["count"] for c in causes.values()),
+                "frame_idx_span": [self._episode_frame0, frame_idx],
+                "episode_duration_s": round(time.perf_counter() - self._t_episode, 3),
                 "run_duration_s": round(time.perf_counter() - self._t0, 3),
                 "causes": sorted(
-                    causes.values(), key=lambda c: c["first_frame"]
+                    causes.values(), key=lambda c: c["first_frame_idx"]
                 ),
+                "appearance": appearance,
             }
+        elif final and appearance:
+            record = {
+                "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "event": "appearance_checks",
+                "log_version": self.LOG_VERSION,
+                "stop_reason": stop_reason,
+                "run_duration_s": round(time.perf_counter() - self._t0, 3),
+                "appearance": appearance,
+            }
+        else:
+            return
+        # in this record now: the next one counts from zero
+        self._appearance = self._no_appearance()
+        try:
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, default=str) + "\n")
         except Exception:
@@ -821,6 +915,9 @@ class OverlayLivePage(QWidget):
         self._track_converged = False      # pose output filter warmup latch
         self._track_frames = 0             # frames since tracking start
         self._track_stale = 0              # consecutive frames without fresh pose
+        self._track_prev_accepted = False  # previous frame had an accepted pose
+        self._track_episode_results = 0    # frames since the lock (failure log)
+        self._track_last_index = -1        # camera frame_index of the last frame
         self._tool_overlay: TrackingOverlay | None = None
         self._last_pose_result = None      # last TrackerResult with a fresh pose
         self._has_fresh_pose = None        # tracker_log.has_fresh_pose (lazy)
@@ -1193,7 +1290,7 @@ class OverlayLivePage(QWidget):
                 )
                 if prof:
                     prof.add("track", time.perf_counter() - t)
-                self._update_tracking_state(result)
+                self._update_tracking_state(result, frame.frame_index)
 
             if self._plane_acquiring:
                 t = time.perf_counter()
@@ -1357,13 +1454,20 @@ class OverlayLivePage(QWidget):
         self._track_converged = False
         self._track_frames = 0
         self._track_stale = 0
+        self._track_prev_accepted = False
+        self._track_episode_results = 0
+        self._track_last_index = -1
         self.controls.btn_track.setText("Stop tracking")
         self.controls.lbl_track_status.setText("acquiring…")
 
     def _stop_tracking(self, reason: str) -> None:
         self._tracking_active = False
         if self._track_fail_log is not None:
-            self._track_fail_log.flush(reason, self._track_frames)
+            # closes the lock episode (frames of it, the locking one included)
+            self._track_fail_log.flush(
+                reason, self._track_last_index,
+                self._track_episode_results if self._track_locked else 0, final=True,
+            )
         if self._tool_overlay is not None:
             self._tool_overlay.clear()
         self._last_pose_result = None
@@ -1375,11 +1479,29 @@ class OverlayLivePage(QWidget):
         self.controls.btn_track.setText("Start tracking")
         self.controls.lbl_track_status.setText(reason)
 
-    def _update_tracking_state(self, result) -> None:
+    def _update_tracking_state(self, result, frame_idx: int) -> None:
         self._track_frames += 1
+        self._track_last_index = int(frame_idx)
+        log = self._track_fail_log
+
+        # Appearance checks of every frame, the search included: the
+        # engine's re-entry rule is "the previous processed frame has no
+        # accepted pose" (the first frame of a run is one).
+        reentry = not self._track_prev_accepted
+        timings = getattr(result, "timings_ms", None) or {}
+        self._track_prev_accepted = bool(timings.get(_TRACK_ACCEPTED_KEY, 0.0))
+        if log is not None:
+            log.note_appearance(result, frame_idx, reentry)
 
         if self._has_fresh_pose(result):
             self._track_stale = 0
+            if not self._track_locked:
+                # the lock starts the failure log's episode (one per run:
+                # a loss stops tracking)
+                self._track_episode_results = 0
+                if log is not None:
+                    log.begin_episode(1, frame_idx)
+            self._track_episode_results += 1
             converged = bool(getattr(result, "pose_converged", False))
             if not self._track_locked or converged != self._track_converged:
                 self._track_locked = True
@@ -1403,8 +1525,9 @@ class OverlayLivePage(QWidget):
         # Dropout after a successful lock: aggregate the cause (dedup by
         # stage/reason, counter on repeats). Acquisition failures above are
         # deliberately not logged.
-        if self._track_fail_log is not None:
-            self._track_fail_log.note(result, self._track_frames, self._track_stale)
+        self._track_episode_results += 1
+        if log is not None:
+            log.note(result, frame_idx, self._track_stale)
         if self._track_stale >= self.TRACK_LOST_STOP_FRAMES:
             self._stop_tracking("lost — press Start")
 
