@@ -1554,6 +1554,19 @@ def classify_failure(result) -> tuple[str, str]:
     if "idle" in msg_l and "skipped" in msg_l:
         return "IDLE", "DETECTION_SKIPPED"
 
+    # The engine drops a held detection (a repeat of an earlier frame's
+    # grid), so the frame reads like one without any detection; the timing
+    # key tells the two apart.
+    timings = getattr(result, "timings_ms", None) or {}
+    if _debug_counter(timings, "held_detection_count"):
+        return "DETECTION", "HELD_DETECTION"
+
+    return _classify_message(msg_l)
+
+
+def _classify_message(msg_l: str) -> tuple[str, str]:
+    """(stage, reason) of a lower-case failure message; also used for the
+    cause a held pose stands in for (classify_hold)."""
     if "no valid decoded patches" in msg_l:
         return "PATCH_DECODER", "NO_VALID_DECODED_PATCHES"
 
@@ -1581,7 +1594,82 @@ def classify_failure(result) -> tuple[str, str]:
     if "reprojection" in msg_l and ("too large" in msg_l or "rejected" in msg_l):
         return "REPROJECTION_GATE", "REPROJECTION_ERROR_TOO_LARGE"
 
+    if "no valid checkerboard detection" in msg_l:
+        return "DETECTION", "NO_VALID_DETECTION"
+
+    # The decode pose of a (re)acquisition failed the photometric check:
+    # "Appearance check failed (parity=.., dot=.., cells=..)".
+    if msg_l.startswith("appearance check failed"):
+        return "APPEARANCE", "APPEARANCE_CHECK_FAILED"
+
     return "OTHER", "OTHER"
+
+
+def classify_hold(result) -> tuple[str, str]:
+    """
+    Classify a held pose (success without a fresh pose).
+
+    ("POSE_HELD", "HOLD:<cause>") for the ordinary hold, ("POSE_HELD",
+    "EMERGENCY_HOLD:<cause>") for the emergency hold; <cause> is the reason
+    classify_failure would give the frame without the hold, e.g.
+    EMERGENCY_HOLD:APPEARANCE_CHECK_FAILED. The sum over all POSE_HELD keys
+    equals the former single key ("POSE_HELD", "hold").
+    """
+    msg_l = str(getattr(result, "message", "") or "").lower()
+    kind = "EMERGENCY_HOLD" if msg_l.startswith("emergency pose held") else "HOLD"
+
+    timings = getattr(result, "timings_ms", None) or {}
+    if _debug_counter(timings, "held_detection_count"):
+        cause = "HELD_DETECTION"
+    elif "without checkerboard detection" in msg_l:
+        cause = "NO_VALID_DETECTION"
+    else:
+        # "Emergency pose held from last accepted pose after: <reason> (age=..)"
+        _, sep, reason = msg_l.partition("after: ")
+        cause = _classify_message(reason)[1] if sep else "OTHER"
+
+    return "POSE_HELD", f"{kind}:{cause}"
+
+
+# The engine's appearance checks and their timing-key prefixes: the decode
+# pose of a (re)acquisition, the fast pose and the persistent fallback.
+APPEARANCE_CHECKS = (
+    ("decode", "appearance"),
+    ("fast", "fast_appearance"),
+    ("persistent", "persistent_appearance"),
+)
+
+
+def appearance_rejects(result) -> tuple[str, ...]:
+    """Appearance checks that rejected a pose in this frame ("decode",
+    "fast", "persistent"); only the decode reject leaves a message."""
+    timings = getattr(result, "timings_ms", None) or {}
+    return tuple(
+        kind for kind, prefix in APPEARANCE_CHECKS
+        if _debug_counter(timings, f"{prefix}_reject_count")
+    )
+
+
+def appearance_undecided(result) -> tuple[str, ...]:
+    """Appearance checks of tracking poses that could not decide (too few
+    cells, no variance); the engine kept those poses."""
+    timings = getattr(result, "timings_ms", None) or {}
+    return tuple(
+        kind for kind, prefix in APPEARANCE_CHECKS
+        if _debug_counter(timings, f"{prefix}_undecided_count")
+    )
+
+
+def appearance_values(result, kind: str) -> dict:
+    """parity / dot / cells of one appearance check of this frame (None
+    where the frame has no such check)."""
+    prefix = dict(APPEARANCE_CHECKS)[kind]
+    t = getattr(result, "timings_ms", None) or {}
+    return {
+        "parity": t.get(f"{prefix}_parity"),
+        "dot": t.get(f"{prefix}_dot"),
+        "cells": t.get(f"{prefix}_cells"),
+    }
 
 
 def pose_source_value(result) -> str:
