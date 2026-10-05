@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from collections import defaultdict
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 from overlay.calib.calib_xray_to_pointer import extract_depth
 from overlay.gui.state import SessionState
 from overlay.tools.homography import estimate_plane_induced_homography
+from overlay.tools.live_tracking import STATUS_SEARCHING, TrackingSession, TrackingWorker
 from overlay.tools.pointer_depth import PointerDepthEstimator, depth_capture_arrays
 from overlay.tools.tracking_overlay import TrackingOverlay
 from overlay.tools.warp import prepare_live_overlay
@@ -37,7 +39,8 @@ from overlay.tools.xray_io import read_xray_gray_u8
 # RealSense options (auto_exposure_priority=0 for guaranteed fps, emitter
 # off for the IR pair, ...) live in exactly one place. The tracker itself
 # (HydraTracker, C++ engine) is imported lazily in _start_tracking so the
-# GUI starts and the overlay runs even when the tracking build is absent.
+# GUI starts and the overlay runs even when the tracking build is absent;
+# overlay.tools.live_tracking (its thread) imports neither Qt nor the engine.
 from tracking.hydramarker.camera_setup import RealSenseCameraSource
 from tracking.hydramarker.config import CameraConfig
 
@@ -64,19 +67,17 @@ SNAPSHOT_DIR = Path(__file__).resolve().parents[2] / "data" / "snapshots"
 # Tracking failure log
 # ============================================================
 
-# Aggregated dropout causes per lock episode (lock -> stop after a loss, or
-# Stop), written as one JSONL record when the episode ends. Costs next to
-# nothing in the live loop: fresh results only look up the
+# Aggregated dropout causes per lock episode (lock -> engine reset after a
+# loss, or Stop), written as one JSONL record when the episode ends. Costs
+# next to nothing in the live loop: fresh results only look up the
 # appearance-check keys, stale results only update an in-memory dict (and
 # take a one-time detail snapshot per distinct cause); the file write
-# happens only when an episode ends, in _stop_tracking.
+# happens only when an episode ends. Everything runs in the GUI thread, on
+# the drained tracking results (TrackingSession calls it).
 # On/off switch: TrackerConfig.failure_log_enabled (set in
 # run_tracker.make_live_tracker_config, like every other tracking setting);
 # the file itself only exists in Evaluation mode (session folder).
 TRACK_FAILURE_LOG_NAME = "tracking_failure_log.jsonl"
-# tracker_log timing key of the engine's current_pose_accepted (1.0 / 0.0):
-# its re-entry rule for the appearance check (previous frame not accepted)
-_TRACK_ACCEPTED_KEY = "cpp_tracker_engine_current_pose_accepted_count"
 
 
 class _TrackFailureLog:
@@ -270,10 +271,15 @@ class _FrameProfile:
     """
     Per-stage timing for the live loop.
 
-    Prints one summary line every PROFILE_EVERY frames with mean and max per
-    stage in ms. 'interval' is the wall time between two timer callbacks - if
-    that is well above 1000/FPS while the stages are cheap, the timer itself is
-    being starved rather than the processing being slow.
+    Prints one summary line every PROFILE_EVERY shown frames with mean and
+    max per stage in ms. 'interval' is the wall time between two shown
+    frames - if that is well above 1000/FPS while the stages are cheap, the
+    timer itself is being starved rather than the processing being slow.
+
+    Written by the GUI thread only. The tracking thread's numbers arrive with
+    its results: 'track' (tracker call in the worker), 'wait' (poll -> start
+    of the call), 'lag' (poll -> result), 'pickup' (result -> drained by the
+    GUI); 'age' is poll -> shown, per shown frame.
     """
 
     def __init__(self, fps: int, log_path: Path | None):
@@ -293,6 +299,7 @@ class _FrameProfile:
 
     def reset(self) -> None:
         self._t: dict[str, list[float]] = defaultdict(list)
+        self._c: dict[str, int] = defaultdict(int)
         self._n_frames = 0
         self._n_polls = 0
         self._n_empty = 0
@@ -303,6 +310,10 @@ class _FrameProfile:
         self._n_polls += 1
         if empty:
             self._n_empty += 1
+
+    def count(self, name: str, n: int = 1) -> None:
+        """Event counters of the window (tracking thread hand-off, display)."""
+        self._c[name] += n
 
     def frame_start(self) -> float:
         now = time.perf_counter()
@@ -332,10 +343,35 @@ class _FrameProfile:
                 parts.append(f"{stage.strip()} {np.mean(v):6.1f}/{np.max(v):6.1f}")
 
         empty_pct = 100.0 * self._n_empty / max(1, self._n_polls)
+
+        # While tracking: processed frames per second, share of submitted
+        # frames the worker skipped (a newer one replaced them), share of
+        # shown frames that carried a pose.
+        c = self._c
+        track = ""
+        if c["submitted"]:
+            proc = c["processed"] / elapsed if elapsed > 0 else 0.0
+            skipped_pct = 100.0 * c["skipped"] / c["submitted"]
+            shown = c["shown_pose"] + c["shown_live"]
+            pose_pct = 100.0 * c["shown_pose"] / max(1, shown)
+            track = (
+                f"proc {proc:4.1f}/s skipped {skipped_pct:3.0f}%  "
+                f"pose {pose_pct:3.0f}%  "
+            )
+        # Pose frames that could not be shown any more (older than the
+        # frame on screen - one at every lock - or than
+        # TRACK_POSE_MAX_AGE_S), and what must not happen: no free frame
+        # slot (also in a window where nothing could be submitted), results
+        # lost in the outbox.
+        for name in ("pose_dropped", "pool_exhausted", "outbox_dropped"):
+            if c[name]:
+                track += f"{name} {c[name]}  "
+
         self.emit(
             f"[live] {time.strftime('%H:%M:%S')}  {fps:5.1f} fps "
             f"(budget {self.budget_ms:.1f} ms)  polls empty {empty_pct:4.0f}%  "
-            "|  mean/max ms: " + "  ".join(parts)
+            + track
+            + "|  mean/max ms: " + "  ".join(parts)
         )
 
 
@@ -513,8 +549,9 @@ class _OverlayControlRail(QFrame):
 
         # ---------------- Tool tracking ----------------
         # Only shown when a tool is loaded (set_tracking_visible). Tracking
-        # is started explicitly via the button; on loss it stops and the
-        # button re-arms (no auto re-acquire).
+        # is started and stopped via the button; in between it searches
+        # until stopped: after a loss the engine is reset and the search
+        # goes on.
         self.btn_track = QPushButton("Start tracking")
         self.btn_track.setObjectName("overlayRailTrackBtn")
         self.btn_track.setMinimumHeight(self._s(40))
@@ -888,12 +925,23 @@ class OverlayLivePage(QWidget):
     DX_OFFSET_MIN_MM = -10
     DX_OFFSET_MAX_MM = 10
 
-    # Tool tracking (button-driven: started explicitly, stops on loss, no
-    # auto re-acquire). Frame counts at 30 fps; the timeouts match the
-    # validated run_tracker values (ACQUIRE_TIMEOUT_FRAMES,
-    # TRACKING_STALE_TO_IDLE_FRAMES).
-    TRACK_ACQUIRE_TIMEOUT_FRAMES = 90   # 3 s without a first pose -> stop
-    TRACK_LOST_STOP_FRAMES = 45         # 1.5 s stale while tracking -> stop
+    # Tool tracking (button-driven: started and stopped via the rail button,
+    # searching in between). The tracker runs in its own thread
+    # (overlay.tools.live_tracking), so the windows count seconds of frame
+    # time, not processed frames; 1.5 s is the validated 45 frames at 30 fps
+    # (run_tracker TRACKING_STALE_TO_IDLE_FRAMES).
+    TRACK_SEARCH_HINT_S = 3.0     # no lock for 3 s -> status hint, search goes on
+    TRACK_LOST_RESET_S = 1.5      # 1.5 s without a fresh pose -> engine reset, search on
+    # A pose frame is shown only while it is the newest result and younger
+    # than this: bounds the freeze if the tracker stalls, and stays above
+    # tracking time + one camera period + pickup, so a pose stream never
+    # flickers to the live image.
+    TRACK_POSE_MAX_AGE_S = 0.10
+    # Frame copies in flight at a submit: the one being filled + pending +
+    # processing + the newest undrained result + the one the page holds
+    # (the result frame on screen; _choose_frame shows or drops every other
+    # one within the tick that drained it).
+    TRACK_FRAME_POOL = 5
     # Manual IR exposure while the IR pair streams (same default the
     # run_tracker IR path uses; short = less motion blur on the pair).
     TRACK_IR_EXPOSURE_US = 8000.0
@@ -909,24 +957,51 @@ class OverlayLivePage(QWidget):
 
         # --- tool tracking runtime state ---
         self._tool = None                  # ToolAssets while on the page
-        self._tracker = None               # HydraTracker while tracking
+        self._tracker = None               # HydraTracker while on the page
         self._tracking_active = False
-        self._track_locked = False         # False = acquiring, True = had a pose
-        self._track_converged = False      # pose output filter warmup latch
-        self._track_frames = 0             # frames since tracking start
-        self._track_stale = 0              # consecutive frames without fresh pose
-        self._track_prev_accepted = False  # previous frame had an accepted pose
-        self._track_episode_results = 0    # frames since the lock (failure log)
-        self._track_last_index = -1        # camera frame_index of the last frame
+        # Thread + state machine while tracking (overlay.tools.live_tracking);
+        # the worker owns self._tracker until it is stopped.
+        self._track_worker: TrackingWorker | None = None
+        self._track_session: TrackingSession | None = None
         self._tool_overlay: TrackingOverlay | None = None
-        self._last_pose_result = None      # last TrackerResult with a fresh pose
+        self._overlay_out = None           # TrackOutput behind _tool_overlay's geometry
+        self._pose_out = None              # newest result with a fresh pose (holds its frame)
+        self._live_out = None              # newest result without one (holds its frame)
+        self._shown_out = None             # result whose frame is on screen (None: a polled frame)
+        self._drawn_out = None             # result whose drill is drawn on it (None: no drill)
+        self._shown_index = -1             # camera frame_index of the frame on screen
+        self._shown_t_frame = 0.0          # its poll time
+        self._outbox_dropped_seen = 0      # profiler: worker counter already reported
+        # The newest submitted frame and the newest result, so the display
+        # can wait for a pose on its way (_pose_on_its_way).
+        self._track_submitted_index = -1   # camera frame_index of the newest submit
+        self._track_result_index = -1      # ... of the newest result drained
+        self._track_result_lag_s = 0.0     # its poll -> result time
+        self._track_result_t_done = 0.0    # when it was ready
+        # The newest polled frame the display held back (its view lives
+        # until the next poll) and the poll time of the first one held back
+        # since a frame went up: the wait ends TRACK_POSE_MAX_AGE_S after it.
+        self._withheld = None              # (CameraFrame, t_frame) or None
+        self._t_withheld: float | None = None
+        self._tick_s = 0.0                 # timer interval (_start_timer)
+        # A worker whose engine call had not returned when tracking stopped;
+        # no new tracker starts while it still runs (_start_tracking).
+        self._abandoned_worker: TrackingWorker | None = None
+        self._abandoned_reason = ""        # the status of that stop
+        self._engine_releases_gil: bool | None = None
         self._has_fresh_pose = None        # tracker_log.has_fresh_pose (lazy)
         self._tracker_log_module = None    # tracking.hydramarker.tracker_log (lazy)
         # Created in _make_tracker iff TrackerConfig.failure_log_enabled and
         # Evaluation mode (the file lives in the session folder).
         self._track_fail_log: _TrackFailureLog | None = None
 
+        # The image on screen (before the X-ray layer): a result's frame
+        # copy, the page's copy of a polled frame, or the view of the last
+        # poll (_screen_view: valid until the next poll, and the display
+        # holds no poll back while it is on screen).
         self._live_color: np.ndarray | None = None
+        self._screen_view = False
+        self._screen_copy: np.ndarray | None = None
         self._display_bgra: np.ndarray | None = None
 
         self._xray_gray_u8: np.ndarray | None = None
@@ -1134,12 +1209,14 @@ class OverlayLivePage(QWidget):
     # Overlay
     # --------------------------------------------------------
 
-    def _compose_frame(self, frame_bgra: np.ndarray) -> np.ndarray:
+    def _compose_frame(self, frame_bgra: np.ndarray, draw_tool: bool = False) -> np.ndarray:
         """
         Build the display frame in a persistent buffer.
 
         Nothing here allocates and nothing touches the full frame except the
-        one copy of the camera image, which is a plain memcpy.
+        one copy of the camera image, which is a plain memcpy. draw_tool:
+        frame_bgra is the frame the drill pose was computed on, so its tip
+        and axis are drawn (never on any other frame).
         """
         prof = self._profile
 
@@ -1186,7 +1263,7 @@ class OverlayLivePage(QWidget):
             if prof:
                 prof.add("tip", time.perf_counter() - t)
 
-        if self._tool_overlay is not None:
+        if draw_tool and self._tool_overlay is not None:
             t = time.perf_counter()
             self._tool_overlay.draw_into(
                 self._frame_buf, show_tip=True, show_axis=self._show_axis
@@ -1249,6 +1326,7 @@ class OverlayLivePage(QWidget):
         # 21 fps instead of 30. An empty poll costs 0.1 ms, so oversampling is
         # far cheaper than the beat it removes.
         interval_ms = max(1, int(round(1000.0 / (float(self.FPS) * self.POLL_OVERSAMPLE))))
+        self._tick_s = interval_ms / 1000.0
         self.timer.start(interval_ms)
 
     def _stop_timer(self) -> None:
@@ -1259,52 +1337,75 @@ class OverlayLivePage(QWidget):
         if self.camera is None:
             return
 
+        abandoned = self._abandoned_worker
+        if abandoned is not None and not abandoned.alive:
+            # The engine call it was stuck in has returned: a new tracker
+            # can start, the status no longer says the engine is busy.
+            self._abandoned_worker = None
+            if not self._tracking_active:
+                self.controls.lbl_track_status.setText(self._abandoned_reason)
+
         prof = self._profile
 
         try:
             t_poll = time.perf_counter()
             # Zero-copy views into the SDK buffers, valid until the next
-            # poll() — everything below runs within this tick, and the
-            # colour image is copied into the persistent frame buffer as
-            # the first step of _compose_frame.
+            # poll() — everything that reads them runs within this tick: the
+            # tracking thread gets copies (submit), and a live frame is
+            # copied into the persistent frame buffer as the first step of
+            # _compose_frame.
             frame = self.camera.poll()
-            if frame is None:
-                if prof:
-                    prof.note_poll(empty=True)
-                return
-
-            img = frame.image_bgr  # BGRA (realsense_color_format="bgra8")
-
-            t0 = prof.frame_start() if prof else 0.0
             if prof:
-                prof.note_poll(empty=False)
-                prof.add("poll", t0 - t_poll)
+                prof.note_poll(empty=frame is None)
 
-            if self._tracking_active:
-                t = time.perf_counter()
-                result = self._tracker.process_frame(
-                    img,
-                    run_detection=True,
-                    ir_left=frame.ir_left,
-                    ir_right=frame.ir_right,
-                )
+            t_frame = 0.0
+            if frame is not None:
+                t_frame = time.perf_counter()
                 if prof:
-                    prof.add("track", time.perf_counter() - t)
-                self._update_tracking_state(result, frame.frame_index)
+                    prof.add("poll", t_frame - t_poll)
+                worker = self._track_worker
+                if worker is not None:
+                    n_dry = worker.n_pool_exhausted
+                    taken = worker.submit(frame, t_frame)
+                    if taken:
+                        self._track_submitted_index = int(frame.frame_index)
+                    if prof:
+                        prof.add("submit", time.perf_counter() - t_frame)
+                        if taken:
+                            prof.count("submitted")
+                        # only a missing slot counts (a worker that has
+                        # ended takes nothing either)
+                        prof.count("pool_exhausted", worker.n_pool_exhausted - n_dry)
 
-            if self._plane_acquiring:
+            if self._track_worker is not None:
+                self._drain_tracking()
+
+            if frame is not None and self._plane_acquiring:
                 t = time.perf_counter()
-                self._plane_step(img)
+                self._plane_step(frame.image_bgr)
                 if prof:
                     prof.add("plane", time.perf_counter() - t)
 
+            shown = self._choose_frame(frame, t_frame)
+            if shown is None:
+                return
+            img, pose_out = shown   # BGRA (realsense_color_format="bgra8")
+
+            t0 = prof.frame_start() if prof else 0.0
             self._live_color = img
-            self._display_bgra = self._compose_frame(img)
+            self._display_bgra = self._compose_frame(img, draw_tool=pose_out is not None)
+            # the result whose drill is now on screen (the snapshot redraws it)
+            ov = self._tool_overlay
+            self._drawn_out = (
+                pose_out if pose_out is not None and ov is not None and ov.has_pose else None
+            )
             if self._plane_acquiring:
                 self._draw_plane_acquire(self._display_bgra)
             self._update_image_label()
 
             if prof:
+                prof.add("age", time.perf_counter() - self._shown_t_frame)
+                prof.count("shown_pose" if pose_out is not None else "shown_live")
                 prof.frame_end(t0)
 
         except Exception as e:
@@ -1321,6 +1422,141 @@ class OverlayLivePage(QWidget):
     # --------------------------------------------------------
     # Display
     # --------------------------------------------------------
+
+    def _choose_frame(self, frame, t_frame: float):
+        """
+        The display rule: (image, pose result or None), or None when there
+        is nothing new to show.
+
+        The drill is only ever drawn on the frame its pose was computed on.
+        If the newest tracking result has a fresh pose, its frame is not
+        older than the one on screen and at most TRACK_POSE_MAX_AGE_S old,
+        that frame is shown with tip and axis - later than the live image
+        by the tracking time, exactly on the drill. Otherwise (searching, a
+        dropout, tracking off, reference plane) the newest frame there is
+        is shown at once, without the drill: the one polled in this tick,
+        or else the frame of the newest result without a pose. Shown frames
+        never go back in time: at a (re)lock the locking frame is usually
+        older than the live frame already on screen, so the drill appears
+        with the next result. While locked, a polled frame is held back as
+        long as the pose of a newer frame is on its way (_pose_on_its_way):
+        shown at once, it would make that pose older than the frame on
+        screen, and with a tracker slower than the camera no pose would be
+        drawn at all. The wait never freezes the image longer than
+        TRACK_POSE_MAX_AGE_S after the first polled frame it held back:
+        then the newest polled frame goes up without the drill.
+        """
+        now = time.perf_counter()
+        if frame is not None:
+            # this poll ended the view of the frame held back before
+            self._withheld = None
+        cand = self._pose_out
+        if cand is not None and (
+            cand.frame_index < self._shown_index
+            or now - cand.t_frame > self.TRACK_POSE_MAX_AGE_S
+        ):
+            # can never be shown any more: give its frame copy back
+            self._pose_out = None
+            self._release_out(cand)
+            cand = None
+            if self._profile:
+                self._profile.count("pose_dropped")
+        held = self._withheld
+        live, self._live_out = self._live_out, None
+        if live is not None and (
+            frame is not None
+            or live.frame_index <= self._shown_index
+            or (held is not None and held[0].frame_index > live.frame_index)
+        ):
+            # shown now or never: a newer frame is polled, held or on screen
+            self._release_out(live)
+            live = None
+
+        pose = holder = image = None
+        if cand is not None:
+            if cand is not self._shown_out:
+                holder = pose = cand
+                image, index, t_shown = cand.image, cand.frame_index, cand.t_frame
+            # else on screen; the frames polled meanwhile come as results
+        elif frame is not None:
+            # unless the frame on screen stays until a pose arrives
+            if not self._pose_on_its_way(now):
+                image, index, t_shown = frame.image_bgr, frame.frame_index, t_frame
+        elif live is not None:
+            # nothing polled in this tick: the result's frame is the newest
+            holder = live
+            image, index, t_shown = live.image, live.frame_index, live.t_frame
+        elif held is not None and not self._pose_on_its_way(now):
+            # the wait is over: the frame it held back goes up (its view is
+            # still valid, nothing was polled since)
+            image, index, t_shown = held[0].image_bgr, held[0].frame_index, held[1]
+
+        if image is not None:
+            previous, self._shown_out = self._shown_out, holder
+            self._release_out(previous)
+            self._shown_index = int(index)
+            self._shown_t_frame = t_shown
+            self._t_withheld = None
+            if self._withheld is not None and self._withheld[0].frame_index <= index:
+                self._withheld = None
+            image = self._screen_image(image, holder, now)
+        if frame is not None and (image is None or holder is not None):
+            # polled in this tick and not shown: held back
+            self._withheld = (frame, t_frame)
+        if self._withheld is not None and self._t_withheld is None:
+            self._t_withheld = t_frame if frame is not None else now
+        return None if image is None else (image, pose)
+
+    def _screen_image(self, image, holder, now: float):
+        """The image that goes on screen. A result's frame copy stays valid
+        while the page holds the result; a camera view only until the next
+        poll, so it is copied when the wait is armed (the next poll may be
+        held back while the view is still on screen)."""
+        if holder is not None:
+            self._screen_view = False
+            return image
+        if not self._wait_armed(now):
+            self._screen_view = True
+            return image
+        if self._screen_copy is None or self._screen_copy.shape != image.shape:
+            self._screen_copy = np.empty_like(image)
+        np.copyto(self._screen_copy, image)
+        self._screen_view = False
+        return self._screen_copy
+
+    def _wait_armed(self, now: float) -> bool:
+        """
+        Locked, and a pose of a newer frame can still be shown: results
+        come back within TRACK_POSE_MAX_AGE_S (the last one took less, and
+        it is not longer ago: a stalled tracker ends the wait, a tracker
+        slower than that never starts it), and the first polled frame held
+        back is younger than TRACK_POSE_MAX_AGE_S minus two timer ticks (so
+        the tick that ends the wait comes in time, also when it is one
+        interval late).
+        """
+        session = self._track_session
+        if session is None or not session.locked or session.stale:
+            return False
+        max_age = self.TRACK_POSE_MAX_AGE_S
+        if self._t_withheld is not None and now - self._t_withheld + 2 * self._tick_s >= max_age:
+            return False
+        return (
+            self._track_result_lag_s < max_age
+            and now - self._track_result_t_done < max_age
+        )
+
+    def _pose_on_its_way(self, now: float) -> bool:
+        """
+        A frame newer than the one on screen is still in the worker and the
+        wait is armed (_wait_armed); never while a camera view is on screen
+        (the next poll would end it).
+        """
+        if self._screen_view:
+            return False
+        newest = max(self._track_result_index, self._shown_index)
+        if self._track_submitted_index <= newest:
+            return False
+        return self._wait_armed(now)
 
     def _update_image_label(self) -> None:
         if self._display_bgra is None:
@@ -1360,12 +1596,16 @@ class OverlayLivePage(QWidget):
             prof.add("qpixmap", time.perf_counter() - t)
 
     # --------------------------------------------------------
-    # Tool tracking (button-driven)
+    # Tool tracking (button-driven, own thread)
     # --------------------------------------------------------
     #
-    # Started explicitly via the rail button. No auto re-acquire: when the
-    # marker is not found within the acquire timeout, or the pose goes
-    # stale while tracking, tracking stops and the button re-arms.
+    # Started and stopped via the rail button. In between the tracker runs
+    # in a TrackingWorker thread on copies of the polled frames, so the
+    # live image never waits for it, and searches until stopped: after
+    # TRACK_LOST_RESET_S without a fresh pose TrackingSession resets the
+    # engine and the search goes on (re-locks pass the engine's appearance
+    # check). The results are drained in the GUI tick, in order; the state,
+    # the overlay, the failure log and the profile are only touched here.
 
     def _on_track_button(self) -> None:
         if self._plane_acquiring:
@@ -1428,6 +1668,16 @@ class OverlayLivePage(QWidget):
     def _start_tracking(self) -> None:
         if self._tracking_active or self._tool is None or self.camera is None:
             return
+        abandoned = self._abandoned_worker
+        if abandoned is not None:
+            if abandoned.alive:
+                # Its engine call has still not returned: no second tracker
+                # next to a hung one (the status of that stop stays).
+                self.controls.lbl_track_status.setText(
+                    f"{self._abandoned_reason} — engine still busy"
+                )
+                return
+            self._abandoned_worker = None
 
         try:
             self._tracker = self._make_tracker()
@@ -1446,90 +1696,210 @@ class OverlayLivePage(QWidget):
             )
             return
 
+        self._check_engine_gil()
         self._tool_overlay.clear()
+        self._overlay_out = None
         if self._track_fail_log is not None:
             self._track_fail_log.start(self._tracker_log_module)
+        # The worker owns the tracker from here until _stop_tracking joined it.
+        self._track_worker = TrackingWorker(self._tracker, pool_size=self.TRACK_FRAME_POOL)
+        self._track_session = TrackingSession(
+            self._has_fresh_pose,
+            self._track_worker.request_reset,
+            lost_reset_s=self.TRACK_LOST_RESET_S,
+            search_hint_s=self.TRACK_SEARCH_HINT_S,
+            fail_log=self._track_fail_log,
+        )
+        self._outbox_dropped_seen = 0
+        self._track_submitted_index = self._track_result_index = -1
+        self._track_worker.start()
         self._tracking_active = True
-        self._track_locked = False
-        self._track_converged = False
-        self._track_frames = 0
-        self._track_stale = 0
-        self._track_prev_accepted = False
-        self._track_episode_results = 0
-        self._track_last_index = -1
         self.controls.btn_track.setText("Stop tracking")
-        self.controls.lbl_track_status.setText("acquiring…")
+        self.controls.lbl_track_status.setText(STATUS_SEARCHING)
+
+    def _check_engine_gil(self) -> None:
+        """A build from before the tracking thread holds the GIL for the
+        whole frame: tracking works, but the GUI thread waits for every
+        frame as before. Said once on the console, and in the profile log
+        at every start."""
+        if self._engine_releases_gil is None:
+            from tracking.hydramarker.tracker import hydramarker_cpp
+
+            self._engine_releases_gil = bool(
+                getattr(hydramarker_cpp, "PROCESS_FRAME_RELEASES_GIL", False)
+            )
+            if not self._engine_releases_gil:
+                print(
+                    "[WARN] Live page: this hydramarker_cpp build holds the GIL in "
+                    "process_frame; the live image waits for the tracker until it "
+                    "is rebuilt."
+                )
+        if self._profile is not None:
+            self._profile.emit(
+                f"[live] tracking start {time.strftime('%H:%M:%S')}: worker thread, "
+                f"engine releases GIL: {'yes' if self._engine_releases_gil else 'NO'}"
+            )
 
     def _stop_tracking(self, reason: str) -> None:
         self._tracking_active = False
-        if self._track_fail_log is not None:
-            # closes the lock episode (frames of it, the locking one included)
-            self._track_fail_log.flush(
-                reason, self._track_last_index,
-                self._track_episode_results if self._track_locked else 0, final=True,
-            )
+        worker, self._track_worker = self._track_worker, None
+        stopped = True
+        error = None
+        if worker is not None:
+            # Returns after the frame in progress (at most one engine call).
+            stopped = worker.stop(timeout_s=2.0)
+            # results of that frame are not shown any more; an error no
+            # tick has drained yet (a Stop click right after it) is still
+            # reported
+            for out in worker.take_outputs():
+                if out.error is not None and error is None:
+                    error = (out.error, out.traceback)
+                worker.release(out.slot)
+            if error is None and worker.failure is not None:
+                error = (worker.failure, worker.failure_traceback or "")
+        if error is not None and reason != "error":
+            self._report_track_error(*error)
+            reason = "error"
+        # The frame on screen stays until the next one; the other results
+        # the page kept give their frame back.
+        for out in (self._pose_out, self._live_out):
+            if out is not None and out is not self._shown_out and worker is not None:
+                worker.release(out.slot)
+                out.slot = None
+        self._pose_out = None
+        self._live_out = None
+        self._track_submitted_index = self._track_result_index = -1
+        if self._track_session is not None:
+            self._track_session.finish(reason)
+            self._track_session = None
         if self._tool_overlay is not None:
             self._tool_overlay.clear()
-        self._last_pose_result = None
+        self._overlay_out = None
         if self._tracker is not None:
-            try:
-                self._tracker.reset()
-            except Exception:
-                pass
+            if stopped:
+                try:
+                    self._tracker.reset()
+                except Exception:
+                    pass
+            else:
+                # Still inside process_frame in the abandoned thread: this
+                # engine is never touched again; the next start builds one
+                # once that thread has ended.
+                self._tracker = None
+                self._abandoned_worker = worker
+                self._abandoned_reason = reason
+                reason += " — engine still busy"
         self.controls.btn_track.setText("Start tracking")
         self.controls.lbl_track_status.setText(reason)
 
-    def _update_tracking_state(self, result, frame_idx: int) -> None:
-        self._track_frames += 1
-        self._track_last_index = int(frame_idx)
-        log = self._track_fail_log
+    def _drain_tracking(self) -> None:
+        """Every result of the tracking thread since the last tick, in
+        processing order."""
+        worker = self._track_worker
+        prof = self._profile
+        t = time.perf_counter()
+        # read first: once the thread has ended, all its results are here
+        ended = worker.ended
+        outs = worker.take_outputs()
+        for i, out in enumerate(outs):
+            if out.error is not None:
+                for rest in outs[i:]:
+                    worker.release(rest.slot)
+                self._on_track_error(out.error, out.traceback)
+                return
+            try:
+                self._on_track_output(out, t)
+            except Exception as e:
+                # The GUI side of a result (session, overlay, failure log):
+                # a tracking error as well - tracking stops, the camera and
+                # the X-ray overlay keep running.
+                for rest in outs[i:]:
+                    self._release_out(rest)
+                self._on_track_error(e, traceback.format_exc())
+                return
+        if ended:
+            # ended without a tracker error: it failed outside the call
+            self._on_track_error(
+                worker.failure or RuntimeError("the tracking thread ended"),
+                worker.failure_traceback or "",
+            )
+            return
+        if not outs:
+            return
+        if prof:
+            prof.add("drain", time.perf_counter() - t)
+            dropped = worker.n_outbox_dropped
+            if dropped != self._outbox_dropped_seen:
+                prof.count("outbox_dropped", dropped - self._outbox_dropped_seen)
+                self._outbox_dropped_seen = dropped
 
-        # Appearance checks of every frame, the search included: the
-        # engine's re-entry rule is "the previous processed frame has no
-        # accepted pose" (the first frame of a run is one).
-        reentry = not self._track_prev_accepted
-        timings = getattr(result, "timings_ms", None) or {}
-        self._track_prev_accepted = bool(timings.get(_TRACK_ACCEPTED_KEY, 0.0))
-        if log is not None:
-            log.note_appearance(result, frame_idx, reentry)
+    def _on_track_output(self, out, t_drain: float) -> None:
+        prof = self._profile
+        if prof:
+            prof.count("processed")
+            prof.count("skipped", out.skipped)
+            prof.add("track", out.t_done - out.t_start)
+            prof.add("wait", out.t_start - out.t_frame)
+            prof.add("lag", out.t_done - out.t_frame)
+            prof.add("pickup", t_drain - out.t_done)
+        self._track_result_index = max(self._track_result_index, out.frame_index)
+        self._track_result_lag_s = out.t_done - out.t_frame
+        self._track_result_t_done = out.t_done
 
-        if self._has_fresh_pose(result):
-            self._track_stale = 0
-            if not self._track_locked:
-                # the lock starts the failure log's episode (one per run:
-                # a loss stops tracking)
-                self._track_episode_results = 0
-                if log is not None:
-                    log.begin_episode(1, frame_idx)
-            self._track_episode_results += 1
-            converged = bool(getattr(result, "pose_converged", False))
-            if not self._track_locked or converged != self._track_converged:
-                self._track_locked = True
-                self._track_converged = converged
-                self.controls.lbl_track_status.setText(
-                    "tracking" if converged else "tracking (settling…)"
-                )
-            self._tool_overlay.update(result)
-            self._last_pose_result = result
+        step = self._track_session.update(out)
+        if not step.current:
+            # computed before the last engine reset: neither shown nor logged
+            self._release_out(out)
             return
 
-        self._track_stale += 1
-        self._tool_overlay.clear()
-        self._last_pose_result = None
+        # the overlay first: if it raises, no result has changed hands yet
+        if step.fresh:
+            self._tool_overlay.update(out.result)
+        else:
+            self._tool_overlay.clear()
+        previous = (self._pose_out, self._live_out)
+        self._pose_out = self._live_out = None
+        # only the newest result of a batch still has its frame
+        if step.fresh:
+            self._overlay_out = out
+            if out.slot is not None:
+                self._pose_out = out
+        else:
+            self._overlay_out = None
+            if out.slot is not None:
+                # the newest image, unless this tick polled a newer one
+                self._live_out = out
+        for old in previous:
+            self._release_out(old)
+        self._release_out(out)
+        if step.status is not None:
+            self.controls.lbl_track_status.setText(step.status)
 
-        if not self._track_locked:
-            if self._track_frames >= self.TRACK_ACQUIRE_TIMEOUT_FRAMES:
-                self._stop_tracking("no marker found")
+    def _on_track_error(self, error: BaseException, traceback_text: str) -> None:
+        """The tracking thread ended with an exception: stop tracking only;
+        the camera and the X-ray overlay keep running."""
+        self._report_track_error(error, traceback_text)
+        self._stop_tracking("error")
+
+    def _report_track_error(self, error: BaseException, traceback_text: str) -> None:
+        print(f"[live] drill tracking failed: {error!r}\n{traceback_text}")
+        # After this tick: the box runs its own event loop, and this tick
+        # still uses the views of its poll.
+        QTimer.singleShot(0, lambda e=error: QMessageBox.critical(
+            self,
+            "Tool Tracking",
+            f"Tracking failed.\n\n{str(e) or type(e).__name__}",
+        ))
+
+    def _release_out(self, out) -> None:
+        """Give a result's frame copy back to the worker's pool unless it is
+        still needed (newest result with or without a pose, or on screen)."""
+        if (out is None or out is self._pose_out or out is self._live_out
+                or out is self._shown_out):
             return
-
-        # Dropout after a successful lock: aggregate the cause (dedup by
-        # stage/reason, counter on repeats). Acquisition failures above are
-        # deliberately not logged.
-        self._track_episode_results += 1
-        if log is not None:
-            log.note(result, frame_idx, self._track_stale)
-        if self._track_stale >= self.TRACK_LOST_STOP_FRAMES:
-            self._stop_tracking("lost — press Start")
+        if out.slot is not None and self._track_worker is not None:
+            self._track_worker.release(out.slot)
+        out.slot = None
 
     # --------------------------------------------------------
     # Controls callbacks
@@ -1580,10 +1950,15 @@ class OverlayLivePage(QWidget):
                                         instead of recovering them from the
                                         burnt-in pixels
 
-        Runs in the click handler between two timer ticks, so the zero-copy
-        camera view is stable for the duration; the live loop just skips a
-        few frames while the PNGs are written.
+        The frame is the one on screen: the tracker's copy of the frame a
+        result came from, the page's copy of a polled frame, or the view of
+        the last poll - valid, because the click handler runs between two
+        timer ticks and the display holds no poll back while a view is on
+        screen. The drill layer is the one drawn on that frame, redrawn from
+        its result. The live loop just skips a few frames while the PNGs are
+        written.
         """
+        t_click = time.perf_counter()
         if self._live_color is None:
             QMessageBox.information(
                 self, "Save snapshot", "No live image yet — start the camera first."
@@ -1622,8 +1997,19 @@ class OverlayLivePage(QWidget):
                 )
                 written.append("02_rgb_overlay")
 
-            if self._tool_overlay is not None and self._tool_overlay.has_pose:
-                self._tool_overlay.draw_into(comp, show_tip=True, show_axis=True)
+            # the drill drawn on this frame (the page's overlay may already
+            # follow a newer result)
+            drawn = self._drawn_out
+            drill = None
+            if drawn is not None:
+                drill = TrackingOverlay(
+                    self.state.K_rgb,
+                    self.state.dist_rgb,
+                    self._tool.p_tip_mm,
+                    self._tool.axis_dir,
+                )
+                drill.update(drawn.result)
+                drill.draw_into(comp, show_tip=True, show_axis=True)
                 cv2.imwrite(
                     str(out_dir / "03_rgb_overlay_drill.png"),
                     cv2.cvtColor(comp, cv2.COLOR_BGRA2BGR),
@@ -1631,7 +2017,8 @@ class OverlayLivePage(QWidget):
                 written.append("03_rgb_overlay_drill")
 
             with open(out_dir / "snapshot.json", "w", encoding="utf-8") as f:
-                json.dump(self._snapshot_record(out_dir.name), f, indent=2)
+                json.dump(self._snapshot_record(out_dir.name, t_click, drawn, drill), f,
+                          indent=2)
             written.append("snapshot.json")
 
             if ev is not None:
@@ -1639,6 +2026,7 @@ class OverlayLivePage(QWidget):
                     "layers": len(written),
                     "d_x_mm": self._current_d_x_mm,
                     "tracking": bool(self._tracking_active),
+                    "shown": "pose" if drawn is not None else "live",
                 })
 
             QMessageBox.information(
@@ -1649,8 +2037,9 @@ class OverlayLivePage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Save snapshot", f"Saving failed.\n\n{e}")
 
-    def _snapshot_record(self, name: str) -> dict:
-        """Everything a figure needs to rebuild the layers from 01_rgb.png."""
+    def _snapshot_record(self, name: str, t_click: float, drawn, drill) -> dict:
+        """Everything a figure needs to rebuild the layers from 01_rgb.png
+        (drawn: the result whose drill is on the frame, drill: its overlay)."""
 
         def arr(v):
             return None if v is None else np.asarray(v, dtype=np.float64).tolist()
@@ -1680,12 +2069,17 @@ class OverlayLivePage(QWidget):
             "show_tip": bool(self._show_tip),
             "show_axis": bool(self._show_axis),
             "tracking_active": bool(self._tracking_active),
+            # "pose": the frame a drill pose was computed on, with its tip and
+            # axis; "live": the newest camera frame, no drill. The age is
+            # poll -> the click (before the PNGs were written).
+            "shown": "pose" if drawn is not None else "live",
+            "frame_age_ms": round((t_click - self._shown_t_frame) * 1000.0, 1),
             "tool": None,
         }
 
-        if self._tool_overlay is not None and self._tool_overlay.has_pose:
-            tool = self._tool_overlay.snapshot_record()
-            res = self._last_pose_result
+        if drawn is not None:
+            tool = drill.snapshot_record()
+            res = drawn.result
             tool["pose"] = None if res is None else {
                 "rvec": arr(res.rvec),
                 "tvec": arr(res.tvec),
@@ -1944,6 +2338,13 @@ class OverlayLivePage(QWidget):
         self.controls.set_plane_visible(self.state.eval is not None)
         self._end_plane_acquire("")
         self._planes_set = 0
+        # a new camera counts its frames from 0 again
+        self._shown_out = None
+        self._drawn_out = None
+        self._shown_index = -1
+        self._withheld = None
+        self._t_withheld = None
+        self._screen_view = False
 
         self._load_xray_from_state()
         self._initialize_dx()
@@ -1980,7 +2381,8 @@ class OverlayLivePage(QWidget):
                     f"[live] === session start {time.strftime('%Y-%m-%d %H:%M:%S')} "
                     f"=== colour {self.COLOR_SIZE[0]}x{self.COLOR_SIZE[1]} @ "
                     f"{self.FPS} fps, x-ray {w}x{h}, "
-                    f"{len(self._H_xc_lookup)} precomputed homographies"
+                    f"{len(self._H_xc_lookup)} precomputed homographies, "
+                    f"drill tracking in a worker thread"
                 )
 
             self._start_realsense()
@@ -1999,9 +2401,13 @@ class OverlayLivePage(QWidget):
     def on_leave(self) -> None:
         self._end_plane_acquire("")
         if self._tracking_active:
+            # joins the tracking thread, so the tracker is free to be
+            # dropped below
             self._stop_tracking("idle")
         self._tracker = None
         self._tool_overlay = None
+        self._shown_out = None
+        self._withheld = None              # its view ends with the camera
         self._stop_timer()
         self._stop_realsense()
 
