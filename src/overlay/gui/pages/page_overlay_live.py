@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer, QRect
+from PySide6.QtCore import Qt, QTimer, QRect, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -946,6 +946,12 @@ class OverlayLivePage(QWidget):
     # run_tracker IR path uses; short = less motion blur on the pair).
     TRACK_IR_EXPOSURE_US = 8000.0
 
+    # Emitted by the tracking thread for every result, queued to the GUI
+    # thread: the result's frame (with or without the drill) is shown when
+    # the result is ready instead of at the next timer tick (up to one
+    # Windows timer tick, 15.6 ms, later).
+    _track_result_ready = Signal()
+
     def __init__(self, state: SessionState, on_complete_changed=None, parent=None):
         super().__init__(parent)
 
@@ -1093,6 +1099,7 @@ class OverlayLivePage(QWidget):
         self.controls.btn_track.clicked.connect(self._on_track_button)
         self.controls.btn_save.clicked.connect(self._on_save_snapshot)
         self.controls.btn_plane.clicked.connect(self._on_plane_button)
+        self._track_result_ready.connect(self._on_track_result_ready, Qt.QueuedConnection)
 
     # --------------------------------------------------------
     # State / prerequisites
@@ -1333,7 +1340,7 @@ class OverlayLivePage(QWidget):
         if self.timer is not None:
             self.timer.stop()
 
-    def _on_timer(self) -> None:
+    def _on_timer(self, poll: bool = True) -> None:
         if self.camera is None:
             return
 
@@ -1353,9 +1360,10 @@ class OverlayLivePage(QWidget):
             # poll() — everything that reads them runs within this tick: the
             # tracking thread gets copies (submit), and a live frame is
             # copied into the persistent frame buffer as the first step of
-            # _compose_frame.
-            frame = self.camera.poll()
-            if prof:
+            # _compose_frame. poll=False: woken by a tracking result, which
+            # only needs the drain and the display.
+            frame = self.camera.poll() if poll else None
+            if prof and poll:
                 prof.note_poll(empty=frame is None)
 
             t_frame = 0.0
@@ -1702,7 +1710,11 @@ class OverlayLivePage(QWidget):
         if self._track_fail_log is not None:
             self._track_fail_log.start(self._tracker_log_module)
         # The worker owns the tracker from here until _stop_tracking joined it.
-        self._track_worker = TrackingWorker(self._tracker, pool_size=self.TRACK_FRAME_POOL)
+        self._track_worker = TrackingWorker(
+            self._tracker,
+            pool_size=self.TRACK_FRAME_POOL,
+            notify=self._track_result_ready.emit,
+        )
         self._track_session = TrackingSession(
             self._has_fresh_pose,
             self._track_worker.request_reset,
@@ -1791,6 +1803,11 @@ class OverlayLivePage(QWidget):
                 reason += " — engine still busy"
         self.controls.btn_track.setText("Start tracking")
         self.controls.lbl_track_status.setText(reason)
+
+    def _on_track_result_ready(self) -> None:
+        # a result between two ticks: drain and show it now, no poll
+        if self._track_worker is not None:
+            self._on_timer(poll=False)
 
     def _drain_tracking(self) -> None:
         """Every result of the tracking thread since the last tick, in
