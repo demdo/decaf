@@ -825,7 +825,8 @@ class OverlayLivePage(QWidget):
         self._last_pose_result = None      # last TrackerResult with a fresh pose
         self._has_fresh_pose = None        # tracker_log.has_fresh_pose (lazy)
         self._tracker_log_module = None    # tracking.hydramarker.tracker_log (lazy)
-        # Created in _make_tracker iff TrackerConfig.failure_log_enabled.
+        # Created in _make_tracker iff TrackerConfig.failure_log_enabled and
+        # Evaluation mode (the file lives in the session folder).
         self._track_fail_log: _TrackFailureLog | None = None
 
         self._live_color: np.ndarray | None = None
@@ -1307,10 +1308,11 @@ class OverlayLivePage(QWidget):
         ir_path = getattr(self.state, "ir_calibration_path", None)
         config.ir_refine_enabled = bool(ir_path)
 
-        if getattr(config, "failure_log_enabled", False):
-            ev = self.state.eval
+        # The log file lives in the Evaluation session folder; Normal mode
+        # keeps no failure log.
+        if getattr(config, "failure_log_enabled", False) and ev is not None:
             self._track_fail_log = _TrackFailureLog(
-                None if ev is None else str(ev.dir / TRACK_FAILURE_LOG_NAME)
+                str(ev.dir / TRACK_FAILURE_LOG_NAME)
             )
         else:
             self._track_fail_log = None
