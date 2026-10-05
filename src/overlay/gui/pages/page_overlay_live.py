@@ -475,6 +475,10 @@ class _OverlayControlRail(QFrame):
     TRACK_EXTRA_H = int(round(150 * SCALE))
     # Extra panel height while the reference-plane card is visible.
     PLANE_EXTRA_H = int(round(150 * SCALE))
+    # Without an X-ray (set_tracking_only): the alpha and plane-depth cards
+    # and the pointer-tip box go, the Back card comes.
+    XRAY_H = int(round(250 * SCALE))
+    BACK_H = int(round(100 * SCALE))
     GAP = int(round(10 * SCALE))
 
     def __init__(self, parent: QWidget | None = None):
@@ -686,6 +690,34 @@ class _OverlayControlRail(QFrame):
         self.track_card.hide()
         self._tracking_visible = False
 
+        # ---------------- Back (tracking only) ----------------
+        # In the tracking test (no X-ray) the page has the rail as its only
+        # control, so it carries the way back to Tool Tracking (the main
+        # window wires it as the page's btn_back). With an X-ray it stays
+        # hidden.
+        self.btn_back = QPushButton("Back to Tool Tracking")
+        self.btn_back.setObjectName("overlayRailTrackBtn")
+        self.btn_back.setMinimumHeight(self._s(40))
+        self.btn_back.setFocusPolicy(Qt.NoFocus)
+
+        self.back_card = QFrame()
+        self.back_card.setObjectName("overlayRailGroup")
+        self.back_card.setAttribute(Qt.WA_StyledBackground, True)
+        back_layout = QVBoxLayout(self.back_card)
+        back_layout.setContentsMargins(
+            self._s(18),
+            self._s(13),
+            self._s(18),
+            self._s(13),
+        )
+        back_layout.addWidget(self.btn_back)
+        self.back_card.hide()
+        self._tracking_only = False
+
+        # hidden without an X-ray (set_tracking_only)
+        self.alpha_card = alpha_card
+        self.dx_card = dx_card
+
         panel_layout = QVBoxLayout(self.panel)
         panel_layout.setContentsMargins(
             self._s(22),
@@ -701,6 +733,7 @@ class _OverlayControlRail(QFrame):
         panel_layout.addWidget(save_card)
         panel_layout.addWidget(self.plane_card)
         panel_layout.addWidget(self.track_card)
+        panel_layout.addWidget(self.back_card)
         panel_layout.addStretch(1)
 
         self._apply_style()
@@ -733,19 +766,41 @@ class _OverlayControlRail(QFrame):
         if parent is not None and hasattr(parent, "_position_controls"):
             parent._position_controls()
 
+    def set_tracking_only(self, on: bool) -> None:
+        """Camera image + drill, no X-ray: the X-ray controls (alpha, plane
+        depth, pointer tip) are hidden and the Back card is shown."""
+        on = bool(on)
+        if on == self._tracking_only:
+            return
+        self._tracking_only = on
+        self.alpha_card.setVisible(not on)
+        self.dx_card.setVisible(not on)
+        self.chk_show_tip.setVisible(not on)
+        self.back_card.setVisible(on)
+        self.title_label.setText("Tracking Controls" if on else "Overlay Controls")
+        self.handle.setToolTip(self._handle_tooltip())
+        self._update_geometry()
+
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "_position_controls"):
+            parent._position_controls()
+
     def _panel_height(self) -> int:
         return (
             self.PANEL_H
             + (self.TRACK_EXTRA_H if self._tracking_visible else 0)
             + (self.PLANE_EXTRA_H if self._plane_visible else 0)
+            + (self.BACK_H - self.XRAY_H if self._tracking_only else 0)
         )
+
+    def _handle_tooltip(self) -> str:
+        what = "tracking" if self._tracking_only else "overlay"
+        return f"{'Hide' if self._expanded else 'Show'} {what} controls"
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
         self.handle.setText("›" if self._expanded else "‹")
-        self.handle.setToolTip(
-            "Hide overlay controls" if self._expanded else "Show overlay controls"
-        )
+        self.handle.setToolTip(self._handle_tooltip())
         self._update_geometry()
 
         parent = self.parentWidget()
@@ -1043,6 +1098,12 @@ class OverlayLivePage(QWidget):
 
         self._H_xc_lookup: dict[int, np.ndarray] = {}
 
+        # The Evaluation tracking test (no X-ray calibration), set by the
+        # main window. Only then does the page run without an X-ray: camera
+        # image + drill, set in on_enter (_is_tracking_only).
+        self.tracking_test = False
+        self._tracking_only = False
+
         # --- "Set reference plane" (Evaluation mode) ---
         # While acquiring, every frame runs the pointer solve of the
         # Pointer Tool Depth page; SPACE + confirm swaps in the new X-ray
@@ -1081,6 +1142,8 @@ class OverlayLivePage(QWidget):
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.controls = _OverlayControlRail(self)
+        # the main window wires a page's btn_back (shown in tracking only)
+        self.btn_back = self.controls.btn_back
 
         self.setStyleSheet(
             """
@@ -1131,6 +1194,34 @@ class OverlayLivePage(QWidget):
             and self.state.tip_uv_c is not None
         )
 
+    def _is_tracking_only(self) -> bool:
+        """The Evaluation tracking test (tracking_test, set by the main
+        window) with a tool and the camera intrinsics: the page shows the
+        camera image with the drill only, no X-ray. Outside the test the
+        page needs the whole X-ray chain as before."""
+        return (
+            self.tracking_test
+            and self.state.tool_assets is not None
+            and self.state.K_rgb is not None
+        )
+
+    def _clear_xray_layer(self) -> None:
+        """Tracking only: no X-ray image, plane depth or homographies on the
+        page (state is left as it is)."""
+        self._xray_gray_u8 = None
+        self._xray_working_u8 = None
+        self._overlay_cache = None
+        self._frame_buf = None
+        self._reset_dx()
+
+    def _reset_dx(self) -> None:
+        """No plane depth on the page (no d_x in state, or tracking only)."""
+        self._base_d_x_mm = None
+        self._current_d_x_mm = None
+        self._dx_offset_mm = 0
+        self._H_xc_lookup = {}
+        self.controls.lbl_dx_value.setText("-")
+
     def _load_xray_from_state(self) -> None:
         if self.state.xray_image_anatomy is None:
             self._xray_gray_u8 = None
@@ -1160,11 +1251,7 @@ class OverlayLivePage(QWidget):
 
     def _initialize_dx(self) -> None:
         if self.state.d_x is None:
-            self._base_d_x_mm = None
-            self._current_d_x_mm = None
-            self._dx_offset_mm = 0
-            self._H_xc_lookup = {}
-            self.controls.lbl_dx_value.setText("-")
+            self._reset_dx()
             return
 
         self._base_d_x_mm = float(self.state.d_x)
@@ -1281,7 +1368,8 @@ class OverlayLivePage(QWidget):
                 if prof:
                     prof.add("blend", time.perf_counter() - t)
 
-        if self._show_tip:
+        # the reference-plane point of the X-ray overlay (not the drill tip)
+        if self._show_tip and not self._tracking_only:
             t = time.perf_counter()
             _draw_point_inplace(self._frame_buf, self.state.tip_uv_c)
             if prof:
@@ -1997,6 +2085,10 @@ class OverlayLivePage(QWidget):
                                         instead of recovering them from the
                                         burnt-in pixels
 
+        Without an X-ray (tracking only) 00 and 02 are left out: 03 is the
+        drill on the bare camera image, snapshot.json says tracking_only
+        and its X-ray fields are null (show_tip false).
+
         The frame is the one on screen: the tracker's copy of the frame a
         result came from, the page's copy of a polled frame, or the view of
         the last poll - valid, because the click handler runs between two
@@ -2069,12 +2161,14 @@ class OverlayLivePage(QWidget):
             written.append("snapshot.json")
 
             if ev is not None:
-                ev.log("overlay_live", out_dir.name + "/", {
-                    "layers": len(written),
-                    "d_x_mm": self._current_d_x_mm,
-                    "tracking": bool(self._tracking_active),
-                    "shown": "pose" if drawn is not None else "live",
-                })
+                numbers = {"layers": len(written)}
+                if self._tracking_only:
+                    numbers["tracking_only"] = True
+                else:
+                    numbers["d_x_mm"] = self._current_d_x_mm
+                numbers["tracking"] = bool(self._tracking_active)
+                numbers["shown"] = "pose" if drawn is not None else "live"
+                ev.log("overlay_live", out_dir.name + "/", numbers)
 
             QMessageBox.information(
                 self,
@@ -2123,6 +2217,15 @@ class OverlayLivePage(QWidget):
             "frame_age_ms": round((t_click - self._shown_t_frame) * 1000.0, 1),
             "tool": None,
         }
+        if self._tracking_only:
+            # camera image + drill: nothing of the X-ray overlay was drawn,
+            # so none of its numbers (state may still hold some) go in
+            rec["tracking_only"] = True
+            for key in ("alpha", "H_xc", "K_xray", "T_xc", "warp_through_lens",
+                        "xray_image_path", "xray_image_anatomy_path",
+                        "reference_plane_point_uv", "reference_plane_point_xyz_c_mm"):
+                rec[key] = None
+            rec["show_tip"] = False
 
         if drawn is not None:
             tool = drill.snapshot_record()
@@ -2164,6 +2267,9 @@ class OverlayLivePage(QWidget):
     def _on_plane_button(self) -> None:
         if self._plane_acquiring:
             self._end_plane_acquire("cancelled")
+            return
+        if self._tracking_only:
+            # no X-ray overlay to set a plane for (the card is hidden)
             return
 
         if self.camera is None or not self._has_prerequisites():
@@ -2379,10 +2485,14 @@ class OverlayLivePage(QWidget):
         # Tool tracking is optional: without a loaded tool the page behaves
         # exactly as before (no IR streams, no tracker, no rail card).
         self._tool = self.state.tool_assets
+        # The tracking test with a tool: camera image + drill only (no
+        # X-ray blend, no homographies, no reference plane).
+        self._tracking_only = self._is_tracking_only()
         self.controls.set_tracking_visible(self._tool is not None)
+        self.controls.set_tracking_only(self._tracking_only)
         self.controls.btn_track.setText("Start tracking")
         self.controls.lbl_track_status.setText("idle")
-        self.controls.set_plane_visible(self.state.eval is not None)
+        self.controls.set_plane_visible(self.state.eval is not None and not self._tracking_only)
         self._end_plane_acquire("")
         self._planes_set = 0
         # a new camera counts its frames from 0 again
@@ -2396,7 +2506,7 @@ class OverlayLivePage(QWidget):
         self._load_xray_from_state()
         self._initialize_dx()
 
-        if not self._has_prerequisites():
+        if not self._tracking_only and not self._has_prerequisites():
             QMessageBox.information(
                 self,
                 "Live Overlay",
@@ -2404,7 +2514,7 @@ class OverlayLivePage(QWidget):
             )
             return
 
-        if self._xray_gray_u8 is None:
+        if not self._tracking_only and self._xray_gray_u8 is None:
             QMessageBox.information(
                 self,
                 "Live Overlay",
@@ -2413,8 +2523,11 @@ class OverlayLivePage(QWidget):
             return
 
         try:
-            self._precompute_H_xc_lookup()
-            self._invalidate_overlay_cache()
+            if self._tracking_only:
+                self._clear_xray_layer()
+            else:
+                self._precompute_H_xc_lookup()
+                self._invalidate_overlay_cache()
 
             ev = self.state.eval
             self._profile = (
@@ -2423,14 +2536,31 @@ class OverlayLivePage(QWidget):
             )
             if self._profile is not None:
                 self._profile.reset()
-                h, w = self._xray_gray_u8.shape[:2]
+                if self._tracking_only:
+                    layer = "no x-ray (tracking only)"
+                else:
+                    h, w = self._xray_gray_u8.shape[:2]
+                    layer = (
+                        f"x-ray {w}x{h}, "
+                        f"{len(self._H_xc_lookup)} precomputed homographies"
+                    )
                 self._profile.emit(
                     f"[live] === session start {time.strftime('%Y-%m-%d %H:%M:%S')} "
                     f"=== colour {self.COLOR_SIZE[0]}x{self.COLOR_SIZE[1]} @ "
-                    f"{self.FPS} fps, x-ray {w}x{h}, "
-                    f"{len(self._H_xc_lookup)} precomputed homographies, "
+                    f"{self.FPS} fps, {layer}, "
                     f"drill tracking in a worker thread"
                 )
+            if self._tracking_only and ev is not None:
+                # which drill the tracking test runs with
+                ir_path = getattr(self.state, "ir_calibration_path", None)
+                ev.log("overlay_live", "-", {
+                    "tracking_only": True,
+                    "tool": self._tool.name,
+                    "field": Path(self._tool.field_path).name,
+                    "markers": Path(self._tool.marker_json_path).name,
+                    "pivot": Path(self._tool.pivot_npz_path).name,
+                    "ir_calibration": Path(ir_path).name if ir_path else "off",
+                }, tagged=False)
 
             self._start_realsense()
             self._start_timer()
