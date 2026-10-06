@@ -401,7 +401,11 @@ class TrackerConfig:
     pose_kf_sigma_px: float = 0.12
     pose_kf_q_translation_mm: float = 0.15  # moving accel noise per frame
     pose_kf_q_rotation_deg: float = 0.5     # moving accel noise per frame
-    pose_kf_gate_mahalanobis: float = 30.0  # spike deweighting gate
+    # Innovation gate (squared Mahalanobis distance): a frame beyond it does
+    # not update the filter (its pose is reported as measured);
+    # pose_kf_reinit_frames in a row are motion and restart the filter there.
+    pose_kf_gate_mahalanobis: float = 30.0
+    pose_kf_reinit_frames: int = 2
     pose_kf_reset_rotation_deg: float = 10.0
     # Adaptive process noise (default): Q collapses to the floor while the tool
     # is still (averages many frames -> static tip jitter 0.10 -> 0.034 mm) and

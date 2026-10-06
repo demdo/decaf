@@ -82,6 +82,7 @@ PoseOutputFilterConfig makePoseOutputFilterConfig(const TrackerConfig& config)
     cfg.meas_floor_rot_deg = config.pose_kf_meas_floor_rot_deg;
     cfg.meas_floor_trans_mm = config.pose_kf_meas_floor_trans_mm;
     cfg.gate_mahalanobis = config.pose_kf_gate_mahalanobis;
+    cfg.reinit_frames = config.pose_kf_reinit_frames;
     cfg.reset_rotation_deg = config.pose_kf_reset_rotation_deg;
     cfg.max_translation_jump_mm = config.max_translation_jump_mm;
     cfg.min_points = config.min_points;
@@ -1394,8 +1395,10 @@ void TrackerEngine::applyPoseFilter(TrackerFrameResult& result)
     }
     result.pose_covariance.assign(
         filtered.covariance.begin(), filtered.covariance.end());
+    // 0: the measurement reported as it is (filter (re)started, or the
+    // innovation beyond the gate)
     result.timings_ms["pose_kf_applied"] =
-        filtered.initialized_this_frame ? 0.0 : 1.0;
+        (filtered.initialized_this_frame || filtered.gated) ? 0.0 : 1.0;
     result.timings_ms["pose_kf_mahalanobis"] = filtered.mahalanobis;
     if (filtered.gated) {
         result.timings_ms["pose_kf_gated"] = 1.0;

@@ -57,8 +57,13 @@ struct PoseOutputFilterConfig {
     double meas_floor_rot_deg = 0.035;
     double meas_floor_trans_mm = 0.02;
 
-    // Gating / reset (same semantics as the former inline filter).
+    // Innovation gate (squared Mahalanobis distance of the pose measurement):
+    // a frame beyond it does not update the state (the measurement itself is
+    // reported); reinit_frames frames in a row beyond it are motion, and the
+    // filter restarts at the measurement. 0 disables the gate.
     double gate_mahalanobis = 30.0;
+    int reinit_frames = 2;
+    // Reset on a large real jump (accepted by the caller's own gates).
     double reset_rotation_deg = 10.0;
     double max_translation_jump_mm = 40.0;
     int min_points = 6;
@@ -68,13 +73,14 @@ struct PoseOutputFilterConfig {
 struct PoseOutputFilterResult {
     bool applied = false;   // true => rvec/tvec/covariance below are valid and
                             // the caller should write them to its output pose
-    bool initialized_this_frame = false;
-    bool gated = false;
+    bool initialized_this_frame = false;   // also: restarted by the gate
+    bool gated = false;                     // innovation beyond the gate
     double mahalanobis = 0.0;
     std::array<double, 3> rvec{{0.0, 0.0, 0.0}};
     std::array<double, 3> tvec{{0.0, 0.0, 0.0}};
-    // 6x6 pose covariance (rvec, tvec block of the state covariance),
-    // row-major. Downstream can propagate any rigidly attached point
+    // 6x6 pose covariance (rvec, tvec block of the state covariance; the
+    // measurement's on a gated frame, reported as measured), row-major.
+    // Downstream can propagate any rigidly attached point
     // p (marker frame) to its camera-frame uncertainty via J * P * J^T,
     // where J = d(R(rvec)*p + tvec)/d(rvec, tvec).
     std::array<double, 36> covariance{};
@@ -128,6 +134,11 @@ public:
         double meas_var_scale = 1.0);
 
 private:
+    // State = measurement, velocities zero, initial covariance.
+    void initializeState(const cv::Mat& z);
+    // rvec/tvec = pose (6x1), covariance = the pose block of P_.
+    void writeResult(const cv::Mat& pose, PoseOutputFilterResult& result) const;
+
     PoseOutputFilterConfig config_;
     cv::Matx33d K_ = cv::Matx33d::eye();
     cv::Mat dist_coeffs_;
@@ -145,6 +156,7 @@ private:
     std::deque<double> dtrans_hist_;
     double est_r_ = 0.0;
     double est_t_ = 0.0;
+    int gate_streak_ = 0;   // consecutive frames beyond the gate
 };
 
 }  // namespace hydramarker

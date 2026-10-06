@@ -51,6 +51,41 @@ void PoseOutputFilter::reset()
     dtrans_hist_.clear();
     est_r_ = 0.0;
     est_t_ = 0.0;
+    gate_streak_ = 0;
+}
+
+void PoseOutputFilter::initializeState(const cv::Mat& z)
+{
+    x_ = cv::Mat::zeros(12, 1, CV_64F);
+    z.copyTo(x_.rowRange(0, 6));
+    P_ = cv::Mat::zeros(12, 12, CV_64F);
+    const double r2 = std::pow(2.0 * CV_PI / 180.0, 2.0);
+    const double vr2 = std::pow(0.5 * CV_PI / 180.0, 2.0);
+    for (int i = 0; i < 3; ++i) {
+        P_.at<double>(i, i) = r2;
+        P_.at<double>(i + 3, i + 3) = 25.0;       // (5 mm)^2
+        P_.at<double>(i + 6, i + 6) = vr2;
+        P_.at<double>(i + 9, i + 9) = 4.0;        // (2 mm/f)^2
+    }
+    prev_z_ = z.clone();
+    gate_streak_ = 0;
+    initialized_ = true;
+}
+
+void PoseOutputFilter::writeResult(
+    const cv::Mat& pose, PoseOutputFilterResult& result) const
+{
+    for (int i = 0; i < 3; ++i) {
+        result.rvec[static_cast<size_t>(i)] = pose.at<double>(i);
+        result.tvec[static_cast<size_t>(i)] = pose.at<double>(i + 3);
+    }
+    for (int r = 0; r < 6; ++r) {
+        for (int c = 0; c < 6; ++c) {
+            result.covariance[static_cast<size_t>(r * 6 + c)] =
+                P_.at<double>(r, c);
+        }
+    }
+    result.applied = true;
 }
 
 void PoseOutputFilter::coast()
@@ -143,34 +178,12 @@ PoseOutputFilterResult PoseOutputFilter::update(
     }
 
     if (!initialized_) {
-        x_ = cv::Mat::zeros(12, 1, CV_64F);
-        z.copyTo(x_.rowRange(0, 6));
-        P_ = cv::Mat::zeros(12, 12, CV_64F);
-        const double r2 = std::pow(2.0 * CV_PI / 180.0, 2.0);
-        const double vr2 = std::pow(0.5 * CV_PI / 180.0, 2.0);
-        for (int i = 0; i < 3; ++i) {
-            P_.at<double>(i, i) = r2;
-            P_.at<double>(i + 3, i + 3) = 25.0;       // (5 mm)^2
-            P_.at<double>(i + 6, i + 6) = vr2;
-            P_.at<double>(i + 9, i + 9) = 4.0;        // (2 mm/f)^2
-        }
-        prev_z_ = z.clone();
+        initializeState(z);
         motion_ema_ = cv::Vec2d(0.0, 0.0);
         drot_hist_.clear();
         dtrans_hist_.clear();
-        initialized_ = true;
         // First frame: output = measurement.
-        for (int i = 0; i < 3; ++i) {
-            result.rvec[static_cast<size_t>(i)] = z.at<double>(i);
-            result.tvec[static_cast<size_t>(i)] = z.at<double>(i + 3);
-        }
-        for (int r = 0; r < 6; ++r) {
-            for (int c = 0; c < 6; ++c) {
-                result.covariance[static_cast<size_t>(r * 6 + c)] =
-                    P_.at<double>(r, c);
-            }
-        }
-        result.applied = true;
+        writeResult(z, result);
         result.initialized_this_frame = true;
         return result;
     }
@@ -297,30 +310,36 @@ PoseOutputFilterResult PoseOutputFilter::update(
     cv::Mat S_inv;
     cv::invert(S, S_inv, cv::DECOMP_SVD);
     const double m2 = cv::Mat(innov.t() * S_inv * innov).at<double>(0);
-    if (m2 > config_.gate_mahalanobis && config_.gate_mahalanobis > 0.0) {
-        // Spike: deweight the measurement instead of dropping it, so a
-        // genuine fast motion still pulls the state over a few frames.
-        Sigma *= m2 / config_.gate_mahalanobis;
-        S = Hm * P_ * Hm.t() + Sigma;
-        cv::invert(S, S_inv, cv::DECOMP_SVD);
+    result.mahalanobis = m2;
+    // Innovation far outside the predicted spread: a one-frame outlier pose
+    // or a motion the constant-velocity model did not expect. The first such
+    // frame does not update the state (it only predicts) and the measurement
+    // is reported as it is; when it persists it is motion, and the filter
+    // restarts at the measurement. (Deweighting by m2 / gate instead dragged
+    // the state behind real motion onsets for several frames.)
+    if (config_.gate_mahalanobis > 0.0 && m2 > config_.gate_mahalanobis) {
         result.gated = true;
+        if (++gate_streak_ >= std::max(1, config_.reinit_frames)) {
+            initializeState(z);
+            result.initialized_this_frame = true;
+        }
+        writeResult(z, result);
+        if (!result.initialized_this_frame) {
+            // reported as measured: with the measurement's covariance
+            for (int r = 0; r < 6; ++r) {
+                for (int c = 0; c < 6; ++c) {
+                    result.covariance[static_cast<size_t>(r * 6 + c)] =
+                        Sigma.at<double>(r, c);
+                }
+            }
+        }
+        return result;
     }
+    gate_streak_ = 0;
     const cv::Mat Kg = P_ * Hm.t() * S_inv;
     x_ = x_ + Kg * innov;
     P_ = (cv::Mat::eye(12, 12, CV_64F) - Kg * Hm) * P_;
-
-    for (int i = 0; i < 3; ++i) {
-        result.rvec[static_cast<size_t>(i)] = x_.at<double>(i);
-        result.tvec[static_cast<size_t>(i)] = x_.at<double>(i + 3);
-    }
-    for (int r = 0; r < 6; ++r) {
-        for (int c = 0; c < 6; ++c) {
-            result.covariance[static_cast<size_t>(r * 6 + c)] =
-                P_.at<double>(r, c);
-        }
-    }
-    result.applied = true;
-    result.mahalanobis = m2;
+    writeResult(x_.rowRange(0, 6), result);
     return result;
 }
 

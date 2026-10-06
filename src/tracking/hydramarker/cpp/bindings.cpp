@@ -1018,6 +1018,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("meas_floor_rot_deg", &PoseOutputFilterConfig::meas_floor_rot_deg)
         .def_readwrite("meas_floor_trans_mm", &PoseOutputFilterConfig::meas_floor_trans_mm)
         .def_readwrite("gate_mahalanobis", &PoseOutputFilterConfig::gate_mahalanobis)
+        .def_readwrite("reinit_frames", &PoseOutputFilterConfig::reinit_frames)
         .def_readwrite("reset_rotation_deg", &PoseOutputFilterConfig::reset_rotation_deg)
         .def_readwrite("max_translation_jump_mm", &PoseOutputFilterConfig::max_translation_jump_mm)
         .def_readwrite("min_points", &PoseOutputFilterConfig::min_points);
@@ -1423,6 +1424,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("pose_kf_q_translation_mm", &TrackerConfig::pose_kf_q_translation_mm)
         .def_readwrite("pose_kf_q_rotation_deg", &TrackerConfig::pose_kf_q_rotation_deg)
         .def_readwrite("pose_kf_gate_mahalanobis", &TrackerConfig::pose_kf_gate_mahalanobis)
+        .def_readwrite("pose_kf_reinit_frames", &TrackerConfig::pose_kf_reinit_frames)
         .def_readwrite("pose_kf_reset_rotation_deg", &TrackerConfig::pose_kf_reset_rotation_deg)
         .def_readwrite("pose_kf_adaptive", &TrackerConfig::pose_kf_adaptive)
         .def_readwrite("pose_kf_q_rotation_floor_deg", &TrackerConfig::pose_kf_q_rotation_floor_deg)

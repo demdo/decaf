@@ -120,7 +120,8 @@ struct TrackerConfig {
     double pose_kf_sigma_px = 0.12;
     double pose_kf_q_translation_mm = 0.15;   // moving accel noise per frame
     double pose_kf_q_rotation_deg = 0.5;      // moving accel noise per frame
-    double pose_kf_gate_mahalanobis = 30.0;
+    double pose_kf_gate_mahalanobis = 30.0;   // innovation gate (m^2)
+    int pose_kf_reinit_frames = 2;            // frames beyond it in a row -> re-init
     double pose_kf_reset_rotation_deg = 10.0; // innovation beyond -> reset
     // Adaptive process noise (default). While the tool is still the process
     // noise collapses to the floor so the filter averages many frames (static
