@@ -555,6 +555,9 @@ REALSENSE_COLOR_OPTIONS = tuple(
 
 # What start records besides the option values (calibration_info keys).
 _REALSENSE_COLOR_RECORD = (
+    "realsense_color_ae_roi_px",
+    "realsense_color_ae_roi_skipped",
+    "realsense_color_ae_roi_error",
     "realsense_color_written",
     "realsense_color_mismatch",
 )
@@ -578,7 +581,7 @@ _REALSENSE_COLOR_SHORT = (
     ("realsense_backlight_compensation", "backlight"),
 )
 REALSENSE_COLOR_KEY_VALUES = (
-    "AE", "AE_priority", "exposure", "gain", "PLF", "writes", "mismatch",
+    "AE", "AE_priority", "exposure", "gain", "PLF", "AE_ROI", "writes", "mismatch",
 )
 
 
@@ -609,6 +612,11 @@ def realsense_color_summary(
         if name in readback and (keys is None or short in keys):
             value = float(readback[name])
             out[short] = int(value) if value.is_integer() else value
+    if keys is None or "AE_ROI" in keys:
+        if readback.get("realsense_color_ae_roi_px") is not None:
+            out["AE_ROI"] = ",".join(str(v) for v in readback["realsense_color_ae_roi_px"])
+        elif "realsense_color_ae_roi_error" in readback:
+            out["AE_ROI"] = "error"
     written = readback.get("realsense_color_written")
     if written is not None and (keys is None or "writes" in keys):
         out["writes"] = len(written)
@@ -665,14 +673,28 @@ def _configure_realsense_color_sensor(profile, config: CameraConfig, rs) -> dict
         value = getattr(config, config_name, None)
         if value is not None:
             apply(option_name, config_name, value)
+    # after the last AE write (the metering region only matters while it runs)
+    roi = getattr(config, "realsense_color_ae_roi", None)
+    roi_details: dict[str, Any] = {}
+    roi_box = None
+    if roi is not None:
+        width, height = int(config.width), int(config.height)
+        try:
+            stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            width, height = int(stream.width()), int(stream.height())
+        except Exception:
+            pass
+        roi_box = _realsense_roi_pixels(roi, width, height)
+        roi_details = _apply_realsense_color_ae_roi(sensor, rs, roi_box, written)
 
     sensor_name = _realsense_sensor_name(sensor, rs)
     details: dict[str, Any] = {
         "realsense_color_sensor_found": True,
         "realsense_color_sensor_name": sensor_name,
         "realsense_color_written": written,
+        **roi_details,
     }
-    mismatch: dict[str, dict[str, float]] = {}
+    mismatch: dict[str, dict[str, Any]] = {}
     for option_name, config_name in REALSENSE_COLOR_OPTIONS:
         current = _read_realsense_option(sensor, rs, option_name)
         if current is not None:
@@ -687,9 +709,45 @@ def _configure_realsense_color_sensor(profile, config: CameraConfig, rs) -> dict
             mismatch[config_name] = {
                 "config": _realsense_option_number(wanted), "device": current,
             }
+    roi_px = roi_details.get("realsense_color_ae_roi_px")
+    if (roi_box is not None and roi_px is not None and roi_px != roi_box
+            and "realsense_color_ae_roi_skipped" not in roi_details):
+        mismatch["realsense_color_ae_roi"] = {"config": roi_box, "device": roi_px}
     if mismatch:
         details["realsense_color_mismatch"] = mismatch
     return details
+
+
+def _realsense_roi_pixels(roi, width: int, height: int) -> list[int]:
+    """(min_x, min_y, max_x, max_y) as fractions -> pixels of the image."""
+    x0, y0, x1, y1 = (float(v) for v in roi)
+    return [int(round(x0 * width)), int(round(y0 * height)),
+            int(round(x1 * width)), int(round(y1 * height))]
+
+
+def _read_realsense_roi(roi_sensor) -> list[int]:
+    region = roi_sensor.get_region_of_interest()
+    return [int(region.min_x), int(region.min_y), int(region.max_x), int(region.max_y)]
+
+
+def _apply_realsense_color_ae_roi(sensor, rs, box: list[int], written: list[str]) -> dict[str, Any]:
+    """Set the colour AE metering region (pixels) if the AE is on and the
+    region differs; read it back. Never raises: an error is recorded and the
+    camera runs with the device's region."""
+    out: dict[str, Any] = {}
+    try:
+        roi_sensor = rs.roi_sensor(sensor)
+        if not _realsense_option_equals(sensor, rs, "enable_auto_exposure", True):
+            out["realsense_color_ae_roi_skipped"] = "auto exposure off"
+        elif _read_realsense_roi(roi_sensor) != box:
+            region = rs.region_of_interest()
+            region.min_x, region.min_y, region.max_x, region.max_y = box
+            roi_sensor.set_region_of_interest(region)
+            written.append("ae_roi=" + ",".join(str(v) for v in box))
+        out["realsense_color_ae_roi_px"] = _read_realsense_roi(roi_sensor)
+    except Exception as exc:
+        out["realsense_color_ae_roi_error"] = repr(exc)
+    return out
 
 
 def _find_realsense_color_sensor(profile, rs):

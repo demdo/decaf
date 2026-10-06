@@ -111,6 +111,13 @@ class CameraConfig:
     realsense_sharpness: Optional[float] = 50.0
     realsense_gamma: Optional[float] = 300.0
     realsense_backlight_compensation: Optional[float] = 0.0
+    # Colour AE metering region as fractions of the colour image (min_x,
+    # min_y, max_x, max_y), set while the AE is on. Default: the centre
+    # region (middle half of each axis, a quarter of the image), the region
+    # the device was found with (480, 270, 1440, 810 at 1920x1080) - it
+    # meters the image centre, not the marker.
+    realsense_color_ae_roi: Optional[tuple[float, float, float, float]] = (
+        0.25, 0.25, 0.75, 0.75)
     # Manual IR exposure (microseconds). None = auto. Short values (3000-8000)
     # reduce motion blur on the IR pair -> higher corner-detection success during
     # fast motion; needs enough scene brightness (or realsense_ir_gain).
@@ -181,6 +188,16 @@ class CameraConfig:
             value = getattr(self, name, None)
             if value is not None and float(value) <= 0.0:
                 raise ValueError(f"camera {name} must be positive when set; got {value}.")
+        ae_roi = getattr(self, "realsense_color_ae_roi", None)
+        if ae_roi is not None:
+            box = tuple(float(v) for v in ae_roi)
+            if len(box) != 4 or not (
+                0.0 <= box[0] < box[2] <= 1.0 and 0.0 <= box[1] < box[3] <= 1.0
+            ):
+                raise ValueError(
+                    "camera realsense_color_ae_roi must be (min_x, min_y, max_x, "
+                    f"max_y) as fractions of the image in 0..1; got {ae_roi!r}."
+                )
         color_format = getattr(self, "realsense_color_format", "bgr8")
         if str(color_format).strip().lower() not in ("bgr8", "bgra8"):
             raise ValueError(
