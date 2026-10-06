@@ -34,6 +34,8 @@ while the worker reads it fails the test.
     (frame_time_ms, ir_time_offset_ms) reach process_frame with that frame;
     without frame_timing process_frame gets neither; one that raises takes
     no slot
+(l) ToolPoints: the empirical line-of-sight shift of both points, off on
+    request (tool_points(los_offset_mm=0)), in the snapshot record
 
 Run from src/:
 
@@ -587,6 +589,30 @@ def _pose_result(t_rgb, *, applied: bool, d_fused=(0.0, 0.0, 0.0), gate: bool = 
 
 
 def test_tool_points() -> None:
+    los, ToolPoints.LOS_OFFSET_MM = ToolPoints.LOS_OFFSET_MM, 0.0    # geometry below without it
+    try:
+        _check_tool_points()
+    finally:
+        ToolPoints.LOS_OFFSET_MM = los
+    # the line-of-sight shift: both points toward the camera along the ray to
+    # the marker origin (of the RGB-only pose under a carried offset)
+    t0 = np.array([0.0, 0.0, 400.0])
+    d = np.array([0.1, -0.2, 2.0])
+    tp = ToolPoints(P_TIP, P_BACK, los_offset_mm=2.0)
+    pts = tp.update(_pose_result(t0, applied=False, ir=False), 0.0)
+    assert np.allclose(pts, [P_TIP + t0 - [0.0, 0.0, 2.0], P_BACK + t0 - [0.0, 0.0, 2.0]])
+    pts = tp.update(_pose_result(t0, applied=True, d_fused=d), 0.1)
+    assert tp.kind == "fused" and np.allclose(pts[0], P_TIP + t0 + d - [0.0, 0.0, 2.0])
+    assert ToolPoints(P_TIP, P_BACK).los_offset_mm == ToolPoints.LOS_OFFSET_MM
+    ov = TrackingOverlay(np.eye(3), None, P_TIP, [0.0, 2.0, 0.0])
+    assert ov.tool_points().los_offset_mm == ToolPoints.LOS_OFFSET_MM
+    assert ov.tool_points(los_offset_mm=0.0).los_offset_mm == 0.0
+    ov.update(np.stack([P_TIP + t0, P_BACK + t0]))
+    assert ov.snapshot_record()["los_offset_mm"] == ToolPoints.LOS_OFFSET_MM
+    print("  (l) line-of-sight shift of the drawn points (LOS_OFFSET_MM)")
+
+
+def _check_tool_points() -> None:
     tp = ToolPoints(P_TIP, P_BACK, max_carry_s=0.5)
     back = P_BACK
     t0 = np.array([0.0, 0.0, 400.0])

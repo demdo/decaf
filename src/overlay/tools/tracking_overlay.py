@@ -64,10 +64,10 @@ class TrackingOverlay:
         self._tip_cam: Optional[np.ndarray] = None
         self._back_cam: Optional[np.ndarray] = None
 
-    def tool_points(self) -> "ToolPoints":
+    def tool_points(self, los_offset_mm: Optional[float] = None) -> "ToolPoints":
         """A ToolPoints of this tool's tip and back point, for the tracking
-        thread."""
-        return ToolPoints(self._p_tip, self._p_back)
+        thread; los_offset_mm None: ToolPoints.LOS_OFFSET_MM (the page's)."""
+        return ToolPoints(self._p_tip, self._p_back, los_offset_mm=los_offset_mm)
 
     # ------------------------------------------------------------------
     # Per-frame state
@@ -120,7 +120,9 @@ class TrackingOverlay:
 
         tip_uv/back_uv are the exact float pixels draw_into rounds from,
         tip_cam/back_cam the camera-frame points (mm, ToolPoints) they were
-        projected from, p_tip/axis_dir/axis_back_mm the tool geometry.
+        projected from, p_tip/axis_dir/axis_back_mm the tool geometry,
+        los_offset_mm the line-of-sight shift already in tip_cam/back_cam
+        (ToolPoints.LOS_OFFSET_MM, the one the page draws with).
         """
         if self._tip_uv is None:
             return None
@@ -132,6 +134,7 @@ class TrackingOverlay:
             "p_tip_mm": [float(v) for v in self._p_tip],
             "axis_dir": [float(v) for v in self._axis],
             "axis_back_mm": float(self.AXIS_BACK_MM),
+            "los_offset_mm": float(ToolPoints.LOS_OFFSET_MM),
             "style": {
                 "tip_radius_px": int(self.TIP_RADIUS),
                 "tip_cross_px": int(self.TIP_CROSS),
@@ -244,13 +247,30 @@ class ToolPoints:
     # dropping. Max age by frame time, not by processed frames.
     MAX_CARRY_S = 1.0
 
-    def __init__(self, p_tip_mm, p_back_mm, max_carry_s: Optional[float] = None) -> None:
+    # EMPIRICAL depth correction of the drawn points, not a calibration: on
+    # the board ground truth (30.09. + 05.10., 15 takes, marker 300-480 mm
+    # from the camera) the RGB-only marker pose puts the tip 2.27 mm (take
+    # mean) too far along the line of sight to the marker, with no trend over
+    # the distance and turning with the camera, not with the label; the
+    # cause is open. Both points move this far toward the camera along the
+    # ray to the marker origin. Held out (fit without the take / the session):
+    # tip error 1.37 / 1.38 mm instead of 2.87 (offset carry), 1.28 / 1.29
+    # mm instead of 2.82 (filtered drawing).
+    # Re-fit after any change of the marker model, the RGB intrinsics or the
+    # tip calibration; < 300 and > 480 mm untested. 0 = off; measurements
+    # against that ground truth (tests/test_tip_board_principle.py) run
+    # with 0, the value was fitted on it.
+    LOS_OFFSET_MM = 2.27
+
+    def __init__(self, p_tip_mm, p_back_mm, max_carry_s: Optional[float] = None,
+                 los_offset_mm: Optional[float] = None) -> None:
         # rows: tip, marker-side end of the dashed shaft segment
         self._p = np.stack([
             np.asarray(p_tip_mm, dtype=np.float64).reshape(3),
             np.asarray(p_back_mm, dtype=np.float64).reshape(3),
         ])
         self.max_carry_s = self.MAX_CARRY_S if max_carry_s is None else float(max_carry_s)
+        self.los_offset_mm = self.LOS_OFFSET_MM if los_offset_mm is None else float(los_offset_mm)
         self.reset()
 
     def reset(self) -> None:
@@ -264,6 +284,20 @@ class ToolPoints:
 
     def update(self, result, t_frame: float) -> Optional[np.ndarray]:
         """(2, 3) camera-frame points [tip, back] in mm, None without a pose."""
+        pts = self._update(result, t_frame)
+        if pts is None or not self.los_offset_mm:
+            return pts
+        # ray to the marker origin: of the drawn pose, or of the RGB-only
+        # pose under the carried offset (pre-fusion pose on fused frames)
+        t = None
+        if self.kind == "fused":
+            t = getattr(result, "tvec_prefusion", None)
+        if t is None:
+            t = result.tvec
+        t = np.asarray(t, dtype=np.float64).reshape(3)
+        return pts - self.los_offset_mm * t / max(float(np.linalg.norm(t)), 1e-9)
+
+    def _update(self, result, t_frame: float) -> Optional[np.ndarray]:
         self.kind = None
         rvec = getattr(result, "rvec", None)
         tvec = getattr(result, "tvec", None)
