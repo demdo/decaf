@@ -159,53 +159,62 @@ class RealSenseCameraSource(CameraSource):
             cfg.enable_stream(rs.stream.infrared, 2, ir_w, ir_h,
                               rs.format.y8, int(self.config.fps))
         profile = pipeline.start(cfg)
-        if self._ir_enabled:
-            ir_exposure = getattr(self.config, "realsense_ir_exposure_us", None)
-            ir_gain = getattr(self.config, "realsense_ir_gain", None)
-            for sensor in profile.get_device().query_sensors():
-                options = [
-                    (rs.option.emitter_enabled, 0.0),
-                    (rs.option.laser_power, 0.0),
-                ]
-                # optional manual IR exposure (short -> less motion blur on the
-                # global-shutter pair during fast motion)
-                is_depth = False
-                try:
-                    is_depth = "stereo" in sensor.get_info(
-                        rs.camera_info.name).lower()
-                except Exception:
-                    pass
-                if is_depth and ir_exposure is not None:
-                    options.append((rs.option.enable_auto_exposure, 0.0))
-                    options.append((rs.option.exposure, float(ir_exposure)))
-                    if ir_gain is not None:
-                        options.append((rs.option.gain, float(ir_gain)))
-                for option, value in options:
+        try:
+            if self._ir_enabled:
+                ir_exposure = getattr(self.config, "realsense_ir_exposure_us", None)
+                ir_gain = getattr(self.config, "realsense_ir_gain", None)
+                for sensor in profile.get_device().query_sensors():
+                    options = [
+                        (rs.option.emitter_enabled, 0.0),
+                        (rs.option.laser_power, 0.0),
+                    ]
+                    # optional manual IR exposure (short -> less motion blur on the
+                    # global-shutter pair during fast motion)
+                    is_depth = False
                     try:
-                        if sensor.supports(option):
-                            sensor.set_option(option, value)
+                        is_depth = "stereo" in sensor.get_info(
+                            rs.camera_info.name).lower()
                     except Exception:
                         pass
-        realsense_details = _configure_realsense_color_sensor(profile, self.config, rs)
+                    if is_depth and ir_exposure is not None:
+                        options.append((rs.option.enable_auto_exposure, 0.0))
+                        options.append((rs.option.exposure, float(ir_exposure)))
+                        if ir_gain is not None:
+                            options.append((rs.option.gain, float(ir_gain)))
+                    for option, value in options:
+                        try:
+                            if sensor.supports(option):
+                                sensor.set_option(option, value)
+                        except Exception:
+                            pass
+            realsense_details = _configure_realsense_color_sensor(profile, self.config, rs)
 
-        queue_size = getattr(self.config, "realsense_frames_queue_size", None)
-        if queue_size is not None:
-            for sensor in profile.get_device().query_sensors():
-                try:
-                    if sensor.supports(rs.option.frames_queue_size):
-                        sensor.set_option(
-                            rs.option.frames_queue_size, float(int(queue_size))
-                        )
-                except Exception:
-                    pass
+            queue_size = getattr(self.config, "realsense_frames_queue_size", None)
+            if queue_size is not None:
+                for sensor in profile.get_device().query_sensors():
+                    try:
+                        if sensor.supports(rs.option.frames_queue_size):
+                            sensor.set_option(
+                                rs.option.frames_queue_size, float(int(queue_size))
+                            )
+                    except Exception:
+                        pass
 
-        color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        intr = color_stream.get_intrinsics()
-        self.actual_width = int(getattr(intr, "width", self.config.width))
-        self.actual_height = int(getattr(intr, "height", self.config.height))
-        self.actual_fps = int(color_stream.fps())
-        self.pixel_format = color_format
-        _validate_active_stream(self.config, self.actual_width, self.actual_height, self.actual_fps)
+            color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            intr = color_stream.get_intrinsics()
+            self.actual_width = int(getattr(intr, "width", self.config.width))
+            self.actual_height = int(getattr(intr, "height", self.config.height))
+            self.actual_fps = int(color_stream.fps())
+            self.pixel_format = color_format
+            _validate_active_stream(self.config, self.actual_width, self.actual_height, self.actual_fps)
+        except Exception:
+            # self._pipeline is not set yet, so stop() would not reach it:
+            # stop here, or the device stays busy until the process ends
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            raise
 
         self._pipeline = pipeline
         self._profile = profile
@@ -515,45 +524,171 @@ def _require_pypylon():
     return pylon
 
 
+# Colour sensor options as (rs.option name, CameraConfig field).
+# exposure and gain belong to the auto exposure, white_balance to the auto
+# white balance: writing one switches its automatic off (librealsense
+# auto-disabling controls), and on Windows switching the AE off writes the
+# DEFAULT exposure (librealsense mf-uvc.cpp). So the manual values are
+# written with their automatic off, the automatic flag after them.
+_REALSENSE_COLOR_AUTO_GROUPS = (
+    (("enable_auto_exposure", "realsense_enable_auto_exposure"),
+     (("exposure", "realsense_exposure"), ("gain", "realsense_gain"))),
+    (("enable_auto_white_balance", "realsense_enable_auto_white_balance"),
+     (("white_balance", "realsense_white_balance"),)),
+)
+_REALSENSE_COLOR_OTHER = (
+    # 0 = constant frame rate: AE caps the exposure at the frame period
+    # and compensates via gain (guaranteed fps even in dim light)
+    ("auto_exposure_priority", "realsense_auto_exposure_priority"),
+    ("power_line_frequency", "realsense_power_line_frequency"),
+    ("brightness", "realsense_brightness"),
+    ("contrast", "realsense_contrast"),
+    ("saturation", "realsense_saturation"),
+    ("hue", "realsense_hue"),
+    ("sharpness", "realsense_sharpness"),
+    ("gamma", "realsense_gamma"),
+    ("backlight_compensation", "realsense_backlight_compensation"),
+)
+REALSENSE_COLOR_OPTIONS = tuple(
+    pair for auto, manual in _REALSENSE_COLOR_AUTO_GROUPS for pair in (auto, *manual)
+) + _REALSENSE_COLOR_OTHER
+
+# What start records besides the option values (calibration_info keys).
+_REALSENSE_COLOR_RECORD = (
+    "realsense_color_written",
+    "realsense_color_mismatch",
+)
+
+# Short names for log lines (Live page profile header and log.md, the
+# evaluation script); REALSENSE_COLOR_KEY_VALUES are the ones a header names.
+_REALSENSE_COLOR_SHORT = (
+    ("realsense_enable_auto_exposure", "AE"),
+    ("realsense_auto_exposure_priority", "AE_priority"),
+    ("realsense_exposure", "exposure"),
+    ("realsense_gain", "gain"),
+    ("realsense_power_line_frequency", "PLF"),
+    ("realsense_enable_auto_white_balance", "AWB"),
+    ("realsense_white_balance", "WB"),
+    ("realsense_brightness", "brightness"),
+    ("realsense_contrast", "contrast"),
+    ("realsense_saturation", "saturation"),
+    ("realsense_hue", "hue"),
+    ("realsense_sharpness", "sharpness"),
+    ("realsense_gamma", "gamma"),
+    ("realsense_backlight_compensation", "backlight"),
+)
+REALSENSE_COLOR_KEY_VALUES = (
+    "AE", "AE_priority", "exposure", "gain", "PLF", "writes", "mismatch",
+)
+
+
+def realsense_color_readback(info: dict[str, Any]) -> dict[str, Any]:
+    """The colour options a started RealSense source runs with.
+
+    info is the source's calibration_info. Returns CameraConfig field ->
+    value read back after start, the writes start made, in order
+    ("realsense_color_written", "option=value") and the config values the
+    device did not take ("realsense_color_mismatch"). Empty for other
+    cameras or without a colour sensor.
+    """
+    if not info.get("realsense_color_sensor_found"):
+        return {}
+    keys = [name for _, name in REALSENSE_COLOR_OPTIONS] + list(_REALSENSE_COLOR_RECORD)
+    return {key: info[key] for key in keys if key in info}
+
+
+def realsense_color_summary(
+    readback: dict[str, Any], keys: tuple[str, ...] | None = None
+) -> dict[str, Any]:
+    """Short name -> value of a realsense_color_readback for log lines
+    (whole numbers as int). keys limits it to these short names; "writes"
+    is the number of options start wrote, "mismatch" the options the device
+    did not take."""
+    out: dict[str, Any] = {}
+    for name, short in _REALSENSE_COLOR_SHORT:
+        if name in readback and (keys is None or short in keys):
+            value = float(readback[name])
+            out[short] = int(value) if value.is_integer() else value
+    written = readback.get("realsense_color_written")
+    if written is not None and (keys is None or "writes" in keys):
+        out["writes"] = len(written)
+    mismatch = readback.get("realsense_color_mismatch")
+    if mismatch and (keys is None or "mismatch" in keys):
+        out["mismatch"] = ",".join(sorted(mismatch))
+    return out
+
+
+def format_realsense_color(
+    readback: dict[str, Any], keys: tuple[str, ...] | None = REALSENSE_COLOR_KEY_VALUES
+) -> str:
+    """One line, "AE=1 AE_priority=0 exposure=156 ..." ("" if empty)."""
+    summary = realsense_color_summary(readback, keys)
+    return " ".join(f"{k}={v}" for k, v in summary.items())
+
+
 def _configure_realsense_color_sensor(profile, config: CameraConfig, rs) -> dict[str, Any]:
+    """Apply the config's colour options and read all of them back.
+
+    Per automatic (AE, then auto white balance): if a manual value has to
+    change, the automatic goes off, the manual values are written, then the
+    automatic flag as configured; then the other options. An option whose
+    read-back already equals the config value is not written - a device in
+    the configured state is left untouched (no AE off/on at start).
+    """
     sensor = _find_realsense_color_sensor(profile, rs)
     if sensor is None:
         return {"realsense_color_sensor_found": False}
 
-    option_specs = (
-        ("enable_auto_exposure", "realsense_enable_auto_exposure"),
-        # 0 = constant frame rate: AE caps the exposure at the frame period
-        # and compensates via gain (guaranteed fps even in dim light)
-        ("auto_exposure_priority", "realsense_auto_exposure_priority"),
-        ("exposure", "realsense_exposure"),
-        ("gain", "realsense_gain"),
-        ("enable_auto_white_balance", "realsense_enable_auto_white_balance"),
-        ("white_balance", "realsense_white_balance"),
-        ("power_line_frequency", "realsense_power_line_frequency"),
-        ("brightness", "realsense_brightness"),
-        ("contrast", "realsense_contrast"),
-        ("saturation", "realsense_saturation"),
-        ("sharpness", "realsense_sharpness"),
-        ("gamma", "realsense_gamma"),
-    )
+    written: list[str] = []
 
-    for option_name, config_name in option_specs:
+    def apply(option_name: str, config_name: str, value) -> None:
+        if _realsense_option_equals(sensor, rs, option_name, value):
+            return
+        _set_realsense_option(sensor, rs, option_name, value, config_name)
+        written.append(f"{option_name}={_realsense_option_number(value):g}")
+
+    for (auto_name, auto_config), manual in _REALSENSE_COLOR_AUTO_GROUPS:
+        values = [
+            (option_name, config_name, getattr(config, config_name, None))
+            for option_name, config_name in manual
+        ]
+        values = [entry for entry in values if entry[2] is not None]
+        if any(not _realsense_option_equals(sensor, rs, name, value)
+               for name, _, value in values):
+            apply(auto_name, auto_config, False)
+            for option_name, config_name, value in values:
+                apply(option_name, config_name, value)
+        auto = getattr(config, auto_config, None)
+        if auto is not None:
+            apply(auto_name, auto_config, auto)
+    for option_name, config_name in _REALSENSE_COLOR_OTHER:
         value = getattr(config, config_name, None)
         if value is not None:
-            _set_realsense_option(sensor, rs, option_name, value, config_name)
+            apply(option_name, config_name, value)
 
     sensor_name = _realsense_sensor_name(sensor, rs)
     details: dict[str, Any] = {
         "realsense_color_sensor_found": True,
         "realsense_color_sensor_name": sensor_name,
+        "realsense_color_written": written,
     }
-    for option_name, config_name in option_specs:
+    mismatch: dict[str, dict[str, float]] = {}
+    for option_name, config_name in REALSENSE_COLOR_OPTIONS:
         current = _read_realsense_option(sensor, rs, option_name)
         if current is not None:
             details[config_name] = current
         option_range = _read_realsense_option_range(sensor, rs, option_name)
         if option_range is not None:
             details[f"{config_name}_range"] = option_range
+        wanted = getattr(config, config_name, None)
+        if wanted is not None and current is not None and not _realsense_option_equals(
+            sensor, rs, option_name, wanted, current
+        ):
+            mismatch[config_name] = {
+                "config": _realsense_option_number(wanted), "device": current,
+            }
+    if mismatch:
+        details["realsense_color_mismatch"] = mismatch
     return details
 
 
@@ -581,6 +716,18 @@ def _realsense_sensor_name(sensor, rs) -> str:
         return "unknown"
 
 
+def _realsense_option_number(value) -> float:
+    return 1.0 if isinstance(value, bool) and value else 0.0 if isinstance(value, bool) else float(value)
+
+
+def _realsense_option_equals(sensor, rs, option_name: str, value, current=None) -> bool:
+    """True if the option reads back as value (current: a read-back already
+    taken). False if it cannot be read."""
+    if current is None:
+        current = _read_realsense_option(sensor, rs, option_name)
+    return current is not None and abs(current - _realsense_option_number(value)) < 1e-6
+
+
 def _set_realsense_option(sensor, rs, option_name: str, value, config_name: str) -> None:
     option = getattr(rs.option, option_name, None)
     if option is None:
@@ -588,7 +735,7 @@ def _set_realsense_option(sensor, rs, option_name: str, value, config_name: str)
     if not sensor.supports(option):
         raise RuntimeError(f"RealSense color sensor does not support option {option_name!r}.")
 
-    numeric = 1.0 if isinstance(value, bool) and value else 0.0 if isinstance(value, bool) else float(value)
+    numeric = _realsense_option_number(value)
     try:
         option_range = sensor.get_option_range(option)
         minimum = float(option_range.min)

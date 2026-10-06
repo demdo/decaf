@@ -53,20 +53,6 @@ class CameraConfig:
     calibration_path: Optional[str] = None
     serial: Optional[str] = None
 
-    # RealSense D435i color tuning. Leave values as None to keep the device
-    # default/current setting. For low-noise tracking, use fixed exposure/gain
-    # together with enough external light.
-    realsense_enable_auto_exposure: Optional[bool] = None
-    realsense_exposure: Optional[float] = None
-    realsense_gain: Optional[float] = None
-    realsense_enable_auto_white_balance: Optional[bool] = None
-    realsense_white_balance: Optional[float] = None
-    realsense_power_line_frequency: Optional[float] = None
-    realsense_brightness: Optional[float] = None
-    realsense_contrast: Optional[float] = None
-    realsense_saturation: Optional[float] = None
-    realsense_sharpness: Optional[float] = None
-    realsense_gamma: Optional[float] = None
     # Global-shutter IR pair co-streaming for the tracker's IR pose
     # refinement (design B). RealSense-only: every other backend ignores it
     # and delivers ir_left/ir_right = None. Enabling this also disables the
@@ -98,6 +84,33 @@ class CameraConfig:
     # With the IR refinement the geometry comes from IR anyway - RGB only
     # needs to identify corners, which tolerates gain noise well.
     realsense_auto_exposure_priority: Optional[float] = 0.0
+    # RealSense colour sensor options (None = leave the device as it is).
+    # The defaults are the state the D435i was in at every camera start of
+    # the debug recordings (30.09., 05.10.) and the evaluation runs (28.09.,
+    # 05.10.): AE on, exposure register 156, gain 64, 60 Hz anti-flicker,
+    # the device defaults otherwise - what the app ran with while these
+    # fields stood in the class docstring and were never applied.
+    # Setting them explicitly keeps that image even after another program
+    # left the device elsewhere. camera_setup writes exposure/gain with the
+    # AE off and white_balance with the auto white balance off, then the
+    # auto flags, then the rest; an option already at its value is not
+    # written. Windows rounds a manual exposure to 1 s / 2^n (register
+    # 10000 / 2^n in 100 us): only 9/19/39/78/156/312 are reached exactly.
+    realsense_enable_auto_exposure: Optional[bool] = True
+    # exposure in 100 us; the register stays as set while the AE is on
+    realsense_exposure: Optional[float] = 156.0
+    realsense_gain: Optional[float] = 64.0
+    realsense_enable_auto_white_balance: Optional[bool] = True
+    realsense_white_balance: Optional[float] = 4600.0
+    # 0 off, 1 = 50 Hz, 2 = 60 Hz, 3 = auto (device default 3)
+    realsense_power_line_frequency: Optional[float] = 2.0
+    realsense_brightness: Optional[float] = 0.0
+    realsense_contrast: Optional[float] = 50.0
+    realsense_saturation: Optional[float] = 64.0
+    realsense_hue: Optional[float] = 0.0
+    realsense_sharpness: Optional[float] = 50.0
+    realsense_gamma: Optional[float] = 300.0
+    realsense_backlight_compensation: Optional[float] = 0.0
     # Manual IR exposure (microseconds). None = auto. Short values (3000-8000)
     # reduce motion blur on the IR pair -> higher corner-detection success during
     # fast motion; needs enough scene brightness (or realsense_ir_gain).
