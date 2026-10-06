@@ -83,6 +83,11 @@ public:
     // fit RMS ~1.4 all run). References re-enroll through the normal gates.
     void resetIrReferences();
 
+    // Frame time (seconds, any monotonic clock) of the next processFrame
+    // call: the output filter's time base. Not set (or <= 0): one nominal
+    // frame period per call.
+    void setFrameTime(double t_s);
+
     // Last frame's measured QF-IR stereo pairs (self-calibration input).
     const IrPoseRefiner::IrPairDump& lastIrPairDump() const {
         return ir_pose_refiner_.lastPairDump();
@@ -192,6 +197,7 @@ private:
     // kPoseFilterMaxMissedUpdates of them.
     static constexpr int kPoseFilterMaxMissedUpdates = 3;
     int pose_filter_missed_updates_ = 0;
+    double frame_time_s_ = -1.0;   // setFrameTime, consumed by applyPoseFilter
 
     // ---- IR global-shutter pose refinement (output-only, opt-in) ----
     // Re-measures the reported pose on the IR stereo pair; runs FIRST in the

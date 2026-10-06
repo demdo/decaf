@@ -83,6 +83,8 @@ PoseOutputFilterConfig makePoseOutputFilterConfig(const TrackerConfig& config)
     cfg.meas_floor_trans_mm = config.pose_kf_meas_floor_trans_mm;
     cfg.gate_mahalanobis = config.pose_kf_gate_mahalanobis;
     cfg.reinit_frames = config.pose_kf_reinit_frames;
+    cfg.frame_period_s = config.pose_kf_frame_period_s;
+    cfg.max_gap_s = config.pose_kf_max_gap_s;
     cfg.reset_rotation_deg = config.pose_kf_reset_rotation_deg;
     cfg.max_translation_jump_mm = config.max_translation_jump_mm;
     cfg.min_points = config.min_points;
@@ -1300,6 +1302,11 @@ void TrackerEngine::resetPoseWarmup()
     pose_converged_ = false;
 }
 
+void TrackerEngine::setFrameTime(double t_s)
+{
+    frame_time_s_ = t_s;
+}
+
 void TrackerEngine::resetPoseFilter()
 {
     pose_output_filter_.reset();
@@ -1308,6 +1315,8 @@ void TrackerEngine::resetPoseFilter()
 
 void TrackerEngine::applyPoseFilter(TrackerFrameResult& result)
 {
+    const double t_s = frame_time_s_;
+    frame_time_s_ = -1.0;
     if (!config_.pose_kf_enabled) {
         return;
     }
@@ -1316,7 +1325,7 @@ void TrackerEngine::applyPoseFilter(TrackerFrameResult& result)
         result.tvec.size() != 3) {
         // No fresh measurement this frame (hold / rejection): coast the
         // state so velocities stay time-consistent, output stays untouched.
-        pose_output_filter_.coast();
+        pose_output_filter_.coast(t_s);
         return;
     }
 
@@ -1360,11 +1369,11 @@ void TrackerEngine::applyPoseFilter(TrackerFrameResult& result)
     const PoseOutputFilterResult filtered = pose_output_filter_.update(
         rvec_in, tvec_in, object_points,
         ir_meas_cov_valid_ ? &ir_meas_cov_ : nullptr,
-        meas_var_scale);
+        meas_var_scale, t_s);
     if (!filtered.applied) {
         // Too few corners even so: predict through the frame and start over
         // after a few such frames; the raw pose is reported.
-        pose_output_filter_.coast();
+        pose_output_filter_.coast(t_s);
         if (++pose_filter_missed_updates_ > kPoseFilterMaxMissedUpdates) {
             resetPoseFilter();
         }

@@ -52,6 +52,21 @@ void PoseOutputFilter::reset()
     est_r_ = 0.0;
     est_t_ = 0.0;
     gate_streak_ = 0;
+    t_prev_s_ = -1.0;
+    t_update_s_ = -1.0;
+}
+
+double PoseOutputFilter::stepFrames(double t_s)
+{
+    double tau = 1.0;
+    if (t_s > 0.0) {
+        if (t_prev_s_ > 0.0 && config_.frame_period_s > 0.0) {
+            tau = std::min(std::max((t_s - t_prev_s_) / config_.frame_period_s, 0.05),
+                           1000.0);
+        }
+        t_prev_s_ = t_s;
+    }
+    return tau;
 }
 
 void PoseOutputFilter::initializeState(const cv::Mat& z)
@@ -88,34 +103,37 @@ void PoseOutputFilter::writeResult(
     result.applied = true;
 }
 
-void PoseOutputFilter::predict(double q_r, double q_t)
+void PoseOutputFilter::predict(double tau, double q_r, double q_t)
 {
-    // Constant-velocity predict; process noise on the acceleration (DWNA).
+    // Constant-velocity predict; process noise on the acceleration (DWNA),
+    // G = [tau^2 / 2, tau], Q = q G G^T.
     cv::Mat F = cv::Mat::eye(12, 12, CV_64F);
     for (int i = 0; i < 6; ++i) {
-        F.at<double>(i, i + 6) = 1.0;
+        F.at<double>(i, i + 6) = tau;
     }
+    const double t2 = tau * tau;
     cv::Mat Q = cv::Mat::zeros(12, 12, CV_64F);
     for (int i = 0; i < 6; ++i) {
         const double q = (i < 3) ? q_r : q_t;
-        Q.at<double>(i, i) = 0.25 * q;
-        Q.at<double>(i, i + 6) = 0.5 * q;
-        Q.at<double>(i + 6, i) = 0.5 * q;
-        Q.at<double>(i + 6, i + 6) = q;
+        Q.at<double>(i, i) = 0.25 * q * t2 * t2;
+        Q.at<double>(i, i + 6) = 0.5 * q * t2 * tau;
+        Q.at<double>(i + 6, i) = 0.5 * q * t2 * tau;
+        Q.at<double>(i + 6, i + 6) = q * t2;
     }
     x_ = F * x_;
     P_ = F * P_ * F.t() + Q;
 }
 
-void PoseOutputFilter::coast()
+void PoseOutputFilter::coast(double t_s)
 {
+    const double tau = stepFrames(t_s);
     if (!initialized_) {
         return;
     }
     // No measurement: predict with the moving process noise, so the next
     // update weighs the extrapolated state by its real uncertainty (the
     // covariance stayed put before).
-    predict(std::pow(config_.q_rotation_deg * CV_PI / 180.0, 2.0),
+    predict(tau, std::pow(config_.q_rotation_deg * CV_PI / 180.0, 2.0),
             std::pow(config_.q_translation_mm, 2.0));
 }
 
@@ -124,7 +142,8 @@ PoseOutputFilterResult PoseOutputFilter::update(
     const std::array<double, 3>& tvec,
     const std::vector<cv::Point3d>& object_points,
     const std::array<double, 36>* ext_meas_cov,
-    double meas_var_scale)
+    double meas_var_scale,
+    double t_s)
 {
     PoseOutputFilterResult result;
     if (!config_.enabled) {
@@ -138,6 +157,15 @@ PoseOutputFilterResult PoseOutputFilter::update(
     for (int i = 0; i < 3; ++i) {
         z.at<double>(i) = rvec[static_cast<size_t>(i)];
         z.at<double>(i + 3) = tvec[static_cast<size_t>(i)];
+    }
+
+    const double tau = stepFrames(t_s);
+    if (initialized_ && t_s > 0.0 && t_update_s_ > 0.0 &&
+        config_.max_gap_s > 0.0 && t_s - t_update_s_ > config_.max_gap_s) {
+        initialized_ = false;   // too long without a measurement to extrapolate
+    }
+    if (t_s > 0.0) {
+        t_update_s_ = t_s;
     }
 
     // Large real jumps (accepted by the caller's own gates, e.g. after
@@ -261,9 +289,11 @@ PoseOutputFilterResult PoseOutputFilter::update(
         // the floor (heavy averaging); from the floor to 2x the floor Q ramps
         // linearly up to the moving value and saturates there, so fast motion
         // follows lag-free without unbounded velocity overshoot.
+        // Motion per frame period: after skipped frames the delta spans more.
         const double a = config_.adaptive_ema_alpha;
-        motion_ema_[0] = (1.0 - a) * motion_ema_[0] + a * drot;
-        motion_ema_[1] = (1.0 - a) * motion_ema_[1] + a * dtrans;
+        const double per = std::max(tau, 1.0);
+        motion_ema_[0] = (1.0 - a) * motion_ema_[0] + a * drot / per;
+        motion_ema_[1] = (1.0 - a) * motion_ema_[1] + a * dtrans / per;
         const double floor_r = config_.q_rotation_floor_deg * CV_PI / 180.0;
         const double move_r = config_.q_rotation_deg * CV_PI / 180.0;
         const double s_r = std::min(1.0, std::max(0.0,
@@ -280,8 +310,9 @@ PoseOutputFilterResult PoseOutputFilter::update(
         // the estimate, which then reclassifies the whole motion as "still"
         // (observed as slow-rotation lag). The instantaneous delta rejects the
         // onset frame immediately. Recompute the persisted quiet baseline
-        // (median of the still deltas) for the next frame's floors.
-        if (config_.auto_noise) {
+        // (median of the still deltas) for the next frame's floors. Only
+        // deltas over about one frame period are comparable.
+        if (config_.auto_noise && tau > 0.5 && tau < 1.5) {
             if (drot < motion_floor_r) {
                 drot_hist_.push_back(drot);
                 while (static_cast<int>(drot_hist_.size()) > config_.noise_window) {
@@ -303,7 +334,7 @@ PoseOutputFilterResult PoseOutputFilter::update(
     }
     prev_z_ = z.clone();
 
-    predict(q_r, q_t);
+    predict(tau, q_r, q_t);
 
     cv::Mat Hm = cv::Mat::zeros(6, 12, CV_64F);  // H = [I6 | 0]
     for (int i = 0; i < 6; ++i) {

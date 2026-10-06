@@ -67,6 +67,14 @@ struct PoseOutputFilterConfig {
     double reset_rotation_deg = 10.0;
     double max_translation_jump_mm = 40.0;
     int min_points = 6;
+
+    // Time base. One model step is one nominal frame period; with frame
+    // times (t_s > 0 in update / coast) a step is dt / frame_period_s, so
+    // camera frames the caller skipped while busy count as elapsed time.
+    // Without frame times every call is one period. A gap above max_gap_s
+    // since the last update restarts the filter (0 disables).
+    double frame_period_s = 1.0 / 30.0;
+    double max_gap_s = 0.5;
 };
 
 // Outcome of one filter step.
@@ -109,8 +117,9 @@ public:
 
     // No fresh measurement this frame (hold / rejection): predict the state
     // so the velocities stay time-consistent; the covariance grows with the
-    // moving process noise. The caller's output is untouched.
-    void coast();
+    // moving process noise. The caller's output is untouched. t_s: frame
+    // time in seconds (<= 0: one frame period).
+    void coast(double t_s = -1.0);
 
     // Fresh measurement. object_points are the pose-set corner coordinates
     // (marker/object frame) used to build the anisotropic measurement
@@ -132,16 +141,20 @@ public:
         const std::array<double, 3>& tvec,
         const std::vector<cv::Point3d>& object_points,
         const std::array<double, 36>* ext_meas_cov = nullptr,
-        double meas_var_scale = 1.0);
+        double meas_var_scale = 1.0,
+        double t_s = -1.0);
 
 private:
     // State = measurement, velocities zero, initial covariance.
     void initializeState(const cv::Mat& z);
     // rvec/tvec = pose (6x1), covariance = the pose block of P_.
     void writeResult(const cv::Mat& pose, PoseOutputFilterResult& result) const;
-    // Constant-velocity prediction x = F x, P = F P F^T + Q with the
-    // acceleration process noise q_r (rad^2), q_t (mm^2) per frame.
-    void predict(double q_r, double q_t);
+    // Constant-velocity prediction over tau frame periods, x = F x,
+    // P = F P F^T + Q, acceleration process noise q_r (rad^2), q_t (mm^2)
+    // per frame period.
+    void predict(double tau, double q_r, double q_t);
+    // Frame periods since the previous call with a frame time (1 without).
+    double stepFrames(double t_s);
 
     PoseOutputFilterConfig config_;
     cv::Matx33d K_ = cv::Matx33d::eye();
@@ -161,6 +174,8 @@ private:
     double est_r_ = 0.0;
     double est_t_ = 0.0;
     int gate_streak_ = 0;   // consecutive frames beyond the gate
+    double t_prev_s_ = -1.0;     // frame time of the previous predict
+    double t_update_s_ = -1.0;   // frame time of the previous update
 };
 
 }  // namespace hydramarker

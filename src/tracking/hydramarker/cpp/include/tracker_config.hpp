@@ -142,6 +142,10 @@ struct TrackerConfig {
     double pose_kf_motion_floor_trans_mm = 0.05;
     double pose_kf_meas_floor_rot_deg = 0.035;
     double pose_kf_meas_floor_trans_mm = 0.02;
+    // Time base (TrackerEngine::setFrameTime): model step = dt / frame
+    // period; a gap above max_gap_s restarts the filter.
+    double pose_kf_frame_period_s = 1.0 / 30.0;
+    double pose_kf_max_gap_s = 0.5;
 
     // ---- IR depth-only stereo fusion (opt-in, output-only) ----
     // Fuses the absolute depth / out-of-plane tilt from the global-shutter

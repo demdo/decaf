@@ -28,7 +28,8 @@ while the worker reads it fails the test.
 (i) tracker_log classes for held detections, appearance rejects and holds
 (j) ToolPoints: fused pose, offset carry within max_carry_s of frame time,
     RGB-only after it, offset dropped by the reprojection gate and reset();
-    in the worker: points of every result, in order, reset with the tracker
+    in the worker: points of every result, in order, reset with the tracker;
+    the frame time goes to the tracker (t_frame)
 (k) frame timing: frame_timing(frame.metadata) runs in submit() and its
     (frame_time_ms, ir_time_offset_ms) reach process_frame with that frame;
     without frame_timing process_frame gets neither; one that raises takes
@@ -124,7 +125,7 @@ class FakeTracker:
             self.errors.append(f"IR pattern broken {where}")
         return v
 
-    def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None):
+    def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None, t_frame=None):
         v = self._check(color, ir_left, ir_right, "before")
         self.calls.append(("process", v, threading.get_ident()))
         if self.fail_at is not None and v == _pattern(self.fail_at):
@@ -627,13 +628,15 @@ def test_tool_points() -> None:
     # in the worker: every result gets its points, in order, with its frame
     # time; a requested reset resets ToolPoints with the tracker
     class PoseTracker(FakeTracker):
-        def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None):
+        def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None, t_frame=None):
             v = int(color[0, 0, 0])
             self.calls.append(("process", v, threading.get_ident()))
+            self.t_frames.append(t_frame)
             # frames 0, 1 fused; 2, 3 not
             return _pose_result(t0 + [v, 0.0, 0.0], applied=v < 2, d_fused=d)
 
     tracker = PoseTracker()
+    tracker.t_frames = []
     worker = TrackingWorker(tracker, pool_size=5, tool_points=ToolPoints(P_TIP, P_BACK, max_carry_s=0.5))
     worker.start()
     outs = []
@@ -648,6 +651,8 @@ def test_tool_points() -> None:
         [o.points_kind for o in outs]
     assert np.allclose(outs[2].points[0], P_TIP + t0 + [2.0, 0.0, 0.0] + d)
     assert np.allclose(outs[3].points[0], P_TIP + t0 + [3.0, 0.0, 0.0])
+    # the tracker gets each frame's time (time base of its output filter)
+    assert tracker.t_frames == [0.1 * i for i in range(4)], tracker.t_frames
     assert _pool_balanced(worker)
     print("  (j) tool points: fused, carry for 0.5 s of frame time, then RGB-only; "
           "gate and reset drop the offset; computed in the worker, reset with the tracker")
@@ -660,7 +665,7 @@ def test_frame_timing() -> None:
             self.timing = []
 
         def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None,
-                          **timing):
+                          t_frame=None, **timing):
             self.timing.append((int(color[0, 0, 0]), timing))
             return _result(True)
 

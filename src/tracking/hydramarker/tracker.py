@@ -723,6 +723,7 @@ class HydraTracker:
         run_detection: bool = True,
         ir_left: Optional[np.ndarray] = None,
         ir_right: Optional[np.ndarray] = None,
+        t_frame: Optional[float] = None,
         frame_time_ms: Optional[float] = None,
         ir_time_offset_ms: Optional[float] = None,
     ) -> TrackerResult:
@@ -731,9 +732,15 @@ class HydraTracker:
         ir_left / ir_right: optional synchronized global-shutter IR pair for
         the IR pose refinement stage (design "B"). Ignored unless the config
         enables ir_refine_enabled AND set_ir_calibration() was called.
+        t_frame: the frame's time in seconds (any monotonic clock), the time
+        base of the output filter; None: one frame period per call.
         frame_time_ms / ir_time_offset_ms: the camera time of the frame and
         the IR offset of colour row 0 (ir_frame_timing) for the IR
         time-offset correction; None = unknown, nothing is shifted."""
+        if t_frame is not None:
+            fn = getattr(self._engine, "set_frame_time", None)
+            if fn is not None:
+                fn(float(t_frame))
         try:
             if ir_left is not None and ir_right is not None:
                 images = (

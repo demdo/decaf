@@ -424,6 +424,12 @@ class TrackerConfig:
     pose_kf_motion_floor_trans_mm: float = 0.05
     pose_kf_meas_floor_rot_deg: float = 0.035
     pose_kf_meas_floor_trans_mm: float = 0.02
+    # Time base (tracker.process_frame(t_frame=...)): one model step is
+    # dt / pose_kf_frame_period_s, so camera frames skipped while the tracker
+    # was busy count as elapsed time; a gap above pose_kf_max_gap_s restarts
+    # the filter. Without frame times one step per processed frame.
+    pose_kf_frame_period_s: float = 1.0 / 30.0
+    pose_kf_max_gap_s: float = 0.5
     # IR depth-only stereo fusion (output-only). Fuses absolute depth and the
     # two out-of-plane tilt DoF from the global-shutter IR stereo pair into
     # the reported pose; RGB keeps rotation and lateral position (full IR

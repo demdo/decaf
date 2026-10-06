@@ -14,7 +14,8 @@ result.
 
 Qt-free and engine-free on purpose: the evaluation script and the unit
 test use exactly these classes, without a QApplication, a camera or the
-C++ build. The tracker is whatever object has process_frame() and
+C++ build. The tracker is whatever object has process_frame() (with the
+frame time as t_frame) and
 reset() (HydraTracker on the page).
 """
 
@@ -386,6 +387,7 @@ class TrackingWorker:
                         run_detection=True,
                         ir_left=slot.ir_left if slot.has_ir else None,
                         ir_right=slot.ir_right if slot.has_ir else None,
+                        t_frame=slot.t_frame,
                         **timing,
                     )
                     if self._tool_points is not None:
