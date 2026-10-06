@@ -1448,6 +1448,12 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("ir_depth_scale", &TrackerConfig::ir_depth_scale)
         .def_readwrite("ir_sigma_px", &TrackerConfig::ir_sigma_px)
         .def_readwrite("ir_sigma_ir_px", &TrackerConfig::ir_sigma_ir_px)
+        .def_readwrite("ir_time_offset_enabled",
+                       &TrackerConfig::ir_time_offset_enabled)
+        .def_readwrite("ir_time_offset_row_ms",
+                       &TrackerConfig::ir_time_offset_row_ms)
+        .def_readwrite("ir_time_offset_deadband_px",
+                       &TrackerConfig::ir_time_offset_deadband_px)
         .def_readwrite("ir_w3d", &TrackerConfig::ir_w3d)
         .def_readwrite("ir_fit_gate_rms_mm", &TrackerConfig::ir_fit_gate_rms_mm)
         .def_readwrite("ir_cov_inflate_ref_rms_mm",
@@ -1836,19 +1842,25 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> img,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> ir_left,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> ir_right,
-               bool run_detection) -> TrackerFrameResult
+               bool run_detection,
+               double frame_time_ms,
+               double ir_time_offset_ms) -> TrackerFrameResult
             {
                 cv::Mat mat = numpyToMat(img);
                 cv::Mat irl = numpyToMat(ir_left);
                 cv::Mat irr = numpyToMat(ir_right);
                 // As in process_frame: no GIL while the engine runs.
                 py::gil_scoped_release release;
-                return self.processFrame(mat, irl, irr, run_detection);
+                return self.processFrame(mat, irl, irr, run_detection,
+                                         frame_time_ms, ir_time_offset_ms);
             },
             py::arg("frame"),
             py::arg("ir_left"),
             py::arg("ir_right"),
-            py::arg("run_detection") = true
+            py::arg("run_detection") = true,
+            // NaN: unknown -> no IR time-offset correction for this frame
+            py::arg("frame_time_ms") = std::numeric_limits<double>::quiet_NaN(),
+            py::arg("ir_time_offset_ms") = std::numeric_limits<double>::quiet_NaN()
         )
         .def(
             "set_ir_calibration",

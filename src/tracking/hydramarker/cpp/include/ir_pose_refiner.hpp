@@ -341,13 +341,19 @@ public:
     // widening the RGB sigma with velocity hands orientation authority to IR
     // exactly when the shear strikes. <= 0 keeps the configured sigma
     // (bindings/acceptance replays stay bit-identical).
+    // time_shift_px (one per rgb_uv, or nullptr): image motion of each corner
+    // from the IR exposure to its colour exposure. The seeds start from the
+    // detected pixel moved back by it, the IR 3D points move forward by it
+    // (laterally, at their depth): IR and colour then show one instant.
     IrPoseRefinerResult fuse(const cv::Mat& ir_left,
                              const cv::Mat& ir_right,
                              const std::array<double, 3>& rvec,
                              const std::array<double, 3>& tvec,
                              const std::vector<cv::Vec3d>& rgb_xyz,
                              const std::vector<cv::Point2d>& rgb_uv,
-                             double sigma_px_override = -1.0);
+                             double sigma_px_override = -1.0,
+                             const std::vector<cv::Point2d>* time_shift_px =
+                                 nullptr);
 
 private:
     IrPoseRefinerConfig config_;
@@ -390,7 +396,9 @@ private:
                      int use_pairs,
                      size_t n,
                      double sigma_px,
-                     const std::vector<float>* q_min = nullptr) const;
+                     const std::vector<float>* q_min = nullptr,
+                     const std::vector<cv::Point2d>* time_shift_px =
+                         nullptr) const;
 };
 
 }  // namespace hydramarker

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -48,11 +49,17 @@ public:
     // enabled (config flag) AND calibrated (setIrCalibration) the REPORTED
     // pose is re-measured on the global-shutter IR pair. Without both the
     // call is byte-identical to processFrame(frame, run_detection).
+    // frame_time_ms (camera time of the frame) and ir_time_offset_ms (how
+    // much earlier the IR pair was exposed than colour row 0, exposure
+    // centres) feed the IR time-offset correction (ir_time_offset_enabled);
+    // NaN = unknown, nothing is shifted.
     TrackerFrameResult processFrame(
         const cv::Mat& frame,
         const cv::Mat& ir_left,
         const cv::Mat& ir_right,
-        bool run_detection = true
+        bool run_detection = true,
+        double frame_time_ms = std::numeric_limits<double>::quiet_NaN(),
+        double ir_time_offset_ms = std::numeric_limits<double>::quiet_NaN()
     );
 
     // Data gate of the IR refinement stage (the rig calibration from
@@ -199,6 +206,12 @@ private:
     // per-frame corner motion, used to inflate the RGB sigma under motion.
     std::unordered_map<int, cv::Point2d> ir_prev_corner_uv_;
     double ir_last_vpx_ = 0.0;
+    // IR time-offset correction: this frame's time and IR offset (NaN outside
+    // processFrame with IR) and the time of the frame ir_prev_corner_uv_
+    // belongs to.
+    double ir_frame_time_ms_ = std::numeric_limits<double>::quiet_NaN();
+    double ir_time_offset_ms_ = std::numeric_limits<double>::quiet_NaN();
+    double ir_prev_frame_time_ms_ = std::numeric_limits<double>::quiet_NaN();
     // Fusion attempted with references but rejected by the gates this
     // frame: the RGB corner evidence is suspect -> pose filter distrust.
     bool ir_last_fusion_rejected_ = false;

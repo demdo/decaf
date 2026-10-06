@@ -540,7 +540,8 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
                                         const std::array<double, 3>& tvec,
                                         const std::vector<cv::Vec3d>& rgb_xyz,
                                         const std::vector<cv::Point2d>& rgb_uv,
-                                        double sigma_px_override)
+                                        double sigma_px_override,
+                                        const std::vector<cv::Point2d>* time_shift_px)
 {
     const double sigma_px_eff =
         sigma_px_override > 0.0 ? sigma_px_override : config_.sigma_px;
@@ -575,8 +576,20 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
 
     // Seeds: the DETECTED RGB pixels transferred through the rig (per-corner
     // depth from the IR-left frame, prototype convention -> the seed follows the
-    // real corner, the operator refines from there).
-    const std::vector<cv::Point2d>& uv_rgb = uv_det;
+    // real corner, the operator refines from there). With a time shift the
+    // pixel is first moved back to where the corner was at the IR exposure.
+    if (time_shift_px != nullptr && time_shift_px->size() != n) {
+        time_shift_px = nullptr;
+    }
+    std::vector<cv::Point2d> uv_at_ir;
+    if (time_shift_px != nullptr) {
+        uv_at_ir = uv_det;
+        for (size_t i = 0; i < n; ++i) {
+            uv_at_ir[i] -= (*time_shift_px)[i];
+        }
+    }
+    const std::vector<cv::Point2d>& uv_rgb =
+        time_shift_px != nullptr ? uv_at_ir : uv_det;
     std::vector<double> z_mm(n);
     for (size_t i = 0; i < n; ++i) {
         z_mm[i] = (R_A * xyz[i] + t_A)[2];
@@ -744,7 +757,7 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
                 q_pair[i] = std::min(qL[i], qR[i]);
             }
             fuseAttempt(out, good, ptsL, ptsR, xyz, uv_det, R_rgb, t_rgb,
-                        pairs, n, sigma_px_eff, &q_pair);
+                        pairs, n, sigma_px_eff, &q_pair, time_shift_px);
         }
         return out;
     }
@@ -765,12 +778,14 @@ bool IrPoseRefiner::fuseAttempt(IrPoseRefinerResult& out,
                                 int use_pairs,
                                 size_t n,
                                 double sigma_px,
-                                const std::vector<float>* q_min) const
+                                const std::vector<float>* q_min,
+                                const std::vector<cv::Point2d>* time_shift_px) const
 {
     // Gather the surviving pairs and triangulate over the metric baseline.
     std::vector<cv::Point2f> gl, gr;
     std::vector<cv::Vec3d> M;
     std::vector<cv::Point2d> uv_s;
+    std::vector<cv::Point2d> shift_s;
     std::vector<double> sig_scale;
     gl.reserve(static_cast<size_t>(use_pairs));
     gr.reserve(static_cast<size_t>(use_pairs));
@@ -783,6 +798,9 @@ bool IrPoseRefiner::fuseAttempt(IrPoseRefinerResult& out,
             gr.push_back(use_ptsR[i]);
             M.push_back(xyz[i]);
             uv_s.push_back(uv_det[i]);
+            if (time_shift_px != nullptr) {
+                shift_s.push_back((*time_shift_px)[i]);
+            }
             double sc = 1.0;
             if (q_min != nullptr && i < q_min->size()) {
                 const double q = std::max(0.25, static_cast<double>((*q_min)[i]));
@@ -822,6 +840,11 @@ bool IrPoseRefiner::fuseAttempt(IrPoseRefinerResult& out,
     std::vector<cv::Matx33d> SigYinv(m);
     for (size_t i = 0; i < m; ++i) {
         Yrgb[i] = R_rl.t() * (cam[i] - t_rl);
+        if (!shift_s.empty()) {
+            // IR observation moved to the colour time of the corner
+            Yrgb[i][0] += Yrgb[i][2] / calib_.K_rgb(0, 0) * shift_s[i].x;
+            Yrgb[i][1] += Yrgb[i][2] / calib_.K_rgb(1, 1) * shift_s[i].y;
+        }
         const double Z = std::max(cam[i][2], 1.0);
         const double sig_i = config_.sigma_ir_px * sig_scale[i];
         const double sl = Z / f_ir * sig_i;

@@ -29,6 +29,10 @@ while the worker reads it fails the test.
 (j) ToolPoints: fused pose, offset carry within max_carry_s of frame time,
     RGB-only after it, offset dropped by the reprojection gate and reset();
     in the worker: points of every result, in order, reset with the tracker
+(k) frame timing: frame_timing(frame.metadata) runs in submit() and its
+    (frame_time_ms, ir_time_offset_ms) reach process_frame with that frame;
+    without frame_timing process_frame gets neither; one that raises takes
+    no slot
 
 Run from src/:
 
@@ -649,6 +653,69 @@ def test_tool_points() -> None:
           "gate and reset drop the offset; computed in the worker, reset with the tracker")
 
 
+def test_frame_timing() -> None:
+    class TimingTracker(FakeTracker):
+        def __init__(self):
+            super().__init__()
+            self.timing = []
+
+        def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None,
+                          **timing):
+            self.timing.append((int(color[0, 0, 0]), timing))
+            return _result(True)
+
+    def frame(i):
+        f = _frame(i)
+        f.metadata = {"color_time_ms": 1000.0 + 33.4 * i}
+        return f
+
+    tracker = TimingTracker()
+    seen = []
+
+    def timing(meta):
+        seen.append(threading.get_ident())
+        return meta["color_time_ms"], -8.0
+
+    worker = TrackingWorker(tracker, pool_size=5, frame_timing=timing)
+    worker.start()
+    for i in range(3):
+        worker.submit(frame(i), 0.1 * i)
+        assert _wait_until(lambda: worker.n_processed == i + 1)
+        _drain_all(worker)
+    assert worker.stop()
+    assert tracker.timing == [
+        (i, {"frame_time_ms": 1000.0 + 33.4 * i, "ir_time_offset_ms": -8.0}) for i in range(3)
+    ], tracker.timing
+    assert seen == [threading.get_ident()] * 3     # in submit(), the caller's thread
+
+    tracker = TimingTracker()
+    worker = TrackingWorker(tracker, pool_size=5)
+    worker.start()
+    worker.submit(_frame(0), 0.0)
+    assert _wait_until(lambda: worker.n_processed == 1)
+    _drain_all(worker)
+    assert worker.stop()
+    assert tracker.timing == [(0, {})], tracker.timing
+    assert _pool_balanced(worker)
+
+    # a frame_timing that raises: the error reaches the caller, no slot is lost
+    def broken(meta):
+        raise ValueError("no camera time")
+
+    worker = TrackingWorker(TimingTracker(), pool_size=5, frame_timing=broken)
+    worker.start()
+    try:
+        worker.submit(frame(0), 0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("frame_timing error swallowed")
+    assert worker.stop()
+    assert worker.n_submitted == 0 and _pool_balanced(worker)
+    print("  (k) frame timing: computed in submit(), handed to process_frame with its "
+          "frame; nothing without frame_timing; a raising one loses no slot")
+
+
 def main() -> None:
     long = "--long" in sys.argv
     print("test_live_tracking")
@@ -662,6 +729,7 @@ def main() -> None:
     test_session()
     test_tracker_log_classes()
     test_tool_points()
+    test_frame_timing()
     print("all checks passed")
 
 

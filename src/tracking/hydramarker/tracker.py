@@ -72,6 +72,21 @@ def tracker_config_from_python(config=None):
     return cpp_config
 
 
+def ir_time_offset_ms(
+    ir_exposure_ms: float,
+    color_auto_exposure: bool,
+    color_exposure_ms: Optional[float],
+    config: Optional[TrackerConfig] = None,
+) -> float:
+    """How much earlier the IR pair was exposed than colour row 0 (ms,
+    exposure centres): (E_ir - E_rgb) / 2. The colour AE reports no
+    exposure; it counts as config.ir_time_offset_ae_exposure_ms."""
+    config = config or TrackerConfig()
+    if color_auto_exposure or color_exposure_ms is None:
+        color_exposure_ms = config.ir_time_offset_ae_exposure_ms
+    return 0.5 * (float(ir_exposure_ms) - float(color_exposure_ms))
+
+
 def create_tracker_engine(
     field_path: str,
     marker_json_path: str,
@@ -324,6 +339,9 @@ class HydraTracker:
         self._last_accepted_pose_frame = -1
         self._last_debug_counters: Dict[str, float] = {}
         self._persistent_corners: list[object] = []
+        # False once the module turned out to predate the IR time-offset
+        # correction (its process_frame_ir takes no frame time)
+        self._engine_takes_frame_time = True
 
         try:
             self._engine = create_tracker_engine(
@@ -705,20 +723,43 @@ class HydraTracker:
         run_detection: bool = True,
         ir_left: Optional[np.ndarray] = None,
         ir_right: Optional[np.ndarray] = None,
+        frame_time_ms: Optional[float] = None,
+        ir_time_offset_ms: Optional[float] = None,
     ) -> TrackerResult:
         """Process one camera frame through the C++ TrackerEngine.
 
         ir_left / ir_right: optional synchronized global-shutter IR pair for
         the IR pose refinement stage (design "B"). Ignored unless the config
-        enables ir_refine_enabled AND set_ir_calibration() was called."""
+        enables ir_refine_enabled AND set_ir_calibration() was called.
+        frame_time_ms / ir_time_offset_ms: the camera time of the frame and
+        the IR offset of colour row 0 (ir_frame_timing) for the IR
+        time-offset correction; None = unknown, nothing is shifted."""
         try:
             if ir_left is not None and ir_right is not None:
-                cpp_result = self._engine.process_frame_ir(
+                images = (
                     np.asarray(frame, dtype=np.uint8),
                     np.asarray(ir_left, dtype=np.uint8),
                     np.asarray(ir_right, dtype=np.uint8),
                     bool(run_detection),
                 )
+                if self._engine_takes_frame_time:
+                    try:
+                        cpp_result = self._engine.process_frame_ir(
+                            *images,
+                            float("nan") if frame_time_ms is None else float(frame_time_ms),
+                            float("nan") if ir_time_offset_ms is None
+                            else float(ir_time_offset_ms),
+                        )
+                    except TypeError:
+                        # a module built before the IR time-offset correction
+                        # (no frame time): track on without it until the rebuild
+                        cpp_result = self._engine.process_frame_ir(*images)
+                        self._engine_takes_frame_time = False
+                        print("[WARN] hydramarker_cpp takes no frame time (built before "
+                              "the IR time-offset correction): tracking without it "
+                              "until the module is rebuilt")
+                else:
+                    cpp_result = self._engine.process_frame_ir(*images)
             else:
                 cpp_result = self._engine.process_frame(
                     np.asarray(frame, dtype=np.uint8),
@@ -728,6 +769,22 @@ class HydraTracker:
             raise RuntimeError("C++ TrackerEngine.process_frame failed.") from exc
 
         return self._tracker_result_from_cpp_engine(cpp_result)
+
+    def ir_frame_timing(self, metadata) -> tuple[Optional[float], Optional[float]]:
+        """(frame_time_ms, ir_time_offset_ms) for process_frame from the
+        per-frame metadata of the RealSense source (camera_setup): the
+        colour frame's camera time, the frameset's IR exposure and the
+        colour exposure the source runs with. (None, None) without the
+        camera time or the IR exposure."""
+        t_ms = metadata.get("color_time_ms") if metadata else None
+        ir_us = metadata.get("ir_exposure_us") if metadata else None
+        if t_ms is None or ir_us is None:
+            return None, None
+        color = metadata.get("color_exposure") or {"auto": True}
+        offset = ir_time_offset_ms(
+            ir_us / 1000.0, color["auto"], color.get("exposure_ms"), self.config
+        )
+        return float(t_ms), offset
 
     def reset_ir_references(self) -> None:
         """Drop the IR reference library (after a runtime IR-exposure change:

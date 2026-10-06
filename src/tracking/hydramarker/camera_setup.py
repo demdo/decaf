@@ -34,6 +34,23 @@ class CameraFrame:
     ir_right: np.ndarray | None = None
 
 
+class ColorExposureState:
+    """The colour exposure a RealSense source runs with: the AE, or a
+    manual exposure (ms), as read back after the start. The tracker's IR
+    time-offset correction needs it per frame (HydraTracker.ir_frame_timing),
+    and the colour frames carry none that can be used (the AE metadata reads
+    0, the timestamps only show the exposure register). Nothing changes the
+    colour exposure at runtime; a control that does must update this state
+    and decide which frames still carry the old exposure."""
+
+    def __init__(self, auto: bool, exposure_ms: Optional[float]) -> None:
+        self.auto = bool(auto)
+        self.exposure_ms = exposure_ms
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"auto": self.auto, "exposure_ms": self.exposure_ms}
+
+
 class CameraSource:
     """Base class for live camera sources."""
 
@@ -119,6 +136,7 @@ class RealSenseCameraSource(CameraSource):
         self._profile = None
         self._stereo_sensor_cache = None
         self._ir_exposure_us = None
+        self._color_exposure: Optional[ColorExposureState] = None
         self._live_frames = None  # newest poll() frameset (keeps views alive)
 
     @property
@@ -179,6 +197,7 @@ class RealSenseCameraSource(CameraSource):
                     if is_depth and ir_exposure is not None:
                         options.append((rs.option.enable_auto_exposure, 0.0))
                         options.append((rs.option.exposure, float(ir_exposure)))
+                        self._ir_exposure_us = float(ir_exposure)
                         if ir_gain is not None:
                             options.append((rs.option.gain, float(ir_gain)))
                     for option, value in options:
@@ -240,6 +259,40 @@ class RealSenseCameraSource(CameraSource):
                 **realsense_details,
             }
         )
+        # what the colour sensor runs with after the start (read back),
+        # else what it was told
+        info = self.calibration_info
+        ae = info.get("realsense_enable_auto_exposure",
+                      getattr(self.config, "realsense_enable_auto_exposure", None))
+        exposure = info.get("realsense_exposure",
+                            getattr(self.config, "realsense_exposure", None))
+        self._color_exposure = ColorExposureState(
+            ae is None or bool(ae),
+            None if exposure is None else float(exposure) / 10.0,  # 100 us -> ms
+        )
+
+    def _frame_metadata(self, color_frame, ir_frame) -> dict[str, Any]:
+        """Per-frame metadata for the tracker (HydraTracker.ir_frame_timing):
+        the colour frame's camera time (ms), the frameset's IR exposure (us:
+        the frame's actual_exposure, else the manual exposure set) and the
+        colour exposure state. A few metadata reads, no copies."""
+        meta: dict[str, Any] = {"backend": "realsense"}
+        try:
+            meta["color_time_ms"] = float(color_frame.get_timestamp())
+        except Exception:
+            pass
+        if ir_frame is not None:
+            exposure = self._ir_exposure_us
+            try:
+                key = self._rs.frame_metadata_value.actual_exposure
+                if ir_frame.supports_frame_metadata(key):
+                    exposure = float(ir_frame.get_frame_metadata(key))
+            except Exception:
+                pass
+            meta["ir_exposure_us"] = exposure
+        if self._color_exposure is not None:
+            meta["color_exposure"] = self._color_exposure.snapshot()
+        return meta
 
     def _stereo_sensor(self):
         if self._stereo_sensor_cache is not None:
@@ -306,12 +359,15 @@ class RealSenseCameraSource(CameraSource):
         if image.size == 0:
             return None
         ir_left = ir_right = None
+        irl = None
         if getattr(self, "_ir_enabled", False):
             irl = frames.get_infrared_frame(1)
             irr = frames.get_infrared_frame(2)
             if irl and irr:
                 ir_left = np.asanyarray(irl.get_data())
                 ir_right = np.asanyarray(irr.get_data())
+            else:
+                irl = None
         # Keep the composite frameset referenced so the zero-copy views
         # above stay valid until the next poll() replaces it.
         self._live_frames = frames
@@ -319,7 +375,7 @@ class RealSenseCameraSource(CameraSource):
             image_bgr=image,
             frame_index=self._next_frame_index(),
             timestamp_s=time.time(),
-            metadata={"backend": "realsense"},
+            metadata=self._frame_metadata(color_frame, irl),
             ir_left=ir_left,
             ir_right=ir_right,
         )
@@ -333,17 +389,20 @@ class RealSenseCameraSource(CameraSource):
             return None
         image = np.asanyarray(color_frame.get_data()).copy()
         ir_left = ir_right = None
+        irl = None
         if getattr(self, "_ir_enabled", False):
             irl = frames.get_infrared_frame(1)
             irr = frames.get_infrared_frame(2)
             if irl and irr:
                 ir_left = np.asanyarray(irl.get_data()).copy()
                 ir_right = np.asanyarray(irr.get_data()).copy()
+            else:
+                irl = None
         return CameraFrame(
             image_bgr=image,
             frame_index=self._next_frame_index(),
             timestamp_s=time.time(),
-            metadata={"backend": "realsense"},
+            metadata=self._frame_metadata(color_frame, irl),
             ir_left=ir_left,
             ir_right=ir_right,
         )

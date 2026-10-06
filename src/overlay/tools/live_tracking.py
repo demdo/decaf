@@ -47,7 +47,7 @@ class FrameSlot:
 
     __slots__ = (
         "pool", "color", "ir_left", "ir_right", "has_ir",
-        "frame_index", "t_frame", "meta",
+        "frame_index", "t_frame", "meta", "timing",
     )
 
     def __init__(self, pool: "_FramePool", color_shape: tuple, ir_shape: tuple | None):
@@ -59,6 +59,7 @@ class FrameSlot:
         self.frame_index = -1
         self.t_frame = 0.0
         self.meta: dict | None = None
+        self.timing: tuple | None = None
 
     def fits(self, color_shape: tuple, ir_shape: tuple | None) -> bool:
         if self.color.shape != tuple(color_shape):
@@ -196,6 +197,12 @@ class TrackingWorker:
     on every result, right after the tracker, with the frame time
     (TrackOutput.points / points_kind), and is reset with the tracker.
 
+    frame_timing: HydraTracker.ir_frame_timing or None. Called in submit()
+    with the frame's metadata, before a slot is taken (if it raises, no
+    slot is lost); its (frame_time_ms, ir_time_offset_ms) go
+    with the frame to process_frame (IR time-offset correction). None:
+    process_frame gets neither.
+
     The tracker belongs to this thread while it runs: nobody else may call
     it until stop() returned True.
     """
@@ -203,9 +210,11 @@ class TrackingWorker:
     OUTBOX_MAX = 64
 
     def __init__(self, tracker, *, pool_size: int, keep_every_frame: bool = False,
-                 notify: Callable[[], None] | None = None, tool_points=None) -> None:
+                 notify: Callable[[], None] | None = None, tool_points=None,
+                 frame_timing: Callable[[dict], tuple] | None = None) -> None:
         self._tracker = tracker
         self._tool_points = tool_points
+        self._frame_timing = frame_timing
         self._pool = _FramePool(pool_size)
         self._keep_every_frame = bool(keep_every_frame)
         self._notify = notify
@@ -265,6 +274,8 @@ class TrackingWorker:
         ir_left, ir_right = frame.ir_left, frame.ir_right
         has_ir = ir_left is not None and ir_right is not None
         ir_shape = ir_left.shape if has_ir else None
+        timing = (None if self._frame_timing is None
+                  else self._frame_timing(frame.metadata))
 
         slot = self._pool.acquire(color.shape, ir_shape)
         if slot is None and self._keep_every_frame:
@@ -283,6 +294,7 @@ class TrackingWorker:
         slot.frame_index = int(frame.frame_index)
         slot.t_frame = float(t_frame)
         slot.meta = meta
+        slot.timing = timing
 
         with self._cond:
             if self._stopping or self._ended:
@@ -365,11 +377,16 @@ class TrackingWorker:
                         self._tracker.reset()
                         if self._tool_points is not None:
                             self._tool_points.reset()
+                    timing = {}
+                    if slot.timing is not None:
+                        timing = dict(zip(("frame_time_ms", "ir_time_offset_ms"),
+                                          slot.timing))
                     result = self._tracker.process_frame(
                         slot.color,
                         run_detection=True,
                         ir_left=slot.ir_left if slot.has_ir else None,
                         ir_right=slot.ir_right if slot.has_ir else None,
+                        **timing,
                     )
                     if self._tool_points is not None:
                         points = self._tool_points.update(result, slot.t_frame)

@@ -143,6 +143,7 @@ void TrackerEngine::reset()
     resetPoseWarmup();
     resetPoseFilter();
     ir_pose_refiner_.reset();
+    ir_prev_frame_time_ms_ = std::numeric_limits<double>::quiet_NaN();
     checkerboard_detector_.resetTracking();
     dot_detector_.reset();
     pose_tracker_.reset();
@@ -153,14 +154,20 @@ TrackerFrameResult TrackerEngine::processFrame(
     const cv::Mat& frame,
     const cv::Mat& ir_left,
     const cv::Mat& ir_right,
-    bool run_detection
+    bool run_detection,
+    double frame_time_ms,
+    double ir_time_offset_ms
 )
 {
     current_ir_left_ = ir_left;
     current_ir_right_ = ir_right;
+    ir_frame_time_ms_ = frame_time_ms;
+    ir_time_offset_ms_ = ir_time_offset_ms;
     TrackerFrameResult result = processFrame(frame, run_detection);
     current_ir_left_ = cv::Mat();
     current_ir_right_ = cv::Mat();
+    ir_frame_time_ms_ = std::numeric_limits<double>::quiet_NaN();
+    ir_time_offset_ms_ = std::numeric_limits<double>::quiet_NaN();
     return result;
 }
 
@@ -1392,8 +1399,16 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
     // velocity: at rest the calibrated weighting, under motion the orientation
     // authority moves to the shear-free IR measurement.
     double vpx = ir_last_vpx_;
+    // Frame-median signed corner motion since the previous IR frame and its
+    // time span, for the IR time-offset correction below.
+    cv::Point2d v_med(0.0, 0.0);
+    bool v_med_valid = false;
+    const double frame_dt_ms = ir_frame_time_ms_ - ir_prev_frame_time_ms_;
+    ir_prev_frame_time_ms_ = ir_frame_time_ms_;
     {
         std::vector<double> dmov;
+        std::vector<double> du;
+        std::vector<double> dv;
         std::unordered_map<int, cv::Point2d> cur;
         cur.reserve(result.corners.size());
         for (const TrackerCorner& c : result.corners) {
@@ -1405,19 +1420,55 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
             cur.emplace(key, uv);
             const auto it = ir_prev_corner_uv_.find(key);
             if (it != ir_prev_corner_uv_.end()) {
-                dmov.push_back(cv::norm(uv - it->second));
+                const cv::Point2d d = uv - it->second;
+                dmov.push_back(cv::norm(d));
+                du.push_back(d.x);
+                dv.push_back(d.y);
             }
         }
         if (dmov.size() >= 8) {
-            std::nth_element(dmov.begin(),
-                             dmov.begin() +
-                                 static_cast<std::ptrdiff_t>(dmov.size() / 2),
-                             dmov.end());
+            const auto mid = static_cast<std::ptrdiff_t>(dmov.size() / 2);
+            std::nth_element(dmov.begin(), dmov.begin() + mid, dmov.end());
             vpx = dmov[dmov.size() / 2];
             ir_last_vpx_ = vpx;    // few matches -> keep the last estimate
+            std::nth_element(du.begin(), du.begin() + mid, du.end());
+            std::nth_element(dv.begin(), dv.begin() + mid, dv.end());
+            v_med = cv::Point2d(du[du.size() / 2], dv[dv.size() / 2]);
+            v_med_valid = true;
         }
         ir_prev_corner_uv_ = std::move(cur);
     }
+    // IR -> RGB time-offset correction: corner i (colour row y_i) was
+    // exposed tau_i = offset + row_ms * y_i after the IR pair; moving by
+    // v_med over frame_dt_ms, the IR pair shows it v_med * tau_i / dt
+    // earlier on its path. One image velocity per frame (per-corner
+    // velocities add their noise to the seeds and the 3D points); the shift
+    // moves the IR seeds back and the IR 3D points forward to the colour
+    // time. Not below the dead band: at rest the velocity is noise.
+    std::vector<cv::Point2d> time_shift;
+    if (config_.ir_time_offset_enabled && v_med_valid &&
+        std::isfinite(ir_time_offset_ms_) && std::isfinite(frame_dt_ms) &&
+        frame_dt_ms > 1.0 && frame_dt_ms < 120.0) {
+        constexpr double kFramePeriodMs = 33.37;   // 30 fps stream
+        if (cv::norm(v_med) * kFramePeriodMs / frame_dt_ms >=
+            config_.ir_time_offset_deadband_px) {
+            time_shift.reserve(result.corners.size());
+            for (const TrackerCorner& c : result.corners) {
+                const double tau_ms = ir_time_offset_ms_ +
+                                      config_.ir_time_offset_row_ms * c.uv[1];
+                time_shift.push_back(v_med * (tau_ms / frame_dt_ms));
+            }
+        }
+    }
+    double shift_px = 0.0;
+    for (const cv::Point2d& s : time_shift) {
+        shift_px += cv::norm(s);
+    }
+    result.timings_ms["ir_frame_dt_ms"] = frame_dt_ms;
+    result.timings_ms["ir_time_offset_ms"] = ir_time_offset_ms_;   // as given (NaN: none)
+    result.timings_ms["ir_time_shift_px"] =
+        time_shift.empty() ? 0.0
+                           : shift_px / static_cast<double>(time_shift.size());
     // Rotation gate on the shear compensation: image velocity from
     // TRANSLATION is the rolling-shutter case (RGB corrupt, global-shutter IR
     // clean -> shift authority). Image velocity from fast ROTATION (divot
@@ -1458,7 +1509,7 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
     const std::int64_t ir_t0 = cv::getTickCount();
     const IrPoseRefinerResult fused = ir_pose_refiner_.fuse(
         current_ir_left_, current_ir_right_, rvec_in, tvec_in, rgb_xyz, rgb_uv,
-        sigma_px_eff);
+        sigma_px_eff, time_shift.empty() ? nullptr : &time_shift);
     result.timings_ms["ir_refine_ms"] = elapsedMs(ir_t0);
     result.timings_ms["ir_fit_rms_mm"] = fused.fit_rms_mm;
     // Near-range safety net: a fusion that moves the pose off the RGB image

@@ -1859,6 +1859,7 @@ class OverlayLivePage(QWidget):
             pool_size=self.TRACK_FRAME_POOL,
             notify=self._track_result_ready.emit,
             tool_points=self._tool_overlay.tool_points(),
+            frame_timing=self._tracker.ir_frame_timing,
         )
         self._track_session = TrackingSession(
             self._has_fresh_pose,

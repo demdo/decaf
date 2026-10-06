@@ -463,6 +463,26 @@ class TrackerConfig:
     # Rotation share of the image velocity (px per deg/frame), subtracted from
     # vpx so only the TRANSLATION share drives the shear compensation.
     ir_sigma_px_motion_rot_px_per_deg: float = 8.0
+    # IR -> RGB time-offset correction (engine): the IR pair is exposed at
+    # another time than the rolling-shutter colour rows (row y after row 0 by
+    # ir_time_offset_row_ms * y); under motion the engine moves the IR seeds
+    # and 3D points to the colour time of each corner, with the frame-median
+    # colour image velocity, above ir_time_offset_deadband_px per frame.
+    # HydraTracker.ir_frame_timing gives the engine the frame time and the
+    # IR offset of colour row 0, (E_ir - E_rgb) / 2 from the exposures: the
+    # IR exposure of the frame, the colour exposure the camera was told to
+    # use. The colour AE reports none; it runs as
+    # ir_time_offset_ae_exposure_ms. Measured on the 30.09./05.10. debug
+    # recordings: 27.8 us per row; 7.0 ms at row 540 with the AE and IR
+    # 8 ms, so the AE counts as 24.0 ms. Dead band 3.0 px per frame:
+    # below it the shift is at most a few tenths of a pixel and the
+    # velocity noise costs more than the correction gains (board takes,
+    # hand held in a seat: 1 px moved the drawn tip 0.041 mm further from
+    # the seat, 3.0 px 0.014 mm; fast motion fused the same).
+    ir_time_offset_enabled: bool = True
+    ir_time_offset_row_ms: float = 0.0278
+    ir_time_offset_deadband_px: float = 3.0
+    ir_time_offset_ae_exposure_ms: float = 24.0
     ir_sigma_ir_px: float = 0.05
     # IR/reproj balance: 1 = still-frame sigma calibration; 4 compensates the
     # correlated (non-IID) RGB corner errors during motion (weak-mode wobble).

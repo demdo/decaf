@@ -188,6 +188,18 @@ struct TrackerConfig {
     // driven velocity stresses the IR warp itself, so only the TRANSLATION
     // share may shift authority to IR (divot regressed otherwise).
     double ir_sigma_px_motion_rot_px_per_deg = 8.0;
+    // IR -> RGB time-offset correction. The colour camera is rolling shutter
+    // (row y is exposed ir_time_offset_row_ms * y after row 0), the IR pair is
+    // global shutter and exposed at another time of the same frameset: under
+    // motion the IR seeds and the IR 3D points show the marker where it was,
+    // not where the colour corners are. The engine moves them to the colour
+    // time of each corner's row with the frame-median colour image velocity.
+    // Needs the frame time and the IR offset of colour row 0 with the frame
+    // (processFrame with IR); without them, below the dead band (px per
+    // 33.37 ms frame) or with the flag off nothing is shifted.
+    bool ir_time_offset_enabled = true;
+    double ir_time_offset_row_ms = 0.0278;
+    double ir_time_offset_deadband_px = 3.0;
     double ir_sigma_ir_px = 0.05;         // IR corner-localisation noise (px)
     // IR/reproj balance. 1 = the still-frame sigma calibration. During MOTION
     // the RGB corner errors are CORRELATED (blur/LK lag, the weak-mode wobble),
