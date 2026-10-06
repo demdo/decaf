@@ -449,6 +449,19 @@ class TrackerConfig:
     # CHANGES, RE-DERIVE BOTH from its fit_rms distribution.
     ir_fit_gate_rms_mm: float = 2.5
     ir_fit_gate_max_trans_jump_mm: float = 6.0
+    # Near-range safety net: reject a fusion that raises the RMS reprojection
+    # of the pose's own RGB corners by more than this (px) over the RGB-only
+    # pose; the engine then reports the RGB-only pose. Under motion the gate
+    # is scaled by the shear compensation's inflation sigma_px_eff /
+    # ir_sigma_px (at least 1): there the MAP is meant to leave the sheared
+    # RGB image. timings_ms: ir_reproj_increase_px and ir_reproj_gate_px on
+    # every fusion, ir_reproj_gate_reject.
+    # Replays: at 221 mm marker distance (30.09. G02) it rejects all 44
+    # fusions (fused tip 2.8 mm / 11.5 px from the RGB-only tip), at 237 mm
+    # (A06) 14 of 358; on the fast-motion takes (05.10. M01-M04) 13 of 775
+    # (256 without the motion scaling); elsewhere 0-0.12 %.
+    # 0 disables.
+    ir_max_reproj_increase_px: float = 2.0
     # Weak-evidence honesty: inflate the MAP covariance handed to the temporal
     # filter by the reduced chi-square (fit_rms / this)^2 so the filter damps
     # poor-fit frames instead of following them. 0 disables.

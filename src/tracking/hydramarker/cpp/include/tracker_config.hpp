@@ -197,6 +197,11 @@ struct TrackerConfig {
     double ir_w3d = 4.0;
     double ir_fit_gate_rms_mm = 1.50;     // reject if MAP 3D-residual RMS exceeds
     double ir_fit_gate_max_trans_jump_mm = 3.0;  // reject if |t_map-t_rgb| exceeds
+    // Near-range safety net: reject a fusion that raises the RMS reprojection
+    // of the pose's own RGB corners by more than this (px) over the RGB-only
+    // pose, scaled by the motion inflation sigma_px_eff / ir_sigma_px (>= 1);
+    // the RGB-only pose is reported then. <= 0 disables.
+    double ir_max_reproj_increase_px = 2.0;
     // Weak-evidence honesty: the Huber-trimmed GN understates uncertainty when
     // the fit is poor (few pairs / bad matches survive). Inflate the covariance
     // handed to the temporal filter by the reduced chi-square vs this typical

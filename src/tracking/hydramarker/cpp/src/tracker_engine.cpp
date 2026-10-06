@@ -28,6 +28,42 @@ std::string formatDouble(double value, int precision)
     return stream.str();
 }
 
+// RMS reprojection error (px) of model points under one pose; -1 when the
+// projection fails.
+double reprojectionRmsPx(
+    const std::vector<cv::Vec3d>& xyz,
+    const std::vector<cv::Point2d>& uv,
+    const std::array<double, 3>& rvec,
+    const std::array<double, 3>& tvec,
+    const cv::Matx33d& K,
+    const std::vector<double>& dist_coeffs)
+{
+    if (xyz.empty() || xyz.size() != uv.size()) {
+        return -1.0;
+    }
+    cv::Mat dist_mat;
+    if (!dist_coeffs.empty()) {
+        dist_mat = cv::Mat(dist_coeffs).clone();
+    }
+    std::vector<cv::Point2d> projected;
+    try {
+        cv::projectPoints(xyz, cv::Vec3d(rvec[0], rvec[1], rvec[2]),
+                          cv::Vec3d(tvec[0], tvec[1], tvec[2]), K, dist_mat,
+                          projected);
+    } catch (const cv::Exception&) {
+        return -1.0;
+    }
+    if (projected.size() != uv.size()) {
+        return -1.0;
+    }
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < projected.size(); ++i) {
+        const cv::Point2d d = projected[i] - uv[i];
+        sum_sq += d.x * d.x + d.y * d.y;
+    }
+    return std::sqrt(sum_sq / static_cast<double>(projected.size()));
+}
+
 PoseOutputFilterConfig makePoseOutputFilterConfig(const TrackerConfig& config)
 {
     PoseOutputFilterConfig cfg;
@@ -1424,7 +1460,40 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
         sigma_px_eff);
     result.timings_ms["ir_refine_ms"] = elapsedMs(ir_t0);
     result.timings_ms["ir_fit_rms_mm"] = fused.fit_rms_mm;
-    result.timings_ms["ir_applied"] = fused.applied ? 1.0 : 0.0;
+    // Near-range safety net: a fusion that moves the pose off the RGB image
+    // (RMS reprojection of the same corners up by more than the gate) is
+    // rejected and the RGB-only pose stays. At close range the fused pose
+    // shifts by several px against the RGB image while every fit gate of the
+    // fusion passes. Under motion the shear compensation above inflates
+    // sigma_px_eff so that the MAP may leave the sheared RGB image on
+    // purpose; the gate grows with that inflation, so it only judges the
+    // shift the MAP was not allowed to make. Not a suspect RGB frame, so
+    // ir_last_fusion_rejected_ below stays a matter of the fit gates. The
+    // increase is recorded on every fusion, also with the gate off.
+    bool fusion_applied = fused.applied;
+    bool reproj_gate_reject = false;
+    if (fusion_applied) {
+        const double rms_rgb = reprojectionRmsPx(
+            rgb_xyz, rgb_uv, rvec_in, tvec_in, K_, dist_coeffs_);
+        const double rms_fused = reprojectionRmsPx(
+            rgb_xyz, rgb_uv, fused.rvec, fused.tvec, K_, dist_coeffs_);
+        if (rms_rgb >= 0.0 && rms_fused >= 0.0) {
+            const double increase_px = rms_fused - rms_rgb;
+            const double inflation =
+                config_.ir_sigma_px > 0.0
+                    ? std::max(1.0, sigma_px_eff / config_.ir_sigma_px)
+                    : 1.0;
+            const double gate_px = config_.ir_max_reproj_increase_px * inflation;
+            result.timings_ms["ir_reproj_increase_px"] = increase_px;
+            result.timings_ms["ir_reproj_gate_px"] = gate_px;
+            if (config_.ir_max_reproj_increase_px > 0.0 && increase_px > gate_px) {
+                fusion_applied = false;
+                reproj_gate_reject = true;
+            }
+        }
+    }
+    result.timings_ms["ir_reproj_gate_reject"] = reproj_gate_reject ? 1.0 : 0.0;
+    result.timings_ms["ir_applied"] = fusion_applied ? 1.0 : 0.0;
     result.timings_ms["ir_mode"] = static_cast<double>(fused.mode);
     result.timings_ms["ir_ref_count"] =
         static_cast<double>(fused.ref_count);
@@ -1448,7 +1517,7 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
     result.rvec_prefusion = result.rvec;
     result.tvec_prefusion = result.tvec;
 
-    if (fused.applied) {
+    if (fusion_applied) {
         // MAP fusion: the tightly-coupled RGB-reprojection + IR-stereo-3D solve
         // replaces the reported pose (rotation + translation), covariance-
         // weighted so IR only moves the DOF it observes well.
