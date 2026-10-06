@@ -41,7 +41,12 @@ from overlay.tools.xray_io import read_xray_gray_u8
 # (HydraTracker, C++ engine) is imported lazily in _start_tracking so the
 # GUI starts and the overlay runs even when the tracking build is absent;
 # overlay.tools.live_tracking (its thread) imports neither Qt nor the engine.
-from tracking.hydramarker.camera_setup import RealSenseCameraSource
+from tracking.hydramarker.camera_setup import (
+    RealSenseCameraSource,
+    format_realsense_color,
+    realsense_color_readback,
+    realsense_color_summary,
+)
 from tracking.hydramarker.config import CameraConfig
 
 
@@ -1031,6 +1036,9 @@ class OverlayLivePage(QWidget):
         self.on_complete_changed = on_complete_changed
 
         self.camera: RealSenseCameraSource | None = None
+        # colour options read back after the camera start
+        # (camera_setup.realsense_color_readback)
+        self._camera_color: dict = {}
         self.timer: QTimer | None = None
 
         # --- tool tracking runtime state ---
@@ -1412,6 +1420,20 @@ class OverlayLivePage(QWidget):
         camera = RealSenseCameraSource(cfg)
         camera.start()
         self.camera = camera
+        # The colour options are the CameraConfig defaults; the start sets
+        # them and reads them back. Evaluation mode keeps the read-back:
+        # session.json "realsense_color" (the last start) and a log.md row
+        # per start.
+        self._camera_color = realsense_color_readback(camera.calibration_info)
+        ev = self.state.eval
+        if ev is not None:
+            # bookkeeping must not fail the camera start
+            try:
+                ev.set_meta("realsense_color", self._camera_color)
+                ev.log("overlay_live", "-", realsense_color_summary(self._camera_color),
+                       tagged=False)
+            except Exception as e:
+                print(f"[WARN] Could not record the colour options: {e}")
 
     def _stop_realsense(self) -> None:
         if self.camera is None:
@@ -2542,21 +2564,9 @@ class OverlayLivePage(QWidget):
                 if (PROFILE_LIVE and ev is not None) else None
             )
             if self._profile is not None:
+                # the session header follows the camera start (it names the
+                # colour options read back); the first window counts from here
                 self._profile.reset()
-                if self._tracking_only:
-                    layer = "no x-ray (tracking only)"
-                else:
-                    h, w = self._xray_gray_u8.shape[:2]
-                    layer = (
-                        f"x-ray {w}x{h}, "
-                        f"{len(self._H_xc_lookup)} precomputed homographies"
-                    )
-                self._profile.emit(
-                    f"[live] === session start {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                    f"=== colour {self.COLOR_SIZE[0]}x{self.COLOR_SIZE[1]} @ "
-                    f"{self.FPS} fps, {layer}, "
-                    f"drill tracking in a worker thread"
-                )
             if self._tracking_only and ev is not None:
                 # which drill the tracking test runs with
                 ir_path = getattr(self.state, "ir_calibration_path", None)
@@ -2570,6 +2580,22 @@ class OverlayLivePage(QWidget):
                 }, tagged=False)
 
             self._start_realsense()
+            if self._profile is not None:
+                if self._tracking_only:
+                    layer = "no x-ray (tracking only)"
+                else:
+                    h, w = self._xray_gray_u8.shape[:2]
+                    layer = (
+                        f"x-ray {w}x{h}, "
+                        f"{len(self._H_xc_lookup)} precomputed homographies"
+                    )
+                self._profile.emit(
+                    f"[live] === session start {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"=== colour {self.COLOR_SIZE[0]}x{self.COLOR_SIZE[1]} @ "
+                    f"{self.FPS} fps, {layer}, "
+                    f"drill tracking in a worker thread; colour sensor "
+                    f"{format_realsense_color(self._camera_color) or 'not read back'}"
+                )
             self._start_timer()
             self.setFocus()
 
