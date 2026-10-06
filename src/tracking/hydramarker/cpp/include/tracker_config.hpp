@@ -203,6 +203,10 @@ struct TrackerConfig {
     // pose, scaled by the motion inflation sigma_px_eff / ir_sigma_px (>= 1);
     // the RGB-only pose is reported then. <= 0 disables.
     double ir_max_reproj_increase_px = 2.0;
+    // Upper bound (px) of that gate: the motion scaling grows with the image
+    // motion between two processed frames, i.e. with every dropped frame.
+    // <= 0: no bound.
+    double ir_reproj_gate_max_px = 10.0;
     // Weak-evidence honesty: the Huber-trimmed GN understates uncertainty when
     // the fit is poor (few pairs / bad matches survive). Inflate the covariance
     // handed to the temporal filter by the reduced chi-square vs this typical

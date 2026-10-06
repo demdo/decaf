@@ -501,6 +501,11 @@ class TrackerConfig:
     # (256 without the motion scaling); elsewhere 0-0.12 %.
     # 0 disables.
     ir_max_reproj_increase_px: float = 2.0
+    # Upper bound (px) of that gate. The motion scaling grows with the image
+    # motion between two processed frames, i.e. with every frame the tracking
+    # thread drops: live-paced replays reached 1181 px, where the
+    # gate no longer judges anything. <= 0: no bound.
+    ir_reproj_gate_max_px: float = 10.0
     # Weak-evidence honesty: inflate the MAP covariance handed to the temporal
     # filter by the reduced chi-square (fit_rms / this)^2 so the filter damps
     # poor-fit frames instead of following them. 0 disables.

@@ -1456,6 +1456,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
                        &TrackerConfig::ir_fit_gate_max_trans_jump_mm)
         .def_readwrite("ir_max_reproj_increase_px",
                        &TrackerConfig::ir_max_reproj_increase_px)
+        .def_readwrite("ir_reproj_gate_max_px",
+                       &TrackerConfig::ir_reproj_gate_max_px)
         .def_readwrite("ir_enroll_max_rot_deg", &TrackerConfig::ir_enroll_max_rot_deg)
         .def_readwrite("ir_enroll_max_trans_mm", &TrackerConfig::ir_enroll_max_trans_mm)
         .def_readwrite("ir_ref_tile_deg", &TrackerConfig::ir_ref_tile_deg)

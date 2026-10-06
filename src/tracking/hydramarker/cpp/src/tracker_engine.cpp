@@ -1468,9 +1468,11 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
     // fusion passes. Under motion the shear compensation above inflates
     // sigma_px_eff so that the MAP may leave the sheared RGB image on
     // purpose; the gate grows with that inflation, so it only judges the
-    // shift the MAP was not allowed to make. Not a suspect RGB frame, so
-    // ir_last_fusion_rejected_ below stays a matter of the fit gates. The
-    // increase is recorded on every fusion, also with the gate off.
+    // shift the MAP was not allowed to make, up to ir_reproj_gate_max_px
+    // (with dropped frames the inflation grows without a useful limit). Not
+    // a suspect RGB frame, so ir_last_fusion_rejected_ below stays a matter
+    // of the fit gates. The increase is recorded on every fusion, also with
+    // the gate off.
     bool fusion_applied = fused.applied;
     bool reproj_gate_reject = false;
     if (fusion_applied) {
@@ -1484,7 +1486,10 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
                 config_.ir_sigma_px > 0.0
                     ? std::max(1.0, sigma_px_eff / config_.ir_sigma_px)
                     : 1.0;
-            const double gate_px = config_.ir_max_reproj_increase_px * inflation;
+            double gate_px = config_.ir_max_reproj_increase_px * inflation;
+            if (config_.ir_reproj_gate_max_px > 0.0) {
+                gate_px = std::min(gate_px, config_.ir_reproj_gate_max_px);
+            }
             result.timings_ms["ir_reproj_increase_px"] = increase_px;
             result.timings_ms["ir_reproj_gate_px"] = gate_px;
             if (config_.ir_max_reproj_increase_px > 0.0 && increase_px > gate_px) {
