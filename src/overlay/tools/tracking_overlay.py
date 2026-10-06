@@ -7,9 +7,10 @@ belong here, not in the page. The same performance rules as the rest of
 the live loop apply: draw directly into the frame buffer, touch only the
 glyph pixels, no per-frame allocations beyond a few small arrays.
 
-Per frame this costs two 3x3 rotations (tip_camera_blend), one
-cv2.projectPoints over two points and a handful of cv2.line calls —
-well under 0.1 ms.
+The camera-frame points come from ToolPoints, which runs in the tracking
+thread on every result (overlay.tools.live_tracking.TrackingWorker); per
+frame the GUI thread pays one cv2.projectPoints over two points and a
+handful of cv2.line calls — well under 0.1 ms.
 """
 
 from __future__ import annotations
@@ -25,8 +26,9 @@ _ZERO3 = np.zeros(3)
 class TrackingOverlay:
     """Projects tip + drill axis of one tracked tool and draws them in place.
 
-    update(result) per fresh pose, clear() on loss, draw_into(frame) per
-    composed frame. All 3D inputs are marker-frame millimetres.
+    update(points) per fresh pose (TrackOutput.points, from the ToolPoints
+    of tool_points()), clear() on loss, draw_into(frame) per composed
+    frame. p_tip_mm / axis_dir are marker-frame millimetres.
     """
 
     # Dashed shaft segment: from the tip toward the marker (the physical
@@ -43,12 +45,6 @@ class TrackingOverlay:
     TIP_CROSS = 20
 
     def __init__(self, K, dist, p_tip_mm, axis_dir) -> None:
-        # Lazy import: pulls in the C++ tracker module, which must only
-        # load once tracking is actually used.
-        from tracking.hydramarker.tracker import tip_camera_blend
-
-        self._blend = tip_camera_blend
-
         self._K = np.asarray(K, dtype=np.float64)
         self._dist = None if dist is None else np.asarray(dist, dtype=np.float64)
 
@@ -63,23 +59,30 @@ class TrackingOverlay:
 
         self._tip_uv: Optional[np.ndarray] = None
         self._back_uv: Optional[np.ndarray] = None
-        # The blended camera-frame points behind the pixels (mm), kept for
-        # the snapshot record; not needed for drawing.
+        # The camera-frame points behind the pixels (mm), kept for the
+        # snapshot record; not needed for drawing.
         self._tip_cam: Optional[np.ndarray] = None
         self._back_cam: Optional[np.ndarray] = None
+
+    def tool_points(self) -> "ToolPoints":
+        """A ToolPoints of this tool's tip and back point, for the tracking
+        thread."""
+        return ToolPoints(self._p_tip, self._p_back)
 
     # ------------------------------------------------------------------
     # Per-frame state
     # ------------------------------------------------------------------
 
-    def update(self, result) -> None:
-        """Recompute the 2D geometry from a fresh TrackerResult."""
-        tip_cam = self._blend(result, self._p_tip)
-        back_cam = self._blend(result, self._p_back)
+    def update(self, points) -> None:
+        """Recompute the 2D geometry from the camera-frame points of a fresh
+        result (TrackOutput.points: rows tip and back point, mm)."""
+        if points is None:
+            self.clear()
+            return
+        tip_cam = np.asarray(points[0], dtype=np.float64).reshape(3)
+        back_cam = np.asarray(points[1], dtype=np.float64).reshape(3)
         if (
-            tip_cam is None
-            or back_cam is None
-            or tip_cam[2] <= 0.0
+            tip_cam[2] <= 0.0
             or back_cam[2] <= 0.0
         ):
             self.clear()
@@ -116,7 +119,7 @@ class TrackingOverlay:
         """The numbers behind the current drawing, JSON-ready; None without a pose.
 
         tip_uv/back_uv are the exact float pixels draw_into rounds from,
-        tip_cam/back_cam the blended camera-frame points (mm) they were
+        tip_cam/back_cam the camera-frame points (mm, ToolPoints) they were
         projected from, p_tip/axis_dir/axis_back_mm the tool geometry.
         """
         if self._tip_uv is None:
@@ -205,3 +208,84 @@ class TrackingOverlay:
             thickness=self.THICKNESS,
             line_type=cv2.LINE_AA,
         )
+
+
+class ToolPoints:
+    """Tip and axis back point in the camera frame (mm), the points the Live
+    page draws, from one TrackerResult. p_tip_mm / p_back_mm are the
+    marker-frame points of TrackingOverlay.tool_points().
+
+    Runs in the tracking thread (TrackingWorker) on every result, in
+    processing order, with the frame time; the GUI thread only projects the
+    two points (TrackingOverlay.update). Stateful, hence reset() whenever
+    the tracker is reset.
+
+    The live tracker runs with the output filter off (pose_kf_enabled =
+    False): result.rvec/tvec is the unfiltered pose, IR-fused where the
+    fusion was applied (timings_ms ir_applied), the RGB-only pose
+    otherwise. Live, the fusion is not applied on every frame (no IR pair,
+    rejected by its fit gates); drawing the RGB-only pose there would make
+    the tip jump by the fused-minus-RGB offset at every switch. So on such
+    a frame the RGB-only points are shifted by the camera-frame offset of
+    the tip and back point of the last fused frame (fused points minus the
+    RGB-only points of rvec_prefusion / tvec_prefusion), for at most
+    max_carry_s of frame time after it; without a recent offset the
+    RGB-only points are drawn. A fusion the engine rejected for raising the
+    RGB reprojection (ir_reproj_gate_reject, near range) drops the offset:
+    carrying it would bring back exactly the shift the gate rejected.
+
+    kind after update(): "fused", "carry", "rgb", "gate" (RGB-only, fusion
+    rejected by the reprojection gate) or None (no pose).
+    """
+
+    # Replays of the live runs: a carried offset is off from the fused one
+    # by 0.78 mm (median; p90 2.01) 0.85-1.25 s after its fused frame,
+    # dropping it by 0.99 mm (p90 2.09); after longer the p90 is worse than
+    # dropping. Max age by frame time, not by processed frames.
+    MAX_CARRY_S = 1.0
+
+    def __init__(self, p_tip_mm, p_back_mm, max_carry_s: Optional[float] = None) -> None:
+        # rows: tip, marker-side end of the dashed shaft segment
+        self._p = np.stack([
+            np.asarray(p_tip_mm, dtype=np.float64).reshape(3),
+            np.asarray(p_back_mm, dtype=np.float64).reshape(3),
+        ])
+        self.max_carry_s = self.MAX_CARRY_S if max_carry_s is None else float(max_carry_s)
+        self.reset()
+
+    def reset(self) -> None:
+        self._offset: Optional[np.ndarray] = None   # fused - RGB-only, rows as _p
+        self._t_offset = 0.0
+        self.kind: Optional[str] = None
+
+    def _points(self, rvec, tvec) -> np.ndarray:
+        R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+        return self._p @ R.T + np.asarray(tvec, dtype=np.float64).reshape(1, 3)
+
+    def update(self, result, t_frame: float) -> Optional[np.ndarray]:
+        """(2, 3) camera-frame points [tip, back] in mm, None without a pose."""
+        self.kind = None
+        rvec = getattr(result, "rvec", None)
+        tvec = getattr(result, "tvec", None)
+        if rvec is None or tvec is None:
+            return None
+        pts = self._points(rvec, tvec)
+        timings = getattr(result, "timings_ms", None) or {}
+        if float(timings.get("ir_applied", 0.0)) > 0.5:
+            rp = getattr(result, "rvec_prefusion", None)
+            tp = getattr(result, "tvec_prefusion", None)
+            if rp is not None and tp is not None:
+                self._offset = pts - self._points(rp, tp)
+                self._t_offset = float(t_frame)
+            self.kind = "fused"
+            return pts
+        # no fusion this frame: rvec/tvec is the RGB-only pose
+        if float(timings.get("ir_reproj_gate_reject", 0.0)) > 0.5:
+            self._offset = None
+            self.kind = "gate"
+            return pts
+        if self._offset is not None and float(t_frame) - self._t_offset <= self.max_carry_s:
+            self.kind = "carry"
+            return pts + self._offset
+        self.kind = "rgb"
+        return pts

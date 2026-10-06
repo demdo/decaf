@@ -26,6 +26,9 @@ while the worker reads it fails the test.
     outputs that is, hint at 3 s, old epochs ignored, re-entry flag,
     failure-log calls
 (i) tracker_log classes for held detections, appearance rejects and holds
+(j) ToolPoints: fused pose, offset carry within max_carry_s of frame time,
+    RGB-only after it, offset dropped by the reprojection gate and reset();
+    in the worker: points of every result, in order, reset with the tracker
 
 Run from src/:
 
@@ -54,6 +57,7 @@ from overlay.tools.live_tracking import (
     TrackingWorker,
     TrackOutput,
 )
+from overlay.tools.tracking_overlay import ToolPoints, TrackingOverlay
 
 
 COLOR_SHAPE = (48, 64, 4)
@@ -552,6 +556,99 @@ def test_tracker_log_classes() -> None:
     print("  (i) tracker_log: old keys unchanged, held / appearance / hold-cause keys")
 
 
+# ============================================================
+# Drawn points
+# ============================================================
+
+P_TIP = np.array([12.0, -179.0, -1.0])
+P_BACK = np.array([12.0, -129.0, -1.0])
+
+
+def _pose_result(t_rgb, *, applied: bool, d_fused=(0.0, 0.0, 0.0), gate: bool = False,
+                 ir: bool = True):
+    """Identity rotation; RGB-only translation t_rgb, the fusion adds d_fused."""
+    t_rgb = np.asarray(t_rgb, np.float64)
+    t_out = t_rgb + np.asarray(d_fused, np.float64) if applied else t_rgb
+    timings = {}
+    if ir:
+        timings = {"ir_applied": 1.0 if applied else 0.0,
+                   "ir_reproj_gate_reject": 1.0 if gate else 0.0}
+    return SimpleNamespace(
+        rvec=np.zeros(3), tvec=t_out,
+        rvec_prefusion=np.zeros(3) if ir else None,
+        tvec_prefusion=t_rgb if ir else None,
+        timings_ms=timings,
+    )
+
+
+def test_tool_points() -> None:
+    tp = ToolPoints(P_TIP, P_BACK, max_carry_s=0.5)
+    back = P_BACK
+    t0 = np.array([0.0, 0.0, 400.0])
+    d = np.array([0.1, -0.2, 2.0])
+
+    pts = tp.update(_pose_result(t0, applied=True, d_fused=d), 0.0)
+    assert tp.kind == "fused"
+    assert np.allclose(pts, [P_TIP + t0 + d, back + t0 + d])
+    # no fusion: RGB-only pose + the fused-minus-RGB offset, the drill moved 1 mm
+    t1 = t0 + [1.0, 0.0, 0.0]
+    pts = tp.update(_pose_result(t1, applied=False), 0.5)
+    assert tp.kind == "carry" and np.allclose(pts, [P_TIP + t1 + d, back + t1 + d])
+    # past max_carry_s of frame time after the last fused frame: RGB-only
+    pts = tp.update(_pose_result(t1, applied=False), 0.51)
+    assert tp.kind == "rgb" and np.allclose(pts, [P_TIP + t1, back + t1])
+    # IR stage not run at all (no pair): carried like a rejected fusion
+    tp.update(_pose_result(t0, applied=True, d_fused=d), 1.0)
+    pts = tp.update(_pose_result(t1, applied=False, ir=False), 1.1)
+    assert tp.kind == "carry" and np.allclose(pts[0], P_TIP + t1 + d)
+    # the reprojection gate: RGB-only, and the offset is gone afterwards
+    pts = tp.update(_pose_result(t1, applied=False, gate=True), 1.2)
+    assert tp.kind == "gate" and np.allclose(pts[0], P_TIP + t1)
+    tp.update(_pose_result(t1, applied=False), 1.3)
+    assert tp.kind == "rgb"
+    # reset drops the offset
+    tp.update(_pose_result(t0, applied=True, d_fused=d), 2.0)
+    tp.reset()
+    tp.update(_pose_result(t1, applied=False), 2.1)
+    assert tp.kind == "rgb"
+    # no pose
+    assert tp.update(SimpleNamespace(rvec=None, tvec=None, timings_ms={}), 3.0) is None
+    assert tp.kind is None
+    # the default carry age; the overlay hands over its own tip and back point
+    assert ToolPoints(P_TIP, P_BACK).max_carry_s == ToolPoints.MAX_CARRY_S
+    ov = TrackingOverlay(np.eye(3), None, P_TIP, [0.0, 2.0, 0.0])
+    pts = ov.tool_points().update(_pose_result(t0, applied=False, ir=False), 0.0)
+    assert np.allclose(pts, [P_TIP + t0, P_TIP + [0.0, TrackingOverlay.AXIS_BACK_MM, 0.0] + t0])
+
+    # in the worker: every result gets its points, in order, with its frame
+    # time; a requested reset resets ToolPoints with the tracker
+    class PoseTracker(FakeTracker):
+        def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None):
+            v = int(color[0, 0, 0])
+            self.calls.append(("process", v, threading.get_ident()))
+            # frames 0, 1 fused; 2, 3 not
+            return _pose_result(t0 + [v, 0.0, 0.0], applied=v < 2, d_fused=d)
+
+    tracker = PoseTracker()
+    worker = TrackingWorker(tracker, pool_size=5, tool_points=ToolPoints(P_TIP, P_BACK, max_carry_s=0.5))
+    worker.start()
+    outs = []
+    for i in range(4):
+        if i == 3:
+            worker.request_reset()
+        worker.submit(_frame(i), 0.1 * i)
+        assert _wait_until(lambda: worker.n_processed == i + 1)
+        outs += _drain_all(worker)
+    assert worker.stop()
+    assert [o.points_kind for o in outs] == ["fused", "fused", "carry", "rgb"], \
+        [o.points_kind for o in outs]
+    assert np.allclose(outs[2].points[0], P_TIP + t0 + [2.0, 0.0, 0.0] + d)
+    assert np.allclose(outs[3].points[0], P_TIP + t0 + [3.0, 0.0, 0.0])
+    assert _pool_balanced(worker)
+    print("  (j) tool points: fused, carry for 0.5 s of frame time, then RGB-only; "
+          "gate and reset drop the offset; computed in the worker, reset with the tracker")
+
+
 def main() -> None:
     long = "--long" in sys.argv
     print("test_live_tracking")
@@ -564,6 +661,7 @@ def main() -> None:
     test_exception()
     test_session()
     test_tracker_log_classes()
+    test_tool_points()
     print("all checks passed")
 
 

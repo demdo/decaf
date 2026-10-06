@@ -8,7 +8,9 @@ processing order, through an outbox the GUI thread drains on its timer.
 TrackingSession turns those results into the page's tracking state
 (searching, tracking, engine reset after a loss, status texts), also in
 the GUI thread, so every widget, the overlay and the logs keep a single
-writer.
+writer. The drill's camera-frame points (tracking_overlay.ToolPoints) are
+computed in the worker, right after the tracker, and travel with the
+result.
 
 Qt-free and engine-free on purpose: the evaluation script and the unit
 test use exactly these classes, without a QApplication, a camera or the
@@ -117,19 +119,22 @@ class TrackOutput:
     keeps its image on the page). t_frame is the perf_counter() of the poll
     that delivered the frame, t_start / t_done bracket the tracker call in
     the worker (reset included), skipped counts the newer frames that
-    replaced a pending one since the previous processed frame.
+    replaced a pending one since the previous processed frame. points /
+    points_kind: the worker's ToolPoints.update() and .kind for this result
+    (None without tool_points or without a pose).
     """
 
     __slots__ = (
         "slot", "frame_index", "t_frame", "meta", "has_ir", "epoch",
         "result", "t_start", "t_done", "skipped", "reset",
-        "error", "traceback", "frame_dropped",
+        "error", "traceback", "frame_dropped", "points", "points_kind",
     )
 
     def __init__(self, slot: FrameSlot, epoch: int, *, result=None,
                  t_start: float = 0.0, t_done: float = 0.0, skipped: int = 0,
                  reset: bool = False, error: BaseException | None = None,
-                 traceback_text: str | None = None) -> None:
+                 traceback_text: str | None = None, points=None,
+                 points_kind: str | None = None) -> None:
         self.slot: FrameSlot | None = slot
         self.frame_index = slot.frame_index
         self.t_frame = slot.t_frame
@@ -143,6 +148,8 @@ class TrackOutput:
         self.reset = reset
         self.error = error
         self.traceback = traceback_text
+        self.points = points
+        self.points_kind = points_kind
         # eval mode: the slot was taken back for a newer frame before the
         # output was drained (its image is gone, the result is not)
         self.frame_dropped = False
@@ -185,6 +192,10 @@ class TrackingWorker:
     (frame_dropped) instead of skipping the frame, so the tracker input is
     the page's.
 
+    tool_points: tracking_overlay.ToolPoints or None. Runs in this thread
+    on every result, right after the tracker, with the frame time
+    (TrackOutput.points / points_kind), and is reset with the tracker.
+
     The tracker belongs to this thread while it runs: nobody else may call
     it until stop() returned True.
     """
@@ -192,8 +203,9 @@ class TrackingWorker:
     OUTBOX_MAX = 64
 
     def __init__(self, tracker, *, pool_size: int, keep_every_frame: bool = False,
-                 notify: Callable[[], None] | None = None) -> None:
+                 notify: Callable[[], None] | None = None, tool_points=None) -> None:
         self._tracker = tracker
+        self._tool_points = tool_points
         self._pool = _FramePool(pool_size)
         self._keep_every_frame = bool(keep_every_frame)
         self._notify = notify
@@ -347,15 +359,21 @@ class TrackingWorker:
                     epoch = self._epoch
 
                 t_start = time.perf_counter()
+                points = points_kind = None
                 try:
                     if reset:
                         self._tracker.reset()
+                        if self._tool_points is not None:
+                            self._tool_points.reset()
                     result = self._tracker.process_frame(
                         slot.color,
                         run_detection=True,
                         ir_left=slot.ir_left if slot.has_ir else None,
                         ir_right=slot.ir_right if slot.has_ir else None,
                     )
+                    if self._tool_points is not None:
+                        points = self._tool_points.update(result, slot.t_frame)
+                        points_kind = self._tool_points.kind
                 except Exception as exc:
                     out = TrackOutput(
                         slot, epoch, t_start=t_start, t_done=time.perf_counter(),
@@ -368,6 +386,7 @@ class TrackingWorker:
                 out = TrackOutput(
                     slot, epoch, result=result, t_start=t_start,
                     t_done=time.perf_counter(), skipped=skipped, reset=reset,
+                    points=points, points_kind=points_kind,
                 )
                 slot = None
                 self._publish(out)

@@ -1511,9 +1511,9 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
     // so ir_delta_rot_deg (how far the fusion rotated the pose) is a new signal.
     result.timings_ms["ir_delta_rot_deg"] = 0.0;
 
-    // Remember the RGB-only pose before the fusion overwrites rvec/tvec. The tip
-    // blend downstream keeps this pose's image-plane and takes only the fused
-    // depth (see TrackerFrameResult::rvec_prefusion).
+    // Remember the RGB-only pose before the fusion overwrites rvec/tvec. The
+    // Live page's drawn tip carries the fused-minus-RGB offset with it on
+    // frames without fusion (see TrackerFrameResult::rvec_prefusion).
     result.rvec_prefusion = result.rvec;
     result.tvec_prefusion = result.tvec;
 

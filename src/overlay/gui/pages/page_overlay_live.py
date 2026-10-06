@@ -1770,6 +1770,10 @@ class OverlayLivePage(QWidget):
         config = make_live_tracker_config()
         ir_path = getattr(self.state, "ir_calibration_path", None)
         config.ir_refine_enabled = bool(ir_path)
+        # The drill is drawn from the unfiltered pose (tracking_overlay.
+        # ToolPoints): the output filter pulls the pose off the image in
+        # motion and does not smooth at rest. On again once it is repaired.
+        config.pose_kf_enabled = False
 
         # The log file lives in the Evaluation session folder; Normal mode
         # keeps no failure log.
@@ -1832,6 +1836,7 @@ class OverlayLivePage(QWidget):
             self._tracker,
             pool_size=self.TRACK_FRAME_POOL,
             notify=self._track_result_ready.emit,
+            tool_points=self._tool_overlay.tool_points(),
         )
         self._track_session = TrackingSession(
             self._has_fresh_pose,
@@ -1989,7 +1994,7 @@ class OverlayLivePage(QWidget):
 
         # the overlay first: if it raises, no result has changed hands yet
         if step.fresh:
-            self._tool_overlay.update(out.result)
+            self._tool_overlay.update(out.points)
         else:
             self._tool_overlay.clear()
         previous = (self._pose_out, self._live_out)
@@ -2147,7 +2152,7 @@ class OverlayLivePage(QWidget):
                     self._tool.p_tip_mm,
                     self._tool.axis_dir,
                 )
-                drill.update(drawn.result)
+                drill.update(drawn.points)
                 drill.draw_into(comp, show_tip=True, show_axis=True)
                 cv2.imwrite(
                     str(out_dir / "03_rgb_overlay_drill.png"),
@@ -2229,6 +2234,8 @@ class OverlayLivePage(QWidget):
 
         if drawn is not None:
             tool = drill.snapshot_record()
+            # fused / carry / rgb / gate: tracking_overlay.ToolPoints.kind
+            tool["points_kind"] = drawn.points_kind
             res = drawn.result
             tool["pose"] = None if res is None else {
                 "rvec": arr(res.rvec),

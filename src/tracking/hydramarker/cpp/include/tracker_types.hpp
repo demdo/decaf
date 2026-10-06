@@ -77,11 +77,11 @@ struct TrackerFrameResult {
     std::vector<double> tvec;
     std::vector<double> T_marker_camera;
     // Pre-fusion (RGB-only) pose, captured before the IR stereo fusion may
-    // overwrite rvec/tvec. Empty when IR refinement did not run. Downstream tip
-    // computation blends the two: image-plane (camera x,y) from this RGB pose
-    // (rolling-shutter-sharp, monocular-precise laterally), depth (camera z)
-    // from the fused rvec/tvec (the unique IR stereo contribution) -- keeps the
-    // IR depth gain without the IR lateral tilt wandering the tip over the lever.
+    // overwrite rvec/tvec. Empty when IR refinement did not run. Used by the
+    // drawn-tip offset carry of the Live page (fused minus RGB-only points of
+    // the last fused frame, overlay.tools.tracking_overlay.ToolPoints) and by
+    // tip_camera_blend() in the scripts (image plane from this pose, depth
+    // from the fused one).
     std::vector<double> rvec_prefusion;
     std::vector<double> tvec_prefusion;
     // 6x6 covariance (rvec, tvec) of the output pose filter, row-major (36

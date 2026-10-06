@@ -204,7 +204,8 @@ class TrackerResult:
     rvec: Optional[np.ndarray] = None
     tvec: Optional[np.ndarray] = None
     # Pre-fusion (RGB-only) pose; None unless IR refinement ran this frame. Used
-    # by tip_camera_blend() to keep the RGB image-plane and the IR depth.
+    # by the drawn-tip offset carry (overlay.tools.tracking_overlay.ToolPoints)
+    # and by tip_camera_blend() in the scripts.
     rvec_prefusion: Optional[np.ndarray] = None
     tvec_prefusion: Optional[np.ndarray] = None
     T_marker_camera: Optional[np.ndarray] = None
