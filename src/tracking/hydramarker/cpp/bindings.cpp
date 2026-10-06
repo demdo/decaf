@@ -1023,7 +1023,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("max_translation_jump_mm", &PoseOutputFilterConfig::max_translation_jump_mm)
         .def_readwrite("min_points", &PoseOutputFilterConfig::min_points)
         .def_readwrite("frame_period_s", &PoseOutputFilterConfig::frame_period_s)
-        .def_readwrite("max_gap_s", &PoseOutputFilterConfig::max_gap_s);
+        .def_readwrite("max_gap_s", &PoseOutputFilterConfig::max_gap_s)
+        .def_readwrite("switch_offset_time_s", &PoseOutputFilterConfig::switch_offset_time_s);
 
     py::class_<PoseOutputFilterResult>(m, "PoseOutputFilterResult")
         .def_readonly("applied", &PoseOutputFilterResult::applied)
@@ -1440,6 +1441,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("pose_kf_meas_floor_trans_mm", &TrackerConfig::pose_kf_meas_floor_trans_mm)
         .def_readwrite("pose_kf_frame_period_s", &TrackerConfig::pose_kf_frame_period_s)
         .def_readwrite("pose_kf_max_gap_s", &TrackerConfig::pose_kf_max_gap_s)
+        .def_readwrite("pose_kf_switch_offset_time_s", &TrackerConfig::pose_kf_switch_offset_time_s)
         .def_readwrite("ir_refine_enabled", &TrackerConfig::ir_refine_enabled)
         .def_readwrite("ir_min_pairs", &TrackerConfig::ir_min_pairs)
         .def_readwrite("ir_min_ref_rot_deg", &TrackerConfig::ir_min_ref_rot_deg)

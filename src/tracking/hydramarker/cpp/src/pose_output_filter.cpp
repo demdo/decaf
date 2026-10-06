@@ -54,6 +54,11 @@ void PoseOutputFilter::reset()
     gate_streak_ = 0;
     t_prev_s_ = -1.0;
     t_update_s_ = -1.0;
+    switch_offset_ = cv::Vec<double, 6>::all(0.0);
+    rgb_minus_fused_ = cv::Vec<double, 6>::all(0.0);
+    have_rgb_minus_fused_ = false;
+    last_source_ = PoseMeasurementSource::Unknown;
+    t_offset_s_ = -1.0;
 }
 
 double PoseOutputFilter::stepFrames(double t_s)
@@ -143,7 +148,9 @@ PoseOutputFilterResult PoseOutputFilter::update(
     const std::vector<cv::Point3d>& object_points,
     const std::array<double, 36>* ext_meas_cov,
     double meas_var_scale,
-    double t_s)
+    double t_s,
+    PoseMeasurementSource source,
+    const std::array<double, 6>* rgb_only_pose)
 {
     PoseOutputFilterResult result;
     if (!config_.enabled) {
@@ -168,6 +175,52 @@ PoseOutputFilterResult PoseOutputFilter::update(
         t_update_s_ = t_s;
     }
 
+    // Bumpless switching: keep the measurement level continuous where the
+    // source changes. On a fused frame the RGB-only pose of the same frame
+    // gives the offset b = rgb - fused; RGB-only -> fused adds b to the shift,
+    // fused -> RGB-only subtracts the last b. The shift decays.
+    const cv::Mat z_raw = z.clone();
+    if (config_.switch_offset_time_s > 0.0 &&
+        source != PoseMeasurementSource::Unknown) {
+        double dt_off = config_.frame_period_s;
+        if (t_s > 0.0) {
+            dt_off = t_offset_s_ > 0.0 ? std::max(0.0, t_s - t_offset_s_) : 0.0;
+            t_offset_s_ = t_s;
+        }
+        if (initialized_) {
+            switch_offset_ *= std::exp(-dt_off / config_.switch_offset_time_s);
+        }
+        if (source == PoseMeasurementSource::Fused && rgb_only_pose != nullptr) {
+            cv::Vec<double, 6> b;
+            for (int i = 0; i < 6; ++i) {
+                b[i] = (*rgb_only_pose)[static_cast<size_t>(i)] - z.at<double>(i);
+            }
+            if (last_source_ == PoseMeasurementSource::RgbOnly && initialized_) {
+                switch_offset_ += b;
+            }
+            rgb_minus_fused_ = b;
+            have_rgb_minus_fused_ = true;
+        } else if (source == PoseMeasurementSource::RgbOnly) {
+            if (last_source_ == PoseMeasurementSource::Fused && initialized_ &&
+                have_rgb_minus_fused_) {
+                switch_offset_ -= rgb_minus_fused_;
+            }
+        } else if (source == PoseMeasurementSource::RgbOnlyFusionRejected) {
+            // carrying the shift would bring back the fused level the gate
+            // rejected (near range): drop it
+            switch_offset_ = cv::Vec<double, 6>::all(0.0);
+            have_rgb_minus_fused_ = false;
+        }
+        last_source_ = source == PoseMeasurementSource::RgbOnlyFusionRejected
+            ? PoseMeasurementSource::RgbOnly : source;
+        if (!initialized_) {
+            switch_offset_ = cv::Vec<double, 6>::all(0.0);
+        }
+        for (int i = 0; i < 6; ++i) {
+            z.at<double>(i) += switch_offset_[i];
+        }
+    }
+
     // Large real jumps (accepted by the caller's own gates, e.g. after
     // recovery) restart the filter instead of being dragged in slowly.
     if (initialized_) {
@@ -190,8 +243,8 @@ PoseOutputFilterResult PoseOutputFilter::update(
     // along the weak observability mode, tiny along observable directions.
     // Computed from the measurement (independent of the filter state), so it
     // also seeds the adaptive motion floor below.
-    cv::Mat rvec_m = z.rowRange(0, 3).clone();
-    cv::Mat tvec_m = z.rowRange(3, 6).clone();
+    cv::Mat rvec_m = z_raw.rowRange(0, 3).clone();   // at the measured pose
+    cv::Mat tvec_m = z_raw.rowRange(3, 6).clone();
     std::vector<cv::Point2d> projected;
     cv::Mat J;
     cv::projectPoints(object_points, rvec_m, tvec_m, K_, dist_coeffs_,
@@ -225,12 +278,14 @@ PoseOutputFilterResult PoseOutputFilter::update(
     }
 
     if (!initialized_) {
-        initializeState(z);
+        // (re)start at the measurement itself, without a switch shift
+        initializeState(z_raw);
+        switch_offset_ = cv::Vec<double, 6>::all(0.0);
         motion_ema_ = cv::Vec2d(0.0, 0.0);
         drot_hist_.clear();
         dtrans_hist_.clear();
         // First frame: output = measurement.
-        writeResult(z, result);
+        writeResult(z_raw, result);
         result.initialized_this_frame = true;
         return result;
     }

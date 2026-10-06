@@ -85,6 +85,7 @@ PoseOutputFilterConfig makePoseOutputFilterConfig(const TrackerConfig& config)
     cfg.reinit_frames = config.pose_kf_reinit_frames;
     cfg.frame_period_s = config.pose_kf_frame_period_s;
     cfg.max_gap_s = config.pose_kf_max_gap_s;
+    cfg.switch_offset_time_s = config.pose_kf_switch_offset_time_s;
     cfg.reset_rotation_deg = config.pose_kf_reset_rotation_deg;
     cfg.max_translation_jump_mm = config.max_translation_jump_mm;
     cfg.min_points = config.min_points;
@@ -1366,10 +1367,28 @@ void TrackerEngine::applyPoseFilter(TrackerFrameResult& result)
             ? config_.ir_reject_cov_inflate
             : 1.0;
     result.timings_ms["pose_kf_meas_var_scale"] = meas_var_scale;
+    // Fused frame: the RGB-only pose of the same frame (pre-fusion pose) for
+    // the filter's bumpless switching; a fusion the reprojection gate
+    // rejected drops the switch shift.
+    std::array<double, 6> rgb_only_pose{};
+    const bool fused = ir_meas_cov_valid_ &&
+        result.rvec_prefusion.size() == 3 && result.tvec_prefusion.size() == 3;
+    const auto gate = result.timings_ms.find("ir_reproj_gate_reject");
+    const bool gate_rejected = gate != result.timings_ms.end() && gate->second > 0.5;
+    if (fused) {
+        for (int i = 0; i < 3; ++i) {
+            rgb_only_pose[static_cast<size_t>(i)] = result.rvec_prefusion[static_cast<size_t>(i)];
+            rgb_only_pose[static_cast<size_t>(i + 3)] = result.tvec_prefusion[static_cast<size_t>(i)];
+        }
+    }
     const PoseOutputFilterResult filtered = pose_output_filter_.update(
         rvec_in, tvec_in, object_points,
         ir_meas_cov_valid_ ? &ir_meas_cov_ : nullptr,
-        meas_var_scale, t_s);
+        meas_var_scale, t_s,
+        fused ? PoseMeasurementSource::Fused
+              : (gate_rejected ? PoseMeasurementSource::RgbOnlyFusionRejected
+                               : PoseMeasurementSource::RgbOnly),
+        fused ? &rgb_only_pose : nullptr);
     if (!filtered.applied) {
         // Too few corners even so: predict through the frame and start over
         // after a few such frames; the raw pose is reported.

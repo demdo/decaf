@@ -146,6 +146,9 @@ struct TrackerConfig {
     // period; a gap above max_gap_s restarts the filter.
     double pose_kf_frame_period_s = 1.0 / 30.0;
     double pose_kf_max_gap_s = 0.5;
+    // Bumpless fused <-> RGB-only switching: decay time of the switch shift
+    // (s). 0 disables.
+    double pose_kf_switch_offset_time_s = 0.1;
 
     // ---- IR depth-only stereo fusion (opt-in, output-only) ----
     // Fuses the absolute depth / out-of-plane tilt from the global-shutter

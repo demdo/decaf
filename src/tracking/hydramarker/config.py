@@ -430,6 +430,16 @@ class TrackerConfig:
     # the filter. Without frame times one step per processed frame.
     pose_kf_frame_period_s: float = 1.0 / 30.0
     pose_kf_max_gap_s: float = 0.5
+    # Bumpless fused <-> RGB-only switching: where the IR fusion starts or
+    # stops applying, the filter shifts its measurement by the fused-minus-
+    # RGB-only offset (a few mm along the weak depth mode) so the drill does
+    # not jump, and lets the shift decay with this time constant (s); 0 off.
+    # A fusion rejected by ir_max_reproj_increase_px drops the shift.
+    # Replays (20 switch takes, 15 board takes; 0 vs 0.1 s): fusion switches
+    # with a tip jump > 2 mm 117 -> 49 of 877, board lateral RMS 1.229 ->
+    # 1.255 mm, RMS distance of the drawn from the unfiltered tip in fast
+    # motion (M01-M04, median) 1.38 -> 2.28 mm.
+    pose_kf_switch_offset_time_s: float = 0.1
     # IR depth-only stereo fusion (output-only). Fuses absolute depth and the
     # two out-of-plane tilt DoF from the global-shutter IR stereo pair into
     # the reported pose; RGB keeps rotation and lateral position (full IR

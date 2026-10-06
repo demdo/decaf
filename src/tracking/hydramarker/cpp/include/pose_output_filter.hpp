@@ -75,6 +75,22 @@ struct PoseOutputFilterConfig {
     // since the last update restarts the filter (0 disables).
     double frame_period_s = 1.0 / 30.0;
     double max_gap_s = 0.5;
+
+    // Bumpless switching between the IR-fused and the RGB-only pose (the
+    // caller says which one each measurement is). The two differ by a few
+    // millimetres along the weak depth mode; at a switch the measurement is
+    // shifted by that offset so its level does not step, and the shift
+    // decays with this time constant (s). 0 disables.
+    double switch_offset_time_s = 0.1;
+};
+
+// What the measurement passed to PoseOutputFilter::update is.
+enum class PoseMeasurementSource {
+    Unknown,                 // no switch handling
+    Fused,                   // IR-fused pose; the RGB-only pose of the same frame is passed too
+    RgbOnly,
+    RgbOnlyFusionRejected,   // RGB-only, the fusion was rejected as implausible (reprojection
+                             // gate): the switch shift is dropped, not carried
 };
 
 // Outcome of one filter step.
@@ -142,7 +158,9 @@ public:
         const std::vector<cv::Point3d>& object_points,
         const std::array<double, 36>* ext_meas_cov = nullptr,
         double meas_var_scale = 1.0,
-        double t_s = -1.0);
+        double t_s = -1.0,
+        PoseMeasurementSource source = PoseMeasurementSource::Unknown,
+        const std::array<double, 6>* rgb_only_pose = nullptr);
 
 private:
     // State = measurement, velocities zero, initial covariance.
@@ -176,6 +194,13 @@ private:
     int gate_streak_ = 0;   // consecutive frames beyond the gate
     double t_prev_s_ = -1.0;     // frame time of the previous predict
     double t_update_s_ = -1.0;   // frame time of the previous update
+    // Bumpless switching: shift added to the measurement ([rvec, tvec]),
+    // the last RGB-only-minus-fused difference, the previous source.
+    cv::Vec<double, 6> switch_offset_ = cv::Vec<double, 6>::all(0.0);
+    cv::Vec<double, 6> rgb_minus_fused_ = cv::Vec<double, 6>::all(0.0);
+    bool have_rgb_minus_fused_ = false;
+    PoseMeasurementSource last_source_ = PoseMeasurementSource::Unknown;
+    double t_offset_s_ = -1.0;
 };
 
 }  // namespace hydramarker
