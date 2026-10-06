@@ -197,7 +197,7 @@ private:
     cv::Mat current_ir_left_;
     cv::Mat current_ir_right_;
     // When the IR MAP fusion applied this frame: its 6x6 measurement covariance
-    // (H^-1) reordered to the filter's [rvec, tvec] layout, fed to the temporal
+    // (H^-1) mapped into the filter's [rvec, tvec] chart, fed to the temporal
     // filter so it smooths the IR-informed pose with the right anisotropy.
     std::array<double, 36> ir_meas_cov_{};
     bool ir_meas_cov_valid_ = false;

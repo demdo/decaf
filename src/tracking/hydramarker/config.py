@@ -533,8 +533,11 @@ class TrackerConfig:
     # Weak-evidence honesty: inflate the MAP covariance handed to the temporal
     # filter by the reduced chi-square (fit_rms / this)^2 so the filter damps
     # poor-fit frames instead of following them. 0 disables.
-    # Operator-bound, see ir_fit_gate_rms_mm above (0.10 for quadratic_form).
-    ir_cov_inflate_ref_rms_mm: float = 0.23
+    # Operator-bound (quadratic_form here). 0.36 makes the covariance
+    # in the filter's chart consistent with the real scatter of the fused pose
+    # of the fixed drill (30.09. G01 G04 G05 G09, 700 fused frames, fit
+    # RMS median 0.72 mm: mean NEES 6.0; the former 0.23 gave 2.5).
+    ir_cov_inflate_ref_rms_mm: float = 0.36
     ir_enroll_max_rot_deg: float = 3.0
     ir_enroll_max_trans_mm: float = 8.0
     ir_ref_tile_deg: float = 12.0

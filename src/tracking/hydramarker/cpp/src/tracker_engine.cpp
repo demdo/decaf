@@ -88,6 +88,30 @@ PoseOutputFilterConfig makePoseOutputFilterConfig(const TrackerConfig& config)
     return cfg;
 }
 
+cv::Matx33d skew3(const cv::Vec3d& v)
+{
+    return cv::Matx33d(0.0, -v[2], v[1],
+                       v[2], 0.0, -v[0],
+                       -v[1], v[0], 0.0);
+}
+
+// Inverse left Jacobian of SO(3) at the rotation vector phi: a left
+// perturbation R <- Exp(dw) R changes phi by Jl^-1(phi) dw.
+cv::Matx33d leftJacobianInvSO3(const cv::Vec3d& phi)
+{
+    const double th = cv::norm(phi);
+    const cv::Matx33d W = skew3(phi);
+    if (th < 1e-6) {
+        return cv::Matx33d::eye() - 0.5 * W + (1.0 / 12.0) * (W * W);
+    }
+    const double s = std::sin(th);
+    // (1 + cos th) / sin th -> 0 at th -> pi: the limit is 1 / th^2
+    const double c = std::abs(s) > 1e-12
+        ? 1.0 / (th * th) - (1.0 + std::cos(th)) / (2.0 * th * s)
+        : 1.0 / (th * th);
+    return cv::Matx33d::eye() - 0.5 * W + c * (W * W);
+}
+
 } // namespace
 
 TrackerEngine::TrackerEngine(
@@ -1603,14 +1627,32 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
             cov_scale = std::max(1.0, r * r);
         }
         result.timings_ms["ir_cov_scale"] = cov_scale;
-        // Hand the MAP measurement covariance to the temporal filter, reordered
-        // from the MAP's [t, rot] layout to the filter's [rvec(rot), tvec(t)].
-        for (int a = 0; a < 6; ++a) {
-            const int ma = a < 3 ? a + 3 : a - 3;
-            for (int b = 0; b < 6; ++b) {
-                const int mb = b < 3 ? b + 3 : b - 3;
-                ir_meas_cov_[static_cast<size_t>(6 * a + b)] =
-                    cov_scale * fused.cov[static_cast<size_t>(6 * ma + mb)];
+        // Hand the MAP measurement covariance to the temporal filter in the
+        // filter's chart. The MAP perturbs R <- Exp(dw) R, t <- Exp(dw) t + dt
+        // (IrPoseRefiner), so its H^-1 lives in [dt, dw]; the filter measures
+        // [rvec, tvec]: d rvec = Jl^-1(rvec) dw, d tvec = dt - [t]x dw, i.e.
+        // C_f = A C A^T. A plain reorder left the rotation's lever arm on t
+        // out of the translation block.
+        {
+            const cv::Vec3d rv(fused.rvec[0], fused.rvec[1], fused.rvec[2]);
+            const cv::Vec3d tv(fused.tvec[0], fused.tvec[1], fused.tvec[2]);
+            const cv::Matx33d Jinv = leftJacobianInvSO3(rv);
+            const cv::Matx33d Tx = skew3(tv);
+            cv::Matx66d A = cv::Matx66d::zeros();   // rows [rvec, tvec], cols [dt, dw]
+            for (int i = 0; i < 3; ++i) {
+                A(3 + i, i) = 1.0;
+                for (int j = 0; j < 3; ++j) {
+                    A(i, 3 + j) = Jinv(i, j);
+                    A(3 + i, 3 + j) = -Tx(i, j);
+                }
+            }
+            cv::Matx66d C;
+            for (int i = 0; i < 36; ++i) {
+                C.val[i] = fused.cov[static_cast<size_t>(i)];
+            }
+            const cv::Matx66d Cf = A * C * A.t();
+            for (int i = 0; i < 36; ++i) {
+                ir_meas_cov_[static_cast<size_t>(i)] = cov_scale * Cf.val[i];
             }
         }
         ir_meas_cov_valid_ = true;
