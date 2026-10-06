@@ -88,16 +88,35 @@ void PoseOutputFilter::writeResult(
     result.applied = true;
 }
 
+void PoseOutputFilter::predict(double q_r, double q_t)
+{
+    // Constant-velocity predict; process noise on the acceleration (DWNA).
+    cv::Mat F = cv::Mat::eye(12, 12, CV_64F);
+    for (int i = 0; i < 6; ++i) {
+        F.at<double>(i, i + 6) = 1.0;
+    }
+    cv::Mat Q = cv::Mat::zeros(12, 12, CV_64F);
+    for (int i = 0; i < 6; ++i) {
+        const double q = (i < 3) ? q_r : q_t;
+        Q.at<double>(i, i) = 0.25 * q;
+        Q.at<double>(i, i + 6) = 0.5 * q;
+        Q.at<double>(i + 6, i) = 0.5 * q;
+        Q.at<double>(i + 6, i + 6) = q;
+    }
+    x_ = F * x_;
+    P_ = F * P_ * F.t() + Q;
+}
+
 void PoseOutputFilter::coast()
 {
     if (!initialized_) {
         return;
     }
-    // Constant-velocity coast: advance position by velocity, leave the
-    // output to the caller (there is no fresh measurement to report).
-    for (int i = 0; i < 6; ++i) {
-        x_.at<double>(i) += x_.at<double>(i + 6);
-    }
+    // No measurement: predict with the moving process noise, so the next
+    // update weighs the extrapolated state by its real uncertainty (the
+    // covariance stayed put before).
+    predict(std::pow(config_.q_rotation_deg * CV_PI / 180.0, 2.0),
+            std::pow(config_.q_translation_mm, 2.0));
 }
 
 PoseOutputFilterResult PoseOutputFilter::update(
@@ -284,21 +303,7 @@ PoseOutputFilterResult PoseOutputFilter::update(
     }
     prev_z_ = z.clone();
 
-    // Constant-velocity predict; process noise on the acceleration (DWNA).
-    cv::Mat F = cv::Mat::eye(12, 12, CV_64F);
-    for (int i = 0; i < 6; ++i) {
-        F.at<double>(i, i + 6) = 1.0;
-    }
-    cv::Mat Q = cv::Mat::zeros(12, 12, CV_64F);
-    for (int i = 0; i < 6; ++i) {
-        const double q = (i < 3) ? q_r : q_t;
-        Q.at<double>(i, i) = 0.25 * q;
-        Q.at<double>(i, i + 6) = 0.5 * q;
-        Q.at<double>(i + 6, i) = 0.5 * q;
-        Q.at<double>(i + 6, i + 6) = q;
-    }
-    x_ = F * x_;
-    P_ = F * P_ * F.t() + Q;
+    predict(q_r, q_t);
 
     cv::Mat Hm = cv::Mat::zeros(6, 12, CV_64F);  // H = [I6 | 0]
     for (int i = 0; i < 6; ++i) {

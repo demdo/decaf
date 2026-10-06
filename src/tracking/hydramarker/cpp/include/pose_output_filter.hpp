@@ -107,8 +107,9 @@ public:
     void reset();
     bool initialized() const { return initialized_; }
 
-    // No fresh measurement this frame (hold / rejection): coast the state so
-    // the velocities stay time-consistent. The caller's output is untouched.
+    // No fresh measurement this frame (hold / rejection): predict the state
+    // so the velocities stay time-consistent; the covariance grows with the
+    // moving process noise. The caller's output is untouched.
     void coast();
 
     // Fresh measurement. object_points are the pose-set corner coordinates
@@ -138,6 +139,9 @@ private:
     void initializeState(const cv::Mat& z);
     // rvec/tvec = pose (6x1), covariance = the pose block of P_.
     void writeResult(const cv::Mat& pose, PoseOutputFilterResult& result) const;
+    // Constant-velocity prediction x = F x, P = F P F^T + Q with the
+    // acceleration process noise q_r (rad^2), q_t (mm^2) per frame.
+    void predict(double q_r, double q_t);
 
     PoseOutputFilterConfig config_;
     cv::Matx33d K_ = cv::Matx33d::eye();
