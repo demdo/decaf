@@ -87,8 +87,9 @@ class CameraConfig:
     # RealSense colour sensor options (None = leave the device as it is).
     # The defaults are the state the D435i was in at every camera start of
     # the debug recordings (30.09., 05.10.) and the evaluation runs (28.09.,
-    # 05.10.): AE on, exposure register 156, gain 64, 60 Hz anti-flicker,
-    # the device defaults otherwise - what the app ran with while these
+    # 05.10.): AE on, exposure register 156, gain 64, 60 Hz anti-flicker
+    # (50 Hz since, see realsense_power_line_frequency), the device defaults
+    # otherwise - what the app ran with while these
     # fields stood in the class docstring and were never applied.
     # Setting them explicitly keeps that image even after another program
     # left the device elsewhere. camera_setup writes exposure/gain with the
@@ -102,8 +103,11 @@ class CameraConfig:
     realsense_gain: Optional[float] = 64.0
     realsense_enable_auto_white_balance: Optional[bool] = True
     realsense_white_balance: Optional[float] = 4600.0
-    # 0 off, 1 = 50 Hz, 2 = 60 Hz, 3 = auto (device default 3)
-    realsense_power_line_frequency: Optional[float] = 2.0
+    # 0 off, 1 = 50 Hz, 2 = 60 Hz, 3 = auto (device default 3). 50 Hz, the
+    # grid here: off / 50 Hz / auto gave the same image and tracking in the
+    # debug recordings of 05.10. (K01-K03), and 60 Hz in a 50 Hz grid is the
+    # one setting that cannot be right.
+    realsense_power_line_frequency: Optional[float] = 1.0
     realsense_brightness: Optional[float] = 0.0
     realsense_contrast: Optional[float] = 50.0
     realsense_saturation: Optional[float] = 64.0
