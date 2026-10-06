@@ -1441,6 +1441,7 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("ir_fallback_min_ref_rot_deg", &TrackerConfig::ir_fallback_min_ref_rot_deg)
         .def_readwrite("ir_sat_threshold", &TrackerConfig::ir_sat_threshold)
         .def_readwrite("ir_sat_half_px", &TrackerConfig::ir_sat_half_px)
+        .def_readwrite("ir_sat_frac_half_px", &TrackerConfig::ir_sat_frac_half_px)
         .def_readwrite("ir_epipolar_max_dv_px", &TrackerConfig::ir_epipolar_max_dv_px)
         .def_readwrite("ir_zncc_weight_floor", &TrackerConfig::ir_zncc_weight_floor)
         .def_readwrite("ir_dtz_clamp_mm", &TrackerConfig::ir_dtz_clamp_mm)

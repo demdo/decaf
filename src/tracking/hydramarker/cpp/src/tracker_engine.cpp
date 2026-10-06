@@ -198,6 +198,7 @@ void TrackerEngine::setIrCalibration(
     ir_cfg.fallback_min_ref_rot_deg = config_.ir_fallback_min_ref_rot_deg;
     ir_cfg.sat_threshold = config_.ir_sat_threshold;
     ir_cfg.sat_half_px = config_.ir_sat_half_px;
+    ir_cfg.sat_frac_half_px = config_.ir_sat_frac_half_px;
     ir_cfg.epipolar_max_dv_px = config_.ir_epipolar_max_dv_px;
     ir_cfg.zncc_weight_floor = config_.ir_zncc_weight_floor;
     ir_cfg.dtz_clamp_mm = config_.ir_dtz_clamp_mm;

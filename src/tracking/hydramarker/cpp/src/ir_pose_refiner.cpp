@@ -598,13 +598,25 @@ IrPoseRefinerResult IrPoseRefiner::fuse(const cv::Mat& ir_left,
     const std::vector<uint8_t> sfR =
         satFree(ir_right, seedR, config_.sat_threshold, config_.sat_half_px);
 
-    // Marker saturation = fraction of visible corners clipped in either view.
-    // Reused by the one-shot IR-exposure calibrator (no extra work: the masks
-    // are already computed for the fusion gate). Reported even on RGB fallback.
+    // Marker saturation = fraction of visible corners clipped in either view,
+    // over the sat_frac_half_px window: the measure the IR-exposure controller
+    // drives down. Wider than the gate's window, so the clipped halo around a
+    // corner counts; with equal windows the gate's masks are reused. Reported
+    // even on RGB fallback.
     {
+        std::vector<uint8_t> wideL;
+        std::vector<uint8_t> wideR;
+        if (config_.sat_frac_half_px != config_.sat_half_px) {
+            wideL = satFree(ir_left, seedL, config_.sat_threshold,
+                            config_.sat_frac_half_px);
+            wideR = satFree(ir_right, seedR, config_.sat_threshold,
+                            config_.sat_frac_half_px);
+        }
+        const std::vector<uint8_t>& fL = wideL.empty() ? sfL : wideL;
+        const std::vector<uint8_t>& fR = wideR.empty() ? sfR : wideR;
         int n_sat = 0;
         for (size_t i = 0; i < n; ++i) {
-            if (!(sfL[i] && sfR[i])) {
+            if (!(fL[i] && fR[i])) {
                 ++n_sat;
             }
         }

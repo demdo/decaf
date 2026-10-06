@@ -165,7 +165,8 @@ struct TrackerConfig {
                                           // z ~= RGB); 0.05 fires ~70-90% and
                                           // drops the translation tip-z to ~0.18.
     int ir_sat_threshold = 250;           // saturation gate (patch max)
-    int ir_sat_half_px = 8;
+    int ir_sat_half_px = 2;               // window half width (config.py)
+    int ir_sat_frac_half_px = 8;          // ir_saturated_frac window (config.py)
     double ir_epipolar_max_dv_px = 2.5;   // |vL - vR| row consistency
     double ir_zncc_weight_floor = 0.05;
     double ir_dtz_clamp_mm = 2.5;         // robust-median depth shift clamp

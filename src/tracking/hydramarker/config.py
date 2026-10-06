@@ -438,7 +438,16 @@ class TrackerConfig:
     # single held orientation without touching the divot/tilt path.
     ir_fallback_min_ref_rot_deg: float = 0.05
     ir_sat_threshold: int = 250
-    ir_sat_half_px: int = 8
+    # Half width (px) of the window around each IR seed that must stay below
+    # ir_sat_threshold: 2 = the corner's own junction. 8 (17x17 px, ~1.5 IR
+    # cells) also took in the neighbouring white cells, which clip first in
+    # bright IR, and blocked the fusion with the corner itself unclipped.
+    ir_sat_half_px: int = 2
+    # Half width (px) of the window behind ir_saturated_frac, the clipped
+    # share of the marker corners that run_tracker's IR exposure controller
+    # drives down: 8 as before the gate window was narrowed, so the clipped
+    # halo of the white cells around a corner still counts there.
+    ir_sat_frac_half_px: int = 8
     ir_epipolar_max_dv_px: float = 2.5
     ir_zncc_weight_floor: float = 0.05
     ir_dtz_clamp_mm: float = 2.5

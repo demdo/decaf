@@ -108,6 +108,9 @@ struct IrPoseRefinerConfig {
     int sat_half_px = 8;               //   (+-half, either view) drops the
                                        //   corner: saturation destroys the
                                        //   information in the sensor.
+    int sat_frac_half_px = 8;          // window of saturated_frac (the IR
+                                       //   exposure controller's measure):
+                                       //   wider, so clipped halos count.
     double epipolar_max_dv_px = 2.5;   // |vL - vR| row-consistency gate
     double zncc_weight_floor = 0.05;   // w = clip(min(znccL,znccR), floor,1)^2
     double dtz_clamp_mm = 2.5;         // robust-median depth shift is clamped
