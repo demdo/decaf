@@ -187,6 +187,11 @@ private:
     // pose; the internal chain (anchors, persistence, prediction) keeps the
     // raw pose so no feedback loop forms. See PoseOutputFilter.
     PoseOutputFilter pose_output_filter_;
+    // Accepted frames in a row the filter could not update (too few corners
+    // for its measurement covariance); it restarts after more than
+    // kPoseFilterMaxMissedUpdates of them.
+    static constexpr int kPoseFilterMaxMissedUpdates = 3;
+    int pose_filter_missed_updates_ = 0;
 
     // ---- IR global-shutter pose refinement (output-only, opt-in) ----
     // Re-measures the reported pose on the IR stereo pair; runs FIRST in the
