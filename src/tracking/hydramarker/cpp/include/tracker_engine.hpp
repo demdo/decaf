@@ -154,6 +154,10 @@ private:
     PersistentMatcher persistent_matcher_;
 
     TrackerMode mode_ = TrackerMode::Lost;
+    // cells_gated / cells_all of the last appearance check of the current
+    // frame (NaN: none, or no gate configured); -> visible_cell_fraction
+    mutable double frame_visible_frac_ =
+        std::numeric_limits<double>::quiet_NaN();
     int frame_index_ = 0;
     int lost_frames_ = 0;
     int low_fresh_correspondence_frames_ = 0;

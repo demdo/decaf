@@ -104,7 +104,8 @@ AppearanceCheck checkMarkerAppearance(
     double min_dot,
     int min_cells,
     double gate_min_dn,
-    double gate_frac
+    double gate_frac,
+    bool gate_apply
 )
 {
     AppearanceCheck out;
@@ -299,6 +300,7 @@ AppearanceCheck checkMarkerAppearance(
     }
     out.cells = static_cast<int>(sampled_base.size());
     out.cells_all = out.cells;
+    out.cells_gated = out.cells;
     if ((gate_min_dn > 0.0 || gate_frac > 0.0) && !sampled_base.empty()) {
         std::unordered_map<int, size_t> at;
         for (size_t j = 0; j < sampled_rc.size(); ++j) {
@@ -354,11 +356,14 @@ AppearanceCheck checkMarkerAppearance(
                 dm2.push_back(dot_measured[j]);
             }
         }
-        sampled_base.swap(b2);
-        off_centre.swap(o2);
-        dot_expected.swap(de2);
-        dot_measured.swap(dm2);
-        out.cells = static_cast<int>(sampled_base.size());
+        out.cells_gated = static_cast<int>(b2.size());
+        if (gate_apply) {
+            sampled_base.swap(b2);
+            off_centre.swap(o2);
+            dot_expected.swap(de2);
+            dot_measured.swap(dm2);
+            out.cells = static_cast<int>(sampled_base.size());
+        }
     }
     if (out.cells < min_cells) {
         return out;

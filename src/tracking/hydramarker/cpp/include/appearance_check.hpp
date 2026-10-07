@@ -26,6 +26,9 @@ struct AppearanceCheck {
     double dot = std::numeric_limits<double>::quiet_NaN();
     int cells = 0;          // sampled cells (used cells when the gate is on)
     int cells_all = 0;      // sampled cells before the occlusion gate
+    // cells that pass the occlusion gate, also when it is not applied
+    // (gate_apply false); = cells_all without a configured gate
+    int cells_gated = 0;
     bool passed = false;    // both correlations finite and above the minimum
     bool failed = false;    // enough cells and a finite correlation below it
 };
@@ -53,7 +56,10 @@ AppearanceCheck checkMarkerAppearance(
     // instead of pulling both correlations towards zero; a whole-cell
     // identity shift keeps the contrast and still fails.
     double gate_min_dn = 0.0,
-    double gate_frac = 0.0
+    double gate_frac = 0.0,
+    // false: only count the cells that pass the gate (cells_gated), the
+    // correlations use every sampled cell
+    bool gate_apply = true
 );
 
 } // namespace hydramarker

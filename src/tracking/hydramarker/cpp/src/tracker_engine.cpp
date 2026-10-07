@@ -408,7 +408,17 @@ TrackerFrameResult TrackerEngine::processFrame(
         checkerboard_detector_.setInterFrameRotationDeg(drot_deg);
     }
 
+    frame_visible_frac_ = std::numeric_limits<double>::quiet_NaN();
     TrackerFrameResult result = processFrameInternal(frame, run_detection);
+    // Share of the marker cells in view that show checker contrast where
+    // the pose projects them (the occlusion gate of the appearance check),
+    // from the check of the pose this frame reports: 1.0 unoccluded, lower
+    // under a finger (O01 one third covered 0.78, O02 half 0.72).
+    if (result.success && std::isfinite(frame_visible_frac_) &&
+        result.pose_source != PoseSource::Hold &&
+        result.pose_source != PoseSource::None) {
+        result.timings_ms["visible_cell_fraction"] = frame_visible_frac_;
+    }
 
     result.tracked_refine_samples =
         checkerboard_detector_.lastTrackedRefineSamples();
@@ -2125,6 +2135,11 @@ AppearanceCheck TrackerEngine::recordAppearanceCheckGated(
         result.timings_ms[timing_prefix + "_cells_all"] =
             static_cast<double>(check.cells_all);
     }
+    frame_visible_frac_ =
+        ((config_.appearance_gate_min_dn > 0.0 ||
+          config_.appearance_gate_frac > 0.0) && check.cells_all > 0)
+        ? static_cast<double>(check.cells_gated) / check.cells_all
+        : std::numeric_limits<double>::quiet_NaN();
     result.timings_ms[timing_prefix + "_ms"] = elapsedMs(check_t0);
     result.timings_ms[timing_prefix + "_parity"] = check.parity;
     result.timings_ms[timing_prefix + "_dot"] = check.dot;
@@ -3190,8 +3205,9 @@ AppearanceCheck TrackerEngine::checkAppearanceGated(
         config_.appearance_min_parity,
         config_.appearance_min_dot,
         config_.appearance_min_cells,
-        gated ? config_.appearance_gate_min_dn : 0.0,
-        gated ? config_.appearance_gate_frac : 0.0
+        config_.appearance_gate_min_dn,
+        config_.appearance_gate_frac,
+        gated
     );
 }
 

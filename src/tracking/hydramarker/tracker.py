@@ -240,6 +240,11 @@ class TrackerResult:
     # 6x6 covariance of the output pose filter (rvec, tvec ordering), or
     # None when the filter did not run this frame.
     pose_covariance: Optional[np.ndarray] = None
+    # Share of the marker cells in view that show checker contrast where the
+    # pose projects them (the engine's occlusion gate, timings_ms
+    # visible_cell_fraction): 1.0 unoccluded, lower under a finger. NaN
+    # without a fresh pose, with the gate off or with an older engine.
+    visible_cell_fraction: float = float("nan")
 
     debug_counters: Dict[str, float] = field(default_factory=dict)
     timings_ms: Dict[str, float] = field(default_factory=dict)
@@ -615,6 +620,9 @@ class HydraTracker:
             pose_covariance=self._cpp_vector_to_array(
                 getattr(cpp_result, "pose_covariance", []),
                 (6, 6),
+            ),
+            visible_cell_fraction=float(
+                timings.get("visible_cell_fraction", float("nan"))
             ),
             debug_counters=debug_counters,
             timings_ms=timings,
