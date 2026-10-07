@@ -40,6 +40,9 @@ class TrackingOverlay:
 
     TIP_COLOR = (80, 220, 80, 255)   # BGRA
     AXIS_COLOR = (80, 220, 80, 255)
+    # A pose kept under a partial occlusion (ToolPoints.marked): same glyphs
+    # in orange.
+    MARKED_COLOR = (0, 165, 255, 255)
     THICKNESS = 2
     TIP_RADIUS = 8
     TIP_CROSS = 20
@@ -63,19 +66,24 @@ class TrackingOverlay:
         # snapshot record; not needed for drawing.
         self._tip_cam: Optional[np.ndarray] = None
         self._back_cam: Optional[np.ndarray] = None
+        self._marked = False
 
-    def tool_points(self, los_offset_mm: Optional[float] = None) -> "ToolPoints":
+    def tool_points(self, los_offset_mm: Optional[float] = None,
+                    mark_below_visible_frac: float = 0.0) -> "ToolPoints":
         """A ToolPoints of this tool's tip and back point, for the tracking
-        thread; los_offset_mm None: ToolPoints.LOS_OFFSET_MM (the page's)."""
-        return ToolPoints(self._p_tip, self._p_back, los_offset_mm=los_offset_mm)
+        thread; los_offset_mm None: ToolPoints.LOS_OFFSET_MM (the page's);
+        mark_below_visible_frac: see ToolPoints.marked."""
+        return ToolPoints(self._p_tip, self._p_back, los_offset_mm=los_offset_mm,
+                          mark_below_visible_frac=mark_below_visible_frac)
 
     # ------------------------------------------------------------------
     # Per-frame state
     # ------------------------------------------------------------------
 
-    def update(self, points) -> None:
+    def update(self, points, marked: bool = False) -> None:
         """Recompute the 2D geometry from the camera-frame points of a fresh
-        result (TrackOutput.points: rows tip and back point, mm)."""
+        result (TrackOutput.points: rows tip and back point, mm); marked:
+        draw in MARKED_COLOR (TrackOutput.points_marked)."""
         if points is None:
             self.clear()
             return
@@ -103,12 +111,14 @@ class TrackingOverlay:
         self._back_uv = uv[1]
         self._tip_cam = tip_cam
         self._back_cam = back_cam
+        self._marked = bool(marked)
 
     def clear(self) -> None:
         self._tip_uv = None
         self._back_uv = None
         self._tip_cam = None
         self._back_cam = None
+        self._marked = False
 
     @property
     def has_pose(self) -> bool:
@@ -122,7 +132,8 @@ class TrackingOverlay:
         tip_cam/back_cam the camera-frame points (mm, ToolPoints) they were
         projected from, p_tip/axis_dir/axis_back_mm the tool geometry,
         los_offset_mm the line-of-sight shift already in tip_cam/back_cam
-        (ToolPoints.LOS_OFFSET_MM, the one the page draws with).
+        (ToolPoints.LOS_OFFSET_MM, the one the page draws with), marked
+        whether it is drawn marked (style colour_bgra: the colour used).
         """
         if self._tip_uv is None:
             return None
@@ -135,12 +146,14 @@ class TrackingOverlay:
             "axis_dir": [float(v) for v in self._axis],
             "axis_back_mm": float(self.AXIS_BACK_MM),
             "los_offset_mm": float(ToolPoints.LOS_OFFSET_MM),
+            "marked": bool(self._marked),
             "style": {
                 "tip_radius_px": int(self.TIP_RADIUS),
                 "tip_cross_px": int(self.TIP_CROSS),
                 "thickness_px": int(self.THICKNESS),
                 "dash_pieces": int(self.DASH_PIECES),
-                "colour_bgra": [int(c) for c in self.AXIS_COLOR],
+                "colour_bgra": [int(c) for c in
+                                (self.MARKED_COLOR if self._marked else self.AXIS_COLOR)],
             },
         }
 
@@ -169,6 +182,7 @@ class TrackingOverlay:
 
     def _draw_axis(self, img: np.ndarray, tip: np.ndarray, back: np.ndarray) -> None:
         h, w = img.shape[:2]
+        colour = self.MARKED_COLOR if self._marked else self.AXIS_COLOR
 
         # Solid trajectory line: from the tip onward in the current drill
         # direction (away from the marker), clipped at the image border.
@@ -182,7 +196,7 @@ class TrackingOverlay:
                 (int(round(far[0])), int(round(far[1]))),
             )
             if ok:
-                cv2.line(img, p1, p2, self.AXIS_COLOR, self.THICKNESS, cv2.LINE_AA)
+                cv2.line(img, p1, p2, colour, self.THICKNESS, cv2.LINE_AA)
 
         # Dashed shaft segment: tip -> marker side (AXIS_BACK_MM), drawn as
         # alternating pieces.
@@ -194,18 +208,19 @@ class TrackingOverlay:
                 img,
                 (int(round(a[0])), int(round(a[1]))),
                 (int(round(b[0])), int(round(b[1]))),
-                self.AXIS_COLOR,
+                colour,
                 self.THICKNESS,
                 cv2.LINE_AA,
             )
 
     def _draw_tip(self, img: np.ndarray, tip: np.ndarray) -> None:
         u, v = int(round(tip[0])), int(round(tip[1]))
-        cv2.circle(img, (u, v), self.TIP_RADIUS, self.TIP_COLOR, self.THICKNESS, cv2.LINE_AA)
+        colour = self.MARKED_COLOR if self._marked else self.TIP_COLOR
+        cv2.circle(img, (u, v), self.TIP_RADIUS, colour, self.THICKNESS, cv2.LINE_AA)
         cv2.drawMarker(
             img,
             (u, v),
-            self.TIP_COLOR,
+            colour,
             markerType=cv2.MARKER_CROSS,
             markerSize=self.TIP_CROSS,
             thickness=self.THICKNESS,
@@ -238,7 +253,12 @@ class ToolPoints:
     carrying it would bring back exactly the shift the gate rejected.
 
     kind after update(): "fused", "carry", "rgb", "gate" (RGB-only, fusion
-    rejected by the reprojection gate) or None (no pose).
+    rejected by the reprojection gate) or None (no pose). marked after
+    update(): the result has points and its visible_cell_fraction
+    (timings_ms; the share of the marker cells in view that show checker
+    contrast) is below mark_below_visible_frac - a pose the engine kept
+    under a partial occlusion (TrackerConfig.drawn_pose_mark_below_visible_frac
+    on the Live page; 0 = never).
     """
 
     # Replays of the live runs: a carried offset is off from the fused one
@@ -263,7 +283,8 @@ class ToolPoints:
     LOS_OFFSET_MM = 2.27
 
     def __init__(self, p_tip_mm, p_back_mm, max_carry_s: Optional[float] = None,
-                 los_offset_mm: Optional[float] = None) -> None:
+                 los_offset_mm: Optional[float] = None,
+                 mark_below_visible_frac: float = 0.0) -> None:
         # rows: tip, marker-side end of the dashed shaft segment
         self._p = np.stack([
             np.asarray(p_tip_mm, dtype=np.float64).reshape(3),
@@ -271,12 +292,14 @@ class ToolPoints:
         ])
         self.max_carry_s = self.MAX_CARRY_S if max_carry_s is None else float(max_carry_s)
         self.los_offset_mm = self.LOS_OFFSET_MM if los_offset_mm is None else float(los_offset_mm)
+        self.mark_below_visible_frac = float(mark_below_visible_frac)
         self.reset()
 
     def reset(self) -> None:
         self._offset: Optional[np.ndarray] = None   # fused - RGB-only, rows as _p
         self._t_offset = 0.0
         self.kind: Optional[str] = None
+        self.marked = False
 
     def _points(self, rvec, tvec) -> np.ndarray:
         R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
@@ -285,6 +308,10 @@ class ToolPoints:
     def update(self, result, t_frame: float) -> Optional[np.ndarray]:
         """(2, 3) camera-frame points [tip, back] in mm, None without a pose."""
         pts = self._update(result, t_frame)
+        frac = float((getattr(result, "timings_ms", None) or {}).get(
+            "visible_cell_fraction", float("nan")))
+        # NaN (no gate, older engine) compares False: not marked
+        self.marked = pts is not None and frac < self.mark_below_visible_frac
         if pts is None or not self.los_offset_mm:
             return pts
         # ray to the marker origin: of the drawn pose, or of the RGB-only

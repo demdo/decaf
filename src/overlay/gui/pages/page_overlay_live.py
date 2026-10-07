@@ -1055,6 +1055,7 @@ class OverlayLivePage(QWidget):
         self._live_out = None              # newest result without one (holds its frame)
         self._shown_out = None             # result whose frame is on screen (None: a polled frame)
         self._drawn_out = None             # result whose drill is drawn on it (None: no drill)
+        self._mark_below_visible_frac = 0.0  # marking threshold of the last tracking start
         self._shown_index = -1             # camera frame_index of the frame on screen
         self._shown_t_frame = 0.0          # its poll time
         self._outbox_dropped_seen = 0      # profiler: worker counter already reported
@@ -1853,12 +1854,19 @@ class OverlayLivePage(QWidget):
         self._overlay_out = None
         if self._track_fail_log is not None:
             self._track_fail_log.start(self._tracker_log_module)
+        # A pose kept under a partial occlusion is drawn marked; the threshold
+        # is kept for the snapshot record (the tracker may be gone by then).
+        self._mark_below_visible_frac = float(getattr(
+            self._tracker.config, "drawn_pose_mark_below_visible_frac", 0.0
+        ))
         # The worker owns the tracker from here until _stop_tracking joined it.
         self._track_worker = TrackingWorker(
             self._tracker,
             pool_size=self.TRACK_FRAME_POOL,
             notify=self._track_result_ready.emit,
-            tool_points=self._tool_overlay.tool_points(),
+            tool_points=self._tool_overlay.tool_points(
+                mark_below_visible_frac=self._mark_below_visible_frac,
+            ),
             frame_timing=self._tracker.ir_frame_timing,
         )
         self._track_session = TrackingSession(
@@ -2017,7 +2025,7 @@ class OverlayLivePage(QWidget):
 
         # the overlay first: if it raises, no result has changed hands yet
         if step.fresh:
-            self._tool_overlay.update(out.points)
+            self._tool_overlay.update(out.points, marked=out.points_marked)
         else:
             self._tool_overlay.clear()
         previous = (self._pose_out, self._live_out)
@@ -2175,7 +2183,8 @@ class OverlayLivePage(QWidget):
                     self._tool.p_tip_mm,
                     self._tool.axis_dir,
                 )
-                drill.update(drawn.points)
+                # as on the screen: a pose drawn marked stays marked
+                drill.update(drawn.points, marked=bool(drawn.points_marked))
                 drill.draw_into(comp, show_tip=True, show_axis=True)
                 cv2.imwrite(
                     str(out_dir / "03_rgb_overlay_drill.png"),
@@ -2259,7 +2268,11 @@ class OverlayLivePage(QWidget):
             tool = drill.snapshot_record()
             # fused / carry / rgb / gate: tracking_overlay.ToolPoints.kind
             tool["points_kind"] = drawn.points_kind
+            # drawn marked (tool["marked"]): visible_cell_fraction below the
+            # threshold in force when the pose was drawn
+            tool["mark_below_visible_frac"] = self._mark_below_visible_frac
             res = drawn.result
+            vis_frac = float(getattr(res, "visible_cell_fraction", float("nan")))
             tool["pose"] = None if res is None else {
                 "rvec": arr(res.rvec),
                 "tvec": arr(res.tvec),
@@ -2270,6 +2283,7 @@ class OverlayLivePage(QWidget):
                 "mean_reprojection_error_px": float(res.mean_reprojection_error_px),
                 "num_points": int(res.num_points),
                 "num_inliers": int(res.num_inliers),
+                "visible_cell_fraction": vis_frac if vis_frac == vis_frac else None,
             }
             if self._tool is not None:
                 tool["assets"] = {

@@ -36,6 +36,10 @@ while the worker reads it fails the test.
     no slot
 (l) ToolPoints: the empirical line-of-sight shift of both points, off on
     request (tool_points(los_offset_mm=0)), in the snapshot record
+(m) marked drawing: ToolPoints.marked below mark_below_visible_frac of the
+    result's visible_cell_fraction (not without a pose, NaN or threshold 0),
+    TrackOutput.points_marked from the worker, TrackingOverlay draws it in
+    MARKED_COLOR and says so in the snapshot record
 
 Run from src/:
 
@@ -684,6 +688,80 @@ def _check_tool_points() -> None:
           "gate and reset drop the offset; computed in the worker, reset with the tracker")
 
 
+def test_marked() -> None:
+    t0 = np.array([0.0, 0.0, 400.0])
+
+    def res(frac):
+        r = _pose_result(t0, applied=False, ir=False)
+        if frac is not None:
+            r.timings_ms["visible_cell_fraction"] = frac
+        return r
+
+    tp = ToolPoints(P_TIP, P_BACK, mark_below_visible_frac=0.75)
+    assert tp.update(res(0.72), 0.0) is not None and tp.marked
+    tp.update(res(0.78), 0.1)
+    assert not tp.marked
+    tp.update(res(0.75), 0.2)
+    assert not tp.marked                       # below, not at the threshold
+    tp.update(res(float("nan")), 0.3)
+    assert not tp.marked
+    tp.update(res(None), 0.4)
+    assert not tp.marked
+    assert tp.update(SimpleNamespace(rvec=None, tvec=None, timings_ms={"visible_cell_fraction": 0.1}),
+                     0.5) is None and not tp.marked
+    tp.update(res(0.5), 0.6)
+    assert tp.marked
+    tp.reset()
+    assert not tp.marked
+    off = ToolPoints(P_TIP, P_BACK)            # default 0: never marked
+    off.update(res(0.1), 0.0)
+    assert not off.marked
+    ov = TrackingOverlay(np.eye(3), None, P_TIP, [0.0, 2.0, 0.0])
+    assert ov.tool_points(mark_below_visible_frac=0.75).mark_below_visible_frac == 0.75
+    assert ov.tool_points().mark_below_visible_frac == 0.0
+
+    # in the worker: points_marked of every output
+    class FracTracker(FakeTracker):
+        def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None, t_frame=None):
+            v = int(color[0, 0, 0])
+            self.calls.append(("process", v, threading.get_ident()))
+            return res([1.0, 0.72, None, 0.8][v])
+
+    worker = TrackingWorker(FracTracker(), pool_size=5,
+                            tool_points=ToolPoints(P_TIP, P_BACK, mark_below_visible_frac=0.75))
+    worker.start()
+    outs = []
+    for i in range(4):
+        worker.submit(_frame(i), 0.1 * i)
+        assert _wait_until(lambda: worker.n_processed == i + 1)
+        outs += _drain_all(worker)
+    assert worker.stop()
+    assert [o.points_marked for o in outs] == [False, True, False, False], \
+        [o.points_marked for o in outs]
+    assert _pool_balanced(worker)
+
+    # the overlay draws a marked pose in MARKED_COLOR, an unmarked one in green
+    K = np.array([[500.0, 0.0, 32.0], [0.0, 500.0, 24.0], [0.0, 0.0, 1.0]])
+    ov = TrackingOverlay(K, None, P_TIP, [0.0, 2.0, 0.0])
+    pts = np.stack([np.array([0.0, 0.0, 400.0]), np.array([0.0, 10.0, 400.0])])
+    colours = []
+    for marked in (False, True):
+        img = np.zeros((48, 64, 4), np.uint8)
+        ov.update(pts, marked=marked)
+        ov.draw_into(img)
+        rec = ov.snapshot_record()
+        assert rec["marked"] is marked
+        want = TrackingOverlay.MARKED_COLOR if marked else TrackingOverlay.AXIS_COLOR
+        assert rec["style"]["colour_bgra"] == list(want)
+        colours.append(tuple(int(c) for c in img.reshape(-1, 4).max(axis=0)))
+    assert colours[0] == TrackingOverlay.TIP_COLOR and colours[1] == TrackingOverlay.MARKED_COLOR, colours
+    ov.clear()
+    ov.update(pts)
+    assert ov.snapshot_record()["marked"] is False
+    print("  (m) marked drawing: below the visible-cell threshold, from the worker, "
+          "in MARKED_COLOR, in the snapshot record")
+
+
 def test_frame_timing() -> None:
     class TimingTracker(FakeTracker):
         def __init__(self):
@@ -760,6 +838,7 @@ def main() -> None:
     test_session()
     test_tracker_log_classes()
     test_tool_points()
+    test_marked()
     test_frame_timing()
     print("all checks passed")
 

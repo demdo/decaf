@@ -122,21 +122,23 @@ class TrackOutput:
     that delivered the frame, t_start / t_done bracket the tracker call in
     the worker (reset included), skipped counts the newer frames that
     replaced a pending one since the previous processed frame. points /
-    points_kind: the worker's ToolPoints.update() and .kind for this result
-    (None without tool_points or without a pose).
+    points_kind / points_marked: the worker's ToolPoints.update(), .kind and
+    .marked for this result (None / None / False without tool_points or
+    without a pose).
     """
 
     __slots__ = (
         "slot", "frame_index", "t_frame", "meta", "has_ir", "epoch",
         "result", "t_start", "t_done", "skipped", "reset",
         "error", "traceback", "frame_dropped", "points", "points_kind",
+        "points_marked",
     )
 
     def __init__(self, slot: FrameSlot, epoch: int, *, result=None,
                  t_start: float = 0.0, t_done: float = 0.0, skipped: int = 0,
                  reset: bool = False, error: BaseException | None = None,
                  traceback_text: str | None = None, points=None,
-                 points_kind: str | None = None) -> None:
+                 points_kind: str | None = None, points_marked: bool = False) -> None:
         self.slot: FrameSlot | None = slot
         self.frame_index = slot.frame_index
         self.t_frame = slot.t_frame
@@ -152,6 +154,7 @@ class TrackOutput:
         self.traceback = traceback_text
         self.points = points
         self.points_kind = points_kind
+        self.points_marked = points_marked
         # eval mode: the slot was taken back for a newer frame before the
         # output was drained (its image is gone, the result is not)
         self.frame_dropped = False
@@ -196,7 +199,8 @@ class TrackingWorker:
 
     tool_points: tracking_overlay.ToolPoints or None. Runs in this thread
     on every result, right after the tracker, with the frame time
-    (TrackOutput.points / points_kind), and is reset with the tracker.
+    (TrackOutput.points / points_kind / points_marked), and is reset with
+    the tracker.
 
     frame_timing: HydraTracker.ir_frame_timing or None. Called in submit()
     with the frame's metadata, before a slot is taken (if it raises, no
@@ -373,6 +377,7 @@ class TrackingWorker:
 
                 t_start = time.perf_counter()
                 points = points_kind = None
+                points_marked = False
                 try:
                     if reset:
                         self._tracker.reset()
@@ -393,6 +398,7 @@ class TrackingWorker:
                     if self._tool_points is not None:
                         points = self._tool_points.update(result, slot.t_frame)
                         points_kind = self._tool_points.kind
+                        points_marked = self._tool_points.marked
                 except Exception as exc:
                     out = TrackOutput(
                         slot, epoch, t_start=t_start, t_done=time.perf_counter(),
@@ -406,6 +412,7 @@ class TrackingWorker:
                     slot, epoch, result=result, t_start=t_start,
                     t_done=time.perf_counter(), skipped=skipped, reset=reset,
                     points=points, points_kind=points_kind,
+                    points_marked=points_marked,
                 )
                 slot = None
                 self._publish(out)

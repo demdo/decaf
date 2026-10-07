@@ -780,6 +780,18 @@ class TrackerConfig:
     # when tracking stops. No effect on the frame loop.
     failure_log_enabled: bool = True
 
+    # Python-side only (the engine ignores it): the Live page draws a pose
+    # whose visible_cell_fraction is below this value MARKED (other colour): a
+    # pose the engine kept with a large part of the marker covered. It flags
+    # the half-covered hold and a label painted over, not every less accurate
+    # pose: replays of the 06.10. hand-held takes (median fraction / drawn tip
+    # error, board ground truth): unoccluded D01-D05 1.00 / 1.12 mm, one finger
+    # over a third of the label (O01) 0.78 / 1.63 mm (drawn unmarked), two
+    # fingers over half (O02) 0.72 / 1.78 mm (marked). With the label painted
+    # over in the image: half 0.47-0.50 / 1.3-2.1 mm, two thirds 0.30 / 1.8-4.6
+    # mm. PROVISIONAL: one hold per real occlusion level. 0 = never marked.
+    drawn_pose_mark_below_visible_frac: float = 0.75
+
 
 __all__ = [
     "CAMERA_BACKENDS",
