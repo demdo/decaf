@@ -28,6 +28,28 @@ std::string formatDouble(double value, int precision)
     return stream.str();
 }
 
+// Rotation (deg) and marker-origin translation (mm) from pose a to pose b
+// (rvec / tvec marker -> camera).
+void poseDelta(
+    const cv::Vec3d& rvec_a,
+    const cv::Vec3d& tvec_a,
+    const cv::Vec3d& rvec_b,
+    const cv::Vec3d& tvec_b,
+    double& drot_deg,
+    double& dtrans_mm)
+{
+    cv::Matx33d R_a;
+    cv::Matx33d R_b;
+    cv::Rodrigues(rvec_a, R_a);
+    cv::Rodrigues(rvec_b, R_b);
+    cv::Mat dr_vec;
+    cv::Rodrigues(cv::Mat(R_b * R_a.t()), dr_vec);
+    drot_deg = cv::norm(dr_vec) * 180.0 / CV_PI;
+    dtrans_mm = std::sqrt(std::pow(tvec_b[0] - tvec_a[0], 2) +
+                          std::pow(tvec_b[1] - tvec_a[1], 2) +
+                          std::pow(tvec_b[2] - tvec_a[2], 2));
+}
+
 // RMS reprojection error (px) of model points under one pose; -1 when the
 // projection fails.
 double reprojectionRmsPx(
@@ -158,6 +180,7 @@ void TrackerEngine::reset()
     max_pts_seen_ = 0;
     last_good_reproj_px_ = -1.0;
     last_accepted_pose_frame_ = -1;
+    last_anchor_pose_frame_ = -1;
     last_accepted_visual_corner_count_ = 0;
     last_accepted_rvec_.clear();
     last_accepted_tvec_.clear();
@@ -449,6 +472,10 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
         if (detection.has_value()) {
             attachDetectionResult(result, *detection);
         }
+        if (tryPriorSubgridPose(
+                "No valid checkerboard detection", result, frame_t0)) {
+            return result;
+        }
         onTrackingFailure();
         const std::int64_t hold_t0 = cv::getTickCount();
         if (tryHoldLastPoseWithoutDetection(result, frame_t0)) {
@@ -559,6 +586,9 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
         result.timings_ms["persistent_fallback_ms"] =
             elapsedMs(fallback_t0);
 
+        if (tryPriorSubgridPose(reason, result, frame_t0)) {
+            return result;
+        }
         const std::int64_t hold_t0 = cv::getTickCount();
         if (tryHoldLastPose(
                 *detection_for_decode,
@@ -641,6 +671,9 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
         result.timings_ms["persistent_fallback_ms"] =
             elapsedMs(fallback_t0);
 
+        if (tryPriorSubgridPose(reason, result, frame_t0)) {
+            return result;
+        }
         const std::int64_t hold_t0 = cv::getTickCount();
         if (tryHoldLastPose(
                 *detection_for_decode,
@@ -717,6 +750,9 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
         result.timings_ms["persistent_fallback_ms"] =
             elapsedMs(fallback_t0);
 
+        if (tryPriorSubgridPose(reason, result, frame_t0)) {
+            return result;
+        }
         const std::int64_t hold_t0 = cv::getTickCount();
         if (tryHoldLastPose(
                 *detection_for_decode,
@@ -758,8 +794,13 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
     // can lock onto a wrong identity or onto a marker-like pattern elsewhere
     // in the scene, and once accepted such a pose seeds the tracking of the
     // following frames.
+    // With the prior sub-grid fallback the engine stays in tracking through
+    // occlusions and glare, so a decode pose in tracking mode is checked like
+    // an acquisition pose (S06 k175: an unchecked tracking-mode decode pose,
+    // reference check 0.55 / 0.26). A rejected one falls to the sub-grid.
     const bool check_appearance =
-        config_.appearance_check_enabled && acquisition;
+        config_.appearance_check_enabled &&
+        (acquisition || config_.prior_subgrid_enabled);
     const bool had_pose = pose_tracker_.hasPose();
     const std::vector<double> previous_rvec =
         check_appearance ? pose_tracker_.rvec() : std::vector<double>();
@@ -771,8 +812,8 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
     result.timings_ms["pnp_ms"] = elapsedMs(pose_t0);
 
     if (pose.success && check_appearance) {
-        const AppearanceCheck appearance =
-            recordAppearanceCheck(pose, "appearance", result);
+        const AppearanceCheck appearance = recordAppearanceCheckGated(
+            pose, "appearance", result, config_.appearance_gate_acquisition);
         if (!appearance.passed) {
             result.timings_ms["appearance_reject_count"] = 1.0;
             pose.success = false;
@@ -838,6 +879,9 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
         lost_frames_ = 0;
         low_fresh_correspondence_frames_ = 0;
     } else {
+        if (tryPriorSubgridPose(pose.message, result, frame_t0)) {
+            return result;
+        }
         onTrackingFailure();
         const std::int64_t emergency_t0 = cv::getTickCount();
         if (tryEmergencyLastPose(
@@ -1127,6 +1171,7 @@ bool TrackerEngine::acceptPoseState(
     last_accepted_tvec_ = pose.tvec;
     last_accepted_T_marker_camera_ = pose.T_marker_camera;
     last_accepted_pose_frame_ = frame_index_;
+    last_anchor_pose_frame_ = frame_index_;
     last_accepted_visual_corner_count_ = visual_corner_count;
     return true;
 }
@@ -1136,6 +1181,7 @@ void TrackerEngine::clearAcceptedState()
     max_pts_seen_ = 0;
     last_good_reproj_px_ = -1.0;
     last_accepted_pose_frame_ = -1;
+    last_anchor_pose_frame_ = -1;
     last_accepted_visual_corner_count_ = 0;
     last_accepted_rvec_.clear();
     last_accepted_tvec_.clear();
@@ -2064,15 +2110,21 @@ void TrackerEngine::restorePoseTrackerState(
     }
 }
 
-AppearanceCheck TrackerEngine::recordAppearanceCheck(
+AppearanceCheck TrackerEngine::recordAppearanceCheckGated(
     const MapPoseResult& pose,
     const std::string& timing_prefix,
-    TrackerFrameResult& result
+    TrackerFrameResult& result,
+    bool gated
 ) const
 {
     const std::int64_t check_t0 = cv::getTickCount();
     const AppearanceCheck check =
-        checkAppearance(current_frame_, pose.rvec, pose.tvec);
+        checkAppearanceGated(current_frame_, pose.rvec, pose.tvec, gated);
+    if (gated && (config_.appearance_gate_min_dn > 0.0 ||
+                  config_.appearance_gate_frac > 0.0)) {
+        result.timings_ms[timing_prefix + "_cells_all"] =
+            static_cast<double>(check.cells_all);
+    }
     result.timings_ms[timing_prefix + "_ms"] = elapsedMs(check_t0);
     result.timings_ms[timing_prefix + "_parity"] = check.parity;
     result.timings_ms[timing_prefix + "_dot"] = check.dot;
@@ -2094,21 +2146,93 @@ bool TrackerEngine::trackingPoseFailsAppearance(
         (!config_.appearance_check_tracking && !acquisition)) {
         return false;
     }
-    const AppearanceCheck check =
-        recordAppearanceCheck(pose, timing_prefix, result);
+    const bool gated =
+        acquisition ? config_.appearance_gate_acquisition : true;
+    const AppearanceCheck check = recordAppearanceCheckGated(
+        pose, timing_prefix, result, gated);
     if (check.passed) {
-        return false;
+        return occlusionGuardRejects(
+            pose, timing_prefix, acquisition, gated, result);
     }
     // Too few cells in view (a strip of the marker, half out of the image)
     // or a correlation without variance (glare) cannot tell a slipped
     // identity from a correct one. A tracking pose is only rejected on
     // evidence; an acquisition pose still has to pass.
     if (!check.failed && !acquisition) {
-        result.timings_ms[timing_prefix + "_undecided_count"] = 1.0;
-        return false;
+        // When the gate itself left too few cells (the ungated sample has
+        // enough: most cells covered or without contrast), the ungated
+        // check decides, so a wrong pose over skin or background is not
+        // accepted without evidence.
+        bool ungated_fails = false;
+        if (gated && check.cells < config_.appearance_min_cells &&
+            check.cells_all >= config_.appearance_min_cells) {
+            const AppearanceCheck ung = checkAppearanceGated(
+                current_frame_, pose.rvec, pose.tvec, false);
+            result.timings_ms[timing_prefix + "_gate_undecided_count"] =
+                1.0;
+            ungated_fails = ung.failed;
+        }
+        if (!ungated_fails) {
+            result.timings_ms[timing_prefix + "_undecided_count"] = 1.0;
+            return occlusionGuardRejects(
+                pose, timing_prefix, acquisition, gated, result);
+        }
     }
     result.timings_ms[timing_prefix + "_reject_count"] = 1.0;
     return true;
+}
+
+bool TrackerEngine::occlusionGuardRejects(
+    const MapPoseResult& pose,
+    const std::string& timing_prefix,
+    bool acquisition,
+    bool gated,
+    TrackerFrameResult& result
+) const
+{
+    if (config_.occlusion_guard_mode <= 0) {
+        return false;
+    }
+    const bool gate_on = gated && (config_.appearance_gate_min_dn > 0.0 ||
+                                   config_.appearance_gate_frac > 0.0);
+    if (!gate_on) {
+        return false;
+    }
+    if (last_accepted_rvec_.size() != 3 || last_accepted_tvec_.size() != 3 ||
+        last_accepted_pose_frame_ < 0 || pose.rvec.size() != 3 ||
+        pose.tvec.size() != 3) {
+        return false;
+    }
+    if (config_.occlusion_guard_mode == 1) {
+        const AppearanceCheck ung =
+            checkAppearanceGated(current_frame_, pose.rvec, pose.tvec, false);
+        result.timings_ms[timing_prefix + "_ungated_parity"] = ung.parity;
+        result.timings_ms[timing_prefix + "_ungated_dot"] = ung.dot;
+        result.timings_ms[timing_prefix + "_ungated_cells"] =
+            static_cast<double>(ung.cells);
+        const bool ungated_accepts =
+            ung.passed || (!ung.failed && !acquisition);
+        if (ungated_accepts) {
+            return false;
+        }
+        result.timings_ms[timing_prefix + "_gate_decisive_count"] = 1.0;
+    }
+    double drot = 0.0;
+    double dtr = 0.0;
+    poseDelta(cv::Vec3d(last_accepted_rvec_.data()),
+              cv::Vec3d(last_accepted_tvec_.data()),
+              cv::Vec3d(pose.rvec.data()), cv::Vec3d(pose.tvec.data()),
+              drot, dtr);
+    result.timings_ms[timing_prefix + "_guard_drot_deg"] = drot;
+    result.timings_ms[timing_prefix + "_guard_dtrans_mm"] = dtr;
+    result.timings_ms[timing_prefix + "_guard_age"] =
+        static_cast<double>(frame_index_ - last_accepted_pose_frame_);
+    if (drot > config_.occlusion_guard_max_rot_deg ||
+        dtr > config_.occlusion_guard_max_trans_mm) {
+        result.timings_ms[timing_prefix + "_guard_reject_count"] = 1.0;
+        return true;
+    }
+    return false;
 }
 
 bool TrackerEngine::isReentryFrame() const
@@ -2307,6 +2431,362 @@ bool TrackerEngine::tryPersistentFallbackPose(
         refreshPersistentIdentities(visual_corners, frame_index_);
     }
 
+    mode_ = TrackerMode::Tracking;
+    lost_frames_ = 0;
+    finalizeFrameResult(result, frame_t0);
+    return true;
+}
+
+bool TrackerEngine::tryPriorSubgridPose(
+    const std::string& reason,
+    TrackerFrameResult& result,
+    std::int64_t frame_t0
+)
+{
+    if (!config_.prior_subgrid_enabled || config_.decode_only_mode ||
+        current_frame_.empty()) {
+        return false;
+    }
+    if (last_accepted_rvec_.size() != 3 || last_accepted_tvec_.size() != 3 ||
+        last_accepted_pose_frame_ < 0 || last_anchor_pose_frame_ < 0) {
+        return false;
+    }
+    // The age counts from the last decode / fast / persistent pose: a
+    // sub-grid pose seeds the next attempt but does not extend the window,
+    // so a chain of sub-grid poses cannot drift on unchecked for seconds.
+    const int age = frame_index_ - last_anchor_pose_frame_;
+    if (age < 1 || age > config_.prior_subgrid_max_age_frames) {
+        return false;
+    }
+    const SurfaceModel& surface = geometry_.surfaceModel();
+    if (surface.type == SurfaceModel::Type::None) {
+        return false;
+    }
+    const std::int64_t t0 = cv::getTickCount();
+    result.timings_ms["prior_subgrid_attempt_count"] = 1.0;
+
+    const cv::Vec3d rv0(last_accepted_rvec_.data());
+    const cv::Vec3d tv0(last_accepted_tvec_.data());
+    cv::Matx33d R0;
+    cv::Rodrigues(rv0, R0);
+    const int rows = geometry_.cornerRows();
+    const int cols = geometry_.cornerCols();
+
+    struct Cand { int r; int c; };
+    std::vector<Cand> cands;
+    // per candidate: corner, 4 samples, row neighbour
+    std::vector<cv::Point3d> pts;
+    std::vector<int> white;         // per candidate 4 flags
+    for (int r = 1; r + 1 < rows; ++r) {
+        for (int c = 1; c + 1 < cols; ++c) {
+            if (!geometry_.hasCorner(r, c) || !geometry_.hasCorner(r, c + 1)) {
+                continue;
+            }
+            bool ok = true;
+            for (int dr = -1; dr <= 1 && ok; ++dr) {
+                for (int dc = -1; dc <= 1 && ok; ++dc) {
+                    ok = geometry_.hasCorner(r + dr, c + dc);
+                }
+            }
+            if (!ok) {
+                continue;
+            }
+            const cv::Point3f p = geometry_.cornerPoint(r, c);
+            const cv::Vec3d P(p.x, p.y, p.z);
+            cv::Vec3d n;
+            if (surface.type == SurfaceModel::Type::Cylinder) {
+                const cv::Vec3d w = P - surface.point;
+                n = w - w.dot(surface.dir) * surface.dir;
+            } else {
+                n = surface.dir;
+            }
+            const double nl = cv::norm(n);
+            if (nl < 1e-9) {
+                continue;
+            }
+            n *= 1.0 / nl;
+            const cv::Vec3d Pc = R0 * P + tv0;
+            cv::Vec3d nc = R0 * n;
+            const double range = cv::norm(Pc);
+            if (Pc[2] <= 0 || range < 1e-6) {
+                continue;
+            }
+            if (surface.type == SurfaceModel::Type::Plane && nc.dot(Pc) > 0.0) {
+                nc = -nc;
+            }
+            if (-nc.dot(Pc) / range <= 0.30) {
+                continue;
+            }
+            cands.push_back({r, c});
+            pts.emplace_back(P);
+            const int drs[4] = {-1, -1, 0, 0};
+            const int dcs[4] = {-1, 0, -1, 0};
+            for (int q = 0; q < 4; ++q) {
+                const int rr = r + drs[q];
+                const int cc = c + dcs[q];
+                const cv::Point3f q00 = geometry_.cornerPoint(rr, cc);
+                const cv::Point3f q01 = geometry_.cornerPoint(rr, cc + 1);
+                const cv::Point3f q10 = geometry_.cornerPoint(rr + 1, cc);
+                const cv::Point3f q11 = geometry_.cornerPoint(rr + 1, cc + 1);
+                const double a = (drs[q] == -1) ? 0.8 : 0.2;
+                const double b = (dcs[q] == -1) ? 0.8 : 0.2;
+                const cv::Point3f s =
+                    static_cast<float>((1 - a) * (1 - b)) * q00 +
+                    static_cast<float>((1 - a) * b) * q01 +
+                    static_cast<float>(a * (1 - b)) * q10 +
+                    static_cast<float>(a * b) * q11;
+                pts.emplace_back(s.x, s.y, s.z);
+                white.push_back(((rr + cc) % 2) == 1 ? 1 : 0);
+            }
+            const cv::Point3f pn = geometry_.cornerPoint(r, c + 1);
+            pts.emplace_back(pn.x, pn.y, pn.z);
+        }
+    }
+    const int nc_all = static_cast<int>(cands.size());
+    result.timings_ms["prior_subgrid_candidates"] = static_cast<double>(nc_all);
+    if (nc_all < config_.prior_subgrid_min_points) {
+        return false;
+    }
+    const cv::Mat dist =
+        dist_coeffs_.empty() ? cv::Mat() : cv::Mat(dist_coeffs_);
+    std::vector<cv::Point2d> uv;
+    cv::projectPoints(pts, rv0, tv0, cv::Mat(K_), dist, uv);
+    std::vector<double> spacing;
+    std::vector<cv::Point2f> seeds;
+    std::vector<int> seed_of;
+    const double W = current_frame_.cols;
+    const double H = current_frame_.rows;
+    for (int i = 0; i < nc_all; ++i) {
+        const cv::Point2d& pc = uv[static_cast<size_t>(6 * i)];
+        if (!(pc.x > 8 && pc.x < W - 9 && pc.y > 8 && pc.y < H - 9)) {
+            continue;
+        }
+        spacing.push_back(cv::norm(uv[static_cast<size_t>(6 * i + 5)] - pc));
+        seeds.emplace_back(static_cast<float>(pc.x), static_cast<float>(pc.y));
+        seed_of.push_back(i);
+    }
+    if (static_cast<int>(seeds.size()) < config_.prior_subgrid_min_points) {
+        return false;
+    }
+    std::nth_element(spacing.begin(), spacing.begin() + spacing.size() / 2,
+                     spacing.end());
+    const double cell_px = spacing[spacing.size() / 2];
+
+    // Grey ROI around the seeds and their contrast samples, widened by the
+    // largest accepted corner move and the cornerSubPix window: only this
+    // part of the frame is converted and blurred. A grey frame is used in
+    // place; a colour frame (the Live page's BGRA) is converted in the ROI
+    // only, into a zeroed frame-sized buffer, so cornerSubPix and the samples
+    // work in frame coordinates on the same pixels as with a grey frame.
+    const double reach =
+        std::max(config_.prior_subgrid_search_frac * cell_px, 4.0) + 24.0;
+    double bx0 = W;
+    double by0 = H;
+    double bx1 = 0.0;
+    double by1 = 0.0;
+    for (int i : seed_of) {
+        for (int q = 0; q < 5; ++q) {
+            const cv::Point2d& p = uv[static_cast<size_t>(6 * i + q)];
+            bx0 = std::min(bx0, p.x);
+            by0 = std::min(by0, p.y);
+            bx1 = std::max(bx1, p.x);
+            by1 = std::max(by1, p.y);
+        }
+    }
+    const int roi_x0 = static_cast<int>(std::max(std::floor(bx0 - reach), 0.0));
+    const int roi_y0 = static_cast<int>(std::max(std::floor(by0 - reach), 0.0));
+    const int roi_x1 =
+        static_cast<int>(std::min(std::ceil(bx1 + reach) + 1.0, W));
+    const int roi_y1 =
+        static_cast<int>(std::min(std::ceil(by1 + reach) + 1.0, H));
+    const cv::Rect roi(roi_x0, roi_y0, roi_x1 - roi_x0, roi_y1 - roi_y0);
+    cv::Mat grey;
+    if (current_frame_.channels() == 3 || current_frame_.channels() == 4) {
+        cv::Mat grey_roi;
+        cv::cvtColor(current_frame_(roi), grey_roi,
+                     current_frame_.channels() == 4 ? cv::COLOR_BGRA2GRAY
+                                                    : cv::COLOR_BGR2GRAY);
+        grey = cv::Mat::zeros(current_frame_.size(), CV_8UC1);
+        grey_roi.copyTo(grey(roi));
+    } else {
+        grey = current_frame_;
+    }
+    std::vector<cv::Point2f> refined = seeds;
+    cv::cornerSubPix(grey, refined, cv::Size(4, 4), cv::Size(-1, -1),
+                     cv::TermCriteria(
+                         cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER,
+                         20, 0.03));
+    cv::Mat grey_f;
+    grey(roi).convertTo(grey_f, CV_32F);
+    cv::GaussianBlur(grey_f, grey_f, cv::Size(3, 3), 0.8);
+    // frame coordinates, clamped to the frame, then into the ROI (every
+    // sample lies at least 24 px inside it, so the blur is the whole
+    // frame's there)
+    auto sample = [&](double u, double v) {
+        u = std::min(std::max(u, 0.0), W - 1.001) - roi.x;
+        v = std::min(std::max(v, 0.0), H - 1.001) - roi.y;
+        u = std::min(std::max(u, 0.0), grey_f.cols - 1.001);
+        v = std::min(std::max(v, 0.0), grey_f.rows - 1.001);
+        const int ix = static_cast<int>(u);
+        const int iy = static_cast<int>(v);
+        const double ax = u - ix;
+        const double ay = v - iy;
+        const float* r0 = grey_f.ptr<float>(iy);
+        const float* r1 = grey_f.ptr<float>(std::min(iy + 1, grey_f.rows - 1));
+        const int ix1 = std::min(ix + 1, grey_f.cols - 1);
+        return (1 - ay) * ((1 - ax) * r0[ix] + ax * r0[ix1]) +
+               ay * ((1 - ax) * r1[ix] + ax * r1[ix1]);
+    };
+    std::vector<cv::Point3d> obj;
+    std::vector<cv::Point2d> img;
+    std::vector<int> obj_cand;
+    const double max_move = config_.prior_subgrid_search_frac * cell_px;
+    for (size_t j = 0; j < seeds.size(); ++j) {
+        const double du = refined[j].x - seeds[j].x;
+        const double dv = refined[j].y - seeds[j].y;
+        if (std::sqrt(du * du + dv * dv) > max_move) {
+            continue;
+        }
+        const int i = seed_of[j];
+        double wsum = 0.0, bsum = 0.0, wmin = 1e9, bmax = -1e9;
+        int nw = 0, nb = 0;
+        for (int q = 0; q < 4; ++q) {
+            const cv::Point2d& s = uv[static_cast<size_t>(6 * i + 1 + q)];
+            const double val = sample(s.x + du, s.y + dv);
+            if (white[static_cast<size_t>(4 * i + q)]) {
+                wsum += val; ++nw; wmin = std::min(wmin, val);
+            } else {
+                bsum += val; ++nb; bmax = std::max(bmax, val);
+            }
+        }
+        if (nw == 0 || nb == 0) {
+            continue;
+        }
+        if (wsum / nw - bsum / nb < config_.prior_subgrid_min_contrast ||
+            wmin <= bmax) {
+            continue;
+        }
+        obj.push_back(pts[static_cast<size_t>(6 * i)]);
+        img.emplace_back(refined[j].x, refined[j].y);
+        obj_cand.push_back(i);
+    }
+    result.timings_ms["prior_subgrid_measured"] =
+        static_cast<double>(obj.size());
+    if (static_cast<int>(obj.size()) < config_.prior_subgrid_min_points) {
+        result.timings_ms["prior_subgrid_ms"] = elapsedMs(t0);
+        return false;
+    }
+    cv::Mat rvec = (cv::Mat_<double>(3, 1) << rv0[0], rv0[1], rv0[2]);
+    cv::Mat tvec = (cv::Mat_<double>(3, 1) << tv0[0], tv0[1], tv0[2]);
+    std::vector<int> inliers;
+    bool ok = false;
+    try {
+        ok = cv::solvePnPRansac(obj, img, cv::Mat(K_), dist, rvec, tvec, true,
+                                100, 2.0f, 0.99, inliers,
+                                cv::SOLVEPNP_ITERATIVE);
+    } catch (const cv::Exception&) {
+        ok = false;
+    }
+    if (!ok ||
+        static_cast<int>(inliers.size()) < config_.prior_subgrid_min_points) {
+        result.timings_ms["prior_subgrid_ms"] = elapsedMs(t0);
+        return false;
+    }
+    std::vector<cv::Point3d> obj_in;
+    std::vector<cv::Point2d> img_in;
+    std::vector<int> cand_in;
+    for (int k : inliers) {
+        obj_in.push_back(obj[static_cast<size_t>(k)]);
+        img_in.push_back(img[static_cast<size_t>(k)]);
+        cand_in.push_back(obj_cand[static_cast<size_t>(k)]);
+    }
+    cv::solvePnPRefineLM(obj_in, img_in, cv::Mat(K_), dist, rvec, tvec);
+    // motion gate against the prior
+    const cv::Vec3d rv1(rvec.at<double>(0), rvec.at<double>(1),
+                        rvec.at<double>(2));
+    const cv::Vec3d tv1(tvec.at<double>(0), tvec.at<double>(1),
+                        tvec.at<double>(2));
+    double drot = 0.0;
+    double dtr = 0.0;
+    poseDelta(rv0, tv0, rv1, tv1, drot, dtr);
+    result.timings_ms["prior_subgrid_drot_deg"] = drot;
+    result.timings_ms["prior_subgrid_dtrans_mm"] = dtr;
+    if (drot > config_.prior_subgrid_max_rot_deg ||
+        dtr > config_.prior_subgrid_max_trans_mm) {
+        result.timings_ms["prior_subgrid_ms"] = elapsedMs(t0);
+        return false;
+    }
+    std::vector<cv::Point2d> rep;
+    cv::projectPoints(obj_in, rvec, tvec, cv::Mat(K_), dist, rep);
+    double se = 0.0, mx = 0.0;
+    for (size_t j = 0; j < rep.size(); ++j) {
+        const double e = cv::norm(rep[j] - img_in[j]);
+        se += e;
+        mx = std::max(mx, e);
+    }
+    cv::Matx33d R1;
+    cv::Rodrigues(rv1, R1);
+    MapPoseResult pose;
+    pose.success = true;
+    pose.method = "prior_subgrid";
+    pose.rvec = {rv1[0], rv1[1], rv1[2]};
+    pose.tvec = {tv1[0], tv1[1], tv1[2]};
+    pose.T_marker_camera.assign(16, 0.0);
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            pose.T_marker_camera[static_cast<size_t>(4 * a + b)] = R1(a, b);
+        }
+        pose.T_marker_camera[static_cast<size_t>(4 * a + 3)] =
+            pose.tvec[static_cast<size_t>(a)];
+    }
+    pose.T_marker_camera[15] = 1.0;
+    pose.reprojection_mean_px = se / std::max<size_t>(1, rep.size());
+    pose.reprojection_max_px = mx;
+    pose.num_points = static_cast<int>(obj.size());
+    pose.num_inliers = static_cast<int>(obj_in.size());
+    std::vector<TrackerCorner> corners;
+    for (size_t j = 0; j < obj_in.size(); ++j) {
+        const Cand& cd = cands[static_cast<size_t>(cand_in[j])];
+        PoseTrackPoint p;
+        p.global_row = cd.r;
+        p.global_col = cd.c;
+        p.xyz_mm = {obj_in[j].x, obj_in[j].y, obj_in[j].z};
+        p.uv = {img_in[j].x, img_in[j].y};
+        p.votes = 1;
+        pose.points.push_back(p);
+        TrackerCorner tc = trackerCornerFromPosePoint(p);
+        tc.observed_frames = 1;
+        corners.push_back(tc);
+    }
+    // identity safeguard: the gated appearance check has to PASS
+    // (acquisition rule)
+    const AppearanceCheck check =
+        recordAppearanceCheckGated(pose, "prior_appearance", result, true);
+    result.timings_ms["prior_subgrid_ms"] = elapsedMs(t0);
+    if (!check.passed) {
+        result.timings_ms["prior_subgrid_appearance_reject_count"] = 1.0;
+        return false;
+    }
+    pose_tracker_.setPose(pose.rvec, pose.tvec);
+    packagePoseResult(
+        result, pose, PoseSource::Persistent,
+        "Pose from the prior-seeded sub-grid after: " + reason + ".",
+        corners, corners);
+    result.timings_ms["prior_subgrid_count"] = 1.0;
+    // accepted, but no anchor: the next sub-grid attempt still counts its
+    // age from the last decode / fast / persistent pose
+    const int anchor = last_anchor_pose_frame_;
+    result.current_pose_accepted =
+        acceptPoseState(pose, static_cast<int>(corners.size()));
+    last_anchor_pose_frame_ = anchor;
+    // Keep a larger identity set of the last fast / decode pose: replacing it
+    // with the (smaller) sub-grid set starves the fast path of the next frames
+    // (run_04, lamp: 84 fresh frames lost). Re-seed only when the matcher holds
+    // fewer identities (e.g. cleared by a full loss).
+    if (persistent_matcher_.identities().size() < corners.size()) {
+        refreshPersistentIdentities(corners, frame_index_);
+        result.timings_ms["prior_subgrid_identity_refresh_count"] = 1.0;
+    }
     mode_ = TrackerMode::Tracking;
     lost_frames_ = 0;
     finalizeFrameResult(result, frame_t0);
@@ -2689,6 +3169,16 @@ AppearanceCheck TrackerEngine::checkAppearance(
     const std::vector<double>& tvec
 ) const
 {
+    return checkAppearanceGated(frame, rvec, tvec, false);
+}
+
+AppearanceCheck TrackerEngine::checkAppearanceGated(
+    const cv::Mat& frame,
+    const std::vector<double>& rvec,
+    const std::vector<double>& tvec,
+    bool gated
+) const
+{
     return checkMarkerAppearance(
         frame,
         geometry_,
@@ -2699,7 +3189,9 @@ AppearanceCheck TrackerEngine::checkAppearance(
         tvec,
         config_.appearance_min_parity,
         config_.appearance_min_dot,
-        config_.appearance_min_cells
+        config_.appearance_min_cells,
+        gated ? config_.appearance_gate_min_dn : 0.0,
+        gated ? config_.appearance_gate_frac : 0.0
     );
 }
 

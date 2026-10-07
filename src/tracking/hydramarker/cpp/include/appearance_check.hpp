@@ -24,7 +24,8 @@ namespace hydramarker {
 struct AppearanceCheck {
     double parity = std::numeric_limits<double>::quiet_NaN();
     double dot = std::numeric_limits<double>::quiet_NaN();
-    int cells = 0;          // sampled cells
+    int cells = 0;          // sampled cells (used cells when the gate is on)
+    int cells_all = 0;      // sampled cells before the occlusion gate
     bool passed = false;    // both correlations finite and above the minimum
     bool failed = false;    // enough cells and a finite correlation below it
 };
@@ -43,7 +44,16 @@ AppearanceCheck checkMarkerAppearance(
     const std::vector<double>& tvec,
     double min_parity,
     double min_dot,
-    int min_cells
+    int min_cells,
+    // Occlusion gate (off when both are <= 0): a cell is used only when its
+    // off-centre mean differs from the median off-centre mean of its sampled
+    // 4-neighbours (at least 2) by max(gate_min_dn, gate_frac * p90 of those
+    // differences) -- i.e. it shows checker contrast at the projected place.
+    // A finger or glove over the marker has no such contrast and drops out
+    // instead of pulling both correlations towards zero; a whole-cell
+    // identity shift keeps the contrast and still fails.
+    double gate_min_dn = 0.0,
+    double gate_frac = 0.0
 );
 
 } // namespace hydramarker

@@ -370,6 +370,38 @@ struct TrackerConfig {
     // or whose fast pose failed the check. Those poses are checked even with
     // appearance_check_tracking = false.
     bool appearance_check_tracking = true;
+    // Occlusion gate of the appearance check (appearance_check.hpp): a cell
+    // counts only where it shows checker contrast at its projected place, so
+    // a finger over the marker drops out instead of failing a correct pose.
+    // 0 / 0 = off. Applied to the fast / persistent tracking checks and to
+    // the prior sub-grid pose; with appearance_gate_acquisition also to the
+    // acquisition checks (decode of a (re)acquisition, re-entry frames,
+    // fast-reject fallbacks; config.py says why not).
+    double appearance_gate_min_dn = 12.0;
+    double appearance_gate_frac = 0.25;
+    bool appearance_gate_acquisition = false;
+    // Prior-seeded sub-grid fallback (tracker_engine.cpp tryPriorSubgridPose):
+    // on a frame without a fresh pose, measure the model corners projected
+    // with the last accepted pose and accept the PnP pose only if the gated
+    // appearance check passes; at most prior_subgrid_max_age_frames after
+    // the last decode / fast / persistent pose (a sub-grid pose does not
+    // extend the window). With it on, every decode pose is checked, also
+    // in tracking mode.
+    bool prior_subgrid_enabled = true;
+    int prior_subgrid_max_age_frames = 15;
+    int prior_subgrid_min_points = 10;
+    double prior_subgrid_search_frac = 0.35;
+    double prior_subgrid_min_contrast = 20.0;
+    double prior_subgrid_max_rot_deg = 8.0;
+    double prior_subgrid_max_trans_mm = 15.0;
+    // Continuity guard of gated tracking poses: 0 = off, 1 = poses only the
+    // occlusion gate made acceptable (the ungated check rejects them), 2 =
+    // every tracking pose checked with the gate. Such a pose is rejected
+    // when it deviates from the last accepted pose by more than max_rot_deg
+    // or max_trans_mm (marker origin).
+    int occlusion_guard_mode = 2;
+    double occlusion_guard_max_rot_deg = 15.0;
+    double occlusion_guard_max_trans_mm = 25.0;
 };
 
 } // namespace hydramarker

@@ -109,7 +109,14 @@ public:
     const IrPoseRefiner& irPoseRefiner() const { return ir_pose_refiner_; }
 
     // Appearance check of a pose on a frame with the configured thresholds
-    // (the check the engine applies to its own poses).
+    // (the check the engine applies to its own poses); gated: with the
+    // occlusion gate (appearance_gate_*).
+    AppearanceCheck checkAppearanceGated(
+        const cv::Mat& frame,
+        const std::vector<double>& rvec,
+        const std::vector<double>& tvec,
+        bool gated
+    ) const;
     AppearanceCheck checkAppearance(
         const cv::Mat& frame,
         const std::vector<double>& rvec,
@@ -154,6 +161,9 @@ private:
     int max_pts_seen_ = 0;
     double last_good_reproj_px_ = -1.0;
     int last_accepted_pose_frame_ = -1;
+    // last accepted pose that was not a prior sub-grid pose: the age of
+    // the sub-grid fallback (prior_subgrid_max_age_frames) counts from it
+    int last_anchor_pose_frame_ = -1;
     int last_accepted_visual_corner_count_ = 0;
     std::vector<double> last_accepted_rvec_;
     std::vector<double> last_accepted_tvec_;
@@ -321,12 +331,14 @@ private:
         const std::vector<double>& rvec,
         const std::vector<double>& tvec
     );
-    // checkAppearance() on the current frame; the values go to
-    // result.timings_ms as <prefix>_ms / _parity / _dot / _cells.
-    AppearanceCheck recordAppearanceCheck(
+    // checkAppearanceGated() on the current frame (gated: with the occlusion
+    // gate); the values go to result.timings_ms as <prefix>_ms / _parity /
+    // _dot / _cells, with the gate also _cells_all.
+    AppearanceCheck recordAppearanceCheckGated(
         const MapPoseResult& pose,
         const std::string& timing_prefix,
-        TrackerFrameResult& result
+        TrackerFrameResult& result,
+        bool gated
     ) const;
     // Appearance check of a fast / persistent pose; true = the pose is
     // rejected (<prefix>_reject_count). A tracking pose is checked only with
@@ -337,6 +349,15 @@ private:
         const MapPoseResult& pose,
         const std::string& timing_prefix,
         bool acquisition,
+        TrackerFrameResult& result
+    ) const;
+    // Continuity guard of a gated tracking pose that the check accepted
+    // (occlusion_guard_mode); true = reject (<prefix>_guard_reject_count).
+    bool occlusionGuardRejects(
+        const MapPoseResult& pose,
+        const std::string& timing_prefix,
+        bool acquisition,
+        bool gated,
         TrackerFrameResult& result
     ) const;
     // The previous frame produced no accepted pose (none yet, failed, held,
@@ -359,6 +380,14 @@ private:
         const std::string& reason,
         bool after_decode_fail,
         bool acquisition,
+        TrackerFrameResult& result,
+        std::int64_t frame_t0
+    );
+
+    // Prior-seeded sub-grid fallback (prior_subgrid_enabled) on a frame
+    // without a fresh pose; true = the result holds its pose and is final.
+    bool tryPriorSubgridPose(
+        const std::string& reason,
         TrackerFrameResult& result,
         std::int64_t frame_t0
     );

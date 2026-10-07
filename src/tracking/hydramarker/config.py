@@ -721,6 +721,52 @@ class TrackerConfig:
     # or whose fast pose failed the check. Those poses are checked even with
     # appearance_check_tracking = False.
     appearance_check_tracking: bool = True
+    # Occlusion gate of the TRACKING checks (fast / persistent poses and the
+    # prior sub-grid pose): a cell counts only where it shows checker
+    # contrast at its projected place (|off-centre mean - median of its
+    # sampled 4-neighbours| >= max(appearance_gate_min_dn,
+    # appearance_gate_frac * p90 of those differences)). A finger over the
+    # marker then drops out of both correlations instead of failing a
+    # correct pose (05.10. live_check run_05 / 30.09. S05: the true pose
+    # failed the ungated check on 183 of 1214 / 88 of 300 frames); identity
+    # shifts still fail (0 of 16155 shifted poses passed). Not on the decode
+    # (re)acquisition check (appearance_gate_acquisition): gated there, a
+    # partial-grid decode pose 70 deg off passed (run_05 k534-536).
+    appearance_gate_min_dn: float = 12.0
+    appearance_gate_frac: float = 0.25
+    appearance_gate_acquisition: bool = False
+    # Prior-seeded sub-grid fallback: on a frame without a fresh pose, up to
+    # prior_subgrid_max_age_frames after the last decode / fast / persistent
+    # pose (a sub-grid pose seeds the next one but does not extend the window),
+    # refine the model corners projected with the last accepted pose
+    # (cornerSubPix, at most prior_subgrid_search_frac of a cell away, local
+    # checker contrast >= prior_subgrid_min_contrast DN), solve PnP around it
+    # (motion gate prior_subgrid_max_rot_deg / _max_trans_mm) and accept the
+    # pose only if the gated appearance check PASSES. With it on, every decode
+    # pose is checked, also in tracking mode. Replays with the Live page's
+    # config and reset, every frame processed: 06.10. O02 (two fingers over
+    # half of the label) 72 -> 292 of 301 frames with a pose; 108 takes 31960
+    # -> 32717 fresh frames (891 gained, 134 lost), poses failing both
+    # photometric checks 10 -> 3, none of the gained poses with a shifted
+    # identity (label-shift test of the RGB-only pose).
+    prior_subgrid_enabled: bool = True
+    prior_subgrid_max_age_frames: int = 15
+    prior_subgrid_min_points: int = 10
+    prior_subgrid_search_frac: float = 0.35
+    prior_subgrid_min_contrast: float = 20.0
+    prior_subgrid_max_rot_deg: float = 8.0
+    prior_subgrid_max_trans_mm: float = 15.0
+    # Continuity guard of the gated tracking poses (mode 2 = every pose checked
+    # with the gate, 1 = only those the ungated check rejects, 0 = off): such a
+    # pose is rejected when it is more than occlusion_guard_max_rot_deg or
+    # occlusion_guard_max_trans_mm (marker origin) from the last accepted pose.
+    # Without it the gate let a fast pose 43 deg / 32 mm off through in fast
+    # motion (05.10. M04 k35). In the 108 replayed takes it rejected 4 poses
+    # (17-43 deg), which removed 9 jump frames; the largest deviation it
+    # accepted was 14.7 deg / 23.9 mm.
+    occlusion_guard_mode: int = 2
+    occlusion_guard_max_rot_deg: float = 15.0
+    occlusion_guard_max_trans_mm: float = 25.0
 
     # Logging Output
     # Controls the corner list that TrackerEngine returns to Python.

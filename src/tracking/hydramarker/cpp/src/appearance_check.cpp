@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -101,7 +102,9 @@ AppearanceCheck checkMarkerAppearance(
     const std::vector<double>& tvec,
     double min_parity,
     double min_dot,
-    int min_cells
+    int min_cells,
+    double gate_min_dn,
+    double gate_frac
 )
 {
     AppearanceCheck out;
@@ -124,6 +127,7 @@ AppearanceCheck checkMarkerAppearance(
     std::vector<cv::Point3d> points;
     std::vector<double> base;
     std::vector<double> centre_expected;
+    std::vector<int> cell_rc;   // r * cols + c of every front-facing cell
     points.reserve(static_cast<size_t>((rows - 1) * (cols - 1) * 5));
     for (int r = 0; r + 1 < rows; ++r) {
         for (int c = 0; c + 1 < cols; ++c) {
@@ -185,6 +189,7 @@ AppearanceCheck checkMarkerAppearance(
             const int bit = field.at(c, r) ? 1 : 0;
             base.push_back(b);
             centre_expected.push_back(static_cast<double>(b ^ bit));
+            cell_rc.push_back(r * cols + c);
             points.emplace_back(centre[0], centre[1], centre[2]);
             for (double a : {0.2, 0.8}) {
                 for (double bb : {0.2, 0.8}) {
@@ -272,6 +277,7 @@ AppearanceCheck checkMarkerAppearance(
     std::vector<double> off_centre;
     std::vector<double> dot_expected;
     std::vector<double> dot_measured;
+    std::vector<int> sampled_rc;
     for (int i = 0; i < visible; ++i) {
         const cv::Point2d pc = uv[static_cast<size_t>(5 * i)];
         if (!(pc.x > 2 && pc.x < frame.cols - 2 &&
@@ -289,8 +295,71 @@ AppearanceCheck checkMarkerAppearance(
         dot_expected.push_back(centre_expected[static_cast<size_t>(i)] -
                                base[static_cast<size_t>(i)]);
         dot_measured.push_back(centre - off);
+        sampled_rc.push_back(cell_rc[static_cast<size_t>(i)]);
     }
     out.cells = static_cast<int>(sampled_base.size());
+    out.cells_all = out.cells;
+    if ((gate_min_dn > 0.0 || gate_frac > 0.0) && !sampled_base.empty()) {
+        std::unordered_map<int, size_t> at;
+        for (size_t j = 0; j < sampled_rc.size(); ++j) {
+            at[sampled_rc[j]] = j;
+        }
+        std::vector<double> diff(sampled_rc.size(),
+                                 std::numeric_limits<double>::quiet_NaN());
+        std::vector<double> finite_abs;
+        for (size_t j = 0; j < sampled_rc.size(); ++j) {
+            const int r = sampled_rc[j] / cols;
+            const int c = sampled_rc[j] % cols;
+            std::vector<double> nb;
+            const int dr[4] = {1, -1, 0, 0};
+            const int dc[4] = {0, 0, 1, -1};
+            for (int q = 0; q < 4; ++q) {
+                const int rr = r + dr[q];
+                const int cc = c + dc[q];
+                if (rr < 0 || cc < 0 || rr >= rows - 1 || cc >= cols - 1) {
+                    continue;
+                }
+                const auto it = at.find(rr * cols + cc);
+                if (it != at.end()) {
+                    nb.push_back(off_centre[it->second]);
+                }
+            }
+            if (nb.size() < 2) {
+                continue;
+            }
+            std::sort(nb.begin(), nb.end());
+            const double med = (nb.size() % 2 == 1)
+                ? nb[nb.size() / 2]
+                : 0.5 * (nb[nb.size() / 2 - 1] + nb[nb.size() / 2]);
+            diff[j] = off_centre[j] - med;
+            finite_abs.push_back(std::abs(diff[j]));
+        }
+        double p90 = 0.0;
+        if (!finite_abs.empty()) {
+            std::sort(finite_abs.begin(), finite_abs.end());
+            // numpy percentile (linear) at 90 %
+            const double pos = 0.9 * static_cast<double>(finite_abs.size() - 1);
+            const size_t lo = static_cast<size_t>(std::floor(pos));
+            const size_t hi = std::min(lo + 1, finite_abs.size() - 1);
+            p90 = finite_abs[lo] +
+                  (pos - lo) * (finite_abs[hi] - finite_abs[lo]);
+        }
+        const double thr = std::max(gate_min_dn, gate_frac * p90);
+        std::vector<double> b2, o2, de2, dm2;
+        for (size_t j = 0; j < diff.size(); ++j) {
+            if (std::isfinite(diff[j]) && std::abs(diff[j]) >= thr) {
+                b2.push_back(sampled_base[j]);
+                o2.push_back(off_centre[j]);
+                de2.push_back(dot_expected[j]);
+                dm2.push_back(dot_measured[j]);
+            }
+        }
+        sampled_base.swap(b2);
+        off_centre.swap(o2);
+        dot_expected.swap(de2);
+        dot_measured.swap(dm2);
+        out.cells = static_cast<int>(sampled_base.size());
+    }
     if (out.cells < min_cells) {
         return out;
     }

@@ -1593,7 +1593,20 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("appearance_min_parity", &TrackerConfig::appearance_min_parity)
         .def_readwrite("appearance_min_dot", &TrackerConfig::appearance_min_dot)
         .def_readwrite("appearance_min_cells", &TrackerConfig::appearance_min_cells)
-        .def_readwrite("appearance_check_tracking", &TrackerConfig::appearance_check_tracking);
+        .def_readwrite("appearance_check_tracking", &TrackerConfig::appearance_check_tracking)
+        .def_readwrite("appearance_gate_min_dn", &TrackerConfig::appearance_gate_min_dn)
+        .def_readwrite("appearance_gate_frac", &TrackerConfig::appearance_gate_frac)
+        .def_readwrite("appearance_gate_acquisition", &TrackerConfig::appearance_gate_acquisition)
+        .def_readwrite("prior_subgrid_enabled", &TrackerConfig::prior_subgrid_enabled)
+        .def_readwrite("prior_subgrid_max_age_frames", &TrackerConfig::prior_subgrid_max_age_frames)
+        .def_readwrite("prior_subgrid_min_points", &TrackerConfig::prior_subgrid_min_points)
+        .def_readwrite("prior_subgrid_search_frac", &TrackerConfig::prior_subgrid_search_frac)
+        .def_readwrite("prior_subgrid_min_contrast", &TrackerConfig::prior_subgrid_min_contrast)
+        .def_readwrite("prior_subgrid_max_rot_deg", &TrackerConfig::prior_subgrid_max_rot_deg)
+        .def_readwrite("prior_subgrid_max_trans_mm", &TrackerConfig::prior_subgrid_max_trans_mm)
+        .def_readwrite("occlusion_guard_mode", &TrackerConfig::occlusion_guard_mode)
+        .def_readwrite("occlusion_guard_max_rot_deg", &TrackerConfig::occlusion_guard_max_rot_deg)
+        .def_readwrite("occlusion_guard_max_trans_mm", &TrackerConfig::occlusion_guard_max_trans_mm);
 
     py::class_<PersistentMatcher>(m, "PersistentMatcher")
         .def(py::init<const TrackerConfig&>(), py::arg("config") = TrackerConfig())
