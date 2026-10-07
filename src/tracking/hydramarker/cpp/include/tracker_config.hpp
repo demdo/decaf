@@ -46,6 +46,15 @@ struct TrackerConfig {
     int checker_local_completion_zero_gain_backoff_max_factor = 16;
     int checker_local_completion_stale_predicted_frames = 18;
     int checker_max_undecodeable_tracking_frames = 12;
+    // A re-entry frame (no accepted pose in the previous frame) whose
+    // LK-tracked detection decodes no patch and whose grid is a wrong
+    // lattice resets the detector's tracking: the next frame runs a full
+    // detection instead of holding the wrong grid (TrackerEngine,
+    // detectionLatticeLooksWrong; config.py).
+    bool checker_wrong_lattice_reset = true;
+    // At most this many such resets until the next accepted pose (each
+    // costs a full detection); <= 0: no limit.
+    int checker_wrong_lattice_reset_max_per_gap = 1;
     int checker_min_fresh_correspondences_for_stable_tracking = 8;
     int checker_max_low_fresh_correspondence_frames = 12;
 

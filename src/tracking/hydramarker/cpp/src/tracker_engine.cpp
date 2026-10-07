@@ -28,6 +28,174 @@ std::string formatDouble(double value, int precision)
     return stream.str();
 }
 
+// Wrong-lattice test of a detection (re-acquisition): the grid stage can
+// build, from a visible and sharp marker, a lattice that cannot decode.
+//  * 45-degree sub-lattice of one corner class (sqrt(2) spacing, the cells
+//    are rhombi around checker corners): the checker score with the
+//    half-sum / half-difference of the two grid steps beats the one with the
+//    steps themselves (quadrant samples at a quarter step around a corner:
+//    diagonal quadrants equal, neighbouring ones different, > 25 DN).
+//  * Sheared lattice (one step along a square diagonal): edge contrast
+//    across the midpoint of the steps e1, e2 and of the alternatives
+//    e2 - e1, e2 + e1 (samples 0.2 step to either side, real above
+//    max(20 DN, 0.4 x p90 of the step contrasts)); one step is real on
+//    fewer than half of the corners, the other step and the better
+//    alternative on at least 3/5. A correct but blurred lattice keeps its
+//    alternatives dark too (they are square diagonals), so blur alone does
+//    not count as shear.
+// Needs >= 16 corners (and >= 3 corners resp. 6 corners with both
+// neighbours for the two tests).
+bool detectionLatticeLooksWrong(
+    const cv::Mat& frame,
+    const CheckerboardDetection& det)
+{
+    if (frame.empty() || det.corners.size() < 16 || frame.depth() != CV_8U) {
+        return false;
+    }
+    std::map<std::pair<int, int>, cv::Point2f> by_ij;
+    for (const auto& c : det.corners) {
+        by_ij[{c.i, c.j}] = c.uv;
+    }
+    // A grey frame is used in place; a colour frame (the Live page's BGRA)
+    // is converted in a ROI only: the corners' bounding box widened by 1.5
+    // grid steps (every sample lies within 1.4 steps of its corner) + 4 px.
+    cv::Mat gray = frame;
+    cv::Point offset(0, 0);
+    if (frame.channels() == 3 || frame.channels() == 4) {
+        float step = 0.0f;
+        float x0 = static_cast<float>(frame.cols);
+        float y0 = static_cast<float>(frame.rows);
+        float x1 = 0.0f;
+        float y1 = 0.0f;
+        for (const auto& c : det.corners) {
+            x0 = std::min(x0, c.uv.x);
+            y0 = std::min(y0, c.uv.y);
+            x1 = std::max(x1, c.uv.x);
+            y1 = std::max(y1, c.uv.y);
+            for (const auto& nb : {by_ij.find({c.i + 1, c.j}),
+                                   by_ij.find({c.i, c.j + 1})}) {
+                if (nb != by_ij.end()) {
+                    step = std::max(
+                        step, static_cast<float>(cv::norm(nb->second - c.uv)));
+                }
+            }
+        }
+        const float m = 1.5f * step + 4.0f;
+        const int rx0 = std::max(0, cvFloor(x0 - m));
+        const int ry0 = std::max(0, cvFloor(y0 - m));
+        const int rx1 = std::min(frame.cols, cvCeil(x1 + m) + 1);
+        const int ry1 = std::min(frame.rows, cvCeil(y1 + m) + 1);
+        if (rx1 - rx0 < 3 || ry1 - ry0 < 3) {
+            return false;
+        }
+        const cv::Rect roi(rx0, ry0, rx1 - rx0, ry1 - ry0);
+        cv::cvtColor(frame(roi), gray, frame.channels() == 4
+                                           ? cv::COLOR_BGRA2GRAY
+                                           : cv::COLOR_BGR2GRAY);
+        offset = roi.tl();
+    }
+    auto box = [&](const cv::Point2f& q, float& v) {
+        const int x = cvRound(q.x);
+        const int y = cvRound(q.y);
+        if (x < 2 || y < 2 || x >= frame.cols - 2 || y >= frame.rows - 2) {
+            return false;
+        }
+        const int lx = x - offset.x;
+        const int ly = y - offset.y;
+        if (lx < 1 || ly < 1 || lx >= gray.cols - 1 || ly >= gray.rows - 1) {
+            return false;
+        }
+        int s = 0;
+        for (int yy = ly - 1; yy <= ly + 1; ++yy) {
+            const uchar* r = gray.ptr<uchar>(yy);
+            for (int xx = lx - 1; xx <= lx + 1; ++xx) {
+                s += r[xx];
+            }
+        }
+        v = static_cast<float>(s) / 9.0f;
+        return true;
+    };
+    auto checker = [&](const cv::Point2f& p, const cv::Point2f& e1,
+                       const cv::Point2f& e2) {
+        const float sa[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
+        const float sb[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
+        float v[4];
+        for (int q = 0; q < 4; ++q) {
+            if (!box(p + 0.25f * (sa[q] * e1 + sb[q] * e2), v[q])) {
+                return false;
+            }
+        }
+        return std::abs(0.5f * (v[0] + v[2]) - 0.5f * (v[1] + v[3])) -
+                   std::max(std::abs(v[0] - v[2]), std::abs(v[1] - v[3])) >
+               25.0f;
+    };
+    auto contrast = [&](const cv::Point2f& p, const cv::Point2f& d,
+                        float& out) {
+        const cv::Point2f m = p + 0.5f * d;
+        const cv::Point2f nrm(-0.2f * d.y, 0.2f * d.x);
+        float a = 0.0f;
+        float b = 0.0f;
+        if (!box(m + nrm, a) || !box(m - nrm, b)) {
+            return false;
+        }
+        out = std::abs(a - b);
+        return true;
+    };
+    struct Steps {
+        float c1, c2, cm, cp;
+    };
+    int n_axis = 0;
+    int n_diag = 0;
+    std::vector<Steps> steps;
+    std::vector<float> step_contrast;
+    for (const auto& c : det.corners) {
+        const auto a = by_ij.find({c.i + 1, c.j});
+        const auto b = by_ij.find({c.i, c.j + 1});
+        if (a == by_ij.end() || b == by_ij.end()) {
+            continue;
+        }
+        const cv::Point2f e1 = a->second - c.uv;
+        const cv::Point2f e2 = b->second - c.uv;
+        n_axis += checker(c.uv, e1, e2) ? 1 : 0;
+        n_diag += checker(c.uv, 0.5f * (e1 + e2), 0.5f * (e1 - e2)) ? 1 : 0;
+        Steps s{};
+        if (contrast(c.uv, e1, s.c1) && contrast(c.uv, e2, s.c2) &&
+            contrast(c.uv, e2 - e1, s.cm) && contrast(c.uv, e2 + e1, s.cp)) {
+            steps.push_back(s);
+            step_contrast.push_back(s.c1);
+            step_contrast.push_back(s.c2);
+        }
+    }
+    if (n_diag >= 3 && n_diag > n_axis) {
+        return true;
+    }
+    const int n = static_cast<int>(steps.size());
+    if (n < 6) {
+        return false;
+    }
+    const size_t q = static_cast<size_t>(
+        0.9 * static_cast<double>(step_contrast.size() - 1));
+    std::nth_element(
+        step_contrast.begin(),
+        step_contrast.begin() + static_cast<std::ptrdiff_t>(q),
+        step_contrast.end());
+    const float thr = std::max(20.0f, 0.4f * step_contrast[q]);
+    int r1 = 0;
+    int r2 = 0;
+    int rm = 0;
+    int rp = 0;
+    for (const auto& s : steps) {
+        r1 += s.c1 > thr ? 1 : 0;
+        r2 += s.c2 > thr ? 1 : 0;
+        rm += s.cm > thr ? 1 : 0;
+        rp += s.cp > thr ? 1 : 0;
+    }
+    const int ra = std::max(rm, rp);
+    const bool shear_1 = 2 * r1 < n && 5 * r2 >= 3 * n && 5 * ra >= 3 * n;
+    const bool shear_2 = 2 * r2 < n && 5 * r1 >= 3 * n && 5 * ra >= 3 * n;
+    return shear_1 || shear_2;
+}
+
 // Rotation (deg) and marker-origin translation (mm) from pose a to pose b
 // (rvec / tvec marker -> camera).
 void poseDelta(
@@ -174,6 +342,7 @@ void TrackerEngine::reset()
 {
     mode_ = TrackerMode::Lost;
     frame_index_ = 0;
+    wrong_lattice_resets_in_gap_ = 0;
     lost_frames_ = 0;
     low_fresh_correspondence_frames_ = 0;
     pose_propagation_block_until_frame_ = -1;
@@ -580,6 +749,23 @@ TrackerFrameResult TrackerEngine::processFrameInternal(
 
     if (decoded_valid.empty()) {
         const std::string reason = "No valid decoded patches";
+        // A wrong lattice (45-degree sub-lattice or sheared) decodes
+        // nothing, and LK tracking would hold it through the whole
+        // re-entry: restart the search with a full detection next frame.
+        // Only a tracked grid; a fresh full detection keeps its frame.
+        // At most checker_wrong_lattice_reset_max_per_gap resets until the
+        // next accepted pose: a search that keeps finding a wrong lattice
+        // would otherwise pay a full detection every few frames.
+        if (config_.checker_wrong_lattice_reset && isReentryFrame() &&
+            detection->tracking &&
+            (config_.checker_wrong_lattice_reset_max_per_gap <= 0 ||
+             wrong_lattice_resets_in_gap_ <
+                 config_.checker_wrong_lattice_reset_max_per_gap) &&
+            detectionLatticeLooksWrong(frame, *detection)) {
+            checkerboard_detector_.resetTracking();
+            ++wrong_lattice_resets_in_gap_;
+            result.timings_ms["wrong_lattice_reset_count"] = 1.0;
+        }
         const std::int64_t fallback_t0 = cv::getTickCount();
         if (tryPersistentFallbackPose(
                 *detection_for_decode,
@@ -1182,6 +1368,7 @@ bool TrackerEngine::acceptPoseState(
     last_accepted_T_marker_camera_ = pose.T_marker_camera;
     last_accepted_pose_frame_ = frame_index_;
     last_anchor_pose_frame_ = frame_index_;
+    wrong_lattice_resets_in_gap_ = 0;
     last_accepted_visual_corner_count_ = visual_corner_count;
     return true;
 }

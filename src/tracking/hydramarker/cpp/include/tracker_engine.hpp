@@ -168,6 +168,8 @@ private:
     // last accepted pose that was not a prior sub-grid pose: the age of
     // the sub-grid fallback (prior_subgrid_max_age_frames) counts from it
     int last_anchor_pose_frame_ = -1;
+    // wrong-lattice resets since the last accepted pose (or reset())
+    int wrong_lattice_resets_in_gap_ = 0;
     int last_accepted_visual_corner_count_ = 0;
     std::vector<double> last_accepted_rvec_;
     std::vector<double> last_accepted_tvec_;

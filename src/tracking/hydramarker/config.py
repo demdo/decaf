@@ -300,6 +300,24 @@ class TrackerConfig:
     # Set to 0 to keep the legacy dynamic predicted-corner lifetime.
     checker_local_completion_stale_predicted_frames: int = 18
     checker_max_undecodeable_tracking_frames: int = 12
+    # Re-acquisition (phase 4): from a visible, sharp marker the grid stage
+    # sometimes builds a wrong lattice - the 45-degree sub-lattice of one
+    # corner class (cells = rhombi around corners) or a sheared one (one step
+    # along a square diagonal). Nothing decodes, and LK tracking holds that
+    # grid until the episode ends (B1 run 2: 36 frames). A re-entry frame (no
+    # accepted pose in the previous frame) whose LK-tracked grid decodes no
+    # patch and is wrong resets the detector's tracking, so the next frame
+    # searches anew; a fresh full detection is kept for one frame (resetting it
+    # too lost a whole board take, G07). Each reset costs a full detection, and
+    # a search that keeps finding a wrong lattice would reset every few frames
+    # (without a limit BT3 reset 31 times, BT2 22, rep H02 17 times): at most
+    # checker_wrong_lattice_reset_max_per_gap resets until the next accepted
+    # pose (<= 0: no limit). Replays of 108 takes on top of the occlusion gate
+    # and the prior sub-grid, every frame processed: fresh frames 32717 ->
+    # 33091, first lock 06.10. D04 1.90 -> 0.37 s, BN1 2.97 -> 1.10 s, rep H02
+    # 4.97 -> 0.73 s, BT3 4.14 -> 1.40 s.
+    checker_wrong_lattice_reset: bool = True
+    checker_wrong_lattice_reset_max_per_gap: int = 1
     checker_min_fresh_correspondences_for_stable_tracking: int = 8
     checker_max_low_fresh_correspondence_frames: int = 12
     # Measurement operator for LK-tracked corners: "quadratic_form" =

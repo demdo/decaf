@@ -1501,6 +1501,8 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("checker_local_completion_zero_gain_backoff_max_factor", &TrackerConfig::checker_local_completion_zero_gain_backoff_max_factor)
         .def_readwrite("checker_local_completion_stale_predicted_frames", &TrackerConfig::checker_local_completion_stale_predicted_frames)
         .def_readwrite("checker_max_undecodeable_tracking_frames", &TrackerConfig::checker_max_undecodeable_tracking_frames)
+        .def_readwrite("checker_wrong_lattice_reset", &TrackerConfig::checker_wrong_lattice_reset)
+        .def_readwrite("checker_wrong_lattice_reset_max_per_gap", &TrackerConfig::checker_wrong_lattice_reset_max_per_gap)
         .def_readwrite("checker_min_fresh_correspondences_for_stable_tracking", &TrackerConfig::checker_min_fresh_correspondences_for_stable_tracking)
         .def_readwrite("checker_max_low_fresh_correspondence_frames", &TrackerConfig::checker_max_low_fresh_correspondence_frames)
         .def_readwrite("dot_canonical_size", &TrackerConfig::dot_canonical_size)
