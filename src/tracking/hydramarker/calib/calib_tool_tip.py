@@ -65,6 +65,7 @@ import numpy as np
 
 from tracking.hydramarker.calib import calib_camera
 from tracking.hydramarker.calib import calib_checkerboard as ccb
+from tracking.hydramarker.config import TrackerConfig
 
 
 def _utc_now_str() -> str:
@@ -582,6 +583,16 @@ class PivotRecorder:
         self.require_ir = bool(require_ir)
         self.ir_applied_count = 0
         self.ir_skipped_count = 0
+        # Poses the tracker kept under a partial occlusion - a prior sub-grid
+        # pose, or a visible cell fraction below the threshold at which the
+        # Live page draws a pose marked - are less accurate (board ground
+        # truth, replays: one finger over a third of the label 1.63 mm, two
+        # over half 1.78 mm, unoccluded 1.12 mm) and are not logged; counted
+        # like the IR skips.
+        self.skip_below_visible_frac = float(
+            TrackerConfig().drawn_pose_mark_below_visible_frac
+        )
+        self.occluded_skipped_count = 0
         # Latest IR pair, stashed by the process_frame wrapper (see
         # cmd_calibrate's after_tracker_created) so the same-frame IR images are
         # saved next to the RGB frame for offline analysis / re-pivoting.
@@ -662,8 +673,14 @@ class PivotRecorder:
             return
         if not tracker_log.has_fresh_pose(result) or result.rvec is None:
             return
+        timings = getattr(result, "timings_ms", None) or {}
+        visible = float(getattr(result, "visible_cell_fraction", float("nan")))
+        if timings.get("prior_subgrid_count") or visible < self.skip_below_visible_frac:
+            # kept under a partial occlusion: neither into the pivot solve nor
+            # into the BA corner log (a NaN fraction - older module - passes)
+            self.occluded_skipped_count += 1
+            return
         if self.require_ir:
-            timings = getattr(result, "timings_ms", None) or {}
             if not bool(timings.get("ir_applied", 0.0)):
                 # IR gated off for this frame (glare / adverse geometry / MAP
                 # reject): do NOT feed the RGB-only pose into the IR pivot solve.
@@ -791,6 +808,10 @@ class PivotRecorder:
             lines.append(
                 f"IR refine: applied {self.ir_applied_count} | skipped {self.ir_skipped_count} "
                 f"({rate:.0f}%) - sweep continuously & slowly; IR is reference-free (frame 1)"
+            )
+        if self.occluded_skipped_count:
+            lines.append(
+                f"Skipped (marker partly covered): {self.occluded_skipped_count} - keep it free"
             )
         if self._last_pivot is not None:
             pv = self._last_pivot
@@ -1209,6 +1230,11 @@ def cmd_calibrate(
         print(
             f"[calib_tool_tip] IR gate: {recorder.ir_applied_count} frames logged WITH "
             f"IR refinement, {recorder.ir_skipped_count} rejected without ({rate:.0f}% applied)."
+        )
+    if recorder.occluded_skipped_count:
+        print(
+            f"[calib_tool_tip] {recorder.occluded_skipped_count} poses kept under a partial "
+            "occlusion (prior sub-grid / few visible cells) were not logged."
         )
 
     T_tc = np.stack([f["T_tc"] for f in recorder.frames]).astype(np.float64)
