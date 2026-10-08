@@ -789,8 +789,11 @@ class HydraTracker:
         """(frame_time_ms, ir_time_offset_ms) for process_frame from the
         per-frame metadata of the RealSense source (camera_setup): the
         colour frame's camera time, the frameset's IR exposure and the
-        colour exposure the source runs with. (None, None) without the
-        camera time or the IR exposure."""
+        colour exposure of the frame. (None, None) without the camera time
+        or the IR exposure. A frame in a colour exposure transition (the
+        marker exposure control's "previous" setting may still be in it)
+        gets the mean of both offsets: off by at most half their
+        difference, whichever it was."""
         t_ms = metadata.get("color_time_ms") if metadata else None
         ir_us = metadata.get("ir_exposure_us") if metadata else None
         if t_ms is None or ir_us is None:
@@ -799,6 +802,11 @@ class HydraTracker:
         offset = ir_time_offset_ms(
             ir_us / 1000.0, color["auto"], color.get("exposure_ms"), self.config
         )
+        previous = color.get("previous")
+        if previous is not None:
+            offset = 0.5 * (offset + ir_time_offset_ms(
+                ir_us / 1000.0, previous["auto"], previous.get("exposure_ms"), self.config
+            ))
         return float(t_ms), offset
 
     def reset_ir_references(self) -> None:

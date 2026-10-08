@@ -42,9 +42,10 @@ class ColorExposureState:
     auto_exposure metadata reads 0 or 1 at random, and the exposure
     register (read back, and in the frame timestamps) keeps the last manual
     value - 06.10. E01: register 3.9 ms while the AE exposed >= 15.6 ms. So
-    exposure_ms is None under the AE. Nothing changes the colour exposure
-    at runtime; a control that does must update this state and decide which
-    frames still carry the old exposure."""
+    exposure_ms is None under the AE. At runtime only the marker exposure
+    control changes the colour exposure; while it runs, the per-frame state
+    comes from color_exposure.CommandedColorExposure (which frames still
+    carry the old setting)."""
 
     def __init__(self, auto: bool, exposure_ms: Optional[float]) -> None:
         self.auto = bool(auto)
@@ -140,6 +141,12 @@ class RealSenseCameraSource(CameraSource):
         self._stereo_sensor_cache = None
         self._ir_exposure_us = None
         self._color_exposure: Optional[ColorExposureState] = None
+        # set by start_color_control (the marker exposure control writes the
+        # colour settings): the exposure of every frame - also after the
+        # stop, until the restore's transition is over
+        self._commanded = None
+        self._color_actuator = None
+        self._color_sensor_cache = None
         self._live_frames = None  # newest poll() frameset (keeps views alive)
 
     @property
@@ -277,11 +284,25 @@ class RealSenseCameraSource(CameraSource):
     def _frame_metadata(self, color_frame, ir_frame) -> dict[str, Any]:
         """Per-frame metadata for the tracker (HydraTracker.ir_frame_timing):
         the colour frame's camera time (ms), the frameset's IR exposure (us:
-        the frame's actual_exposure, else the manual exposure set) and the
-        colour exposure state. A few metadata reads, no copies."""
+        the frame's actual_exposure, else the manual exposure set), the
+        colour exposure register of the frame (2 x (frame - sensor
+        timestamp) in us = 100 us units; stale under the AE) and the colour
+        exposure state of this frame. A few metadata reads, no copies."""
         meta: dict[str, Any] = {"backend": "realsense"}
         try:
             meta["color_time_ms"] = float(color_frame.get_timestamp())
+        except Exception:
+            pass
+        register = None
+        try:
+            md = self._rs.frame_metadata_value
+            if (color_frame.supports_frame_metadata(md.frame_timestamp)
+                    and color_frame.supports_frame_metadata(md.sensor_timestamp)):
+                register = 2.0 * (
+                    float(color_frame.get_frame_metadata(md.frame_timestamp))
+                    - float(color_frame.get_frame_metadata(md.sensor_timestamp))
+                )
+                meta["color_exposure_register"] = register
         except Exception:
             pass
         if ir_frame is not None:
@@ -293,9 +314,107 @@ class RealSenseCameraSource(CameraSource):
             except Exception:
                 pass
             meta["ir_exposure_us"] = exposure
-        if self._color_exposure is not None:
+        commanded = self._commanded
+        if (commanded is not None and self._color_actuator is None
+                and commanded.settled(self._frame_index)):
+            # the control was stopped and its restore's transition is over:
+            # back to the state read at the start once the device runs it
+            # again (a restore that left it manual keeps the commanded one)
+            cur = commanded.current
+            base = (self._color_exposure.snapshot() if self._color_exposure is not None
+                    else {"auto": True, "exposure_ms": None})
+            if cur["auto"] == base["auto"] and cur["exposure_ms"] == base["exposure_ms"]:
+                commanded = None
+        if commanded is not None:
+            meta["color_exposure"] = commanded.for_frame(self._frame_index, register)
+        elif self._color_exposure is not None:
             meta["color_exposure"] = self._color_exposure.snapshot()
         return meta
+
+    # ---------------- colour exposure control ----------------
+
+    @property
+    def latest_frame_index(self) -> int:
+        """frame_index of the newest polled frame (any thread may read it)."""
+        return self._frame_index
+
+    def color_sensor(self):
+        """The colour sensor of the running device, or None."""
+        if self._color_sensor_cache is None and self._profile is not None:
+            self._color_sensor_cache = _find_realsense_color_sensor(self._profile, self._rs)
+        return self._color_sensor_cache
+
+    def color_option_range(self, name: str) -> Optional[dict[str, float]]:
+        """min/max/step/default of a colour option, read from the device."""
+        sensor = self.color_sensor()
+        if sensor is None:
+            return None
+        return _read_realsense_option_range(sensor, self._rs, name)
+
+    @property
+    def color_control_busy(self) -> bool:
+        """A stopped control's actuator thread is still inside a set_option
+        (its restore runs when the call returns): no new control yet."""
+        act = self._color_actuator
+        return act is not None and act.alive
+
+    def start_color_control(self):
+        """Hand the colour exposure to the marker exposure control: returns
+        its running color_exposure.ColorExposureActuator (None without a
+        colour sensor, or while color_control_busy). From now on every
+        frame's colour exposure comes from the actuator's writes
+        (CommandedColorExposure); the start settings it writes back at the
+        stop are the ones read back after the camera start."""
+        from tracking.hydramarker.color_exposure import (
+            ColorExposureActuator,
+            CommandedColorExposure,
+        )
+
+        if self.color_control_busy:
+            return None
+        sensor = self.color_sensor()
+        if sensor is None:
+            return None
+        state = self._color_exposure or ColorExposureState(True, None)
+        info = self.calibration_info
+        start = {
+            "enable_auto_exposure": bool(info.get("realsense_enable_auto_exposure", state.auto)),
+            "exposure": info.get("realsense_exposure"),
+            "gain": info.get("realsense_gain"),
+        }
+        # the device's state now: as read at the start, or as the last
+        # control's restore read it back (it may have left it manual)
+        cur = (self._commanded.current if self._commanded is not None
+               else {"auto": state.auto, "exposure_ms": state.exposure_ms})
+        commanded = CommandedColorExposure(cur["auto"], cur["exposure_ms"])
+        actuator = ColorExposureActuator(
+            sensor, self._rs.option, lambda: self._frame_index, commanded,
+            start_settings=start,
+        )
+        self._color_actuator = actuator
+        self._commanded = commanded
+        actuator.start()
+        return actuator
+
+    def stop_color_control(self, actuator, timeout_s: float = 1.0) -> Optional[dict]:
+        """Stop the actuator and write the start settings back (AE on);
+        returns what the device reads back afterwards (with
+        "restore_mismatch" / "errors" if it is not the start state), or
+        {"late": True} if the actuator thread is still inside a set_option
+        after timeout_s: it stays registered (color_control_busy) and
+        restores when the call returns; stop() joins it again.
+
+        The commanded state stays: the 3-4 frames after the restore still
+        carry the manual setting (transition), and a restore that left the
+        device manual keeps it for the frames; _frame_metadata goes back to
+        the state read at the start once the AE is back."""
+        if actuator is None:
+            return None
+        if not actuator.stop(restore=True, timeout_s=timeout_s):
+            return {"late": True}
+        if actuator is self._color_actuator:
+            self._color_actuator = None
+        return actuator.restored
 
     def _stereo_sensor(self):
         if self._stereo_sensor_cache is not None:
@@ -412,12 +531,26 @@ class RealSenseCameraSource(CameraSource):
 
     def stop(self) -> None:
         try:
+            # a marker exposure control still running (or still restoring
+            # after a late stop) writes the start settings back first: the
+            # device is never left in manual
+            if self._color_actuator is not None:
+                try:
+                    if (self.stop_color_control(self._color_actuator, 3.0) or {}).get("late"):
+                        print("[WARN] Colour exposure: restore late - the camera may stay "
+                              "in manual exposure until its next start")
+                except Exception:
+                    pass
             if self._pipeline is not None:
                 self._pipeline.stop()
         finally:
             self._live_frames = None
             self._pipeline = None
             self._profile = None
+            self._color_sensor_cache = None
+            # the next start writes the configured colour settings again
+            self._color_actuator = None
+            self._commanded = None
             super().stop()
 
 

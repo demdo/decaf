@@ -137,6 +137,15 @@ class CameraConfig:
     # start (1 = lowest latency: the SDK keeps only the newest frame).
     # None keeps the SDK default — the behaviour of all existing callers.
     realsense_frames_queue_size: Optional[int] = None
+    # Colour exposure while the drill is tracked (Live page, evaluation
+    # script): "auto" = the colour AE with the options above (the start
+    # writes and reads them back as always); "marker" = the marker exposure
+    # control of color_exposure.py takes over at the tracking start (AE
+    # off, exposure on the x2 ladder up to 7.8 ms and gain set from the
+    # marker's white level) and writes the start settings back at the
+    # stop. Default "auto" until the marker control has passed its live
+    # test; the Live page can switch it per run.
+    realsense_color_exposure_mode: str = "auto"
 
     def validate_common(self) -> None:
         backend = str(self.backend).strip().lower()
@@ -213,6 +222,12 @@ class CameraConfig:
             raise ValueError(
                 "camera realsense_frames_queue_size must be positive when set; "
                 f"got {queue_size}."
+            )
+        exposure_mode = getattr(self, "realsense_color_exposure_mode", "auto")
+        if str(exposure_mode).strip().lower() not in ("auto", "marker"):
+            raise ValueError(
+                "camera realsense_color_exposure_mode must be 'auto' or 'marker'; "
+                f"got {exposure_mode!r}."
             )
 
     def calibration_path_obj(self) -> Optional[Path]:

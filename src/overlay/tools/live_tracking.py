@@ -10,7 +10,8 @@ TrackingSession turns those results into the page's tracking state
 the GUI thread, so every widget, the overlay and the logs keep a single
 writer. The drill's camera-frame points (tracking_overlay.ToolPoints) are
 computed in the worker, right after the tracker, and travel with the
-result.
+result; so does the marker's white level for the colour exposure control
+(color_exposure.MarkerMeter), measured on the same frame.
 
 Qt-free and engine-free on purpose: the evaluation script and the unit
 test use exactly these classes, without a QApplication, a camera or the
@@ -124,21 +125,23 @@ class TrackOutput:
     replaced a pending one since the previous processed frame. points /
     points_kind / points_marked: the worker's ToolPoints.update(), .kind and
     .marked for this result (None / None / False without tool_points or
-    without a pose).
+    without a pose). metering: the worker's meter for this frame
+    (color_exposure.Metering), None without a meter.
     """
 
     __slots__ = (
         "slot", "frame_index", "t_frame", "meta", "has_ir", "epoch",
         "result", "t_start", "t_done", "skipped", "reset",
         "error", "traceback", "frame_dropped", "points", "points_kind",
-        "points_marked",
+        "points_marked", "metering",
     )
 
     def __init__(self, slot: FrameSlot, epoch: int, *, result=None,
                  t_start: float = 0.0, t_done: float = 0.0, skipped: int = 0,
                  reset: bool = False, error: BaseException | None = None,
                  traceback_text: str | None = None, points=None,
-                 points_kind: str | None = None, points_marked: bool = False) -> None:
+                 points_kind: str | None = None, points_marked: bool = False,
+                 metering=None) -> None:
         self.slot: FrameSlot | None = slot
         self.frame_index = slot.frame_index
         self.t_frame = slot.t_frame
@@ -155,6 +158,7 @@ class TrackOutput:
         self.points = points
         self.points_kind = points_kind
         self.points_marked = points_marked
+        self.metering = metering
         # eval mode: the slot was taken back for a newer frame before the
         # output was drained (its image is gone, the result is not)
         self.frame_dropped = False
@@ -208,6 +212,12 @@ class TrackingWorker:
     with the frame to process_frame (IR time-offset correction). None:
     process_frame gets neither.
 
+    meter: color_exposure.MarkerMeter or None - the colour exposure
+    control's metering, run on every result after tool_points, on the frame
+    the tracker saw (TrackOutput.metering), and reset with the tracker. An
+    exception in it costs only that metering (n_meter_errors), never the
+    tracking.
+
     The tracker belongs to this thread while it runs: nobody else may call
     it until stop() returned True.
     """
@@ -216,9 +226,11 @@ class TrackingWorker:
 
     def __init__(self, tracker, *, pool_size: int, keep_every_frame: bool = False,
                  notify: Callable[[], None] | None = None, tool_points=None,
-                 frame_timing: Callable[[dict], tuple] | None = None) -> None:
+                 frame_timing: Callable[[dict], tuple] | None = None,
+                 meter=None) -> None:
         self._tracker = tracker
         self._tool_points = tool_points
+        self._meter = meter
         self._frame_timing = frame_timing
         self._pool = _FramePool(pool_size)
         self._keep_every_frame = bool(keep_every_frame)
@@ -243,6 +255,7 @@ class TrackingWorker:
         self.n_processed = 0
         self.n_outbox_dropped = 0
         self.n_frame_dropped = 0
+        self.n_meter_errors = 0
         # A frame not taken for want of a free slot. Not part of the design
         # (the page's pool covers every owner at once); counted so a log
         # shows it. GUI thread only.
@@ -314,6 +327,11 @@ class TrackingWorker:
         self._pool.release(replaced)
         return slot is not None
 
+    def set_meter(self, meter) -> None:
+        """Switch the metering on (a MarkerMeter) or off (None) while the
+        thread runs; the worker reads it once per frame."""
+        self._meter = meter
+
     def request_reset(self) -> int:
         """Reset the tracker before its next frame; returns the new epoch."""
         with self._cond:
@@ -376,8 +394,9 @@ class TrackingWorker:
                     epoch = self._epoch
 
                 t_start = time.perf_counter()
-                points = points_kind = None
+                points = points_kind = metering = None
                 points_marked = False
+                meter = self._meter            # set_meter() may swap it meanwhile
                 try:
                     if reset:
                         self._tracker.reset()
@@ -399,6 +418,15 @@ class TrackingWorker:
                         points = self._tool_points.update(result, slot.t_frame)
                         points_kind = self._tool_points.kind
                         points_marked = self._tool_points.marked
+                    if meter is not None:
+                        try:
+                            if reset:
+                                meter.reset()
+                            metering = meter.measure(
+                                slot.color, result, slot.frame_index, slot.t_frame
+                            )
+                        except Exception:
+                            self.n_meter_errors += 1
                 except Exception as exc:
                     out = TrackOutput(
                         slot, epoch, t_start=t_start, t_done=time.perf_counter(),
@@ -412,7 +440,7 @@ class TrackingWorker:
                     slot, epoch, result=result, t_start=t_start,
                     t_done=time.perf_counter(), skipped=skipped, reset=reset,
                     points=points, points_kind=points_kind,
-                    points_marked=points_marked,
+                    points_marked=points_marked, metering=metering,
                 )
                 slot = None
                 self._publish(out)
