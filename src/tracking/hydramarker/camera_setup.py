@@ -37,15 +37,18 @@ class CameraFrame:
 class ColorExposureState:
     """The colour exposure a RealSense source runs with: the AE, or a
     manual exposure (ms), as read back after the start. The tracker's IR
-    time-offset correction needs it per frame (HydraTracker.ir_frame_timing),
-    and the colour frames carry none that can be used (the AE metadata reads
-    0, the timestamps only show the exposure register). Nothing changes the
-    colour exposure at runtime; a control that does must update this state
-    and decide which frames still carry the old exposure."""
+    time-offset correction needs it per frame (HydraTracker.ir_frame_timing).
+    Under the AE the colour frames carry no usable exposure: the
+    auto_exposure metadata reads 0 or 1 at random, and the exposure
+    register (read back, and in the frame timestamps) keeps the last manual
+    value - 06.10. E01: register 3.9 ms while the AE exposed >= 15.6 ms. So
+    exposure_ms is None under the AE. Nothing changes the colour exposure
+    at runtime; a control that does must update this state and decide which
+    frames still carry the old exposure."""
 
     def __init__(self, auto: bool, exposure_ms: Optional[float]) -> None:
         self.auto = bool(auto)
-        self.exposure_ms = exposure_ms
+        self.exposure_ms = None if self.auto else exposure_ms
 
     def snapshot(self) -> dict[str, Any]:
         return {"auto": self.auto, "exposure_ms": self.exposure_ms}
