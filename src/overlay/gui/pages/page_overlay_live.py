@@ -47,6 +47,11 @@ from tracking.hydramarker.camera_setup import (
     realsense_color_readback,
     realsense_color_summary,
 )
+from tracking.hydramarker.color_exposure import (
+    MODE_MARKER,
+    DisplayBrightener,
+    MarkerExposureControl,
+)
 from tracking.hydramarker.config import CameraConfig
 
 
@@ -294,6 +299,7 @@ class _FrameProfile:
         self.budget_ms = 1000.0 / float(fps)
         self.log_path = None if log_path is None else Path(log_path).resolve()
         self._camera_number: int | None = None   # last polled frame number
+        self._exposure = ""                       # note_exposure()
         self.reset()
 
     def emit(self, line: str) -> None:
@@ -323,6 +329,11 @@ class _FrameProfile:
     def count(self, name: str, n: int = 1) -> None:
         """Event counters of the window (tracking thread hand-off, display)."""
         self._c[name] += n
+
+    def note_exposure(self, text: str) -> None:
+        """The marker exposure control's state for the summary lines ("":
+        the control is off)."""
+        self._exposure = text
 
     def note_camera_frame(self, number: int | None) -> None:
         """RealSense frame number of a polled colour frame (None: unknown)."""
@@ -387,12 +398,18 @@ class _FrameProfile:
         camera = ""
         if self._camera_number is not None:
             camera = f"camera lost {c['camera_lost']}  "
+        # marker exposure control: setting, marker white level, steps
+        # (exposure_steps: written in this window)
+        exposure = ""
+        if self._exposure:
+            exposure = f"exposure {self._exposure} steps {c['exposure_steps']}  "
 
         self.emit(
             f"[live] {time.strftime('%H:%M:%S')}  {fps:5.1f} fps "
             f"(budget {self.budget_ms:.1f} ms)  polls empty {empty_pct:4.0f}%  "
             + camera
             + track
+            + exposure
             + "|  mean/max ms: " + "  ".join(parts)
         )
 
@@ -477,7 +494,7 @@ class _OverlayControlRail(QFrame):
     PANEL_W = int(round(380 * SCALE))
     PANEL_H = int(round(452 * SCALE))
     # Extra panel height while the tool-tracking card is visible.
-    TRACK_EXTRA_H = int(round(150 * SCALE))
+    TRACK_EXTRA_H = int(round(186 * SCALE))
     # Extra panel height while the reference-plane card is visible.
     PLANE_EXTRA_H = int(round(150 * SCALE))
     # Without an X-ray (set_tracking_only): the alpha and plane-depth cards
@@ -586,6 +603,18 @@ class _OverlayControlRail(QFrame):
         self.lbl_track_status.setObjectName("overlayRailValue")
         self.lbl_track_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
+        # Colour exposure while tracking: checked = the marker exposure
+        # control (OverlayLivePage._start_exposure_control), unchecked = the
+        # colour AE. Can be switched while tracking.
+        self.chk_marker_exposure = QCheckBox("Marker exposure")
+        self.chk_marker_exposure.setObjectName("overlayRailCheck")
+        self.chk_marker_exposure.setMinimumHeight(self._s(26))
+        self.chk_marker_exposure.setFocusPolicy(Qt.NoFocus)
+        self.chk_marker_exposure.setToolTip(
+            "Set the colour exposure from the drill marker while tracking "
+            "(off: the camera's auto exposure)"
+        )
+
         # ---------------- Cards ----------------
         alpha_card = QFrame()
         alpha_card.setObjectName("overlayRailGroup")
@@ -692,6 +721,7 @@ class _OverlayControlRail(QFrame):
         track_layout.setSpacing(self._s(8))
         track_layout.addWidget(self.btn_track)
         track_layout.addWidget(self.lbl_track_status)
+        track_layout.addWidget(self.chk_marker_exposure)
         self.track_card.hide()
         self._tracking_visible = False
 
@@ -1132,6 +1162,16 @@ class OverlayLivePage(QWidget):
         # is created in on_enter.
         self._profile: _FrameProfile | None = None
 
+        # --- colour exposure while tracking (color_exposure.py) ---
+        # "marker": the marker exposure control runs from the tracking
+        # start to its stop (the checkbox switches it, also while
+        # tracking); "auto": the colour AE as configured.
+        self._exposure_mode = CameraConfig().realsense_color_exposure_mode
+        self._exposure: MarkerExposureControl | None = None   # while it runs
+        # the displayed image only: brightened while the control keeps the
+        # camera darker than the AE would
+        self._display_brightener = DisplayBrightener()
+
         self._build_ui()
         self._connect_signals()
         self._load_xray_from_state()
@@ -1186,6 +1226,8 @@ class OverlayLivePage(QWidget):
         self.controls.chk_show_tip.toggled.connect(self._on_show_tip_toggled)
         self.controls.chk_show_axis.toggled.connect(self._on_show_axis_toggled)
         self.controls.btn_track.clicked.connect(self._on_track_button)
+        self.controls.chk_marker_exposure.setChecked(self._exposure_mode == MODE_MARKER)
+        self.controls.chk_marker_exposure.toggled.connect(self._on_marker_exposure_toggled)
         self.controls.btn_save.clicked.connect(self._on_save_snapshot)
         self.controls.btn_plane.clicked.connect(self._on_plane_button)
         self._track_result_ready.connect(self._on_track_result_ready, Qt.QueuedConnection)
@@ -1348,6 +1390,17 @@ class OverlayLivePage(QWidget):
         if prof:
             prof.add("copy", time.perf_counter() - t)
 
+        # The marker exposure control keeps the camera darker than the AE:
+        # a LUT brightens the display's copy of the camera image (k from its
+        # own centre), before the X-ray blend and the drill drawing - never
+        # the tracking input, a saved frame, the X-ray or the drill colours.
+        if self._exposure is not None:
+            t = time.perf_counter()
+            self._display_brightener.update(self._frame_buf)
+            self._display_brightener.apply(self._frame_buf)
+            if prof:
+                prof.add("lut", time.perf_counter() - t)
+
         if self._xray_gray_u8 is not None:
             H_xc = self._get_current_H_xc()
             self.state.H_xc = H_xc
@@ -1440,6 +1493,7 @@ class OverlayLivePage(QWidget):
         if self.camera is None:
             return
 
+        self._stop_exposure_control("camera stop")
         try:
             self.camera.stop()
         except Exception:
@@ -1882,6 +1936,8 @@ class OverlayLivePage(QWidget):
         self._tracking_active = True
         self.controls.btn_track.setText("Stop tracking")
         self.controls.lbl_track_status.setText(STATUS_SEARCHING)
+        if self._exposure_mode == MODE_MARKER:
+            self._start_exposure_control()
 
     def _check_engine_gil(self) -> None:
         """A build from before the tracking thread holds the GIL for the
@@ -1907,6 +1963,7 @@ class OverlayLivePage(QWidget):
             )
 
     def _stop_tracking(self, reason: str) -> None:
+        self._stop_exposure_control(reason)
         self._tracking_active = False
         worker, self._track_worker = self._track_worker, None
         stopped = True
@@ -2016,6 +2073,8 @@ class OverlayLivePage(QWidget):
         self._track_result_index = max(self._track_result_index, out.frame_index)
         self._track_result_lag_s = out.t_done - out.t_frame
         self._track_result_t_done = out.t_done
+        if self._exposure is not None and out.metering is not None:
+            self._exposure_step(out.metering)
 
         step = self._track_session.update(out)
         if not step.current:
@@ -2071,6 +2130,146 @@ class OverlayLivePage(QWidget):
         if out.slot is not None and self._track_worker is not None:
             self._track_worker.release(out.slot)
         out.slot = None
+
+    # --------------------------------------------------------
+    # Marker exposure control (color_exposure.py)
+    # --------------------------------------------------------
+    #
+    # While tracking with the mode "marker": the worker meters the marker's
+    # white level on every result (MarkerMeter), the controller decides in
+    # this thread when a result is drained, and the camera's actuator thread
+    # writes the colour settings (set_option never runs here). Every stop
+    # path (Stop, error, plane, page change, camera stop) writes the start
+    # settings back - AE on - before anything else.
+
+    def _on_marker_exposure_toggled(self, checked: bool) -> None:
+        self._exposure_mode = MODE_MARKER if checked else "auto"
+        self.controls.chk_marker_exposure.setText("Marker exposure")
+        if not self._tracking_active:
+            return
+        if checked:
+            self._start_exposure_control()
+        else:
+            self._stop_exposure_control("switched off")
+
+    def _start_exposure_control(self) -> None:
+        if self._exposure is not None or self.camera is None or self._track_worker is None:
+            return
+        control = MarkerExposureControl(self.camera, self._has_fresh_pose)
+        try:
+            ok = control.start(self._track_worker, time.perf_counter())
+        except Exception as e:
+            ok = False
+            print(f"[WARN] Marker exposure: could not start: {e}")
+        if not ok:
+            text = ("marker exposure busy — AE" if control.unavailable == "busy"
+                    else "marker exposure unavailable — AE")
+            self.controls.lbl_track_status.setText(text)
+            print(f"[WARN] Marker exposure: {text} ({control.unavailable or 'start failed'})")
+            if self._profile is not None:
+                self._profile.emit(f"[live] marker exposure unavailable {time.strftime('%H:%M:%S')}: "
+                                   f"{control.unavailable or 'start failed'}")
+            return
+        self._exposure = control
+        self._display_brightener.reset()
+        info = control.snapshot()
+        cfg = info["config"]
+        if self._profile is not None:
+            self._profile.emit(
+                f"[live] marker exposure on {time.strftime('%H:%M:%S')}: band "
+                f"{cfg['white_low_dn']:.0f}-{cfg['white_high_dn']:.0f} DN, clip <= "
+                f"{100 * cfg['clip_max_frac']:.0f} %, gain {info['gain_used'][0]:.0f}-"
+                f"{info['gain_used'][1]:.0f}, exposure <= {cfg['exposure_max_ms']:g} ms"
+            )
+        ev = self.state.eval
+        if ev is not None:
+            try:
+                ev.set_meta("color_exposure_control", info)
+                ev.log("overlay_live", "-", {"marker_exposure": "on"}, tagged=False)
+            except Exception as e:
+                print(f"[WARN] Could not record the marker exposure: {e}")
+
+    def _exposure_step(self, metering) -> None:
+        control = self._exposure
+        cmd = control.step(metering)
+        prof = self._profile
+        for err in control.new_errors():
+            print(f"[WARN] Marker exposure: {err}")
+            if prof:
+                prof.emit(f"[live] marker exposure error {time.strftime('%H:%M:%S')}: {err}")
+            self._log_exposure_event({"marker_exposure": "error", "error": err})
+        first = control.take_first_write()
+        if first is not None:
+            # one line to check after the start: the camera took the first setting
+            text = (f"first write {first.exposure_ms:g} ms/{first.gain:.0f} applied, "
+                    f"set_option {first.write_ms:.1f} ms")
+            print(f"[live] marker exposure: {text}")
+            if prof:
+                prof.emit(f"[live] marker exposure {time.strftime('%H:%M:%S')}: {text}")
+        if control.failure:
+            # writes fail: the camera goes back to its AE, the box unchecked
+            # (a restore problem found by the stop overrides both texts)
+            reason = control.failure
+            print(f"[WARN] Marker exposure failed ({reason}): back to the camera's auto exposure")
+            self._set_marker_exposure_check(False, "Marker exposure — failed, AE")
+            self.controls.lbl_track_status.setText("marker exposure failed — AE")
+            self._stop_exposure_control("failed: " + reason)
+            return
+        if prof:
+            if cmd is not None:
+                prof.count("exposure_steps")
+            prof.note_exposure(
+                f"{control.text(metering)} meter {metering.meter_ms:.2f} ms "
+                f"lut x{self._display_brightener.k:.2f}"
+            )
+
+    def _stop_exposure_control(self, reason: str) -> None:
+        control, self._exposure = self._exposure, None
+        self._display_brightener.reset()
+        if control is None:
+            return
+        summary = control.stop()
+        problems = summary["restore_problems"]
+        if self._profile is not None:
+            self._profile.note_exposure("")
+            self._profile.emit(
+                f"[live] marker exposure off {time.strftime('%H:%M:%S')} ({reason}): "
+                f"{summary['steps']} steps, {summary['search_steps']} search steps, "
+                f"{summary['applied']}/{summary['commands']} commands applied, "
+                f"{len(summary['failed_writes'])} failed, restored "
+                f"{summary['restored']} in {summary['stop_ms']:.1f} ms"
+                + (f" - RESTORE PROBLEM: {', '.join(problems)}" if problems else "")
+            )
+        if problems:
+            print(f"[WARN] Marker exposure: camera not restored ({', '.join(problems)}): "
+                  f"{summary['restored']} - restart the app")
+            self.controls.lbl_track_status.setText("camera not restored — restart the app")
+            self._set_marker_exposure_check(False, "Marker exposure — camera not restored")
+        self._log_exposure_event({
+            "marker_exposure": "off", "reason": reason, "steps": summary["steps"],
+            "search_steps": summary["search_steps"], "restored": summary["restored"],
+            "restore_problems": problems, "failure": summary["failure"],
+            "failed_writes": summary["failed_writes"],
+        })
+
+    def _set_marker_exposure_check(self, checked: bool, text: str) -> None:
+        """The checkbox's state and text without starting or stopping the
+        control (a failed control unchecks it and says why)."""
+        chk = self.controls.chk_marker_exposure
+        chk.blockSignals(True)
+        chk.setChecked(checked)
+        chk.blockSignals(False)
+        chk.setText(text)
+        self._exposure_mode = MODE_MARKER if checked else "auto"
+
+    def _log_exposure_event(self, data: dict) -> None:
+        ev = self.state.eval
+        if ev is None:
+            return
+        try:
+            ev.log("overlay_live", "-", data, tagged=False)
+        except Exception as e:
+            print(f"[WARN] Could not record the marker exposure: {e}")
 
     # --------------------------------------------------------
     # Controls callbacks
@@ -2252,6 +2451,13 @@ class OverlayLivePage(QWidget):
             # poll -> the click (before the PNGs were written).
             "shown": "pose" if drawn is not None else "live",
             "frame_age_ms": round((t_click - self._shown_t_frame) * 1000.0, 1),
+            # the colour exposure the camera ran with (the PNGs are the raw
+            # frame; the display LUT of the marker exposure is not in them)
+            "color_exposure": (
+                {"mode": "auto"} if self._exposure is None
+                else {"mode": MODE_MARKER, **self._exposure.controller.status(),
+                      "display_gain": round(self._display_brightener.k, 3)}
+            ),
             "tool": None,
         }
         if self._tracking_only:
