@@ -53,6 +53,8 @@ TARGET_VIEWS = 25
 MIN_SHARED_CORNERS = 8            # per camera pair, per view
 MIN_CORNERS_INTRINSIC = 10        # per camera, per view, to use for intrinsics
 STILL_MAX_SHIFT_PX = 0.35         # frame-to-frame corner shift to count as "still"
+COVER_GRID = (4, 3)               # colour coverage grid (columns, rows) in the preview
+COVER_MIN_CORNERS = 3             # grabbed corners in a grid cell to count it as covered
 
 
 def choose_file_qt(title: str, file_filter: str) -> Path:
@@ -243,7 +245,7 @@ def capture_views(cam: D435iThreeStream, board, aruco_dict, det_params):
                       f"shared LR={shared_lr} CL={shared_cl}  shift={shift:.2f}px")
 
         _draw_mosaic(win, color, irl, irr, dc, dl, dr, len(views),
-                     ok_counts, ok_shared, still, shift)
+                     ok_counts, ok_shared, still, shift, views)
 
         if key == ord("q"):
             views = []
@@ -255,21 +257,57 @@ def capture_views(cam: D435iThreeStream, board, aruco_dict, det_params):
     return views
 
 
+def coverage_cells(views_cam, image_wh, grid=COVER_GRID) -> np.ndarray:
+    """Grabbed corners per cell of a grid (rows x columns) over one camera image."""
+    counts = np.zeros((grid[1], grid[0]), np.int32)
+    w, h = image_wh
+    for det in views_cam:
+        for p in det.by_id.values():
+            cx = min(max(int(p[0] * grid[0] / w), 0), grid[0] - 1)
+            cy = min(max(int(p[1] * grid[1] / h), 0), grid[1] - 1)
+            counts[cy, cx] += 1
+    return counts
+
+
+def _draw_coverage(small, views_cam, image_wh, grid=None):
+    """Grabbed corners of all views (magenta) on a downscaled preview image;
+    with grid: the coverage grid (covered cells green, the others red)."""
+    sx, sy = small.shape[1] / image_wh[0], small.shape[0] / image_wh[1]
+    for det in views_cam:
+        for p in det.by_id.values():
+            cv2.circle(small, (int(p[0] * sx), int(p[1] * sy)), 2, (255, 0, 255), -1)
+    if grid is not None:
+        counts = coverage_cells(views_cam, image_wh, grid)
+        cw, ch = small.shape[1] / grid[0], small.shape[0] / grid[1]
+        for r in range(grid[1]):
+            for c in range(grid[0]):
+                ok = counts[r, c] >= COVER_MIN_CORNERS
+                cv2.rectangle(small, (int(c * cw) + 1, int(r * ch) + 1), (int((c + 1) * cw) - 2, int((r + 1) * ch) - 2),
+                              (0, 200, 0) if ok else (0, 0, 200), 1)
+    return small
+
+
 def _draw_mosaic(win, color, irl, irr, dc, dl, dr, n, ok_counts, ok_shared,
-                 still=True, shift=0.0):
-    def prep(img, det, label):
+                 still=True, shift=0.0, views=()):
+    def prep(img, det, label, views_cam=(), grid=None):
         vis = img if img.ndim == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         vis = vis.copy()
         for cid, p in det.by_id.items():
             cv2.circle(vis, tuple(np.int32(p)), 3, (0, 255, 0), -1)
         cv2.putText(vis, f"{label}: {det.n}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-        return cv2.resize(vis, (640, 360))
+        small = cv2.resize(vis, (640, 360))
+        return _draw_coverage(small, views_cam, (img.shape[1], img.shape[0]), grid)
 
-    top = np.hstack([prep(color, dc, "COLOR"), prep(irl, dl, "IR-L")])
+    views = list(views or ())
+    top = np.hstack([prep(color, dc, "COLOR", [v[0] for v in views], COVER_GRID),
+                     prep(irl, dl, "IR-L", [v[1] for v in views])])
+    cover = coverage_cells([v[0] for v in views], (color.shape[1], color.shape[0]))
+    n_cov, n_cells = int((cover >= COVER_MIN_CORNERS).sum()), cover.size
     panel = np.zeros((360, 640, 3), np.uint8)
     lines = [
-        (f"views grabbed: {n}", (255, 255, 255)),
+        (f"views grabbed: {n}   colour coverage {n_cov}/{n_cells}",
+         (0, 255, 0) if n_cov == n_cells else (255, 255, 255)),
         (f"counts:  {'OK' if ok_counts else 'too few'}", (0, 255, 0) if ok_counts else (0, 0, 255)),
         (f"shared:  {'OK' if ok_shared else 'too few'}", (0, 255, 0) if ok_shared else (0, 0, 255)),
         (f"{'STILL' if still else 'MOVING'}  ({shift:.2f} px)",
@@ -279,7 +317,7 @@ def _draw_mosaic(win, color, irl, irr, dc, dl, dr, n, ok_counts, ok_shared,
     for i, (txt, col) in enumerate(lines):
         cv2.putText(panel, txt, (20, 60 + i * 55), cv2.FONT_HERSHEY_SIMPLEX,
                     1.0 if i == 3 else 0.8, col, 2)
-    bot = np.hstack([prep(irr, dr, "IR-R"), panel])
+    bot = np.hstack([prep(irr, dr, "IR-R", [v[2] for v in views]), panel])
     cv2.imshow(win, np.vstack([top, bot]))
 
 
