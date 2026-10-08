@@ -273,8 +273,8 @@ def test_controller_closed_loop():
     print(f"      lamp on at 200: tracked unclipped again at {on_back} ({on_back - 200} frames), off at 500: "
           f"{off_back} ({off_back - 500} frames), frames without a pose {len(lost)}")
     # out of view 100..400 under the same light, nothing in the frame clips (table, and x30 once settled at
-    # 1.95 ms / 16 - no lamp in view there, see (l) for one): the setting is kept, nothing is written;
-    # back -> tracks at once
+    # 1.95 ms / 16 - no lamp in view there, see (l) for one): the setting is kept, nothing is written (x30:
+    # the label above the band at the darkest setting, nothing darker left); back -> tracks at once
     for L in (1.0, 30.0):
         ctl, log, steps = run_loop(lambda k, L=L: L, lambda k: not (100 <= k < 400), 600)
         out_w = [s for s in steps if 100 <= s[0] < 400]
@@ -726,7 +726,7 @@ def test_policy():
                             frame_clip=fclip if rel <= 1.0 else 0.05)
         res[start] = (back, [w for w in writes if w[0] >= 100])
     back, writes = res[(1.95, 16.0)]
-    dim = [w for w in writes if w[3] == "search-dim"]
+    dim = [w for w in writes if w[3] == "search-bracket"]
     check(back is not None and 30 * cfg.search_dim_after_s - 2 <= back <= 30 * (cfg.search_dim_after_s + 1)
           and dim and dim[0][1:3] == (7.8, 128.0),
           f"label dark under the lamp: pose again {back} frames after the loss, writes {writes}")
@@ -735,6 +735,115 @@ def test_policy():
     print(f"      label dark at 1.95 / 16 (20 DN), frame unchanged, lamp in view: held, first probe "
           f"{dim[0][1]:g} ms / {dim[0][2]:.0f}, pose again {back} frames after the loss; at 3.9 / 64 without "
           f"a lamp in view: 0 writes in 10 s")
+    # 08.10. Lauf 5 (no lamp clip in the frame: below search_dim_frame_clip at the dark settings):
+    # into the spot - lost at 3.9 / 29 after a pose at 236 DN (42 % clipped), the hull of the label
+    # still at 215 DN (8 % clipped) -> darker while it reads above the band, a pose again (5b: held, then
+    # nothing to probe); out of the spot in view - the last pose at 52 DN at 1.95 / 16, the ceiling of
+    # the spot there, then 44 DN -> brighter after the loss (5b: held at 1.95 / 16). One pose frame
+    # before the loss (no step while tracked), then a pose iff 45 <= white <= 200 (the decoder failed
+    # above ~215 and below ~45 DN live)
+    res = {}
+    for name, start, w0 in (("into", (3.9, 29.0), 215.0), ("out of", (1.95, 16.0), 44.0)):
+        ctl = ce.MarkerExposureController(gain_range=(0, 128))
+        pending = ctl.start(0.0)
+        writes = []
+        pending = _feed(ctl, pending, 1, float("nan"), float("nan"), False, 20.0, writes)
+        ctl.applied(ce.ExposureCommand(start[0], start[1], "x", 99), 1)
+        actual, lost, back = start, None, None
+        for i in range(20, 420):
+            for w in writes:
+                if i == w[0] + 4:
+                    actual = (w[1], w[2])
+            rel = B(*actual) / B(*start)
+            if name == "into":
+                at_start, clip0 = (150.0, 0.0) if i < 100 else ((236.0, 0.42) if i == 100 else (w0, 0.08))
+            else:
+                at_start = 205.0 if i < 100 else (52.0 if i == 100 else w0)
+                clip0 = 0.27 if at_start >= 200.0 else 0.0
+            white = dn(ce.linear_dn(at_start) * rel)
+            clip = clip0 if rel >= 1.0 - 1e-6 else (1.0 if white >= 250.0 else 0.0)
+            fresh = 45.0 <= white <= 200.0 or i <= 100
+            if not fresh and lost is None and i >= 100:
+                lost = i
+            if fresh and lost is not None and back is None:
+                back = i - lost
+            pending = _feed(ctl, pending, i, white, clip, fresh, 2.0, writes, frame_clip=0.0)
+        res[name] = (lost, back, [w for w in writes if w[0] >= 100])
+        check(back is not None and back <= 30,
+              f"{name} the spot: lost at {lost}, pose again {back} frames later, writes {res[name][2]}")
+    print(f"      Lauf 5, no lamp clip in the frame: into the spot (lost at 3.9 / 29, hull 215 DN) pose again "
+          f"{res['into'][1]} frames after the loss, writes {[(w[1], w[2], w[3]) for w in res['into'][2]]}; out "
+          f"of the spot in view (44 DN at 1.95 / 16) {res['out of'][1]} frames, writes "
+          f"{[(w[1], w[2], w[3]) for w in res['out of'][2]]}")
+    # the loss step and the bracket go by the last pose only while its region still reads like it (08.10.
+    # review): under the lamp at 1.95 / 16 (label 185 DN, the frame clips 0.5 % there and 5 % at 7.8 / 128)
+    # the last 2 poses fade to 50 DN, then the drill is out of view for 2 s (the hull shows the background,
+    # 8 DN) and back -> no dark-loss on the background, a pose again at once (5c before the fix: 3.9 / 77,
+    # 7.8 / 128, a search, the pose 0.3 s after the return)
+    ctl = ce.MarkerExposureController(gain_range=(0, 128))
+    pending = ctl.start(0.0)
+    writes = []
+    pending = _feed(ctl, pending, 1, float("nan"), float("nan"), False, 3.0, writes)
+    ctl.applied(ce.ExposureCommand(1.95, 16.0, "x", 99), 1)
+    actual, back = (1.95, 16.0), None
+    for i in range(20, 400):
+        for w in writes:
+            if i == w[0] + 4:
+                actual = (w[1], w[2])
+        rel = B(*actual) / B(1.95, 16.0)
+        lab = 185.0 if i < 148 or i >= 210 else 50.0 if i < 150 else 8.0
+        white = dn(ce.linear_dn(lab) * rel)
+        fresh = (i < 150 or i >= 210) and 45.0 <= white <= 200.0
+        if fresh and i >= 210 and back is None:
+            back = i - 210
+        fclip = float(0.005 * 10.0 ** (np.log(rel) / np.log(B(7.8, 128.0) / B(1.95, 16.0))))
+        pending = _feed(ctl, pending, i, white, 0.0, fresh, dn(ce.linear_dn(3.0) * rel), writes, frame_clip=fclip)
+    away = [w for w in writes if 150 <= w[0] < 210]
+    check(not away and back is not None and back <= 3,
+          f"faded last pose, then out of view under the lamp: writes while away {away}, pose again {back}")
+    fade = (away, back)
+    # at the table (7.8 / 128, no frame clip, light unchanged) a single last pose above the band (a glint,
+    # a tilt), then the drill out of view for 20 s with a 70 DN background in the hull: nothing (5c before
+    # the fix: a bracket after 3 s, 12 writes in 20 s)
+    res = {}
+    for last, lclip in ((180.0, 0.0), (150.0, 0.35)):
+        ctl = ce.MarkerExposureController(gain_range=(0, 128))
+        pending = ctl.start(0.0)
+        writes = []
+        for i in range(1, 700):
+            fresh = i <= 100
+            white = (last if i == 100 else 90.0) if fresh else (70.0 if i < 190 else float("nan"))
+            pending = _feed(ctl, pending, i, white, lclip if i == 100 else 0.0, fresh, 60.0, writes)
+        res[last] = [w for w in writes if w[0] > 100]
+        check(not res[last], f"table, last pose {last:.0f} DN / {lclip:.0%} clipped, then away: writes {res[last]}")
+    # tracked at 3.9 / 64 without a lamp, the label fades to 40 DN and does not decode any more, its region
+    # keeps reading so (dark-loss brightens it, still no pose) -> the bracket on the label alone after
+    # search_dim_after_s, one round of probes, then home and nothing more
+    ctl = ce.MarkerExposureController(gain_range=(0, 128))
+    pending = ctl.start(0.0)
+    writes = []
+    pending = _feed(ctl, pending, 1, float("nan"), float("nan"), False, 20.0, writes)
+    ctl.applied(ce.ExposureCommand(3.9, 64.0, "x", 99), 1)
+    actual = (3.9, 64.0)
+    for i in range(20, 1200):
+        for w in writes:
+            if i == w[0] + 4:
+                actual = (w[1], w[2])
+        rel = B(*actual) / B(3.9, 64.0)
+        fresh = i <= 100
+        lab = 100.0 if i < 100 else 40.0
+        white = dn(ce.linear_dn(lab) * rel) if i < 190 else float("nan")
+        pending = _feed(ctl, pending, i, white, 0.0, fresh, dn(ce.linear_dn(20.0) * rel), writes)
+    bracket = [w for w in writes if w[3] == "search-bracket"]
+    late = [w for w in writes if w[0] >= 100 + 30 * 20]
+    check(bracket and len(bracket) <= len(cfg.search_presets) * 2 and not late and ctl.state == "search-home"
+          and actual == bracket[-1][1:3],
+          f"bracket on the label alone: writes {[w for w in writes if w[0] > 100]}, state {ctl.state}")
+    print(f"      faded last pose (50 DN) under the lamp, then out of view 2 s: writes while away {fade[0]}, pose "
+          f"again {fade[1]} frames after the return; table, a single last pose at 180 DN / 150 DN 35 % clipped, "
+          f"then away 20 s: {len(res[180.0])} / {len(res[150.0])} writes; label alone out of the band, never "
+          f"decoded: {len(bracket)} bracket writes (last {bracket[-1][1]:g} ms / {bracket[-1][2]:.0f} at frame "
+          f"{bracket[-1][0]}), then {ctl.state}")
     # a cold start in bright light: the search goes on darker, it does not start over at the first
     # preset (clipped frame) after the hold
     plant_light = 30.0

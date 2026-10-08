@@ -214,15 +214,27 @@ class MarkerExposureConfig:
     # the search (nothing written). Without a bright region nothing is
     # probed at first: the marker comes back under the light it left
     search_stale_slow_s: float = 2.0
-    # ... unless the last pose's setting is darker than the brightest and a
-    # lamp is in view (frame clip >= search_dim_frame_clip in at least half
-    # of the meterings since the loss): then the label itself may have gone
-    # dark (a shadow on the marker only, the label turned away from the
-    # lamp, the drill moved out of a lamp spot in view). After this long
-    # without a pose the brighter presets are probed, brightest first (a
-    # label at 8-30 DN at 1.95 ms / 16 reads 92-182 DN at 7.8 ms / 128),
-    # home held search_stale_slow_s between two probes, doubled after every
-    # round up to search_dim_max_s. inf switches it off
+    # ... unless a lamp is in view (frame clip >= search_dim_frame_clip in
+    # at least half of the meterings since the loss), or the label was out
+    # of the band at the last pose, its region still read so after the
+    # loss (the loss step's rule), and a preset is left on that side: then
+    # the label itself may have changed (a shadow on the marker only,
+    # the label turned away from the lamp, the drill moved into or out of a
+    # lamp spot in view). After this long
+    # without a pose a bracket around home is probed ("search-bracket"):
+    # the darker presets darkest first and the brighter ones brightest
+    # first, in turn, the side the last pose's white points to first
+    # (brighter without one); a label at 8-30 DN at 1.95 ms / 16 reads
+    # 92-182 DN at 7.8 ms / 128, a spot x8-x55 puts a 90 DN label at
+    # 61-189 DN at 1.95 ms / 16. Home held search_stale_slow_s between two
+    # probes, doubled after every round up to search_dim_max_s; on the
+    # label alone one round, then home until the next pose (its reason
+    # cannot go away without one). 08.10.
+    # Lauf 5 (lamp spot 1.4 % of the frame, below search_frame_clip): into
+    # the spot, the search probed only brighter for 37 s; out of it in view
+    # the label sat at 44-47 DN, the frame clipped 0.00-0.02 % at 1.95 ms /
+    # 16 there (no lamp cue), 14 and 26 s without a write. inf switches it
+    # off
     search_dim_after_s: float = 3.0
     search_dim_max_s: float = 8.0
     # 08.10., the live meter at the settings below the brightest: under the
@@ -238,8 +250,22 @@ class MarkerExposureConfig:
     # clip_forget_max_s (a lamp spot: one try per period, not a cycle)
     clip_forget_s: float = 2.0
     clip_forget_max_s: float = 32.0
-    # lost while the marker region clipped (lamp switched on, glare): darken
-    # at once instead of holding
+    # lost while the last pose's region (the meter keeps its hull 3 s) reads
+    # above the band after a pose above it, or within hold_s clips (lamp
+    # switched on, glare): darken at once instead of holding, again after
+    # every settle while it still does ("clip-loss"); reads below the band
+    # after a pose below it, or within hold_s far below with the frame
+    # darker: brighten ("dark-loss"). A marker that leaves the view leaves
+    # the background in the hull, but its last pose was in the band: 08.10.
+    # table (Lauf 2b), the last pose before the 4 losses >= 0.3 s at
+    # 78-90 DN, the hull at 11-96 DN, no clip; Lauf 5 into the spot: last
+    # pose 236 DN (42 % clipped), the hull at 3.9 ms / 29 still 199-248 DN,
+    # held there 39 s; out of the spot in view: last pose 44-45 DN, the
+    # hull 32-67 DN, held 15 / 27 s. Below the band only while the hull
+    # reads at least half the last pose's white (linear): a pose that faded
+    # just before the drill left the view (Lauf 5: 43 of 2106 poses below
+    # the band) leaves the background in the hull, out of view in Lauf 5
+    # 8 DN
     clip_loss_frac: float = 0.30
     # frame clipped share from which the frame has a bright region (a lamp
     # spot or a lamp on the scene): a search preset that shows it counts as
@@ -441,7 +467,7 @@ class ExposureCommand:
         return float(self.exposure_ms) * float(self.gain)
 
 
-_SEARCH_STATES = ("search", "search-slow", "search-dim")
+_SEARCH_STATES = ("search", "search-slow", "search-bracket")
 
 
 class MarkerExposureController:
@@ -462,10 +488,12 @@ class MarkerExposureController:
     median is dark, or brighter would go back to a setting that clipped:
     the light spans more than the camera takes, so nothing is changed),
     "hold" (no pose for less than hold_s),
-    "clip-loss" (lost while the last hull clipped: darken at once),
-    "dark-loss" (lost while the last hull is far below the band: brighten
-    at once),
-    "search", "search-slow", "search-dim" (probing the brighter presets),
+    "clip-loss" (lost while the last hull clips, or reads above the band
+    after a pose above it: darken now and after every settle while it
+    does),
+    "dark-loss" (lost while the last hull reads below the band like a
+    pose below it, or far below with the frame darker: brighten),
+    "search", "search-slow", "search-bracket" (probing presets),
     "search-home" (no pose, nothing to probe: the setting is kept and
     nothing is written).
 
@@ -479,10 +507,12 @@ class MarkerExposureController:
     search_light_change of it: lamp off, shadow) while a brighter setting
     is left. Otherwise - the table, a marker out of view or lost in fast
     motion - the setting of the last pose ("home") is kept and nothing is
-    written; only when home is darker than the brightest setting and a
-    lamp is in view (frame clip >= search_dim_frame_clip) are the brighter
-    presets probed after search_dim_after_s ("search-dim": the label
-    itself went dark). At the start the first preset is home.
+    written; only when a lamp is in view (frame clip >=
+    search_dim_frame_clip), or the last pose's white was out of the band,
+    its region still read so after the loss and a preset is left on that
+    side, is a bracket around home probed after search_dim_after_s
+    ("search-bracket": the label itself changed; on the label alone one
+    round of probes, then home). At the start the first preset is home.
 
     The search: after a light change first the setting scaled by the
     frame's change, then home, then the other presets, each for
@@ -533,7 +563,12 @@ class MarkerExposureController:
         self._t_ceiling_expired: Optional[float] = None
         self._search_clip_product = float("inf")  # lowest preset whose frame clipped (this cycle)
         self._stale = False                       # the search was begun by a bright region, light unchanged
-        self._dim = False                         # ... by a long loss at a setting below the brightest
+        self._dim = False                         # ... by a long loss with a lamp in view / a label out of the band
+        self._pose_white = float("nan")           # white level and clipped share at the last pose
+        self._pose_clip = float("nan")
+        self._loss_seen = False                   # the hull showed the last pose's side after the loss
+        self._label_only = False                  # the bracket was begun by the label alone (no lamp)
+        self._label_tried = False                 # ... and has had its round (until the next pose)
         self._detecting: Optional[tuple] = None   # preset with checkerboard detections (this search)
         self._detect_share = 0.0                  # ... its share of frames with a detection
         self._search_det = 0                      # frames with a detection at the current search step
@@ -665,8 +700,12 @@ class MarkerExposureController:
                     and self._pending is None and m.frame_index >= self._effective_from):
                 self._ref_frame = (linear_dn(m.frame_median_dn) / self._b(self.exposure_ms, self.gain),
                                    m.frame_clip_frac)
+            if m.hull_from_pose and m.n_samples >= c.min_samples and np.isfinite(m.white_dn):
+                self._pose_white = m.white_dn
+                self._pose_clip = m.clip_frac if np.isfinite(m.clip_frac) else 0.0
             self._bright_run = 0
             self._lost_n = self._lost_lamp = 0
+            self._loss_seen = self._label_tried = False
             if self.state in _SEARCH_STATES + ("search-home", "hold", "clip-loss", "dark-loss", "start"):
                 self.state = "track"
                 self._out_count = 0
@@ -698,6 +737,13 @@ class MarkerExposureController:
                 self._clip_forget_s = min(2.0 * self._clip_forget_s, c.clip_forget_max_s)
             self._t_ceiling_expired = None
             self._t_clip = m.t_frame
+        elif self._ceiling_stale(m.white_dn, clip, product):
+            # below the band and unclipped at the ceiling's own setting: the
+            # light it clipped in is gone (08.10. Lauf 5, out of the lamp
+            # spot in view: the spot's ceiling at 1.95 ms / 16 held a label
+            # at 44-64 DN there until the pose was lost - the frame median,
+            # at 1-3 DN at that setting, did not show the change)
+            self._forget_ceiling(reset_backoff=True)
         elif (np.isfinite(self._clip_product)
               and m.t_frame - self._t_clip >= self._clip_forget_s):
             # no clipping for _clip_forget_s (a glare is over): the ceiling
@@ -782,40 +828,77 @@ class MarkerExposureController:
         self._lost_lamp += bool(np.isfinite(m.frame_clip_frac) and m.frame_clip_frac >= c.search_dim_frame_clip)
         bright_start = t_pose is None and self._bright_run >= c.confirm_frames
         searching = t_pose is None and self.state in _SEARCH_STATES
-        if since < c.hold_s and not bright_start and not searching:
-            # clipped marker region of the last pose: darken now
-            if (np.isfinite(m.clip_frac) and m.clip_frac > c.clip_loss_frac
-                    and m.n_samples >= c.min_samples):
-                self.state = "clip-loss"
-                # lost anyway: no motion limit; far over (> 60 % clipped) x4
-                f = 0.25 if m.clip_frac > 0.6 else 1.0 / c.max_step
-                e, g = self._choose(self._b(self.exposure_ms, self.gain) * f, clipped=True)
-                cmd = self._command(e, g, "clip-loss")
-                if cmd is not None:
-                    self.n_steps += 1
+        if t_pose is not None and self.state not in _SEARCH_STATES:
+            cmd = self._loss_step(m, since < c.hold_s)
+            if cmd is not None:
                 return cmd
-            # far below the band at the last pose's place and the frame
-            # darker too (lamp switched off): brighten now, up to x4, not
-            # back into a clipping setting. A marker that left the view
-            # leaves the background in its hull, the frame stays (08.10.
-            # frame bank, out of view under the lamp: x4 + x4 up to
-            # 7.8 ms / 128 without the frame condition)
-            if (np.isfinite(m.white_dn) and m.white_dn < 0.5 * c.white_low_dn
-                    and m.n_samples >= c.min_samples
-                    and self._frame_ratio(m) < 1.0 / c.search_light_change):
-                product = self._b(self.exposure_ms, self.gain)
-                f = min(4.0, linear_dn(c.target_dn) / max(linear_dn(m.white_dn), 1e-4),
-                        self._clip_product / c.max_step_moving / product)
-                if f > 1.05:
-                    self.state = "dark-loss"
-                    e, g = self._choose(product * f)
-                    cmd = self._command(e, g, "dark-loss")
-                    if cmd is not None:
-                        self.n_steps += 1
-                    return cmd
+        if since < c.hold_s and not bright_start and not searching:
             self.state = "hold"
             return None
         return self._search(m)
+
+    def _loss_step(self, m: Metering, holding: bool) -> Optional[ExposureCommand]:
+        """A step from the last pose's region (the meter keeps its hull
+        keep_s): darker while it reads above the band after a pose above
+        it, or (holding: within hold_s of the loss) clips ("clip-loss");
+        brighter while it reads below the band after a pose below it and
+        at least half that pose's white (linear), or (holding) far below
+        with the frame darker (lamp switched off; "dark-loss"). Lost
+        anyway: no motion limit. A marker that leaves the view leaves the
+        background in its hull: the hull alone counts only while holding
+        (08.10. frame bank, out of view under the lamp: x4 + x4 up to 7.8 ms
+        / 128 on the hull alone; 1.3 s after the loss a dark-loss to 3.9 ms
+        / 77 that centred the search there, the drill back under the lamp
+        never relocked), after a faded pose only while it reads like it
+        (review sandbox, under the lamp a pose faded to 50 DN, then the
+        background at 8 DN: 3.9 ms / 77 and 7.8 ms / 128 within 0.27 s,
+        whose frame clipped and started a full search).
+        _loss_seen: the hull showed the last pose's side."""
+        c = self.config
+        if not np.isfinite(m.white_dn) or m.n_samples < c.min_samples:
+            return None
+        clip = m.clip_frac if np.isfinite(m.clip_frac) else 0.0
+        pose_high = self._pose_white > c.white_high_dn or self._pose_clip > c.clip_max_frac
+        product = self._b(self.exposure_ms, self.gain)
+        high = m.white_dn > c.white_high_dn and pose_high
+        low = (m.white_dn < c.white_low_dn and self._pose_white < c.white_low_dn
+               and linear_dn(m.white_dn) >= 0.5 * linear_dn(self._pose_white))
+        self._loss_seen = self._loss_seen or high or low
+        if (holding and clip > c.clip_loss_frac) or high:
+            # far over (> 60 % clipped) x4
+            f = 0.25 if clip > 0.6 else 1.0 / c.max_step
+            e, g = self._choose(product * f, clipped=True)
+            reason = "clip-loss"
+        elif m.white_dn < c.white_low_dn and (
+                low
+                or (holding and m.white_dn < 0.5 * c.white_low_dn
+                    and self._frame_ratio(m) < 1.0 / c.search_light_change)):
+            # up to x4, not back into a setting the marker would still clip at
+            if self._ceiling_stale(m.white_dn, clip, product):
+                self._forget_ceiling(reset_backoff=True)
+            f = min(4.0, linear_dn(c.target_dn) / max(linear_dn(m.white_dn), 1e-4),
+                    self._clip_product / c.max_step_moving / product)
+            if f <= 1.05:
+                return None
+            e, g = self._choose(product * f)
+            reason = "dark-loss"
+        else:
+            return None
+        cmd = self._command(e, g, reason)
+        if cmd is not None:
+            self.state = reason
+            self.n_steps += 1
+        return cmd
+
+    def _ceiling_stale(self, white_dn: float, clip: float, product: float) -> bool:
+        """The clip ceiling is set and the marker reads below the band
+        without a clipped sample at the ceiling's setting itself. Below the
+        ceiling an unclipped marker says nothing about it: a spot that
+        covers part of the label clips there again (the unit test's
+        persistent spot: a linear prediction cycled 55 times in 15 s)."""
+        return (np.isfinite(self._clip_product) and clip <= 0.0 and np.isfinite(white_dn)
+                and white_dn < self.config.white_low_dn
+                and product >= self._clip_product * (1.0 - 1e-6))
 
     @staticmethod
     def _same(a: tuple, b: Optional[tuple]) -> bool:
@@ -831,9 +914,19 @@ class MarkerExposureController:
             out = sorted((q for q in out if self._b(*q) < self._b(*h) * (1.0 - 1e-6)),
                          key=lambda q: self._b(*q))
         elif self._dim:
-            # the label went dark: only the brighter presets, brightest first
-            out = sorted((q for q in out if self._b(*q) > self._b(*h) * (1.0 + 1e-6)),
-                         key=lambda q: -self._b(*q))
+            # the label changed: darker presets darkest first and brighter
+            # ones brightest first, in turn - the side the last pose's white
+            # points to first, brighter without one
+            dark = sorted((q for q in out if self._b(*q) < self._b(*h) * (1.0 - 1e-6)),
+                          key=lambda q: self._b(*q))
+            light = sorted((q for q in out if self._b(*q) > self._b(*h) * (1.0 + 1e-6)),
+                           key=lambda q: -self._b(*q))
+            c = self.config
+            first, second = ((dark, light) if (self._pose_white > c.white_high_dn
+                                               or self._pose_clip > c.clip_max_frac)
+                             else (light, dark))
+            out = [q for k in range(max(len(first), len(second)))
+                   for q in (first[k:k + 1] + second[k:k + 1])]
         return out
 
     def _slow_probes(self) -> list:
@@ -896,12 +989,26 @@ class MarkerExposureController:
                 # comes back under the light it left - keep the setting,
                 # write nothing (08.10. table: 39 probe writes for
                 # out-of-view and fast-motion losses in 206 s, the image
-                # pumped). Below the brightest setting with a lamp in view
-                # the label itself may have gone dark: after
-                # search_dim_after_s the brighter presets
-                if (self._t_last_pose is not None and brighter_left
-                        and 2 * self._lost_lamp >= self._lost_n > 0
+                # pumped). With a lamp in view, or a label out of the band at
+                # the last pose that its region still showed after the loss
+                # and a preset left on that side, the label itself may have
+                # changed: after search_dim_after_s a bracket around home. A
+                # single last pose alone is no reason (a glint, a tilt
+                # before the drill left: at the table 8 of 6770 poses above
+                # the band or clipped). A dim table at the brightest setting
+                # has nothing to try; under the OR lamp the label sits above
+                # the band at the darkest setting ("limit", Lauf 3 neu
+                # 181-224 DN): a drill out of view there probes nothing new
+                presets = [self._b(e, g) for e, g in c.search_presets]
+                lamp = 2 * self._lost_lamp >= self._lost_n > 0
+                label_out = (self._loss_seen and not self._label_tried
+                             and ((self._pose_white < c.white_low_dn
+                                   and any(b > cur * (1.0 + 1e-6) for b in presets))
+                                  or ((self._pose_white > c.white_high_dn or self._pose_clip > c.clip_max_frac)
+                                      and any(b < cur * (1.0 - 1e-6) for b in presets))))
+                if (self._t_last_pose is not None and (lamp or label_out)
                         and m.t_frame - self._t_last_pose >= c.search_dim_after_s):
+                    self._label_only = not lamp
                     return self._begin(m, stale=False, dim=True)
                 self.state = "search-home"
                 return None
@@ -988,8 +1095,19 @@ class MarkerExposureController:
                 self._home = (max(darker, key=lambda p: self._b(*p)) if darker
                               else min(((float(pe), float(pg)) for pe, pg in c.search_presets),
                                        key=lambda p: self._b(*p)))
-            self.state = "search-dim" if self._dim else "search-slow"
             probes = self._slow_probes()
+            if self._dim and self._label_only and self._probe_i >= len(probes):
+                # a bracket on the label alone has tried every probe: home,
+                # no more probes until the next pose - its reason cannot go
+                # away without one (a wrong one would pump for as long as the
+                # drill is away)
+                self._label_tried = True
+                self.state = "search-home"
+                cmd = self._command(self._home[0], self._home[1], "search-bracket")
+                if cmd is not None:
+                    self.n_search_steps += 1
+                return cmd
+            self.state = "search-bracket" if self._dim else "search-slow"
             p = probes[self._probe_i % len(probes)] if probes else self._home
             rounds = self._probe_i // max(1, len(probes))
             self._probe_i += 1
@@ -1015,7 +1133,7 @@ class MarkerExposureController:
         last pose; at the start the first preset)."""
         c = self.config
         cur = self._b(self.exposure_ms, self.gain)
-        self.state = "search-dim" if dim else "search"
+        self.state = "search-bracket" if dim else "search"
         self._forget_ceiling(reset_backoff=True)
         self._search_clip_product = float("inf")
         self._stale = stale
@@ -1032,7 +1150,7 @@ class MarkerExposureController:
         self._search_frames = 0
         self._search_det = 0
         if dim:
-            # home has been held since the loss: the brightest probe first
+            # home has been held since the loss: the first probe now
             probes = self._probes()
             if not probes:
                 self.state = "search-home"
