@@ -4,7 +4,7 @@ test_color_exposure.py
 
 Checks the marker exposure control (tracking.hydramarker.color_exposure)
 and its hooks with fakes - no camera, no Qt; the C++ engine only for
-HydraTracker.ir_frame_timing (k).
+tracker.TrackerResult (e) and HydraTracker.ir_frame_timing (k).
 
 (a) CommandedColorExposure: AE without a number; frames up to the call
     return old, the next LATENCY_FRAMES + 1 in transition (mean), then new;
@@ -13,15 +13,16 @@ HydraTracker.ir_frame_timing (k).
     camera whose frames change 3 (or 4) frames after the call -> each
     frame's exposure is exact or a transition that contains the truth,
     never wrong; with the register always exact
-(c) controller, closed loop on a plant (brightness ~ exposure x gain x
-    light, tone curve, clip 255, 3-4 old frames, gain drift): settles into
-    the band; a static scene then makes ZERO steps at every light level
-    (x0.3 .. x100; x300 cannot be tracked: slow search); 7.8 ms at the
-    table, <= 3.9 ms in bright light; lamp on / off -> tracked again
-    within frames; out of view under the same light -> no write for
-    search_home_s, then the search, tracked again at once when back;
-    out of view while the lamp goes on -> the ladder finds it; steps <= x2
-    (<= x1.41 moving); at the end of the range no pumping
+(c) controller, closed loop on a plant (brightness ~ exposure x the
+    measured gain response x light, tone curve, clip 255, 3-4 old frames,
+    gain drift, a frame with a highlight): settles into the band; a static
+    scene then makes ZERO steps at every light level (x0.3 .. x30; x100
+    and x300 cannot be tracked: slow search); 7.8 ms at the table,
+    <= 3.9 ms in bright light; lamp on / off -> tracked again within
+    frames; out of view under the same light (table, and x30 without a
+    lamp in view) -> no write at all, tracked again at once when back;
+    out of view while the lamp goes on -> the ladder finds it; steps
+    <= x2 (<= x1.41 moving); at the end of the range no pumping
 (d) actuator: AE off once, exposure then gain, newest command wins,
     applied events with the frame index, restore exposure -> gain -> AE on
     and its read-back, nothing restored if never manual, a failing
@@ -30,12 +31,20 @@ HydraTracker.ir_frame_timing (k).
     write, mismatches reported; an AE-off call that raised but took
     effect is restored; stop joins
 (l) policy: a marker that comes back into a lamp spot under unchanged
-    frame light locks (search after search_home_s); a short glare does not
-    cap the brightness for good (ceiling expiry, back to 3.9 ms), a lamp
-    spot does not make it cycle (backoff); 1.95 ms is left as soon as the
-    gain at 3.9 ms stays >= its floor; the frames between a write and its
+    frame light locks (the spot clips in the frame: darker probes), without
+    a spot nothing is written; a short glare does not cap the brightness
+    for good (ceiling expiry, back to 3.9 ms), a lamp spot does not make it
+    cycle (backoff); 1.95 ms is left as soon as the gain at 3.9 ms stays >=
+    its floor; the gain response; the frames between a write and its
     effect do not count as a light change; a cold start in bright light
-    does not restart its search at the clipped first preset
+    does not restart its search at the clipped first preset; a cold start
+    in a pose that never decodes keeps the preset with detections as home
+    of the slow cycle; one that detects only at a preset too dark to
+    decode leaves it after 2 s and locks; a marker lost out of view (dark
+    hull, frame unchanged) is not brightened, under a darker frame (lamp
+    off) at once; at the table a short bright region while the drill is
+    away costs one probe cycle, a single glint nothing; a label that goes
+    dark alone under the lamp is found by the brightest preset after 3 s
 (m) MarkerExposureControl with a failing camera: the first write fails ->
     failure (the caller stops it); one failed write later -> dropped, the
     control goes on; two in a row -> failure
@@ -44,7 +53,8 @@ HydraTracker.ir_frame_timing (k).
     leaves the source busy (no new control) until it returns
 (e) MarkerMeter: white / black level and clipped share of a synthetic
     marker, grey == BGRA, the last hull without a pose (and its expiry),
-    the frame grid; cost on a 1920x1080 BGRA frame
+    the frame grid; cost on a 1920x1080 BGRA frame; the detected corners
+    of tracker.TrackerResult (the type the Live page hands it)
 (f) TrackingWorker: the metering travels with its output, set_meter(None)
     stops it, a raising meter costs only the metering
 (g) DisplayBrightener: brightens a dark display in place, leaves a bright
@@ -156,9 +166,10 @@ def test_every_frame_e_rgb():
 # ============================================================
 
 class Plant:
-    """brightness of the marker's white = light x exposure x gain in linear units through the tone curve;
-    a setting written at frame k shows from frame k + 4 (3 old frames; 4 with prob 0.2), gain steps drift
-    +5.9 / +4 / +2 % over the first 3 new frames."""
+    """brightness of the marker's white = light x setting_brightness (exposure x the measured gain response)
+    in linear units through the tone curve; a setting written at frame k shows from frame k + 4 (3 old frames;
+    4 with prob 0.2), gain steps drift +5.9 / +4 / +2 % over the first 3 new frames. The frame: a background at
+    0.1-4 x 0.3 of the marker white (the top 1/4 a lit highlight); its clipped share is the frame clip."""
 
     def __init__(self, light, seed=0):
         self.light = light
@@ -179,12 +190,14 @@ class Plant:
                 self.E, self.G = item[1], item[2]
                 self.queue.remove(item)
         f = self.drift.pop(0) if self.drift else 1.0
-        lin = 0.00027 * self.light(k) * self.E * self.G * f
+        lin = 0.00027 * self.light(k) * ce.setting_brightness(self.E, self.G) * f
         white_lin = lin * np.linspace(0.85, 1.15, 200)
         dn = np.array([float(ce.dn_of_linear(x)) for x in np.minimum(white_lin, 1.0)])
         white = float(np.median(dn))
-        # the frame: a background at 0.3 x the marker white
+        # the frame: a background at 0.3 x the marker white, a highlight up to 4 x that
         self.frame_median = float(ce.dn_of_linear(min(1.0, 0.3 * lin)))
+        bg = ce.dn_of_linear(np.minimum(0.3 * lin * np.linspace(0.1, 4.0, 200), 1.0))
+        self.frame_clip = float(np.mean(bg >= 250))
         return white, float(np.mean(dn >= 250)), self.E, self.G
 
 
@@ -206,7 +219,7 @@ def run_loop(light, visible, n, speed=None, seed=0, start=None):
                         white_dn=white if (vis and fresh) else (white if vis else float("nan")),
                         clip_frac=clip if vis else float("nan"),
                         n_samples=2000 if vis else 0, hull_from_pose=fresh,
-                        frame_clip_frac=min(1.0, clip * 0.3), frame_median_dn=plant.frame_median,
+                        frame_clip_frac=plant.frame_clip, frame_median_dn=plant.frame_median,
                         speed_px=(speed(k) if speed else 0.0))
         c = ctl.update(m)
         if c is not None:
@@ -227,14 +240,15 @@ def test_controller_closed_loop():
     check(not late, f"static table scene: steps after settling {late}")
     print(f"  (c) table: in band from frame {settle}, {len(steps)} writes in all, 0 after settling "
           f"(final {log[-1][4]:g} ms / {log[-1][5]:.0f}, white {log[-1][2]:.0f})")
-    # every light level in 0.3 .. 100 x: static -> zero steps after settling (or a limit state);
-    # x300: clipped even at 1.95 ms / 16 -> no pose at all, the search cycles slowly
+    # every light level in 0.3 .. 30 x: static -> zero steps after settling (or a limit state);
+    # x100 / x300: clipped even at 1.95 ms / 16 (only x0.073 of 7.8 ms / 128 with the measured gain
+    # response) -> no pose at all, the search cycles slowly
     for L in (0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0):
         ctl, log, steps = run_loop(lambda k, L=L: L, lambda k: True, 600, seed=int(L * 10))
         inb = [k for k, fr, w, c, E, G, s in log if fr and lo <= w <= hi and c <= cfg.clip_max_frac]
         last = steps[-1][0] if steps else 0
         tail = [s for s in steps if s[0] > 300]
-        if L < 300:
+        if L < 100:
             check(not tail, f"light x{L}: steps in the static second half {tail}")
         else:
             check(len(tail) <= 2 * 300 / 30 / cfg.search_slow_s + 2 and ctl.state == "search-slow",
@@ -243,9 +257,10 @@ def test_controller_closed_loop():
         print(f"      light x{L:<5g}: last write frame {last:3d}, final {fin[4]:g} ms / {fin[5]:.0f}, "
               f"white {fin[2]:.0f} DN, clip {100 * fin[3]:.0f} %, state {fin[6]}, in band from "
               f"{inb[0] if inb else '-'}")
-        if 30.0 <= L < 300:
+        if 30.0 <= L < 100:
             check(fin[4] <= 3.9 + 1e-6, f"bright light x{L}: exposure {fin[4]} should be <= 3.9 ms")
-        if L <= 3.0:
+        if L <= 1.0:
+            # (x3 needs < 7.8 ms / 16: the gain darkens 7.8 ms only to x0.29)
             check(fin[4] == 7.8, f"table light x{L}: exposure {fin[4]} should stay 7.8 ms")
     # lamp switched on at frame 200 (x1 -> x40), off at 500
     light = lambda k: 40.0 if 200 <= k < 500 else 1.0
@@ -257,21 +272,18 @@ def test_controller_closed_loop():
     check(not late, f"lamp: steps in the static parts {late}")
     print(f"      lamp on at 200: tracked unclipped again at {on_back} ({on_back - 200} frames), off at 500: "
           f"{off_back} ({off_back - 500} frames), frames without a pose {len(lost)}")
-    # out of view 100..400 under the same light: hold, then nothing is probed for search_home_s
-    # (search-home), then the search (a lamp spot on the label does not show in the frame); back -> tracks
-    ctl, log, steps = run_loop(lambda k: 1.0, lambda k: not (100 <= k < 400), 600)
-    t_home = 99 + int(round(cfg.search_home_s * 30))      # the last pose: frame 99
-    early = [s for s in steps if 100 <= s[0] < t_home]
-    check(not early, f"writes within search_home_s out of view under unchanged light {early}")
-    out_w = [s for s in steps if t_home <= s[0] < 400]
-    check(len(out_w) <= 4 + 2 * (400 - t_home) / 30 / cfg.search_slow_s,
-          f"writes out of view after search_home_s: {len(out_w)}")
-    back = next(k for k, fr, *_ in log if k >= 400 and fr)
-    check(back - 400 <= 30, f"pose again {back - 400} frames after the marker came back")
-    states = sorted(set(s for *_, s in log[100:400]))
-    print(f"      out of view 100-400, same light: 0 writes for {cfg.search_home_s:g} s, then {len(out_w)} "
-          f"search writes in {(400 - t_home) / 30:.0f} s ({states}), pose again {back - 400} frames after "
-          f"the marker came back")
+    # out of view 100..400 under the same light, nothing in the frame clips (table, and x30 once settled at
+    # 1.95 ms / 16 - no lamp in view there, see (l) for one): the setting is kept, nothing is written;
+    # back -> tracks at once
+    for L in (1.0, 30.0):
+        ctl, log, steps = run_loop(lambda k, L=L: L, lambda k: not (100 <= k < 400), 600)
+        out_w = [s for s in steps if 100 <= s[0] < 400]
+        check(not out_w, f"x{L:g}: writes out of view under unchanged light {out_w}")
+        back = next(k for k, fr, *_ in log if k >= 400 and fr)
+        check(back - 400 <= 6, f"x{L:g}: pose again {back - 400} frames after the marker came back")
+        states = sorted(set(s for *_, s in log[100:400]))
+        print(f"      out of view 100-400, same light x{L:g}: 0 writes ({states}), pose again "
+              f"{back - 400} frames after the marker came back")
     # out of view 100..400 and the lamp goes on at 200 (x30): the ladder runs, the marker is found
     # under the lamp
     ctl, log, steps = run_loop(lambda k: 30.0 if k >= 200 else 1.0, lambda k: not (100 <= k < 400), 700)
@@ -295,7 +307,9 @@ def test_controller_closed_loop():
             got = got or c.update(ce.Metering(frame_index=100 + i, t_frame=1.0, fresh=True, white_dn=20.0,
                                               clip_frac=0.0, n_samples=2000, hull_from_pose=True,
                                               speed_px=speed))
-        check(got is not None and abs(got.product / (7.8 * 40.0) - want) < 0.05, f"step at {speed} px: {got}")
+        check(got is not None and abs(ce.setting_brightness(got.exposure_ms, got.gain)
+                                      / ce.setting_brightness(7.8, 40.0) - want) < 0.05,
+              f"step at {speed} px: {got}")
     # at the end of the range: too dark at 7.8 / 128 -> "limit", no write, no pumping
     ctl4 = at(7.8, 128.0)
     writes = [ctl4.update(ce.Metering(frame_index=100 + i, t_frame=1.0 + i / 30, fresh=True, white_dn=30.0,
@@ -454,12 +468,13 @@ def test_actuator():
 # (l) policy cases
 # ============================================================
 
-def _feed(ctl, pending, i, white, clip, fresh, frame_median, writes):
+def _feed(ctl, pending, i, white, clip, fresh, frame_median, writes, frame_clip=0.0, n_detected=0):
     """one frame through the controller; a command is 'written' at once (the actuator's return =
     this frame) and shows from frame + 4"""
     m = ce.Metering(frame_index=i, t_frame=i / 30.0, fresh=fresh, white_dn=white, black_dn=20.0,
                     clip_frac=clip, n_samples=2000 if fresh or np.isfinite(white) else 0,
-                    hull_from_pose=fresh, frame_clip_frac=0.02, frame_median_dn=frame_median, speed_px=0.0)
+                    hull_from_pose=fresh, frame_clip_frac=frame_clip, frame_median_dn=frame_median,
+                    speed_px=0.0, n_detected=n_detected)
     if pending is not None:
         writes.append((i, pending.exposure_ms, pending.gain, pending.reason))
         ctl.applied(pending, i)
@@ -468,27 +483,30 @@ def _feed(ctl, pending, i, white, clip, fresh, frame_median, writes):
 
 def spot_reentry(spot, n=600):
     """table setting 7.8 / 128, marker white 90 DN; lost at 100 (out of view), back at 160 inside a lamp
-    spot `spot` x brighter on the label only (frame median and clip share unchanged). A pose iff
-    30 <= white < 250. Returns (frames from re-entry to the first pose or None, writes after the loss)."""
+    spot `spot` x brighter, in view all the time beside the marker (frame median unchanged; the frame clip
+    is 4 % while the spot clips at the setting). A pose iff 30 <= white < 250. Returns (frames from
+    re-entry to the first pose or None, writes after the loss)."""
     dn = lambda lin: float(ce.dn_of_linear(lin))
+    B = ce.setting_brightness
     ctl = ce.MarkerExposureController(gain_range=(0, 128))
     pending = ctl.start(0.0)
     writes, actual = [], (7.8, 128.0)
-    L_w = ce.linear_dn(90.0) / (7.8 * 128)
-    L_f = ce.linear_dn(110.0) / (7.8 * 128)
+    L_w = ce.linear_dn(90.0) / B(7.8, 128)
+    L_f = ce.linear_dn(110.0) / B(7.8, 128)
     lock = None
     for i in range(1, n):
         for w in writes:
             if i == w[0] + 4:
                 actual = (w[1], w[2])
-        P = actual[0] * actual[1]
+        P = B(*actual)
         present = i < 100 or i >= 160
         white = dn(L_w * P * (spot if i >= 160 else 1.0))
         fresh = present and 30.0 <= white < 250.0
         if fresh and i >= 160 and lock is None:
             lock = i - 160
+        fclip = 0.04 if dn(L_f * P * spot) >= 250.0 else 0.0
         pending = _feed(ctl, pending, i, white if fresh else float("nan"), 0.0 if fresh else float("nan"),
-                        fresh, dn(L_f * P), writes)
+                        fresh, dn(L_f * P), writes, frame_clip=fclip)
     return lock, len([w for w in writes if w[0] >= 100])
 
 
@@ -503,23 +521,24 @@ def glare(glare_frames, base_dn, persistent=False, n=600):
     ctl = ce.MarkerExposureController(cfg, gain_range=(0, 128))
     pending = ctl.start(0.0)
     writes, actual = [], (7.8, 128.0)
-    L = ce.linear_dn(base_dn) / (start[0] * start[1])
-    L_f = ce.linear_dn(110.0) / (start[0] * start[1])
+    B = ce.setting_brightness
+    L = ce.linear_dn(base_dn) / B(*start)
+    L_f = ce.linear_dn(110.0) / B(*start)
     below = n_clip = 0
     t_after = 100 + glare_frames + 60
     for i in range(1, n):
         for w in writes:
             if i == w[0] + 4:
                 actual = (w[1], w[2])
-        P = actual[0] * actual[1]
+        P = B(*actual)
         wd = dn(L * P)
-        g = (i >= 100 and P >= 0.99 * start[0] * start[1]) if persistent else (100 <= i < 100 + glare_frames)
+        g = (i >= 100 and P >= 0.99 * B(*start)) if persistent else (100 <= i < 100 + glare_frames)
         white, clip = (252.0, 0.8) if g else (wd, 1.0 if wd >= 250 else 0.0)
         if i > t_after:
             below += (not g) and wd < 60
             n_clip += bool(g)
         pending = _feed(ctl, pending, i, white, clip, True, dn(L_f * P), writes)
-    P = actual[0] * actual[1]
+    P = B(*actual)
     return actual[0], actual[1], dn(L * P), below, len([w for w in writes if w[0] > t_after]), n_clip
 
 
@@ -548,8 +567,15 @@ def test_policy():
     # 1.95 ms is left when the gain at 3.9 ms stays >= the floor
     ctl = ce.MarkerExposureController(gain_range=(0, 128))
     ctl.exposure_ms, ctl.gain = 1.95, 32.0
-    check(ctl._choose(124.8) == (3.9, 32.0) and ctl._choose(62.4) == (3.9, 16.0)
-          and ctl._choose(31.2) == (1.95, 16.0), "1.95 ms only while 3.9 ms would need a gain below 16")
+    B = ce.setting_brightness
+    for want, clipped in (((3.9, 32.0), False), ((3.9, 16.0), False), ((1.95, 16.0), False),
+                          ((1.95, 16.0), True)):
+        got = ctl._choose(B(*want), clipped=clipped)
+        check(got[0] == want[0] and abs(got[1] - want[1]) < 0.01,
+              f"1.95 ms only while 3.9 ms would need a gain below 16: {want} -> {got}")
+    # the gain response: below 64 the gain hardly acts (08.10.)
+    check(abs(B(3.9, 16) / B(7.8, 128) - 0.146) < 0.005 and abs(B(1.95, 16) / B(7.8, 128) - 0.073) < 0.005
+          and abs(ce.gain_for_response(ce.gain_response(40.0)) - 40.0) < 1e-6, "gain response")
     # the frames between a write and its effect are not a light change: lost 1..4 frames after a step
     # under constant light -> no search write
     dn = lambda lin: float(ce.dn_of_linear(lin))
@@ -557,16 +583,16 @@ def test_policy():
         ctl = ce.MarkerExposureController(gain_range=(0, 128))
         pending = ctl.start(0.0)
         writes, actual = [], (7.8, 128.0)
-        L_w, L_f = ce.linear_dn(200.0) / (7.8 * 128), ce.linear_dn(110.0) / (7.8 * 128)
+        L_w, L_f = ce.linear_dn(200.0) / B(7.8, 128), ce.linear_dn(110.0) / B(7.8, 128)
         step_at = None
-        # until 2.5 s after the loss: before search_home_s ends
+        # 3 s, 2 s of them after the loss
         for i in range(1, 90):
             for w in writes:
                 if i == w[0] + 4:
                     actual = (w[1], w[2])
             if step_at is None and len(writes) >= 2:
                 step_at = writes[1][0]
-            P = actual[0] * actual[1]
+            P = B(*actual)
             fresh = step_at is None or i < step_at + lag
             white = dn(L_w * P)
             pending = _feed(ctl, pending, i, white if fresh else float("nan"), 0.0 if fresh else float("nan"),
@@ -577,14 +603,138 @@ def test_policy():
           f"({out[16.0][1]} writes; x1/x2: at once, 0 writes); glare 10/40 frames at 3.9 / 16: back to "
           f"3.9 ms, white {res[(90.0, 10)][2]:.0f} / {res[(110.0, 10)][2]:.0f} DN; persistent spot: {nw} "
           f"writes, {n_clip} clipped frames in 15 s; 1.95 ms left at gain >= 16; step transition frames "
-          f"are no light change (0 search writes); out of view under x30: only darker probes")
-    # out of view under unchanged OR-like light (x30): the search after search_home_s probes only
-    # presets darker than the setting the marker was lost with (it can only come back brighter)
-    ctl, log, steps = run_loop(lambda k: 30.0, lambda k: not (200 <= k < 500), 600)
-    home = next(s_ for s_ in reversed([x for x in steps if x[0] < 200]))
-    probes = [x for x in steps if 200 <= x[0] < 500 and x[3].startswith("search")]
-    check(probes and all(x[1] * x[2] <= home[1] * home[2] + 1e-6 for x in probes),
-          f"x30 out of view: stale probes {probes[:4]} not darker than home {home[1:3]}")
+          f"are no light change (0 search writes)")
+    # out of view at a dark setting: the last hull shows the dark background (white 5 DN), the frame stays
+    # -> no dark-loss brightening, no write; the frame 3x darker (lamp off) -> brightened at once
+    for frame_dn, want_write in ((60.0, False), (30.0, True)):
+        ctl = ce.MarkerExposureController(gain_range=(0, 128))
+        pending = ctl.start(0.0)
+        writes = []
+        pending = _feed(ctl, pending, 1, float("nan"), float("nan"), False, 60.0, writes)
+        ctl.applied(ce.ExposureCommand(1.95, 16.0, "x", 99), 1)          # tracked at 1.95 / 16
+        for i in range(20, 60):
+            pending = _feed(ctl, pending, i, 120.0, 0.0, True, 60.0, writes)
+        n0 = len(writes)
+        for i in range(60, 120):
+            pending = _feed(ctl, pending, i, 5.0, 0.0, False, frame_dn if i >= 61 else 60.0, writes)
+        got = [w for w in writes[n0:] if w[0] < 120]
+        check(bool(got) == want_write and (not got or got[0][3] == "dark-loss"),
+              f"lost at 1.95 / 16, hull 5 DN, frame {frame_dn:.0f} DN: writes {got}")
+    # a cold start under a lamp in a pose that does not decode: the checkerboard is detected only at
+    # the darkest preset (as 08.10. at 1.95 ms / 16) -> the search keeps it 2 s more and makes it home of
+    # the slow cycle: most frames there, one probe per 2 s at home
+    ctl = ce.MarkerExposureController(gain_range=(0, 128))
+    pending = ctl.start(0.0)
+    writes, actual = [], (15.6, 64.0)
+    L_w = ce.linear_dn(230.0) / B(1.95, 16)          # the label at ~230 DN at 1.95 / 16
+    at_det = 0
+    for i in range(1, 900):
+        for w in writes:
+            if i == w[0] + 4:
+                actual = (w[1], w[2])
+        white = dn(L_w * B(*actual))
+        det = 60 if white < 250.0 else 0
+        at_det += i >= 300 and det > 0
+        pending = _feed(ctl, pending, i, float("nan"), float("nan"), False, dn(0.2 * L_w * B(*actual)),
+                        writes, frame_clip=0.05 if white >= 250.0 else 0.004, n_detected=det)
+    late = [w for w in writes if w[0] >= 300]
+    check(at_det >= 0.7 * 600 and all(w[3] == "search-slow" for w in late)
+          and len(late) <= 2 * 600 / 30 / cfg.search_stale_slow_s + 2,
+          f"undecodable pose under the lamp: {at_det} of 600 frames at the detecting setting, writes {late}")
+    print(f"      cold start, pose that never decodes, detected only at 1.95 / 16: {len(writes) - len(late)} "
+          f"writes, then {at_det} of 600 frames there, {len(late)} probe writes "
+          f"{sorted(set((w[1], w[2]) for w in late))}")
+    # the spot only in the view, the drill under table light outside it (white 90 DN at 7.8 / 128): the
+    # frame clips 4 % at 7.8 / 128 (1.2 % at 3.9 / 64), the checkerboard is detected at 3.9 / 64 (27 DN,
+    # too dark to decode); a cold engine needs 15 frames in a row at 40-250 DN (the AE frames before the
+    # first write count as none) -> the detecting preset is left after 2 s, the slow cycle comes back to
+    # 7.8 / 128 and locks
+    ctl = ce.MarkerExposureController(gain_range=(0, 128))
+    pending = ctl.start(0.0)
+    writes, actual = [], (15.6, 64.0)
+    L_w = ce.linear_dn(90.0) / B(7.8, 128)
+    L_f = ce.linear_dn(110.0) / B(7.8, 128)
+    run, first, det_frames = 0, None, 0
+    for i in range(1, 600):
+        for w in writes:
+            if i == w[0] + 4:
+                actual = (w[1], w[2])
+        P = B(*actual)
+        white = dn(L_w * P)
+        ok = 40.0 <= white < 250.0 and actual != (15.6, 64.0)
+        run = run + 1 if ok else 0
+        fresh = ok and (first is not None or run >= 15)
+        if fresh and first is None:
+            first = i
+        det = 40 if 20.0 <= white < 40.0 else 0
+        det_frames += det > 0
+        fclip = 0.04 if P >= 0.99 * B(7.8, 128) else 0.012 if P >= 0.99 * B(3.9, 64) else 0.004
+        pending = _feed(ctl, pending, i, white if fresh else float("nan"), 0.0 if fresh else float("nan"),
+                        fresh, dn(L_f * P), writes, frame_clip=fclip, n_detected=det)
+    check(first is not None and first <= 12 * 30,
+          f"spot in view, drill outside it, detected at 3.9 / 64 only: first pose {first}, writes {writes}")
+    print(f"      cold start beside a spot, detected only at 3.9 / 64 (too dark): {det_frames} frames there, "
+          f"pose at frame {first} ({len([w for w in writes if first is None or w[0] < first])} writes before)")
+    # at the table, the drill out of view: a white object clips 3 % of the frame for 10 frames, then the
+    # frame is as before -> one probe cycle, back to 7.8 / 128 and nothing more; 8 % (a light-change search)
+    # -> the same once the cycle probes 7.8 / 128 again; a single glint -> nothing
+    for n_tr, frac, max_w in ((10, 0.03, 4), (10, 0.08, 6), (1, 0.03, 0)):
+        ctl = ce.MarkerExposureController(gain_range=(0, 128))
+        pending = ctl.start(0.0)
+        writes, actual = [], (7.8, 128.0)
+        for i in range(1, 126 + 10 + 600):
+            for w in writes:
+                if i == w[0] + 4:
+                    actual = (w[1], w[2])
+            P = B(*actual)
+            fresh = i < 90
+            white = dn(L_w * P)
+            fclip = frac if 126 <= i < 126 + n_tr and P > 0.5 * B(7.8, 128) else 0.0
+            pending = _feed(ctl, pending, i, white if fresh else float("nan"), 0.0 if fresh else float("nan"),
+                            fresh, dn(L_f * P), writes, frame_clip=fclip)
+        after = [w for w in writes if w[0] >= 126]
+        tail = [w for w in writes if w[0] >= 126 + 10 + 300]
+        check(len(after) <= max_w and not tail and ctl.state == "search-home" and actual == (7.8, 128.0),
+              f"table, bright region {n_tr} frames at {frac:.0%} while away: writes {after}, state {ctl.state}, "
+              f"{actual}")
+        print(f"      table, drill away, {100 * frac:.0f} % of the frame clips for {n_tr} frame(s): {len(after)} "
+              f"writes, then {ctl.state} at {actual[0]:g} ms / {actual[1]:.0f}, 0 writes in the last 10 s")
+    # under the lamp at 1.95 / 16 the label alone goes dark (a hand shadow on the marker, turned away from
+    # the lamp, the drill moved out of the spot): 20 DN at 1.95 / 16, the frame unchanged (0.4 % clip: the
+    # lamp in view) -> held, after search_dim_after_s the brightest preset first -> a pose again (old:
+    # never). The same at a setting below the brightest without a lamp in view (frame clip 0, the table
+    # tracked at 3.9 / 64): nothing is probed
+    res = {}
+    for start, fclip in (((1.95, 16.0), 0.004), ((3.9, 64.0), 0.0)):
+        ctl = ce.MarkerExposureController(gain_range=(0, 128))
+        pending = ctl.start(0.0)
+        writes = []
+        pending = _feed(ctl, pending, 1, float("nan"), float("nan"), False, 40.0, writes)
+        ctl.applied(ce.ExposureCommand(start[0], start[1], "x", 99), 1)       # tracked there
+        actual = start
+        back = None
+        for i in range(20, 400):
+            for w in writes:
+                if i == w[0] + 4:
+                    actual = (w[1], w[2])
+            rel = B(*actual) / B(*start)
+            white = dn(ce.linear_dn(150.0 if i < 100 else 20.0) * rel)
+            fresh = 30.0 <= white < 250.0
+            if fresh and i >= 100 and back is None:
+                back = i - 100
+            pending = _feed(ctl, pending, i, white, 0.0, fresh, dn(ce.linear_dn(40.0) * rel), writes,
+                            frame_clip=fclip if rel <= 1.0 else 0.05)
+        res[start] = (back, [w for w in writes if w[0] >= 100])
+    back, writes = res[(1.95, 16.0)]
+    dim = [w for w in writes if w[3] == "search-dim"]
+    check(back is not None and 30 * cfg.search_dim_after_s - 2 <= back <= 30 * (cfg.search_dim_after_s + 1)
+          and dim and dim[0][1:3] == (7.8, 128.0),
+          f"label dark under the lamp: pose again {back} frames after the loss, writes {writes}")
+    check(res[(3.9, 64.0)][0] is None and not res[(3.9, 64.0)][1],
+          f"label dark at 3.9 / 64 without a lamp in view: writes {res[(3.9, 64.0)][1]}")
+    print(f"      label dark at 1.95 / 16 (20 DN), frame unchanged, lamp in view: held, first probe "
+          f"{dim[0][1]:g} ms / {dim[0][2]:.0f}, pose again {back} frames after the loss; at 3.9 / 64 without "
+          f"a lamp in view: 0 writes in 10 s")
     # a cold start in bright light: the search goes on darker, it does not start over at the first
     # preset (clipped frame) after the hold
     plant_light = 30.0
@@ -990,6 +1140,25 @@ def test_start_after_crash():
     print("  (j) CameraConfig.realsense_color_exposure_mode: default 'auto', 'bogus' rejected")
 
 
+def test_meter_result_type():
+    # the result the Live page and the evaluation script hand the meter (TrackingWorker ->
+    # HydraTracker.process_frame) is the Python TrackerResult: it has the detected corners as a list,
+    # no count - the meter must see them (08.10. review: n_detected was 0 live)
+    from tracking.hydramarker.tracker import DetectedCorner, TrackerMode, TrackerResult
+
+    img, _ = synthetic_marker()
+    res = TrackerResult(success=False, mode=TrackerMode.DETECTING,
+                        detection_corners=[DetectedCorner(0, i, (800.0 + 30 * i, 430.0)) for i in range(12)])
+    m = ce.MarkerMeter(lambda r: False).measure(img, res, 1, 0.0)
+    check(m.n_detected == 12 and not hasattr(res, "detection_corner_count"),
+          f"TrackerResult with 12 detected corners: n_detected {m.n_detected}")
+    raw = SimpleNamespace(detection_corner_count=34)
+    check(ce.MarkerMeter.detected_count(raw) == 34 and ce.MarkerMeter.detected_count(SimpleNamespace()) == 0,
+          "C++ result: detection_corner_count; nothing: 0")
+    print("  (e) meter on tracker.TrackerResult: n_detected = len(detection_corners) (12); raw C++ result: "
+          "detection_corner_count")
+
+
 def test_tracker_timing():
     from tracking.hydramarker.config import TrackerConfig
     from tracking.hydramarker.tracker import HydraTracker, ir_time_offset_ms
@@ -1019,6 +1188,7 @@ def main() -> int:
     test_worker_meter()
     test_display()
     test_start_after_crash()
+    test_meter_result_type()
     test_tracker_timing()
     print("all checks passed")
     return 0

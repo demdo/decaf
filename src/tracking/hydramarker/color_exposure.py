@@ -32,8 +32,11 @@ Measured basis (06.10. camera session E01-E04, Phase-2 t24):
     15.6 ms (registers 10 / 20 / 39 / 78 / 156, 100 us units); the frame
     timestamps show the register per frame (2 x (frame - sensor timestamp)
     in us), switching in the same frame as the image.
-  * Gain is linear in UVC units (64 -> 128 = x1.93-2.06); after a gain step
-    the brightness drifts 1-3 more frames (auto white balance).
+  * Gain is linear in UVC units only from 64 up (64 -> 128 = x1.93-2.06);
+    below 64 it hardly acts (08.10. B8, a fixed background box across the
+    search steps): 64 -> 16 = x0.60-0.62, 16 -> 1 = x0.80 - GAIN_RESPONSE.
+    After a gain step the brightness drifts 1-3 more frames (auto white
+    balance).
   * Fast motion: 15.6 ms breaks above ~15 px/frame, 3.9 ms holds; 7.8 and
     3.9 ms are within take scatter at the W-take speeds. The OR lamp
     flickers at 300.3 Hz: 3.9 ms damps the banding ~4x more than 1.95 ms.
@@ -73,6 +76,40 @@ LATENCY_FRAMES = 4
 MODE_AUTO = "auto"        # the colour AE (today's behaviour)
 MODE_MARKER = "marker"    # this controller while the drill is tracked
 EXPOSURE_MODES = (MODE_AUTO, MODE_MARKER)
+
+
+# Brightness of a gain relative to gain 128 at the same exposure (08.10. B8
+# under the OR lamp, linear mean of a fixed background box, last 6 frames
+# before vs frames 7-12 after a step, 3 runs): 7.8/128 -> 3.9/64 x0.240
+# (n 12 steps), -> 3.9/16 x0.146 (n 8), -> 1.95/16 x0.071 (n 6), -> 1.95/32
+# x0.086 (n 2); gain 16 -> 1 at 3.9 ms x0.80 (L01 / L02, clamped drill, 40
+# frames each). Exposure is linear (3.9 -> 1.95 ms x0.484-0.491, n 4).
+GAIN_RESPONSE = ((1.0, 0.234), (16.0, 0.292), (32.0, 0.352), (64.0, 0.48), (128.0, 1.0))
+_GR_G = np.array([g for g, _ in GAIN_RESPONSE])
+_GR_R = np.array([r for _, r in GAIN_RESPONSE])
+
+
+def gain_response(gain: float) -> float:
+    """Brightness of gain relative to gain 128 (GAIN_RESPONSE, linear above
+    128)."""
+    g = float(gain)
+    if g > 128.0:
+        return g / 128.0
+    return float(np.interp(g, _GR_G, _GR_R))
+
+
+def gain_for_response(response: float) -> float:
+    """The gain (UVC units, not rounded) of a relative brightness."""
+    r = float(response)
+    if r > 1.0:
+        return 128.0 * r
+    return float(np.interp(r, _GR_R, _GR_G))
+
+
+def setting_brightness(exposure_ms: float, gain: float) -> float:
+    """Brightness of a colour setting in units of exposure ms x gain at gain
+    128 (7.8 ms / 128 = 998.4, as the product exposure x gain there)."""
+    return float(exposure_ms) * 128.0 * gain_response(gain)
 
 
 def exposure_option_value(exposure_ms: float) -> float:
@@ -136,7 +173,7 @@ class MarkerExposureConfig:
     exposure_max_ms: float = 7.8      # never longer by default (motion blur)
     exposure_min_ms: float = 1.95     # ... only against clipping:
     exposure_min_unclipped_ms: float = 3.9   # shortest for a white merely above the band (300 Hz banding)
-    gain_floor: float = 16.0          # lowest gain used (device minimum if higher)
+    gain_floor: float = 16.0          # lowest gain used (device minimum if higher); 16 -> 1 darkens x0.80 only
     gain_ceiling: float = 128.0       # highest gain used (device maximum if lower)
     gain_longer_min: float = 40.0     # go to the next longer exposure only if its gain stays >= this
     min_gain_change: float = 0.03     # relative gain change below which nothing is written
@@ -155,15 +192,46 @@ class MarkerExposureConfig:
     # frames); the slow cycle comes back to every preset.
     search_attempts: int = 10
     search_slow_s: float = 1.0
-    # lost under unchanged frame light: keep the setting ("search-home")
-    # this long, then search anyway - a marker that comes back into a lamp
-    # spot clips at the old setting while the frame light stays the same
-    search_home_s: float = 3.0
-    # ... and its slow cycle holds home this long between two probes (a
-    # marker back under the old light that meets a dark probe waits for
-    # it to end)
+    # a preset at which the checkerboard is detected in at least this share
+    # of its frames is kept for search_stale_slow_s more and then becomes
+    # home of the slow cycle (home, one probe, home): there the decoder
+    # needs another view rather than another exposure, but a preset too
+    # dark to decode may detect too. 08.10. under the OR lamp, frames whose
+    # logged setting is the commanded one: detection in 38 of 38 and 40 of
+    # 41 frames at 1.95 ms / 16, 13 of 53 and 0 of 51 at 3.9 / 16, 0 of 55
+    # and 0 of 54 at 3.9 / 64, 0 of 309 and 0 of 303 at 7.8 / 128 (Lauf 3
+    # run_01 / run_02); none of them decoded, the 1.95 / 16 frames darkened
+    # or brightened x0.5..x2 once in 8 tries (x0.7, the last 2 of 38
+    # frames)
+    search_detect_frac: float = 0.3
+    # lost under unchanged frame light with a bright region in the frame
+    # (frame clip >= search_frame_clip: a lamp spot, where a marker that
+    # comes back clips at the old setting): probe the darker presets,
+    # darkest first (a spot x8-x55 the table, label 90 DN at 7.8 ms / 128,
+    # puts it at 61-189 DN at 1.95 ms / 16; B8 under the lamp ~245 DN),
+    # home - the setting of the last pose - held this long between two
+    # probes. A home dwell without a bright region or a light change ends
+    # the search (nothing written). Without a bright region nothing is
+    # probed at first: the marker comes back under the light it left
     search_stale_slow_s: float = 2.0
-    # the clip ceiling (lowest exposure x gain at which the marker clipped)
+    # ... unless the last pose's setting is darker than the brightest and a
+    # lamp is in view (frame clip >= search_dim_frame_clip in at least half
+    # of the meterings since the loss): then the label itself may have gone
+    # dark (a shadow on the marker only, the label turned away from the
+    # lamp, the drill moved out of a lamp spot in view). After this long
+    # without a pose the brighter presets are probed, brightest first (a
+    # label at 8-30 DN at 1.95 ms / 16 reads 92-182 DN at 7.8 ms / 128),
+    # home held search_stale_slow_s between two probes, doubled after every
+    # round up to search_dim_max_s. inf switches it off
+    search_dim_after_s: float = 3.0
+    search_dim_max_s: float = 8.0
+    # 08.10., the live meter at the settings below the brightest: under the
+    # OR lamp >= 0.1 % in 99.6-100 % of the frames (1st percentile
+    # 0.20-1.66 %, Lauf 3, 1912 frames); at the table at most 0.025 % (Lauf
+    # 2 at 7.8 / 91 down to 1.95 / 16, 2249 frames): there a loss probes
+    # nothing
+    search_dim_frame_clip: float = 0.001
+    # the clip ceiling (lowest brightness at which the marker clipped)
     # expires after clip_forget_s without clipping (a short glare must not
     # cap the brightness for good); if the brighter step after an expiry
     # clips again, the next expiry waits twice as long, up to
@@ -173,14 +241,24 @@ class MarkerExposureConfig:
     # lost while the marker region clipped (lamp switched on, glare): darken
     # at once instead of holding
     clip_loss_frac: float = 0.30
-    # frame clipped share above which a search preset counts as failed
-    # after one attempt (bright light: no need to wait at a bright preset)
-    search_frame_clip: float = 0.10
-    # without a pose the presets are probed only if the frame says the
-    # light changed since the last pose (frame median, per exposure x gain,
-    # off by more than this factor, or more of the frame clips): a marker
-    # that just left the view or turned away keeps its setting
+    # frame clipped share from which the frame has a bright region (a lamp
+    # spot or a lamp on the scene): a search preset that shows it counts as
+    # failed after one attempt, and only a bright region (on confirm_frames
+    # lost meterings in a row: a single glint is none) or a light change
+    # starts a search at all. 08.10.: OR lamp at 7.8 ms / 128 4.0-6.0 %
+    # (settled medians, 3 runs); table at most 0.57 % (B8 Lauf 2, 6090
+    # frames), 0.83 % (06.10. D01, the brightest table take) -> 2 %, about
+    # x2 from both
+    search_frame_clip: float = 0.02
+    # without a pose and without a bright region the presets are probed
+    # only if the frame got darker since the last pose (frame median per
+    # brightness below 1 / this factor) and a brighter setting is left: a
+    # marker that just left the view or turned away keeps its setting
     search_light_change: float = 1.5
+    # a frame clipped share this far above the one at the last pose is a
+    # light change too (the Phase-5 margin; a new bright region of less
+    # starts the lamp-spot search instead)
+    light_change_clip_margin: float = 0.05
 
     def snapshot(self) -> dict:
         out = {}
@@ -209,6 +287,7 @@ class Metering:
     frame_clip_frac: float = float("nan")   # share of a coarse frame grid >= 250
     frame_median_dn: float = float("nan")
     speed_px: float = float("nan")   # hull centre motion since the last metered pose
+    n_detected: int = 0              # checkerboard corners the detector found in this frame
     meter_ms: float = 0.0
 
 
@@ -252,6 +331,17 @@ class MarkerMeter:
         self._centre: Optional[np.ndarray] = None
 
     @staticmethod
+    def detected_count(result) -> int:
+        """Checkerboard corners the detector found in this frame: the C++
+        result's detection_corner_count, else len(detection_corners) - the
+        Python TrackerResult the Live page and the evaluation script hand
+        over has only the list."""
+        n = getattr(result, "detection_corner_count", None)
+        if n is None:
+            n = len(getattr(result, "detection_corners", None) or ())
+        return int(n or 0)
+
+    @staticmethod
     def corner_points(result) -> Optional[np.ndarray]:
         """Image points of the result's pose (corners, else the
         correspondence corners), None with fewer than 4."""
@@ -264,7 +354,8 @@ class MarkerMeter:
     def measure(self, image: np.ndarray, result, frame_index: int, t_frame: float) -> Metering:
         t0 = time.perf_counter()
         fresh = bool(self._fresh(result))
-        m = Metering(frame_index=int(frame_index), t_frame=float(t_frame), fresh=fresh)
+        m = Metering(frame_index=int(frame_index), t_frame=float(t_frame), fresh=fresh,
+                     n_detected=self.detected_count(result))
         h, w = image.shape[:2]
         if fresh:
             pts = self.corner_points(result)
@@ -350,6 +441,9 @@ class ExposureCommand:
         return float(self.exposure_ms) * float(self.gain)
 
 
+_SEARCH_STATES = ("search", "search-slow", "search-dim")
+
+
 class MarkerExposureController:
     """Decides the colour setting from the marker's white level.
 
@@ -371,24 +465,42 @@ class MarkerExposureController:
     "clip-loss" (lost while the last hull clipped: darken at once),
     "dark-loss" (lost while the last hull is far below the band: brighten
     at once),
-    "search", "search-slow", "search-home" (lost under the light of the
-    last pose: the setting is kept, nothing is probed - for search_home_s,
-    then the search runs anyway).
+    "search", "search-slow", "search-dim" (probing the brighter presets),
+    "search-home" (no pose, nothing to probe: the setting is kept and
+    nothing is written).
 
-    The search starts at "home", the setting the pose was lost with (at
-    the start: the first preset; after a light change: that setting
-    scaled by the frame's change): home, then every other preset, each
-    for search_attempts metered frames. A preset whose frame grid clips is
-    left after one frame when a darker one follows, and the rest of the
-    cycle skips the presets at least as bright. After that cycle without a
-    lock it goes slow: home (if its frame clipped: the brightest preset
-    whose frame did not) for search_slow_s, one probe, home again, the
-    next probe - a marker that comes back under the old light finds the
-    old setting most of the time, a changed light is found within a cycle,
-    and the camera is written twice per search_slow_s + one probe. A
-    search begun by search_home_s (frame light unchanged) probes only the
-    presets darker than home, leaves home at once for them and holds home
-    search_stale_slow_s in its slow cycle.
+    Brightness is setting_brightness (exposure x the measured gain
+    response), not exposure x gain: below gain 64 the gain hardly acts.
+
+    Without a pose a search runs only when the frame says so: it has a
+    bright region (frame clip >= search_frame_clip on confirm_frames lost
+    meterings in a row: a lamp spot or a lamp on the scene), or it got
+    darker since the last pose (frame median per brightness below 1 /
+    search_light_change of it: lamp off, shadow) while a brighter setting
+    is left. Otherwise - the table, a marker out of view or lost in fast
+    motion - the setting of the last pose ("home") is kept and nothing is
+    written; only when home is darker than the brightest setting and a
+    lamp is in view (frame clip >= search_dim_frame_clip) are the brighter
+    presets probed after search_dim_after_s ("search-dim": the label
+    itself went dark). At the start the first preset is home.
+
+    The search: after a light change first the setting scaled by the
+    frame's change, then home, then the other presets, each for
+    search_attempts metered frames; with a bright region but the light
+    unchanged (a lamp spot: a marker that comes back clips at home) only
+    the presets darker than home, darkest first. A preset whose frame grid
+    clips is left after one frame when a darker one follows, and the rest
+    of the cycle skips the presets at least as bright. A preset at which
+    the checkerboard is detected (search_detect_frac of its frames) is
+    kept for search_stale_slow_s more. After a cycle without a lock it
+    goes slow: home (the preset with detections, else - if home's frame
+    clipped at a cold start or after a light change - the brightest preset
+    whose frame did not; for a lamp spot the last pose's setting) for
+    search_slow_s (search_stale_slow_s for a lamp spot or a preset with
+    detections), one probe, home again, the next probe. A search after a
+    pose ends ("search-home", the camera at the last pose's setting) when a
+    whole step at that setting - a home dwell or a probe - sees neither a
+    bright region nor a light change: its trigger is gone.
     """
 
     def __init__(self, config: Optional[MarkerExposureConfig] = None,
@@ -411,21 +523,32 @@ class MarkerExposureController:
         self._seq = 0
         self._out_count = 0
         self._out_dir = 0
-        # lowest exposure x gain at which the marker clipped (cleared when
+        # lowest brightness at which the marker clipped (cleared when
         # a search starts or the frame light changes: the light may have
         # changed; expires after _clip_forget_s without clipping)
         self._clip_product = float("inf")
-        self._clip_ref = float("nan")             # frame light (per exposure x gain) when it was set
+        self._clip_ref = float("nan")             # frame light (per brightness) when it was set
         self._t_clip = float("-inf")              # last metering with the marker clipped
         self._clip_forget_s = self.config.clip_forget_s
         self._t_ceiling_expired: Optional[float] = None
         self._search_clip_product = float("inf")  # lowest preset whose frame clipped (this cycle)
-        self._stale = False                       # the search was begun by search_home_s
-        self.n_failed = 0                         # failed writes in all
+        self._stale = False                       # the search was begun by a bright region, light unchanged
+        self._dim = False                         # ... by a long loss at a setting below the brightest
+        self._detecting: Optional[tuple] = None   # preset with checkerboard detections (this search)
+        self._detect_share = 0.0                  # ... its share of frames with a detection
+        self._search_det = 0                      # frames with a detection at the current search step
+        self._sticky_t0: Optional[float] = None   # first stay at the current preset for its detections
+        self._origin: Optional[tuple] = None      # setting of the last pose when the search began
+        self._trigger = False                     # this search step saw a bright region / a light change
+        self._dwell_s = self.config.search_slow_s  # home dwell of the current slow cycle
+        self._bright_run = 0                      # lost meterings in a row with a bright region
+        self._lost_n = 0                          # lost meterings since the last pose ...
+        self._lost_lamp = 0                       # ... with frame clip >= search_dim_frame_clip
+        self.n_failed = 0                       # failed writes in all
         self.n_failed_row = 0                     # ... since the last applied one
         self._t_last_pose: Optional[float] = None
         self._t_start = 0.0
-        # frame median (linear, per exposure x gain) and clipped share at the
+        # frame median (linear, per brightness) and clipped share at the
         # last pose
         self._ref_frame: Optional[tuple] = None
         self._home: tuple = (7.8, 128.0)
@@ -440,6 +563,10 @@ class MarkerExposureController:
         self.last_metering: Optional[Metering] = None
 
     # ---- bookkeeping ----
+
+    @staticmethod
+    def _b(exposure_ms: float, gain: float) -> float:
+        return setting_brightness(exposure_ms, gain)
 
     def _command(self, exposure_ms: float, gain: float, reason: str) -> Optional[ExposureCommand]:
         gain = float(np.clip(round(gain), self.gain_min, self.gain_max))
@@ -472,6 +599,7 @@ class MarkerExposureController:
             self._pending = None
         self._out_count = 0
         self._search_frames = 0
+        self._search_det = 0
         self.n_failed_row = 0
 
     def failed(self, cmd: ExposureCommand, frame_index: int,
@@ -489,10 +617,11 @@ class MarkerExposureController:
         self._effective_from = int(frame_index) + self.config.latency_frames + 1
         self._out_count = 0
         self._search_frames = 0
+        self._search_det = 0
         self.last_reason = "failed"
 
     def _choose(self, product: float, clipped: bool = False) -> tuple:
-        """(exposure, gain) for an exposure x gain product: keep the
+        """(exposure, gain) for a brightness (setting_brightness): keep the
         current exposure while its gain stays in range, the next shorter
         one when the gain would fall below the floor, the next longer one
         (up to exposure_max_ms) when its gain would stay >= gain_longer_min.
@@ -504,19 +633,23 @@ class MarkerExposureController:
         i = ex.index(e)
         shortest = 0 if clipped else next(
             (k for k, x in enumerate(ex) if x >= self.config.exposure_min_unclipped_ms - 1e-6), 0)
+
+        def gain_at(k):
+            return gain_for_response(product / (ex[k] * 128.0))
+
         while True:
-            g = product / ex[i]
+            g = gain_at(i)
             if g < self.gain_min and i > shortest:
                 i -= 1
                 continue
-            if i + 1 < len(ex) and product / ex[i + 1] >= max(self.config.gain_longer_min, self.gain_min):
+            if i + 1 < len(ex) and gain_at(i + 1) >= max(self.config.gain_longer_min, self.gain_min):
                 i += 1
                 continue
             break
-        if i < shortest and product / ex[shortest] >= self.gain_min:
+        if i < shortest and gain_at(shortest) >= self.gain_min:
             i = shortest
         e = ex[i]
-        return e, float(np.clip(product / e, self.gain_min, self.gain_max))
+        return e, float(np.clip(gain_at(i), self.gain_min, self.gain_max))
 
     # ---- per result ----
 
@@ -525,15 +658,16 @@ class MarkerExposureController:
         c = self.config
         if m.fresh:
             self._t_last_pose = m.t_frame
-            # the frame light at the pose, per exposure x gain - only from a
+            # the frame light at the pose, per brightness - only from a
             # frame that shows the setting written last (frames before
             # _effective_from were taken with the old one)
             if (np.isfinite(m.frame_median_dn) and np.isfinite(self.exposure_ms)
                     and self._pending is None and m.frame_index >= self._effective_from):
-                self._ref_frame = (linear_dn(m.frame_median_dn) / (self.exposure_ms * self.gain),
+                self._ref_frame = (linear_dn(m.frame_median_dn) / self._b(self.exposure_ms, self.gain),
                                    m.frame_clip_frac)
-            if self.state in ("search", "search-slow", "search-home", "hold", "clip-loss",
-                              "dark-loss", "start"):
+            self._bright_run = 0
+            self._lost_n = self._lost_lamp = 0
+            if self.state in _SEARCH_STATES + ("search-home", "hold", "clip-loss", "dark-loss", "start"):
                 self.state = "track"
                 self._out_count = 0
         if self._pending is not None or m.frame_index < self._effective_from:
@@ -548,7 +682,7 @@ class MarkerExposureController:
                 or not m.hull_from_pose):
             return None
         clip = m.clip_frac if np.isfinite(m.clip_frac) else 0.0
-        product = self.exposure_ms * self.gain
+        product = self._b(self.exposure_ms, self.gain)
         frame_lin = (linear_dn(m.frame_median_dn) / product
                      if np.isfinite(m.frame_median_dn) else float("nan"))
         if (np.isfinite(self._clip_product) and np.isfinite(frame_lin)
@@ -597,7 +731,7 @@ class MarkerExposureController:
             emin = c.exposure_min_unclipped_ms
             if (self.exposure_ms < emin - 1e-6 and not np.isfinite(self._clip_product)
                     and clip == 0.0 and emin in self.exposures):
-                up = emin * max(self.gain_min, product / emin) / product
+                up = max(product, self._b(emin, self.gain_min)) / product
                 if (up <= 1.0 + 1e-6 or dn_of_linear(linear_dn(m.white_dn) * up)
                         <= 0.5 * (c.target_dn + c.white_high_dn)):
                     direction, unclip = +1, True
@@ -642,9 +776,12 @@ class MarkerExposureController:
         # a search begun before the first pose goes on (a darker preset
         # whose frame does not clip is no reason to start over)
         since = m.t_frame - (self._t_start if t_pose is None else t_pose)
-        bright_start = (t_pose is None and np.isfinite(m.frame_clip_frac)
-                        and m.frame_clip_frac > c.search_frame_clip)
-        searching = t_pose is None and self.state in ("search", "search-slow")
+        frame_clips = np.isfinite(m.frame_clip_frac) and m.frame_clip_frac >= c.search_frame_clip
+        self._bright_run = self._bright_run + 1 if frame_clips else 0
+        self._lost_n += 1
+        self._lost_lamp += bool(np.isfinite(m.frame_clip_frac) and m.frame_clip_frac >= c.search_dim_frame_clip)
+        bright_start = t_pose is None and self._bright_run >= c.confirm_frames
+        searching = t_pose is None and self.state in _SEARCH_STATES
         if since < c.hold_s and not bright_start and not searching:
             # clipped marker region of the last pose: darken now
             if (np.isfinite(m.clip_frac) and m.clip_frac > c.clip_loss_frac
@@ -652,16 +789,21 @@ class MarkerExposureController:
                 self.state = "clip-loss"
                 # lost anyway: no motion limit; far over (> 60 % clipped) x4
                 f = 0.25 if m.clip_frac > 0.6 else 1.0 / c.max_step
-                e, g = self._choose(self.exposure_ms * self.gain * f, clipped=True)
+                e, g = self._choose(self._b(self.exposure_ms, self.gain) * f, clipped=True)
                 cmd = self._command(e, g, "clip-loss")
                 if cmd is not None:
                     self.n_steps += 1
                 return cmd
-            # far below the band at the last pose's place (lamp switched
-            # off): brighten now, up to x4, not back into a clipping setting
+            # far below the band at the last pose's place and the frame
+            # darker too (lamp switched off): brighten now, up to x4, not
+            # back into a clipping setting. A marker that left the view
+            # leaves the background in its hull, the frame stays (08.10.
+            # frame bank, out of view under the lamp: x4 + x4 up to
+            # 7.8 ms / 128 without the frame condition)
             if (np.isfinite(m.white_dn) and m.white_dn < 0.5 * c.white_low_dn
-                    and m.n_samples >= c.min_samples):
-                product = self.exposure_ms * self.gain
+                    and m.n_samples >= c.min_samples
+                    and self._frame_ratio(m) < 1.0 / c.search_light_change):
+                product = self._b(self.exposure_ms, self.gain)
                 f = min(4.0, linear_dn(c.target_dn) / max(linear_dn(m.white_dn), 1e-4),
                         self._clip_product / c.max_step_moving / product)
                 if f > 1.05:
@@ -675,25 +817,57 @@ class MarkerExposureController:
             return None
         return self._search(m)
 
+    @staticmethod
+    def _same(a: tuple, b: Optional[tuple]) -> bool:
+        return b is not None and abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1.0
+
     def _probes(self) -> list:
         h = self._home
-        out = [(float(e), float(g)) for e, g in self.config.search_presets
-               if not (abs(e - h[0]) < 1e-6 and abs(g - h[1]) < 1.0)]
+        out = [(float(e), float(g)) for e, g in self.config.search_presets if not self._same((e, g), h)]
         if self._stale:
             # under unchanged frame light the marker can only come back
-            # brighter (a lamp spot): only the darker presets
-            out = [q for q in out if q[0] * q[1] < h[0] * h[1] * (1.0 - 1e-6)]
+            # brighter (a lamp spot): only the darker presets, darkest
+            # first (the spot is far brighter than the rest)
+            out = sorted((q for q in out if self._b(*q) < self._b(*h) * (1.0 - 1e-6)),
+                         key=lambda q: self._b(*q))
+        elif self._dim:
+            # the label went dark: only the brighter presets, brightest first
+            out = sorted((q for q in out if self._b(*q) > self._b(*h) * (1.0 + 1e-6)),
+                         key=lambda q: -self._b(*q))
         return out
+
+    def _slow_probes(self) -> list:
+        """The probes of the slow cycle in turn; for a lamp spot the
+        darkest preset every other probe; the last pose's setting first in
+        each round when home moved away from it (a preset with detections):
+        the marker may come back where it left, and there the search can
+        end."""
+        out = self._probes()
+        if self._stale and len(out) > 2:
+            out = [q for r in out[1:] for q in (out[0], r)]
+        o = self._origin
+        if o is not None and not self._same(o, self._home):
+            out = [o] + [q for q in out if not self._same(q, o)]
+        return out
+
+    def _frame_ratio(self, m: Metering) -> float:
+        """frame light now / at the last pose (frame median per brightness;
+        1.0 without a reference or a median)."""
+        ref = self._ref_frame
+        if ref is None or not np.isfinite(m.frame_median_dn):
+            return 1.0
+        now = linear_dn(m.frame_median_dn) / self._b(self.exposure_ms, self.gain)
+        return now / max(ref[0], 1e-9)
 
     def _light_changed(self, m: Metering) -> bool:
         ref = self._ref_frame
         if ref is None or not np.isfinite(m.frame_median_dn):
             return True
-        now = linear_dn(m.frame_median_dn) / (self.exposure_ms * self.gain)
+        now = linear_dn(m.frame_median_dn) / self._b(self.exposure_ms, self.gain)
         ratio = now / max(ref[0], 1e-9)
         lim = self.config.search_light_change
         return (not (1.0 / lim <= ratio <= lim)
-                or m.frame_clip_frac > ref[1] + 0.5 * self.config.search_frame_clip)
+                or m.frame_clip_frac > ref[1] + self.config.light_change_clip_margin)
 
     def _forget_ceiling(self, reset_backoff: bool) -> None:
         self._clip_product = float("inf")
@@ -703,89 +877,195 @@ class MarkerExposureController:
 
     def _search(self, m: Metering) -> Optional[ExposureCommand]:
         c = self.config
-        if self._t_last_pose is not None and self.state not in ("search", "search-slow"):
-            # lost under unchanged light: keep the setting (no write) for
-            # search_home_s - a marker that comes back into a lamp spot
-            # clips at it while the frame light stays the same
-            if (not self._light_changed(m)
-                    and m.t_frame - self._t_last_pose < c.search_home_s):
+        frame_clips = np.isfinite(m.frame_clip_frac) and m.frame_clip_frac >= c.search_frame_clip
+        if self.state not in _SEARCH_STATES:
+            bright = self._bright_run >= c.confirm_frames
+            changed = self._t_last_pose is not None and self._light_changed(m)
+            cur = self._b(self.exposure_ms, self.gain)
+            brighter_left = cur < self._b(self.exposures[-1], self.gain_max) * (1.0 - 1e-6)
+            if changed and not bright:
+                # nothing clips: only a darker frame (lamp off, shadow) calls
+                # for a search, and only with a brighter setting left; a
+                # brighter frame without clipping, or an arm or hand
+                # filling the view at the brightest setting, does not
+                # (08.10. table replay: 3 probe writes at 7.8 ms / 128)
+                changed = self._frame_ratio(m) < 1.0 / c.search_light_change and brighter_left
+            if not changed and not bright:
+                # nothing in the frame clips and its light is the one of the
+                # last pose (at the start: the first preset's): the marker
+                # comes back under the light it left - keep the setting,
+                # write nothing (08.10. table: 39 probe writes for
+                # out-of-view and fast-motion losses in 206 s, the image
+                # pumped). Below the brightest setting with a lamp in view
+                # the label itself may have gone dark: after
+                # search_dim_after_s the brighter presets
+                if (self._t_last_pose is not None and brighter_left
+                        and 2 * self._lost_lamp >= self._lost_n > 0
+                        and m.t_frame - self._t_last_pose >= c.search_dim_after_s):
+                    return self._begin(m, stale=False, dim=True)
                 self.state = "search-home"
                 return None
-        if self.state not in ("search", "search-slow"):
-            # after search_home_s under unchanged frame light the setting
-            # was held long enough: straight to the probes, short each (the
-            # frame tells nothing about the marker)
-            stale = self._t_last_pose is not None and not self._light_changed(m)
-            if stale and not any(e * g < self.exposure_ms * self.gain * (1.0 - 1e-6)
-                                 for e, g in c.search_presets):
+            # a bright region under the light of the last pose: a lamp spot,
+            # the marker can only come back brighter - darker presets only
+            stale = self._t_last_pose is not None and not changed
+            if stale and not any(self._b(e, g) < cur * (1.0 - 1e-6) for e, g in c.search_presets):
                 self.state = "search-home"          # nothing darker to try
                 return None
-            self.state = "search"
-            self._forget_ceiling(reset_backoff=True)
-            self._search_clip_product = float("inf")
-            self._stale = stale
-            self._home = (self.exposure_ms, self.gain)
-            ref = self._ref_frame
-            if (not stale and self._t_last_pose is not None and ref is not None
-                    and np.isfinite(m.frame_median_dn)):
-                # the light changed while the marker was away: home = the
-                # setting scaled by the frame's change (a clipping frame
-                # understates it; the probes cover the rest)
-                now = linear_dn(m.frame_median_dn) / (self.exposure_ms * self.gain)
-                r = float(np.clip(now / max(ref[0], 1e-9), 1.0 / 64.0, 64.0))
-                self._home = self._choose(self.exposure_ms * self.gain / r, clipped=r > 1.0)
-            self._plan = ([(*self._home, "once" if stale else "attempts")]
-                          + [(*p, "attempts") for p in self._probes()])
-            self._plan_i = 0
-            self._probe_i = 0
-            self._search_frames = 0
+            return self._begin(m, stale=stale, dim=False, changed=changed)
         self._search_frames += 1
+        self._search_det += int(m.n_detected > 0)
         e, g, kind = self._plan[self._plan_i]
-        frame_clips = np.isfinite(m.frame_clip_frac) and m.frame_clip_frac > c.search_frame_clip
         if frame_clips:
-            self._search_clip_product = min(self._search_clip_product, e * g)
+            self._search_clip_product = min(self._search_clip_product, self._b(e, g))
         if self._search_frames == 1:
             self._search_t0 = m.t_frame
+        ratio = self._frame_ratio(m)
+        if frame_clips or not (1.0 / c.search_light_change <= ratio <= c.search_light_change):
+            self._trigger = True
         if kind == "slow":
-            done = m.t_frame - self._search_t0 >= (c.search_stale_slow_s if self._stale else c.search_slow_s)
+            done = m.t_frame - self._search_t0 >= self._dwell_s
         elif kind == "once":
             done = True
         else:
             nxt = self._plan[self._plan_i + 1] if self._plan_i + 1 < len(self._plan) else None
             bright = (self.state == "search" and frame_clips
-                      and nxt is not None and nxt[0] * nxt[1] < e * g)
+                      and nxt is not None and self._b(*nxt[:2]) < self._b(e, g))
             done = self._search_frames >= c.search_attempts or bright
         if not done:
             return None
+        if (kind != "once" and not self._dim and not self._trigger
+                and self._t_last_pose is not None and self._same((e, g), self._origin)):
+            # a whole step (home dwell or probe) at the last pose's setting
+            # without a bright region or a light change: the trigger is gone
+            # - keep the setting, no more probes (08.10. review: a 0.3 s
+            # bright region at the table, then 16 probe writes in 20 s; a
+            # light-change search came back to the origin only as a probe)
+            self.state = "search-home"
+            return None
+        share = self._search_det / max(1, self._search_frames)
+        if (kind == "slow" and share >= c.search_detect_frac
+                and (self._same((e, g), self._detecting) or share >= self._detect_share)):
+            # home shows detections too: a probe has to beat its share
+            self._detecting, self._detect_share = (e, g), max(share, self._detect_share)
+        if (kind == "attempts" and self._search_frames >= c.search_attempts
+                and share >= c.search_detect_frac
+                and (self._detecting is None or self._same((e, g), self._detecting)
+                     or (self.state == "search" and share >= self._detect_share))):
+            # the checkerboard is detected at this setting (in the first
+            # cycle at least as often as at the preset kept before; a slow
+            # cycle's probe does not replace a home with detections): the
+            # decoder needs another view - stay for search_stale_slow_s,
+            # then this preset is home of the slow cycle (it may be too
+            # dark to decode)
+            if not self._same((e, g), self._detecting):
+                self._detecting, self._detect_share = (e, g), share
+            self._detect_share = max(self._detect_share, share)
+            if self._sticky_t0 is None:
+                self._sticky_t0 = m.t_frame
+            if m.t_frame - self._sticky_t0 < c.search_stale_slow_s:
+                self._search_frames = 0
+                self._search_det = 0
+                return None
+        self._sticky_t0 = None
         self._plan_i += 1
         if self.state == "search":
             # not again at a preset as bright as one whose frame clipped
-            while (self._plan_i < len(self._plan) and self._plan[self._plan_i][0]
-                   * self._plan[self._plan_i][1] >= self._search_clip_product * (1.0 - 1e-6)):
+            while (self._plan_i < len(self._plan) and self._b(*self._plan[self._plan_i][:2])
+                   >= self._search_clip_product * (1.0 - 1e-6)):
                 self._plan_i += 1
         if self._plan_i >= len(self._plan):
-            # slow: home for search_slow_s, then the next probe; a home
-            # whose frame clipped becomes the brightest preset whose frame
-            # did not
-            if self.state == "search" and (self._home[0] * self._home[1]
-                                           >= self._search_clip_product * (1.0 - 1e-6)):
+            # slow: home for the dwell, then the next probe; home is the
+            # preset with detections, else - at a cold start or after a
+            # light change - a home whose frame clipped becomes the
+            # brightest preset whose frame did not (a lamp spot keeps the
+            # last pose's setting: the marker may come back where it left)
+            if self._detecting is not None:
+                self._home = self._detecting
+            elif (self.state == "search" and not self._stale
+                  and self._b(*self._home) >= self._search_clip_product * (1.0 - 1e-6)):
                 darker = [(float(pe), float(pg)) for pe, pg in c.search_presets
-                          if pe * pg < self._search_clip_product * (1.0 - 1e-6)]
-                self._home = (max(darker, key=lambda p: p[0] * p[1]) if darker
+                          if self._b(pe, pg) < self._search_clip_product * (1.0 - 1e-6)]
+                self._home = (max(darker, key=lambda p: self._b(*p)) if darker
                               else min(((float(pe), float(pg)) for pe, pg in c.search_presets),
-                                       key=lambda p: p[0] * p[1]))
-            self.state = "search-slow"
-            probes = self._probes()
+                                       key=lambda p: self._b(*p)))
+            self.state = "search-dim" if self._dim else "search-slow"
+            probes = self._slow_probes()
             p = probes[self._probe_i % len(probes)] if probes else self._home
+            rounds = self._probe_i // max(1, len(probes))
             self._probe_i += 1
+            if self._dim:
+                self._dwell_s = min(c.search_stale_slow_s * 2.0 ** rounds, c.search_dim_max_s)
+            elif self._stale or self._detecting is not None:
+                self._dwell_s = c.search_stale_slow_s
+            else:
+                self._dwell_s = c.search_slow_s
             self._plan = [(*self._home, "slow"), (*p, "attempts")]
             self._plan_i = 0
         e, g, _ = self._plan[self._plan_i]
         self._search_frames = 0
+        self._search_det = 0
+        self._trigger = False
         cmd = self._command(e, g, self.state)
         if cmd is not None:
             self.n_search_steps += 1
         return cmd
+
+    def _begin(self, m: Metering, stale: bool, dim: bool, changed: bool = False) -> Optional[ExposureCommand]:
+        """A new search from the current setting (home = the setting of the
+        last pose; at the start the first preset)."""
+        c = self.config
+        cur = self._b(self.exposure_ms, self.gain)
+        self.state = "search-dim" if dim else "search"
+        self._forget_ceiling(reset_backoff=True)
+        self._search_clip_product = float("inf")
+        self._stale = stale
+        self._dim = dim
+        self._detecting = None
+        self._detect_share = 0.0
+        self._sticky_t0 = None
+        self._trigger = False
+        # a shadow or a short turn away comes back to home
+        self._home = (self.exposure_ms, self.gain)
+        self._origin = self._home
+        self._plan_i = 0
+        self._probe_i = 0
+        self._search_frames = 0
+        self._search_det = 0
+        if dim:
+            # home has been held since the loss: the brightest probe first
+            probes = self._probes()
+            if not probes:
+                self.state = "search-home"
+                return None
+            self._plan = [(*probes[0], "attempts")]
+            self._probe_i = 1
+            cmd = self._command(probes[0][0], probes[0][1], self.state)
+            if cmd is not None:
+                self.n_search_steps += 1
+            return cmd
+        scaled = []
+        ref = self._ref_frame
+        if changed and ref is not None and np.isfinite(m.frame_median_dn):
+            # the light changed while the marker was away: first the
+            # setting scaled by the frame's change (a clipping frame
+            # understates it; home and the probes cover the rest - a
+            # shadow that ends clips the scaled setting, which is then
+            # left after one frame for the darker home)
+            now = linear_dn(m.frame_median_dn) / cur
+            r = float(np.clip(now / max(ref[0], 1e-9), 1.0 / 64.0, 64.0))
+            s = self._choose(cur / r, clipped=r > 1.0)
+            if abs(self._b(*s) / cur - 1.0) > 0.05:
+                scaled = [(*s, "attempts")]
+        self._plan = (scaled + [(*self._home, "once" if stale else "attempts")]
+                      + [(*p, "attempts") for p in self._probes()])
+        if scaled:
+            # the first entry is not the setting the camera runs with:
+            # written now (frames count from its effect on)
+            cmd = self._command(scaled[0][0], scaled[0][1], self.state)
+            if cmd is not None:
+                self.n_search_steps += 1
+                return cmd
+        return self._search(m)
 
     def status(self) -> dict:
         m = self.last_metering
@@ -798,6 +1078,9 @@ class MarkerExposureController:
             "steps": self.n_steps,
             "search_steps": self.n_search_steps,
             "reason": self.last_reason,
+            # the search's home and the preset kept for its detections
+            "search_home": list(self._home),
+            "detecting": None if self._detecting is None else list(self._detecting),
         }
 
 
