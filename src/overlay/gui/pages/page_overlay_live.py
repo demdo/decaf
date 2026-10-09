@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from overlay.calib.calib_xray_to_pointer import extract_depth
 from overlay.gui.state import SessionState
+from overlay.tools.display_exposure import AutoExposureLook
 from overlay.tools.homography import estimate_plane_induced_homography
 from overlay.tools.live_tracking import STATUS_SEARCHING, TrackingSession, TrackingWorker
 from overlay.tools.pointer_depth import PointerDepthEstimator, depth_capture_arrays
@@ -49,7 +50,6 @@ from tracking.hydramarker.camera_setup import (
 )
 from tracking.hydramarker.color_exposure import (
     MODE_MARKER,
-    DisplayBrightener,
     MarkerExposureControl,
 )
 from tracking.hydramarker.config import CameraConfig
@@ -1168,9 +1168,13 @@ class OverlayLivePage(QWidget):
         # tracking); "auto": the colour AE as configured.
         self._exposure_mode = CameraConfig().realsense_color_exposure_mode
         self._exposure: MarkerExposureControl | None = None   # while it runs
-        # the displayed image only: brightened while the control keeps the
-        # camera darker than the AE would
-        self._display_brightener = DisplayBrightener()
+        # the displayed image only: shown as the AE would expose it while the
+        # control sets the camera for the marker (display_exposure)
+        self._display_look = AutoExposureLook()
+        # the colour setting of each recently polled frame (frame metadata
+        # "color_exposure", by frame_index): the LUT needs the setting of the
+        # frame on screen, which may be an older frame of a tracking result
+        self._frame_exposure: dict[int, dict | None] = {}
 
         self._build_ui()
         self._connect_signals()
@@ -1371,35 +1375,36 @@ class OverlayLivePage(QWidget):
     # Overlay
     # --------------------------------------------------------
 
-    def _compose_frame(self, frame_bgra: np.ndarray, draw_tool: bool = False) -> np.ndarray:
+    def _compose_frame(self, frame_bgra: np.ndarray, draw_tool: bool = False,
+                       exposure: dict | None = None) -> np.ndarray:
         """
         Build the display frame in a persistent buffer.
 
         Nothing here allocates and nothing touches the full frame except the
-        one copy of the camera image, which is a plain memcpy. draw_tool:
-        frame_bgra is the frame the drill pose was computed on, so its tip
-        and axis are drawn (never on any other frame).
+        one pass that copies the camera image (a plain memcpy, or the display
+        LUT below). draw_tool: frame_bgra is the frame the drill pose was
+        computed on, so its tip and axis are drawn (never on any other
+        frame). exposure: the colour setting that frame was taken with
+        (frame metadata "color_exposure").
         """
         prof = self._profile
 
         if self._frame_buf is None or self._frame_buf.shape != frame_bgra.shape:
             self._frame_buf = np.empty_like(frame_bgra)
 
+        # The marker exposure control exposes the camera for the marker, not
+        # like the AE: a LUT shows the display's copy of the camera image as
+        # the AE would (k = emulated AE setting / this frame's own setting,
+        # so a controller step does not flicker), before the X-ray blend and
+        # the drill drawing - never the tracking input, a saved frame, the
+        # X-ray or the drill colours. The LUT pass is the copy. It follows
+        # the frame's own setting, also for the frames right after a stop;
+        # under the AE (or with no known setting) the frame is shown as is.
         t = time.perf_counter()
-        np.copyto(self._frame_buf, frame_bgra)
+        self._display_look.update(frame_bgra, exposure)
+        looked = self._display_look.apply(frame_bgra, self._frame_buf)
         if prof:
-            prof.add("copy", time.perf_counter() - t)
-
-        # The marker exposure control keeps the camera darker than the AE:
-        # a LUT brightens the display's copy of the camera image (k from its
-        # own centre), before the X-ray blend and the drill drawing - never
-        # the tracking input, a saved frame, the X-ray or the drill colours.
-        if self._exposure is not None:
-            t = time.perf_counter()
-            self._display_brightener.update(self._frame_buf)
-            self._display_brightener.apply(self._frame_buf)
-            if prof:
-                prof.add("lut", time.perf_counter() - t)
+            prof.add("lut" if looked else "copy", time.perf_counter() - t)
 
         if self._xray_gray_u8 is not None:
             H_xc = self._get_current_H_xc()
@@ -1474,6 +1479,7 @@ class OverlayLivePage(QWidget):
         camera = RealSenseCameraSource(cfg)
         camera.start()
         self.camera = camera
+        self._frame_exposure = {}     # frame numbers start over
         # The colour options are the CameraConfig defaults; the start sets
         # them and reads them back. Evaluation mode keeps the read-back:
         # session.json "realsense_color" (the last start) and a log.md row
@@ -1554,6 +1560,7 @@ class OverlayLivePage(QWidget):
                 if prof:
                     prof.add("poll", t_frame - t_poll)
                     prof.note_camera_frame(self._camera_frame_number())
+                self._note_frame_exposure(frame)
                 worker = self._track_worker
                 if worker is not None:
                     n_dry = worker.n_pool_exhausted
@@ -1584,7 +1591,10 @@ class OverlayLivePage(QWidget):
 
             t0 = prof.frame_start() if prof else 0.0
             self._live_color = img
-            self._display_bgra = self._compose_frame(img, draw_tool=pose_out is not None)
+            self._display_bgra = self._compose_frame(
+                img, draw_tool=pose_out is not None,
+                exposure=self._frame_exposure.get(self._shown_index),
+            )
             # the result whose drill is now on screen (the snapshot redraws it)
             ov = self._tool_overlay
             self._drawn_out = (
@@ -1613,6 +1623,17 @@ class OverlayLivePage(QWidget):
     # --------------------------------------------------------
     # Display
     # --------------------------------------------------------
+
+    def _note_frame_exposure(self, frame) -> None:
+        """Keep the colour setting of a polled frame for the display LUT
+        (only the last ~second of frames: a shown result is younger than
+        TRACK_POSE_MAX_AGE_S)."""
+        index = int(frame.frame_index)
+        self._frame_exposure[index] = (frame.metadata or {}).get("color_exposure")
+        if len(self._frame_exposure) > 2 * self.FPS:
+            self._frame_exposure = {
+                i: e for i, e in self._frame_exposure.items() if i > index - self.FPS
+            }
 
     def _camera_frame_number(self) -> int | None:
         """RealSense frame number of the colour frame behind the last poll()
@@ -2171,7 +2192,7 @@ class OverlayLivePage(QWidget):
                                    f"{control.unavailable or 'start failed'}")
             return
         self._exposure = control
-        self._display_brightener.reset()
+        self._display_look.reset()
         info = control.snapshot()
         cfg = info["config"]
         if self._profile is not None:
@@ -2220,12 +2241,13 @@ class OverlayLivePage(QWidget):
                 prof.count("exposure_steps")
             prof.note_exposure(
                 f"{control.text(metering)} meter {metering.meter_ms:.2f} ms "
-                f"lut x{self._display_brightener.k:.2f}"
+                f"lut x{self._display_look.k:.2f}"
             )
 
     def _stop_exposure_control(self, reason: str) -> None:
+        # the display LUT stays with the frames: the 3-4 frames after the
+        # restore still carry the control's last setting
         control, self._exposure = self._exposure, None
-        self._display_brightener.reset()
         if control is None:
             return
         summary = control.stop()
@@ -2456,7 +2478,7 @@ class OverlayLivePage(QWidget):
             "color_exposure": (
                 {"mode": "auto"} if self._exposure is None
                 else {"mode": MODE_MARKER, **self._exposure.controller.status(),
-                      "display_gain": round(self._display_brightener.k, 3)}
+                      "display_gain": round(self._display_look.k, 3)}
             ),
             "tool": None,
         }
