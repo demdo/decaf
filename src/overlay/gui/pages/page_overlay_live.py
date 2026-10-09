@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import traceback
 from collections import defaultdict
@@ -1058,6 +1059,10 @@ class OverlayLivePage(QWidget):
     # the result is ready instead of at the next timer tick (up to one
     # Windows timer tick, 15.6 ms, later).
     _track_result_ready = Signal()
+    # Emitted by a snapshot's writer thread when its files are written,
+    # queued to the GUI thread: (folder, written layers, eval numbers,
+    # error text or "").
+    _snapshot_saved = Signal(object)
 
     def __init__(self, state: SessionState, on_complete_changed=None, parent=None):
         super().__init__(parent)
@@ -1235,6 +1240,7 @@ class OverlayLivePage(QWidget):
         self.controls.btn_save.clicked.connect(self._on_save_snapshot)
         self.controls.btn_plane.clicked.connect(self._on_plane_button)
         self._track_result_ready.connect(self._on_track_result_ready, Qt.QueuedConnection)
+        self._snapshot_saved.connect(self._on_snapshot_saved, Qt.QueuedConnection)
 
     # --------------------------------------------------------
     # State / prerequisites
@@ -2351,8 +2357,13 @@ class OverlayLivePage(QWidget):
         the last poll - valid, because the click handler runs between two
         timer ticks and the display holds no poll back while a view is on
         screen. The drill layer is the one drawn on that frame, redrawn from
-        its result. The live loop just skips a few frames while the PNGs are
-        written.
+        its result.
+
+        Here, in the click handler, only the layers are built (BGR copies:
+        the frame on screen goes back to the camera or the tracker with the
+        next tick) together with snapshot.json's numbers; encoding and
+        writing the PNGs (~0.2 s, which stalled the live image) runs in a
+        thread of its own, which reports back through _snapshot_saved.
         """
         t_click = time.perf_counter()
         if self._live_color is None:
@@ -2368,18 +2379,14 @@ class OverlayLivePage(QWidget):
             else:
                 out_dir = SNAPSHOT_DIR / time.strftime("snapshot_%Y%m%d_%H%M%S")
                 out_dir.mkdir(parents=True, exist_ok=True)
-            written = []
+            layers = []
 
             if self._xray_gray_u8 is not None:
-                cv2.imwrite(str(out_dir / "00_xray.png"), self._xray_gray_u8)
-                written.append("00_xray")
+                # replaced, never changed in place: no copy needed
+                layers.append(("00_xray", self._xray_gray_u8))
 
             base = self._live_color
-            cv2.imwrite(
-                str(out_dir / "01_rgb.png"),
-                cv2.cvtColor(base, cv2.COLOR_BGRA2BGR),
-            )
-            written.append("01_rgb")
+            layers.append(("01_rgb", cv2.cvtColor(base, cv2.COLOR_BGRA2BGR)))
 
             # Cumulative composite, built exactly like _compose_frame.
             comp = base.copy()
@@ -2387,11 +2394,7 @@ class OverlayLivePage(QWidget):
                 self._overlay_cache.blend_into(comp, self._alpha)
                 if self._show_tip:
                     _draw_point_inplace(comp, self.state.tip_uv_c)
-                cv2.imwrite(
-                    str(out_dir / "02_rgb_overlay.png"),
-                    cv2.cvtColor(comp, cv2.COLOR_BGRA2BGR),
-                )
-                written.append("02_rgb_overlay")
+                layers.append(("02_rgb_overlay", cv2.cvtColor(comp, cv2.COLOR_BGRA2BGR)))
 
             # the drill drawn on this frame (the page's overlay may already
             # follow a newer result)
@@ -2407,25 +2410,64 @@ class OverlayLivePage(QWidget):
                 # as on the screen: a pose drawn marked stays marked
                 drill.update(drawn.points, marked=bool(drawn.points_marked))
                 drill.draw_into(comp, show_tip=True, show_axis=True)
-                cv2.imwrite(
-                    str(out_dir / "03_rgb_overlay_drill.png"),
-                    cv2.cvtColor(comp, cv2.COLOR_BGRA2BGR),
-                )
-                written.append("03_rgb_overlay_drill")
+                layers.append(("03_rgb_overlay_drill", cv2.cvtColor(comp, cv2.COLOR_BGRA2BGR)))
 
-            with open(out_dir / "snapshot.json", "w", encoding="utf-8") as f:
-                json.dump(self._snapshot_record(out_dir.name, t_click, drawn, drill), f,
-                          indent=2)
-            written.append("snapshot.json")
+            record = self._snapshot_record(out_dir.name, t_click, drawn, drill)
 
+            numbers = None
             if ev is not None:
-                numbers = {"layers": len(written)}
+                numbers = {"layers": 0}       # set when written
                 if self._tracking_only:
                     numbers["tracking_only"] = True
                 else:
                     numbers["d_x_mm"] = self._current_d_x_mm
                 numbers["tracking"] = bool(self._tracking_active)
                 numbers["shown"] = "pose" if drawn is not None else "live"
+
+            # one snapshot at a time: the button comes back with the
+            # writer's report (_on_snapshot_saved) - two quick clicks
+            # would start two writers on the same folder in evaluation
+            # mode (ev.subdir("live"))
+            self.controls.btn_save.setEnabled(False)
+            threading.Thread(
+                target=self._write_snapshot,
+                args=(out_dir, layers, record, numbers),
+                name="snapshot-writer",
+            ).start()
+        except Exception as e:
+            self.controls.btn_save.setEnabled(True)
+            QMessageBox.critical(self, "Save snapshot", f"Saving failed.\n\n{e}")
+
+    def _write_snapshot(self, out_dir: Path, layers: list, record: dict,
+                        numbers: dict | None) -> None:
+        """Writer thread of one snapshot: the PNG layers (cv2.imwrite runs
+        without the GIL) and snapshot.json, then the outcome to the GUI
+        thread. Touches nothing of the page but the signal."""
+        written, error = [], ""
+        try:
+            for name, img in layers:
+                cv2.imwrite(str(out_dir / f"{name}.png"), img)
+                written.append(name)
+            with open(out_dir / "snapshot.json", "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+            written.append("snapshot.json")
+        except Exception as e:
+            error = str(e)
+        try:
+            self._snapshot_saved.emit((out_dir, written, numbers, error))
+        except RuntimeError:
+            pass    # the page is gone; the files are written
+
+    def _on_snapshot_saved(self, saved) -> None:
+        """GUI thread: a snapshot's files are written (or failed)."""
+        self.controls.btn_save.setEnabled(True)
+        out_dir, written, numbers, error = saved
+        try:
+            if error:
+                raise RuntimeError(error)
+            ev = self.state.eval
+            if ev is not None and numbers is not None:
+                numbers["layers"] = len(written)
                 ev.log("overlay_live", out_dir.name + "/", numbers)
 
             QMessageBox.information(
