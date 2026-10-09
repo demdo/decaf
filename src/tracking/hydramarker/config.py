@@ -781,14 +781,24 @@ class TrackerConfig:
     # half of the label) 72 -> 292 of 301 frames with a pose; 108 takes 31960
     # -> 32717 fresh frames (891 gained, 134 lost), poses failing both
     # photometric checks 10 -> 3, none of the gained poses with a shifted
-    # identity (label-shift test of the RGB-only pose).
+    # identity (label-shift test of the RGB-only pose). The motion gate was 8
+    # deg / 15 mm: two sub-grid poses seeded by a decode pose with few corners
+    # (7 and 10) passed it with the tip 29 mm from the next fresh pose (07.10.
+    # live check k4049 right after a re-lock, 6.8 deg; 08.10. B8 table k2690,
+    # 12.6 mm). The other sub-grid poses moved at most 4.2 deg / 8.7 mm (77
+    # poses, 15 live runs of 07./08.10.) and 4.9 deg / 7.9 mm (175 poses, the
+    # 108 replayed takes, which 6 deg / 10 mm therefore leaves unchanged).
+    # Replays of the two runs with 6 deg / 10 mm: both wrong poses gone, 6780
+    # -> 6775 fresh frames (3 held after k4049), every other pose within 0.8
+    # mm of the 8 deg / 15 mm replay; two other runs (20 sub-grid poses)
+    # identical.
     prior_subgrid_enabled: bool = True
     prior_subgrid_max_age_frames: int = 15
     prior_subgrid_min_points: int = 10
     prior_subgrid_search_frac: float = 0.35
     prior_subgrid_min_contrast: float = 20.0
-    prior_subgrid_max_rot_deg: float = 8.0
-    prior_subgrid_max_trans_mm: float = 15.0
+    prior_subgrid_max_rot_deg: float = 6.0
+    prior_subgrid_max_trans_mm: float = 10.0
     # Continuity guard of the gated tracking poses (mode 2 = every pose checked
     # with the gate, 1 = only those the ungated check rejects, 0 = off): such a
     # pose is rejected when it is more than occlusion_guard_max_rot_deg or
