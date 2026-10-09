@@ -25,7 +25,8 @@ while the worker reads it fails the test.
 (h) TrackingSession: texts, reset after 1.5 s of frame time however many
     outputs that is, hint at 3 s, old epochs ignored, re-entry flag,
     failure-log calls
-(i) tracker_log classes for held detections, appearance rejects and holds
+(i) tracker_log classes for held detections, appearance rejects and holds;
+    continuity-guard and prior sub-grid rejects
 (j) ToolPoints: fused pose, offset carry within max_carry_s of frame time,
     RGB-only after it, offset dropped by the reprojection gate and reset();
     in the worker: points of every result, in order, reset with the tracker;
@@ -564,7 +565,22 @@ def test_tracker_log_classes() -> None:
     assert tl.appearance_values(r, "fast") == {"parity": 0.2, "dot": 0.1, "cells": 12.0}
     assert tl.appearance_rejects(res(False, "x", appearance_reject_count=1.0)) == ("decode",)
     assert tl.appearance_rejects(res(False, "x")) == ()
-    print("  (i) tracker_log: old keys unchanged, held / appearance / hold-cause keys")
+    # continuity guard and prior sub-grid rejects
+    r = res(True, "", "hold", fast_appearance_undecided_count=1.0,
+            fast_appearance_guard_reject_count=1.0, fast_appearance_guard_drot_deg=21.0,
+            fast_appearance_guard_dtrans_mm=9.7, prior_subgrid_drot_deg=0.4,
+            prior_subgrid_dtrans_mm=1.2, prior_subgrid_appearance_reject_count=1.0,
+            prior_appearance_parity=0.3)
+    assert tl.appearance_rejects(r) == ("fast_guard", "subgrid")
+    assert tl.appearance_values(r, "fast_guard")["drot_deg"] == 21.0
+    assert tl.appearance_values(r, "subgrid")["parity"] == 0.3
+    r = res(True, "", "hold", prior_subgrid_drot_deg=6.8, prior_subgrid_dtrans_mm=4.6)
+    assert tl.appearance_rejects(r) == ("subgrid_motion",)
+    assert tl.appearance_values(r, "subgrid_motion") == {"drot_deg": 6.8, "dtrans_mm": 4.6}
+    r = res(True, "", "persistent", prior_subgrid_drot_deg=0.5, prior_subgrid_count=1.0)
+    assert tl.appearance_rejects(r) == ()
+    print("  (i) tracker_log: old keys unchanged, held / appearance / hold-cause keys, "
+          "guard / sub-grid rejects")
 
 
 # ============================================================

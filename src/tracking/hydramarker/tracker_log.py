@@ -1640,14 +1640,43 @@ APPEARANCE_CHECKS = (
 )
 
 
+# The other rejects of a pose that would have been kept, with the prefix of
+# their values and the counter the engine sets: the continuity guard of a
+# gated fast / persistent pose (the check passed or could not decide, but the
+# pose is too far from the last accepted one) and the prior sub-grid pose
+# whose check did not pass. A sub-grid pose stopped by its own motion gate
+# has no counter: "subgrid_motion", see appearance_rejects.
+GUARD_REJECTS = (
+    ("fast_guard", "fast_appearance", "fast_appearance_guard_reject_count"),
+    ("persistent_guard", "persistent_appearance",
+     "persistent_appearance_guard_reject_count"),
+    ("subgrid", "prior_appearance", "prior_subgrid_appearance_reject_count"),
+)
+
+
 def appearance_rejects(result) -> tuple[str, ...]:
-    """Appearance checks that rejected a pose in this frame ("decode",
-    "fast", "persistent"); only the decode reject leaves a message."""
+    """Checks that rejected a pose in this frame: the appearance checks
+    ("decode", "fast", "persistent"; only the decode reject leaves a
+    message), the continuity guard ("fast_guard", "persistent_guard") and
+    the prior sub-grid ("subgrid": its appearance check, "subgrid_motion":
+    its motion gate - the engine measured the sub-grid pose's motion but
+    neither accepted it nor failed its check)."""
     timings = getattr(result, "timings_ms", None) or {}
-    return tuple(
+    kinds = [
         kind for kind, prefix in APPEARANCE_CHECKS
         if _debug_counter(timings, f"{prefix}_reject_count")
-    )
+    ]
+    kinds += [
+        kind for kind, _, counter in GUARD_REJECTS
+        if _debug_counter(timings, counter)
+    ]
+    if (
+        "prior_subgrid_drot_deg" in timings
+        and not _debug_counter(timings, "prior_subgrid_count")
+        and not _debug_counter(timings, "prior_subgrid_appearance_reject_count")
+    ):
+        kinds.append("subgrid_motion")
+    return tuple(kinds)
 
 
 def appearance_undecided(result) -> tuple[str, ...]:
@@ -1662,14 +1691,27 @@ def appearance_undecided(result) -> tuple[str, ...]:
 
 def appearance_values(result, kind: str) -> dict:
     """parity / dot / cells of one appearance check of this frame (None
-    where the frame has no such check)."""
-    prefix = dict(APPEARANCE_CHECKS)[kind]
+    where the frame has no such check), for every kind appearance_rejects
+    returns; a guard or sub-grid motion reject also gives the motion it was
+    rejected for (drot_deg / dtrans_mm)."""
     t = getattr(result, "timings_ms", None) or {}
-    return {
+    if kind == "subgrid_motion":
+        return {
+            "drot_deg": t.get("prior_subgrid_drot_deg"),
+            "dtrans_mm": t.get("prior_subgrid_dtrans_mm"),
+        }
+    prefixes = dict(APPEARANCE_CHECKS)
+    prefixes.update((k, prefix) for k, prefix, _ in GUARD_REJECTS)
+    prefix = prefixes[kind]
+    values = {
         "parity": t.get(f"{prefix}_parity"),
         "dot": t.get(f"{prefix}_dot"),
         "cells": t.get(f"{prefix}_cells"),
     }
+    if kind.endswith("_guard"):
+        values["drot_deg"] = t.get(f"{prefix}_guard_drot_deg")
+        values["dtrans_mm"] = t.get(f"{prefix}_guard_dtrans_mm")
+    return values
 
 
 def pose_source_value(result) -> str:
