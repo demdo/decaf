@@ -18,9 +18,18 @@ Flow:
      pattern would corrupt the checkerboard corners).
   3. capture ChArUco views seen simultaneously by all three cameras.
   4. calibrate each IR camera intrinsically with the plain 5-parameter model
-     (standard5), then stereoCalibrate IR-L<->IR-R and RGB<->IR-L with the
-     intrinsics fixed.
-  5. report the acceptance gates and save the bundle.
+     (standard5), then stereoCalibrate IR-L<->IR-R with the intrinsics fixed.
+  5. RGB<->IR-L: ONE joint estimate over all views (every intrinsic and the
+     IR-L<->IR-R pair fixed; unknowns = the extrinsic + one board pose per
+     view; residuals = the reprojection in all three cameras). The per-view
+     PnP relative poses only give the start value and a scatter report.
+  6. report the acceptance gates and save the bundle, plus the grabbed views
+     (corners and images) in ``<bundle>_views.npz`` next to it.
+
+Offline (no camera): recompute a bundle from a saved views file
+    python calib/calib_ir_camera.py --views calib/d435i_ir_calibration_<ts>_views.npz
+optionally with ``--ir-from <bundle.npz>``: keep that bundle's IR intrinsics
+and IR-L<->IR-R pair and re-estimate only RGB<->IR-L.
 
 Board geometry and the ChArUco detector are reused verbatim from calib_camera.
 """
@@ -55,6 +64,7 @@ MIN_CORNERS_INTRINSIC = 10        # per camera, per view, to use for intrinsics
 STILL_MAX_SHIFT_PX = 0.35         # frame-to-frame corner shift to count as "still"
 COVER_GRID = (4, 3)               # colour coverage grid (columns, rows) in the preview
 COVER_MIN_CORNERS = 3             # grabbed corners in a grid cell to count it as covered
+SAVE_VIEW_IMAGES = True           # store the grabbed frames in <bundle>_views.npz (colour as grey)
 
 
 def choose_file_qt(title: str, file_filter: str) -> Path:
@@ -165,6 +175,14 @@ class ViewDet:
             ):
                 self.by_id[int(cid)] = corner.astype(np.float64)
 
+    @classmethod
+    def from_points(cls, uv: np.ndarray) -> "ViewDet":
+        """From a saved (n_ids, 2) array; NaN = corner not detected."""
+        v = cls.__new__(cls)
+        v.by_id = {int(i): np.asarray(uv[i], np.float64)
+                   for i in range(len(uv)) if np.isfinite(uv[i]).all()}
+        return v
+
     @property
     def n(self) -> int:
         return len(self.by_id)
@@ -188,6 +206,17 @@ def _obj_for_ids(board, ids: list[int]) -> np.ndarray:
     return _charuco_object_points(board, np.asarray(ids, dtype=np.int32)).reshape(-1, 3)
 
 
+class SavedBoard:
+    """Stand-in for the ChArUco board of a saved views file: only the corner
+    table (what _charuco_object_points reads)."""
+
+    def __init__(self, obj_xyz: np.ndarray) -> None:
+        self._obj = np.asarray(obj_xyz, np.float32).reshape(-1, 3)
+
+    def getChessboardCorners(self) -> np.ndarray:
+        return self._obj
+
+
 # ---------------------------------------------------------------------------
 # capture loop
 # ---------------------------------------------------------------------------
@@ -204,8 +233,11 @@ def _still_shift(prev: Optional[ViewDet], cur: ViewDet) -> float:
 
 def capture_views(cam: D435iThreeStream, board, aruco_dict, det_params):
     """MANUAL capture: press SPACE only while the board is held STILL (motion
-    blur ruins the extrinsics). Returns list of (color, irl, irr) ViewDet."""
+    blur ruins the extrinsics). Returns (views, frames): views = list of
+    (color, irl, irr) ViewDet, frames = the grabbed (colour grey, IR-L, IR-R)
+    images of the same views."""
     views: list[tuple[ViewDet, ViewDet, ViewDet]] = []
+    frames: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     prev_dl = None
     win = "calib_ir_camera  [SPACE=grab (hold still!)  c=calibrate  q=quit]"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -241,6 +273,8 @@ def capture_views(cam: D435iThreeStream, board, aruco_dict, det_params):
                 print(f"  ! not grabbed: board MOVING ({shift:.2f} px > {STILL_MAX_SHIFT_PX}) -- hold still")
             else:
                 views.append((dc, dl, dr))
+                if SAVE_VIEW_IMAGES:
+                    frames.append((cv2.cvtColor(color, cv2.COLOR_BGR2GRAY), irl.copy(), irr.copy()))
                 print(f"  view {len(views):2d}  corners C/L/R={dc.n}/{dl.n}/{dr.n}  "
                       f"shared LR={shared_lr} CL={shared_cl}  shift={shift:.2f}px")
 
@@ -249,12 +283,13 @@ def capture_views(cam: D435iThreeStream, board, aruco_dict, det_params):
 
         if key == ord("q"):
             views = []
+            frames = []
             break
         if key == ord("c"):
             break
 
     cv2.destroyWindow(win)
-    return views
+    return views, frames
 
 
 def coverage_cells(views_cam, image_wh, grid=COVER_GRID) -> np.ndarray:
@@ -322,6 +357,47 @@ def _draw_mosaic(win, color, irl, irr, dc, dl, dr, n, ok_counts, ok_shared,
 
 
 # ---------------------------------------------------------------------------
+# saved views (corners + images): reproducible, re-computable offline
+# ---------------------------------------------------------------------------
+def save_views(path: Path, views, frames, board, rgb_npz, color_size, ir_size) -> None:
+    """All grabbed views in one npz: per camera c/l/r an (n_views, n_ids, 2)
+    corner array (NaN = not detected), the board's corner table, and the
+    grabbed images (colour as grey) when they were kept."""
+    obj = np.asarray(board.getChessboardCorners(), np.float64).reshape(-1, 3)
+    data: dict[str, Any] = dict(
+        obj_xyz=obj,
+        squares_xy=np.asarray([SQUARES_X, SQUARES_Y], np.int32),
+        square_len_m=np.asarray(SQUARE_LEN_M),
+        color_image_size=np.asarray(color_size, np.int32),
+        ir_image_size=np.asarray(ir_size, np.int32),
+        rgb_source_npz=str(rgb_npz),
+    )
+    for k, cam in enumerate("clr"):
+        uv = np.full((len(views), len(obj), 2), np.nan)
+        for i, v in enumerate(views):
+            for cid, p in v[k].by_id.items():
+                uv[i, cid] = p
+        data[f"uv_{cam}"] = uv
+    if frames and len(frames) == len(views):
+        data["img_color_grey"] = np.stack([f[0] for f in frames])
+        data["img_ir_left"] = np.stack([f[1] for f in frames])
+        data["img_ir_right"] = np.stack([f[2] for f in frames])
+    np.savez_compressed(path, **data)
+
+
+def load_views(path: Path):
+    """-> (views, board stand-in, info) of a save_views file."""
+    with np.load(path, allow_pickle=True) as z:
+        uv = {c: np.asarray(z[f"uv_{c}"], np.float64) for c in "clr"}
+        board = SavedBoard(z["obj_xyz"])
+        info = dict(color_size=tuple(int(x) for x in z["color_image_size"]),
+                    ir_size=tuple(int(x) for x in z["ir_image_size"]),
+                    rgb_npz=str(z["rgb_source_npz"]))
+    views = [tuple(ViewDet.from_points(uv[c][i]) for c in "clr") for i in range(len(uv["c"]))]
+    return views, board, info
+
+
+# ---------------------------------------------------------------------------
 # calibration
 # ---------------------------------------------------------------------------
 def calibrate_intrinsic_standard5(views_idx, board, image_size):
@@ -370,10 +446,12 @@ def _avg_rot(Rs: list[np.ndarray]) -> np.ndarray:
 
 def relative_pose_pnp(views_a, views_b, Ka, da, Kb, db, board,
                       rot_tol_deg=0.4, trans_tol_mm=1.5):
-    """R, T mapping frame a -> frame b. The rig is RIGID, so the per-view
-    relative pose must be identical across views; views that deviate (motion
-    blur, non-simultaneous frames) are rejected, then the consistent ones are
-    averaged. Robust to different resolutions / distortion models."""
+    """R, T mapping frame a -> frame b from one PnP per view and camera: the
+    START VALUE of the joint estimate and a scatter report. Single-view PnP
+    of a flat board scatters in depth and tilt (most at the image border and
+    for tilted boards), so views outside rot_tol_deg / trans_tol_mm of the
+    median are not wrong views -- they only do not enter this average.
+    -> (R, T, n within the tolerance, n views)."""
     Rs, Ts = [], []
     for da_v, db_v in zip(views_a, views_b):
         ids = sorted(set(da_v.by_id) & set(db_v.by_id))
@@ -396,7 +474,6 @@ def relative_pose_pnp(views_a, views_b, Ka, da, Kb, db, board,
     n_all = len(Rs)
     T0 = np.median(np.stack(Ts), axis=0)
     R0 = _avg_rot(Rs)
-    # reject views deviating from the consensus (rigid rig => should be tiny)
     keep_R, keep_T = [], []
     for R_ab, t_ab in zip(Rs, Ts):
         ang = np.degrees(np.arccos(np.clip((np.trace(R0.T @ R_ab) - 1) / 2, -1, 1)))
@@ -409,6 +486,115 @@ def relative_pose_pnp(views_a, views_b, Ka, da, Kb, db, board,
     R = _avg_rot(keep_R)
     T = np.median(np.stack(keep_T), axis=0)
     return R, T, len(keep_R), n_all
+
+
+def _project(X, K, d) -> np.ndarray:
+    p, _ = cv2.projectPoints(X.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K, d)
+    return p.reshape(-1, 2)
+
+
+def joint_rgb_ir(views_c, views_l, views_r, K_c, d_c, K_l, d_l, K_r, d_r,
+                 R_lr, T_lr, board, R0, T0, views_used=None):
+    """RGB -> IR-L extrinsic (X_l = R X_c + T) from ALL views at once, like
+    stereoCalibrate with every intrinsic fixed: unknowns = the extrinsic and
+    one board pose per view (in the colour frame); residuals = the
+    reprojection of the board corners in colour, IR-L and IR-R (IR-R through
+    the fixed IR-L<->IR-R pair), each camera weighted by its own residual RMS
+    (two passes), soft-L1 loss against single bad corners. R0/T0 = start.
+    views_used: indices of the views to use (default all with >= 6 colour
+    corners). -> (R, T, info)."""
+    from scipy.optimize import least_squares
+    from scipy.sparse import lil_matrix
+
+    idx = [i for i in (range(len(views_c)) if views_used is None else views_used)
+           if views_c[i].n >= 6 and views_l[i].n + views_r[i].n >= 6]
+    obs = []                                  # per view: [(cam, obj, img)]
+    x0 = [cv2.Rodrigues(np.asarray(R0, np.float64))[0].reshape(3), np.asarray(T0, np.float64).reshape(3)]
+    for i in idx:
+        per = []
+        for cam, det in (("c", views_c[i]), ("l", views_l[i]), ("r", views_r[i])):
+            ids = sorted(det.by_id)
+            if not ids:
+                continue
+            per.append((cam, _obj_for_ids(board, ids).astype(np.float64),
+                        np.stack([det.by_id[k] for k in ids])))
+        obs.append(per)
+        _, obj, img = per[0]
+        ok, rv, tv = cv2.solvePnP(obj, img, K_c, d_c)
+        x0 += [rv.reshape(3), tv.reshape(3)]
+    x0 = np.concatenate(x0)
+    if not obs:
+        return np.asarray(R0), np.asarray(T0).reshape(3), dict(n_views=0)
+    cams = {"c": (K_c, d_c), "l": (K_l, d_l), "r": (K_r, d_r)}
+    weight = {"c": 1.0, "l": 1.0, "r": 1.0}
+
+    def residuals(x):
+        Re = cv2.Rodrigues(x[:3])[0]
+        te = x[3:6]
+        out = []
+        for j, per in enumerate(obs):
+            Rv = cv2.Rodrigues(x[6 + 6 * j:9 + 6 * j])[0]
+            tv = x[9 + 6 * j:12 + 6 * j]
+            for cam, obj, img in per:
+                X = obj @ Rv.T + tv
+                if cam != "c":
+                    X = X @ Re.T + te
+                if cam == "r":
+                    X = X @ R_lr.T + T_lr.reshape(3)
+                out.append(((_project(X, *cams[cam]) - img) * weight[cam]).ravel())
+        return np.concatenate(out)
+
+    sparsity = lil_matrix((sum(2 * len(o[2]) for per in obs for o in per), len(x0)), dtype=int)
+    row = 0
+    for j, per in enumerate(obs):
+        for cam, obj, _img in per:
+            sparsity[row:row + 2 * len(obj), 6 + 6 * j:12 + 6 * j] = 1
+            if cam != "c":
+                sparsity[row:row + 2 * len(obj), :6] = 1
+            row += 2 * len(obj)
+    x = x0
+    rms = {}
+    for _ in range(2):
+        sol = least_squares(residuals, x, jac_sparsity=sparsity, loss="soft_l1",
+                            f_scale=1.0, x_scale="jac", max_nfev=200)
+        x = sol.x
+        res = residuals(x)
+        row, per_cam = 0, {"c": [], "l": [], "r": []}
+        for per in obs:
+            for cam, obj, _img in per:
+                per_cam[cam].append(res[row:row + 2 * len(obj)] / weight[cam])
+                row += 2 * len(obj)
+        rms = {c: float(np.sqrt(np.mean(np.concatenate(v) ** 2))) if v else float("nan")
+               for c, v in per_cam.items()}
+        weight = {c: 1.0 / max(rms[c], 0.02) if np.isfinite(rms[c]) else 1.0 for c in rms}
+    return (cv2.Rodrigues(x[:3])[0], x[3:6].copy(),
+            dict(n_views=len(obs), rms_px=rms, converged=bool(sol.success)))
+
+
+def joint_holdout_transfer(views_c, views_l, views_r, K_c, d_c, K_l, d_l, K_r, d_r,
+                           R_lr, T_lr, board, R_all, T_all, folds=5):
+    """Held-out check of the joint estimate: views split into `folds` groups;
+    each group's transfer residual is measured with the extrinsic estimated
+    WITHOUT it (the IR intrinsics and the IR pair stay those of all views,
+    so this checks the extrinsic only). R_all/T_all must be the joint
+    estimate of all views: each fold's estimate starts from it and its
+    shift is measured against it. -> (median px over all held-out corners,
+    max fold shift of the extrinsic vs the all-view one in deg / mm)."""
+    n = len(views_c)
+    if n < 2 * folds:
+        return float("nan"), float("nan"), float("nan")
+    errs, dang, dtr = [], [], []
+    for f in range(folds):
+        test = list(range(f, n, folds))
+        train = [i for i in range(n) if i not in test]
+        R, T, _ = joint_rgb_ir(views_c, views_l, views_r, K_c, d_c, K_l, d_l, K_r, d_r,
+                               R_lr, T_lr, board, R_all, T_all, views_used=train)
+        for i in test:
+            e = _transfer_errors(views_c[i], views_l[i], K_c, d_c, K_l, d_l, R, T, board)
+            errs.extend(e)
+        dang.append(np.degrees(np.linalg.norm(cv2.Rodrigues(R @ np.asarray(R_all).T)[0])))
+        dtr.append(float(np.linalg.norm(T - np.asarray(T_all).reshape(3))) * 1000.0)
+    return (float(np.median(errs)) if errs else float("nan"), float(max(dang)), float(max(dtr)))
 
 
 def stereo_fixed(views_a, views_b, Ka, da, Kb, db, board, image_size):
@@ -429,6 +615,13 @@ def stereo_fixed(views_a, views_b, Ka, da, Kb, db, board, image_size):
     return rms, R, np.asarray(T).reshape(3), F, len(obj_pts)
 
 
+def _fundamental(K_a, K_b, R, T) -> np.ndarray:
+    """F of a fixed pair (b expressed in a: X_b = R X_a + T)."""
+    t = np.asarray(T, np.float64).reshape(3)
+    tx = np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]])
+    return np.linalg.inv(K_b).T @ tx @ R @ np.linalg.inv(K_a)
+
+
 def _epipolar_residual(views_a, views_b, F) -> float:
     """Mean symmetric point-to-epipolar-line distance |dv| over shared corners."""
     res = []
@@ -446,108 +639,109 @@ def _epipolar_residual(views_a, views_b, F) -> float:
     return float(np.mean(res)) if res else float("nan")
 
 
+def _transfer_errors(dc_v, dl_v, K_rgb, d_rgb, K_l, d_l, R, T, board) -> list:
+    """Transfer error (px) of one view: solvePnP in RGB, the same 3D corners
+    projected into IR-L via (R, T), compared to the IR-L detections."""
+    ids, pc, pl = _shared(dc_v, dl_v)
+    if len(ids) < MIN_SHARED_CORNERS:
+        return []
+    obj = _obj_for_ids(board, ids).astype(np.float32)
+    ok, rvec, tvec = cv2.solvePnP(obj, pc.astype(np.float32), K_rgb, d_rgb)
+    if not ok:
+        return []
+    Rc, _ = cv2.Rodrigues(rvec)
+    pts_l = (R @ (Rc @ obj.T + tvec.reshape(3, 1)) + np.asarray(T).reshape(3, 1)).T
+    proj, _ = cv2.projectPoints(pts_l.reshape(-1, 1, 3), np.zeros(3), np.zeros(3),
+                                K_l, d_l)
+    return np.linalg.norm(proj.reshape(-1, 2) - pl, axis=1).tolist()
+
+
 def _transfer_residual(views_c, views_l, K_rgb, d_rgb, K_l, d_l, R, T, board) -> float:
     """RGB->IR-L transfer error: for each view solvePnP in RGB, project the same
     3D corners into IR-L via (R,T), compare to IR-L detections. THE number that
     was ~8.7 px with the factory extrinsics."""
     errs = []
     for dc_v, dl_v in zip(views_c, views_l):
-        ids, pc, pl = _shared(dc_v, dl_v)
-        if len(ids) < MIN_SHARED_CORNERS:
-            continue
-        obj = _obj_for_ids(board, ids).astype(np.float32)
-        ok, rvec, tvec = cv2.solvePnP(obj, pc.astype(np.float32), K_rgb, d_rgb)
-        if not ok:
-            continue
-        Rc, _ = cv2.Rodrigues(rvec)
-        pts_l = (R @ (Rc @ obj.T + tvec.reshape(3, 1)) + T.reshape(3, 1)).T
-        proj, _ = cv2.projectPoints(pts_l.reshape(-1, 1, 3), np.zeros(3), np.zeros(3),
-                                    K_l, d_l)
-        proj = proj.reshape(-1, 2)
-        errs.extend(np.linalg.norm(proj - pl, axis=1).tolist())
+        errs.extend(_transfer_errors(dc_v, dl_v, K_rgb, d_rgb, K_l, d_l, R, T, board))
     if not errs:
         return float("nan"), float("nan")
     return float(np.mean(errs)), float(np.median(errs))
 
 
 def _scale_check(views_l, views_r, K_l, d_l, K_r, d_r, R, T, board) -> float:
-    """Triangulate shared corners and compare mean neighbour spacing to the known
-    square size (relative error)."""
+    """Signed scale error of the IR pair: per view the triangulated corners are
+    fitted to the board model with a similarity transform; the median of
+    (scale - 1) over the views. (A median of |pairwise distance error| would
+    measure the corner noise instead: 0.12 px noise alone reads ~0.4 %.)"""
     P1 = K_l @ np.hstack([np.eye(3), np.zeros((3, 1))])
     P2 = K_r @ np.hstack([R, T.reshape(3, 1)])
-    rel = []
+    scales = []
     for dl_v, dr_v in zip(views_l, views_r):
         ids, pl, pr = _shared(dl_v, dr_v)
-        if len(ids) < 4:
+        if len(ids) < 6:
             continue
         pl_u = cv2.undistortPoints(pl.reshape(-1, 1, 2), K_l, d_l, P=K_l).reshape(-1, 2)
         pr_u = cv2.undistortPoints(pr.reshape(-1, 1, 2), K_r, d_r, P=K_r).reshape(-1, 2)
         X = cv2.triangulatePoints(P1, P2, pl_u.T, pr_u.T)
         X = (X[:3] / X[3]).T
-        obj = _obj_for_ids(board, ids)
-        # compare pairwise distances of triangulated vs model corners
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                dm = np.linalg.norm(obj[i] - obj[j])
-                if dm < 1e-6:
-                    continue
-                dt = np.linalg.norm(X[i] - X[j])
-                rel.append(abs(dt - dm) / dm)
-    return float(np.median(rel)) if rel else float("nan")
+        obj = _obj_for_ids(board, ids).astype(np.float64)
+        A, B = obj - obj.mean(0), X - X.mean(0)
+        U, S, Vt = np.linalg.svd(B.T @ A)
+        sign = np.sign(np.linalg.det(U @ Vt))
+        scales.append(float((S[0] + S[1] + sign * S[2]) / (A ** 2).sum()))
+    return float(np.median(scales) - 1.0) if scales else float("nan")
 
 
-def main() -> int:
-    print("== calib_ir_camera :: D435i three-camera (IR-L, IR-R, RGB) ==")
-    rgb_npz = choose_file_qt("Select RGB intrinsics .npz (rational8)", "NPZ (*.npz)")
-    K_rgb, d_rgb, info = load_tracking_calibration_npz(rgb_npz)
-    color_size = info.get("calibration_image_size")
-    if color_size is None:
-        color_w, color_h = 1280, 720
-        print("  ! NPZ has no image size; assuming colour 1280x720. Verify!")
-    else:
-        color_w, color_h = int(color_size[0]), int(color_size[1])
-    print(f"  RGB intrinsics loaded ({d_rgb.size}-coeff model) @ {color_w}x{color_h}, held FIXED")
-
-    board, aruco_dict, det_params = make_charuco_board()
-    cam = D435iThreeStream(color_w, color_h)
-    if cam.baseline_hint_mm:
-        print(f"  factory IR baseline hint: {cam.baseline_hint_mm:.1f} mm")
-
-    try:
-        views = capture_views(cam, board, aruco_dict, det_params)
-    finally:
-        cam.stop()
-
-    if len(views) < 8:
-        print(f"FAIL: only {len(views)} views captured (need >= ~8).")
-        return 1
-    print(f"\ncalibrating from {len(views)} views ...")
-
+def calibrate_views(views, board, K_rgb, d_rgb, color_size, ir_size, ir_from=None):
+    """Everything after the capture: IR intrinsics, IR stereo pair, joint
+    RGB<->IR-L, gates. ir_from: an existing bundle (dict of arrays) whose IR
+    intrinsics and IR-L<->IR-R pair are kept instead of re-estimated.
+    -> (bundle dict for np.savez, all gates passed)."""
     vc = [v[0] for v in views]
     vl = [v[1] for v in views]
     vr = [v[2] for v in views]
-    ir_size = (IR_WIDTH, IR_HEIGHT)
-    color_size_t = (color_w, color_h)
 
     # DIAGNOSTIC: does the loaded RGB model actually match the colour stream?
     rgb_reproj = solvepnp_rms(vc, K_rgb, d_rgb, board)
     print(f"  [diag] RGB solvePnP reproj RMS = {rgb_reproj:.3f} px  "
           f"({'intrinsics MATCH the colour stream' if rgb_reproj < 1.0 else 'WRONG intrinsics for this stream!'})")
 
-    rms_l, K_l, d_l, n_l = calibrate_intrinsic_standard5(vl, board, ir_size)
-    rms_r, K_r, d_r, n_r = calibrate_intrinsic_standard5(vr, board, ir_size)
-    print(f"  IR-L intrinsics (standard5): RMS {rms_l:.3f}px  ({n_l} views)")
-    print(f"  IR-R intrinsics (standard5): RMS {rms_r:.3f}px  ({n_r} views)")
-
-    rms_lr, R_lr, T_lr, F_lr, n_lr = stereo_fixed(vl, vr, K_l, d_l, K_r, d_r, board, ir_size)
+    if ir_from is None:
+        rms_l, K_l, d_l, n_l = calibrate_intrinsic_standard5(vl, board, ir_size)
+        rms_r, K_r, d_r, n_r = calibrate_intrinsic_standard5(vr, board, ir_size)
+        print(f"  IR-L intrinsics (standard5): RMS {rms_l:.3f}px  ({n_l} views)")
+        print(f"  IR-R intrinsics (standard5): RMS {rms_r:.3f}px  ({n_r} views)")
+        rms_lr, R_lr, T_lr, F_lr, n_lr = stereo_fixed(vl, vr, K_l, d_l, K_r, d_r, board, ir_size)
+        print(f"  stereo IR-L<->IR-R: RMS {rms_lr:.3f}px  ({n_lr} views)")
+    else:
+        K_l, d_l = np.asarray(ir_from["K_ir_left"]), np.asarray(ir_from["dist_ir_left"]).reshape(-1, 1)
+        K_r, d_r = np.asarray(ir_from["K_ir_right"]), np.asarray(ir_from["dist_ir_right"]).reshape(-1, 1)
+        R_lr, T_lr = np.asarray(ir_from["R_left_right"]), np.asarray(ir_from["T_left_right"]).reshape(3)
+        F_lr = _fundamental(K_l, K_r, R_lr, T_lr)
+        rms_l = solvepnp_rms(vl, K_l, d_l, board)
+        rms_r = solvepnp_rms(vr, K_r, d_r, board)
+        print(f"  IR intrinsics + IR-L<->IR-R pair KEPT from the given bundle "
+              f"(solvePnP RMS here: IR-L {rms_l:.3f}px, IR-R {rms_r:.3f}px)")
     baseline_mm = float(np.linalg.norm(T_lr)) * 1000.0
-    print(f"  stereo IR-L<->IR-R: RMS {rms_lr:.3f}px  baseline {baseline_mm:.2f} mm  ({n_lr} views)")
+    print(f"  IR baseline {baseline_mm:.2f} mm")
 
-    # RGB<->IR-L via robust per-view relative pose (handles the different
-    # resolution / 14-coeff-vs-5-coeff models that break stereoCalibrate, and
-    # rejects motion-blurred / non-simultaneous views).
-    R_cl, T_cl, n_kept, n_all = relative_pose_pnp(vc, vl, K_rgb, d_rgb, K_l, d_l, board)
-    print(f"  RGB<->IR-L (relative-pose): {n_kept}/{n_all} views consistent (rest rejected as blurred/moving)")
+    # RGB<->IR-L: per-view PnP pairs -> start value + scatter report; then the
+    # joint estimate over all views (the result).
+    R_pv, T_pv, n_in, n_all = relative_pose_pnp(vc, vl, K_rgb, d_rgb, K_l, d_l, board)
+    print(f"  RGB<->IR-L per-view PnP: {n_in}/{n_all} views within 0.4 deg / 1.5 mm of their "
+          f"median (single-view PnP scatter, largest for border / tilted views; report only)")
+    R_cl, T_cl, jinfo = joint_rgb_ir(vc, vl, vr, K_rgb, d_rgb, K_l, d_l, K_r, d_r,
+                                     R_lr, T_lr, board, R_pv, T_pv)
+    d_rot = float(np.degrees(np.linalg.norm(cv2.Rodrigues(R_cl @ R_pv.T)[0])))
+    d_tr = float(np.linalg.norm(T_cl - T_pv)) * 1000.0
+    rp = jinfo.get("rms_px", {})
+    print(f"  RGB<->IR-L joint ({jinfo.get('n_views', 0)} views): reproj RMS colour "
+          f"{rp.get('c', float('nan')):.3f} / IR-L {rp.get('l', float('nan')):.3f} / IR-R "
+          f"{rp.get('r', float('nan')):.3f} px; vs per-view average {d_rot:.3f} deg, {d_tr:.2f} mm")
+    ho_px, ho_deg, ho_mm = joint_holdout_transfer(vc, vl, vr, K_rgb, d_rgb, K_l, d_l, K_r, d_r,
+                                                  R_lr, T_lr, board, R_cl, T_cl)
+    print(f"  held-out (5 folds, extrinsic only): transfer median {ho_px:.3f} px; extrinsic moves "
+          f"by at most {ho_deg:.3f} deg / {ho_mm:.2f} mm when a fold is left out")
 
     # ---- acceptance gates ----
     epi_lr = _epipolar_residual(vl, vr, F_lr)
@@ -561,34 +755,109 @@ def main() -> int:
         ("IR-L reproj RMS   < 0.35 px", rms_l, rms_l < 0.35, f"{rms_l:.3f} px"),
         ("IR-R reproj RMS   < 0.35 px", rms_r, rms_r < 0.35, f"{rms_r:.3f} px"),
         ("epipolar |dv| L-R < 0.25 px", epi_lr, epi_lr < 0.25, f"{epi_lr:.3f} px"),
-        ("scale error       < 0.50 %", scale_rel, scale_rel < 0.005, f"{scale_rel*100:.2f} %"),
+        ("scale error |s-1| < 0.50 %", scale_rel, abs(scale_rel) < 0.005, f"{scale_rel*100:+.2f} %"),
         ("RGB->IR transfer(med) < 0.50 px", transfer_med, transfer_med < 0.50,
          f"{transfer_med:.3f} px (mean {transfer_mean:.3f})"),
+        ("held-out transfer(med) < 0.50 px", ho_px, bool(ho_px < 0.50) or not np.isfinite(ho_px),
+         f"{ho_px:.3f} px" if np.isfinite(ho_px) else "n/a (< 10 views)"),
         ("baseline ~ 50 mm", baseline_mm, abs(baseline_mm - 50.0) < 3.0, f"{baseline_mm:.2f} mm"),
     ]
     all_pass = True
     for label, _val, ok, shown in gates:
-        print(f"  [{'PASS' if ok else 'FAIL'}] {label:30s} -> {shown}")
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label:32s} -> {shown}")
         all_pass = all_pass and ok
     print(f"\n  OVERALL: {'PASS' if all_pass else 'CHECK FAILED GATES'}")
 
-    # ---- save ----
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    out = _HERE / f"d435i_ir_calibration_{ts}.npz"
-    np.savez(
-        out,
+    bundle = dict(
         K_rgb=K_rgb, dist_rgb=d_rgb.reshape(-1),
         K_ir_left=K_l, dist_ir_left=d_l.reshape(-1),
         K_ir_right=K_r, dist_ir_right=d_r.reshape(-1),
         R_left_right=R_lr, T_left_right=T_lr,      # IR-R expressed in IR-L frame
         R_rgb_left=R_cl, T_rgb_left=T_cl,          # IR-L expressed in RGB frame
-        color_image_size=np.asarray(color_size_t, np.int32),
+        R_rgb_left_per_view=R_pv, T_rgb_left_per_view=T_pv,
+        rgb_left_method=np.asarray("joint"),
+        joint_rms_px=np.asarray([rp.get(c, np.nan) for c in "clr"]),
+        joint_n_views=np.asarray(jinfo.get("n_views", 0)),
+        holdout_transfer_med_px=np.asarray(ho_px),
+        color_image_size=np.asarray(color_size, np.int32),
         ir_image_size=np.asarray(ir_size, np.int32),
         baseline_mm=np.asarray(baseline_mm),
         square_len_m=np.asarray(SQUARE_LEN_M),
         squares_xy=np.asarray([SQUARES_X, SQUARES_Y], np.int32),
-        rgb_source_npz=str(rgb_npz),
         gates_pass=np.asarray(all_pass),
+    )
+    return bundle, all_pass
+
+
+def _arg(argv: list, name: str) -> Optional[str]:
+    return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else None
+
+
+def main(argv: Optional[list] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    print("== calib_ir_camera :: D435i three-camera (IR-L, IR-R, RGB) ==")
+    views_path = _arg(argv, "--views")
+    ir_from_path = _arg(argv, "--ir-from")
+    frames = []
+    if views_path:
+        # offline: recompute from saved views (no camera)
+        views, board, vinfo = load_views(Path(views_path))
+        rgb_npz = Path(_arg(argv, "--rgb") or vinfo["rgb_npz"])
+        if not rgb_npz.exists():
+            rgb_npz = choose_file_qt("Select RGB intrinsics .npz (rational8)", "NPZ (*.npz)")
+        K_rgb, d_rgb, info = load_tracking_calibration_npz(rgb_npz)
+        color_w, color_h = vinfo["color_size"]
+        ir_size = vinfo["ir_size"]
+        print(f"  {len(views)} saved views from {views_path}; RGB intrinsics {rgb_npz.name}, held FIXED")
+        out_dir = Path(_arg(argv, "--out-dir") or Path(views_path).parent)
+    else:
+        rgb_npz = choose_file_qt("Select RGB intrinsics .npz (rational8)", "NPZ (*.npz)")
+        K_rgb, d_rgb, info = load_tracking_calibration_npz(rgb_npz)
+        color_size = info.get("calibration_image_size")
+        if color_size is None:
+            color_w, color_h = 1280, 720
+            print("  ! NPZ has no image size; assuming colour 1280x720. Verify!")
+        else:
+            color_w, color_h = int(color_size[0]), int(color_size[1])
+        print(f"  RGB intrinsics loaded ({d_rgb.size}-coeff model) @ {color_w}x{color_h}, held FIXED")
+
+        board, aruco_dict, det_params = make_charuco_board()
+        cam = D435iThreeStream(color_w, color_h)
+        if cam.baseline_hint_mm:
+            print(f"  factory IR baseline hint: {cam.baseline_hint_mm:.1f} mm")
+
+        try:
+            views, frames = capture_views(cam, board, aruco_dict, det_params)
+        finally:
+            cam.stop()
+        ir_size = (IR_WIDTH, IR_HEIGHT)
+        out_dir = _HERE
+
+    if len(views) < 8:
+        print(f"FAIL: only {len(views)} views captured (need >= ~8).")
+        return 1
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out = out_dir / f"d435i_ir_calibration_{ts}.npz"
+    if not views_path:
+        # the grabbed views first: kept even if the calibration below fails
+        views_out = out.with_name(out.stem + "_views.npz")
+        save_views(views_out, views, frames, board, rgb_npz, (color_w, color_h), ir_size)
+        print(f"  views saved -> {views_out}")
+    print(f"\ncalibrating from {len(views)} views ...")
+
+    ir_from = None
+    if ir_from_path:
+        with np.load(ir_from_path, allow_pickle=True) as z:
+            ir_from = {k: z[k] for k in z.files}
+    bundle, all_pass = calibrate_views(views, board, K_rgb, d_rgb, (color_w, color_h), ir_size, ir_from)
+
+    # ---- save ----
+    np.savez(
+        out,
+        **bundle,
+        rgb_source_npz=str(rgb_npz),
+        views_npz=str(views_path or out.with_name(out.stem + "_views.npz")),
+        ir_from_npz=str(ir_from_path or ""),
         created_at=ts,
     )
     print(f"\nsaved -> {out}")
