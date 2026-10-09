@@ -674,12 +674,6 @@ class PivotRecorder:
         if not tracker_log.has_fresh_pose(result) or result.rvec is None:
             return
         timings = getattr(result, "timings_ms", None) or {}
-        visible = float(getattr(result, "visible_cell_fraction", float("nan")))
-        if timings.get("prior_subgrid_count") or visible < self.skip_below_visible_frac:
-            # kept under a partial occlusion: neither into the pivot solve nor
-            # into the BA corner log (a NaN fraction - older module - passes)
-            self.occluded_skipped_count += 1
-            return
         if self.require_ir:
             if not bool(timings.get("ir_applied", 0.0)):
                 # IR gated off for this frame (glare / adverse geometry / MAP
@@ -689,6 +683,13 @@ class PivotRecorder:
                 self.ir_skipped_count += 1
                 return
             self.ir_applied_count += 1
+        # After the IR check, so the IR counts cover every fresh pose as before.
+        visible = float(getattr(result, "visible_cell_fraction", float("nan")))
+        if timings.get("prior_subgrid_count") or visible < self.skip_below_visible_frac:
+            # kept under a partial occlusion: neither into the pivot solve nor
+            # into the BA corner log (a NaN fraction - older module - passes)
+            self.occluded_skipped_count += 1
+            return
         if int(frame_idx) - self._last_sample_frame < self.sample_interval_frames:
             return
         self._last_sample_frame = int(frame_idx)
