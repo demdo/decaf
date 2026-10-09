@@ -36,7 +36,8 @@ while the worker reads it fails the test.
     without frame_timing process_frame gets neither; one that raises takes
     no slot
 (l) ToolPoints: the empirical line-of-sight shift of both points, off on
-    request (tool_points(los_offset_mm=0)), in the snapshot record
+    request (tool_points(los_offset_mm=0)); the snapshot record gives the
+    offset of the overlay's last tool_points()
 (m) marked drawing: ToolPoints.marked below mark_below_visible_frac of the
     result's visible_cell_fraction (not without a pose, NaN or threshold 0),
     TrackOutput.points_marked from the worker, TrackingOverlay draws it in
@@ -625,11 +626,15 @@ def test_tool_points() -> None:
     assert tp.kind == "fused" and np.allclose(pts[0], P_TIP + t0 + d - [0.0, 0.0, 2.0])
     assert ToolPoints(P_TIP, P_BACK).los_offset_mm == ToolPoints.LOS_OFFSET_MM
     ov = TrackingOverlay(np.eye(3), None, P_TIP, [0.0, 2.0, 0.0])
-    assert ov.tool_points().los_offset_mm == ToolPoints.LOS_OFFSET_MM
-    assert ov.tool_points(los_offset_mm=0.0).los_offset_mm == 0.0
     ov.update(np.stack([P_TIP + t0, P_BACK + t0]))
+    # no ToolPoints made here (the page's snapshot overlay): the page's offset
     assert ov.snapshot_record()["los_offset_mm"] == ToolPoints.LOS_OFFSET_MM
-    print("  (l) line-of-sight shift of the drawn points (LOS_OFFSET_MM)")
+    assert ov.tool_points().los_offset_mm == ToolPoints.LOS_OFFSET_MM
+    assert ov.snapshot_record()["los_offset_mm"] == ToolPoints.LOS_OFFSET_MM
+    # the snapshot reports the offset of the ToolPoints that made the points
+    assert ov.tool_points(los_offset_mm=0.0).los_offset_mm == 0.0
+    assert ov.snapshot_record()["los_offset_mm"] == 0.0
+    print("  (l) line-of-sight shift of the drawn points (LOS_OFFSET_MM), in the snapshot record")
 
 
 def _check_tool_points() -> None:

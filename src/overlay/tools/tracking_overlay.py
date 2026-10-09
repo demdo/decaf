@@ -67,14 +67,20 @@ class TrackingOverlay:
         self._tip_cam: Optional[np.ndarray] = None
         self._back_cam: Optional[np.ndarray] = None
         self._marked = False
+        # Line-of-sight shift of the points update() gets: that of the last
+        # ToolPoints made by tool_points(), else the class default.
+        self._los_offset_mm = float(ToolPoints.LOS_OFFSET_MM)
 
     def tool_points(self, los_offset_mm: Optional[float] = None,
                     mark_below_visible_frac: float = 0.0) -> "ToolPoints":
         """A ToolPoints of this tool's tip and back point, for the tracking
         thread; los_offset_mm None: ToolPoints.LOS_OFFSET_MM (the page's);
-        mark_below_visible_frac: see ToolPoints.marked."""
-        return ToolPoints(self._p_tip, self._p_back, los_offset_mm=los_offset_mm,
-                          mark_below_visible_frac=mark_below_visible_frac)
+        mark_below_visible_frac: see ToolPoints.marked. Its line-of-sight
+        shift is the one snapshot_record reports from now on."""
+        tp = ToolPoints(self._p_tip, self._p_back, los_offset_mm=los_offset_mm,
+                        mark_below_visible_frac=mark_below_visible_frac)
+        self._los_offset_mm = float(tp.los_offset_mm)
+        return tp
 
     # ------------------------------------------------------------------
     # Per-frame state
@@ -132,7 +138,8 @@ class TrackingOverlay:
         tip_cam/back_cam the camera-frame points (mm, ToolPoints) they were
         projected from, p_tip/axis_dir/axis_back_mm the tool geometry,
         los_offset_mm the line-of-sight shift already in tip_cam/back_cam
-        (ToolPoints.LOS_OFFSET_MM, the one the page draws with), marked
+        (that of the ToolPoints from tool_points(); without one the page's
+        ToolPoints.LOS_OFFSET_MM), marked
         whether it is drawn marked (style colour_bgra: the colour used).
         """
         if self._tip_uv is None:
@@ -145,7 +152,7 @@ class TrackingOverlay:
             "p_tip_mm": [float(v) for v in self._p_tip],
             "axis_dir": [float(v) for v in self._axis],
             "axis_back_mm": float(self.AXIS_BACK_MM),
-            "los_offset_mm": float(ToolPoints.LOS_OFFSET_MM),
+            "los_offset_mm": self._los_offset_mm,
             "marked": bool(self._marked),
             "style": {
                 "tip_radius_px": int(self.TIP_RADIUS),
