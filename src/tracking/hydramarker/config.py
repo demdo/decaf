@@ -330,7 +330,8 @@ class TrackerConfig:
     # pose (<= 0: no limit). Replays of 108 takes on top of the occlusion gate
     # and the prior sub-grid, every frame processed: fresh frames 32717 ->
     # 33091, first lock 06.10. D04 1.90 -> 0.37 s, BN1 2.97 -> 1.10 s, rep H02
-    # 4.97 -> 0.73 s, BT3 4.14 -> 1.40 s.
+    # 4.97 -> 0.73 s, BT3 4.14 -> 1.40 s (one replay per take, started at its
+    # first frame).
     checker_wrong_lattice_reset: bool = True
     checker_wrong_lattice_reset_max_per_gap: int = 1
     checker_min_fresh_correspondences_for_stable_tracking: int = 8
@@ -803,10 +804,10 @@ class TrackerConfig:
     # with the gate, 1 = only those the ungated check rejects, 0 = off): such a
     # pose is rejected when it is more than occlusion_guard_max_rot_deg or
     # occlusion_guard_max_trans_mm (marker origin) from the last accepted pose.
-    # Without it the gate let a fast pose 43 deg / 32 mm off through in fast
-    # motion (05.10. M04 k35). In the 108 replayed takes it rejected 4 poses
-    # (17-43 deg), which removed 9 jump frames; the largest deviation it
-    # accepted was 14.7 deg / 23.9 mm.
+    # Without it the gate let a persistent pose 42.5 deg / 31.6 mm off
+    # through in fast motion (05.10. M04 k35). In the 108 replayed takes it
+    # rejected 4 poses (17-43 deg), which removed 9 jump frames; the largest
+    # deviation it accepted was 14.7 deg / 23.9 mm.
     occlusion_guard_mode: int = 2
     occlusion_guard_max_rot_deg: float = 15.0
     occlusion_guard_max_trans_mm: float = 25.0
@@ -825,14 +826,19 @@ class TrackerConfig:
 
     # Python-side only (the engine ignores it): the Live page draws a pose
     # whose visible_cell_fraction is below this value MARKED (other colour): a
-    # pose the engine kept with a large part of the marker covered. It flags
-    # the half-covered hold and a label painted over, not every less accurate
-    # pose: replays of the 06.10. hand-held takes (median fraction / drawn tip
-    # error, board ground truth): unoccluded D01-D05 1.00 / 1.12 mm, one finger
-    # over a third of the label (O01) 0.78 / 1.63 mm (drawn unmarked), two
-    # fingers over half (O02) 0.72 / 1.78 mm (marked). With the label painted
-    # over in the image: half 0.47-0.50 / 1.3-2.1 mm, two thirds 0.30 / 1.8-4.6
-    # mm. PROVISIONAL: one hold per real occlusion level. 0 = never marked.
+    # pose the engine kept with part of the marker covered. The tip error
+    # rises step by step as the fraction falls, with no clear knee above 0.5:
+    # label painted over in the image, the same frames painted vs unpainted
+    # (6 takes): 0.70-0.75 x1.34 (+0.32 mm), 0.50-0.55 x1.63 (+0.63 mm),
+    # 0.40-0.50 x1.75, below 0.40 x3.1 (+2.0 mm). A finger at 0.72 is
+    # already less exact, so it is marked: 07.10. live check, drill held
+    # still, jitter 0.59 mm (RMS per second) against 0.21 mm without the
+    # finger, drawn tip 1.3 mm (depth) off where it sat once the finger was
+    # lifted; 06.10. hand-held takes (median fraction / drawn tip error, board
+    # ground truth): unoccluded D01-D05 1.00 / 1.12 mm, two fingers over half
+    # (O02) 0.72 / 1.78 mm (marked), one finger over a third (O01) 0.78 /
+    # 1.63 mm (drawn unmarked: not every less exact pose is flagged).
+    # 0 = never marked.
     drawn_pose_mark_below_visible_frac: float = 0.75
 
 
