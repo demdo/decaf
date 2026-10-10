@@ -816,7 +816,8 @@ bool IrPoseRefiner::fuseAttempt(IrPoseRefinerResult& out,
     const size_t m = M.size();
     // Undistort the survivors' RGB pixels to normalised coordinates (the
     // reprojection residual); move the IR-left triangulation into the RGB camera
-    // frame; build the physical anisotropic stereo covariance (depth-loose).
+    // frame; build the physical anisotropic stereo covariance (loose along each
+    // point's IR-left ray).
     std::vector<cv::Point2d> u_norm(m);
     {
         cv::Mat src(static_cast<int>(m), 1, CV_64FC2);
@@ -848,10 +849,12 @@ bool IrPoseRefiner::fuseAttempt(IrPoseRefinerResult& out,
         const double Z = std::max(cam[i][2], 1.0);
         const double sig_i = config_.sigma_ir_px * sig_scale[i];
         const double sl = Z / f_ir * sig_i;
-        const double sz = Z * Z / (f_ir * baseline) * sig_i;
-        const cv::Matx33d S_irl(sl * sl, 0.0, 0.0,
-                                0.0, sl * sl, 0.0,
-                                0.0, 0.0, sz * sz);
+        // A disparity error moves the point along its own IR-left ray, not
+        // along z: the loose axis follows the ray (~14 deg off z at the label).
+        const cv::Vec3d r = cam[i] * (1.0 / std::max(cv::norm(cam[i]), 1.0));
+        const double sr = Z * Z / (f_ir * baseline) * sig_i / std::max(r[2], 0.1);
+        const cv::Matx33d rr = r * r.t();
+        const cv::Matx33d S_irl = (sl * sl) * (cv::Matx33d::eye() - rr) + (sr * sr) * rr;
         cv::invert(R_rl.t() * S_irl * R_rl, SigYinv[i], cv::DECOMP_SVD);
     }
     const MapFuseResult mf =
