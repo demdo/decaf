@@ -274,20 +274,13 @@ class ToolPoints:
     # dropping. Max age by frame time, not by processed frames.
     MAX_CARRY_S = 1.0
 
-    # EMPIRICAL depth correction of the drawn points, not a calibration: on
-    # the board ground truth (30.09. + 05.10., 15 takes, marker 300-480 mm
-    # from the camera) the RGB-only marker pose puts the tip 2.27 mm (take
-    # mean) too far along the line of sight to the marker, with no trend over
-    # the distance and turning with the camera, not with the label; the
-    # cause is open. Both points move this far toward the camera along the
-    # ray to the marker origin. Held out (fit without the take / the session):
-    # tip error 1.37 / 1.38 mm instead of 2.87 (offset carry), 1.28 / 1.29
-    # mm instead of 2.82 (filtered drawing).
-    # Re-fit after any change of the marker model, the RGB intrinsics or the
-    # tip calibration; < 300 and > 480 mm untested. 0 = off; measurements
-    # against that ground truth (tests/test_tip_board_principle.py) run
-    # with 0, the value was fitted on it.
-    LOS_OFFSET_MM = 2.27
+    # Line-of-sight shift of both drawn points toward the camera along the
+    # ray to the marker origin; 0 = off: live draws the raw pose. On the
+    # board ground truth the tip lies ~2 mm too far along that ray (a scale
+    # error common to the IR-stereo-built marker model and the IR depth);
+    # that correction belongs to the evaluation only, not to the live
+    # drawing. Until 10.10. 2.27 (RGB-only take mean, 30.09. + 05.10.).
+    LOS_OFFSET_MM = 0.0
 
     def __init__(self, p_tip_mm, p_back_mm, max_carry_s: Optional[float] = None,
                  los_offset_mm: Optional[float] = None,
