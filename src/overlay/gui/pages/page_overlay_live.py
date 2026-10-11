@@ -294,6 +294,12 @@ class _FrameProfile:
     colour frames the page never got (gaps in the RealSense frame numbers:
     the SDK keeps only the newest frame for poll(), or the camera dropped
     them).
+
+    frame_sink (Evaluation mode, _EvalFrameLog.add_display): also gets one
+    row per shown frame, the stages added between frame_start and frame_end
+    as "<stage>_ms" (summed if a stage comes twice), plus interval_ms,
+    total_ms, t_s (frame_start, perf_counter), t_wall_s (frame_end,
+    time.time()) and what frame_end is given.
     """
 
     def __init__(self, fps: int, log_path: Path | None):
@@ -301,6 +307,8 @@ class _FrameProfile:
         self.log_path = None if log_path is None else Path(log_path).resolve()
         self._camera_number: int | None = None   # last polled frame number
         self._exposure = ""                       # note_exposure()
+        self.frame_sink = None                    # callable(row) or None
+        self._cur: dict | None = None             # row of the frame in progress
         self.reset()
 
     def emit(self, line: str) -> None:
@@ -346,17 +354,34 @@ class _FrameProfile:
 
     def frame_start(self) -> float:
         now = time.perf_counter()
+        interval = float("nan")
         if self._t_last_start is not None:
-            self._t[" interval"].append((now - self._t_last_start) * 1000.0)
+            interval = (now - self._t_last_start) * 1000.0
+            self._t[" interval"].append(interval)
         self._t_last_start = now
+        if self.frame_sink is not None:
+            self._cur = {"t_s": now, "interval_ms": interval}
         return now
 
     def add(self, stage: str, seconds: float) -> None:
-        self._t[stage].append(seconds * 1000.0)
+        ms = seconds * 1000.0
+        self._t[stage].append(ms)
+        cur = self._cur
+        if cur is not None:
+            key = stage.strip().rstrip("*") + "_ms"
+            cur[key] = cur.get(key, 0.0) + ms
 
-    def frame_end(self, t0: float) -> None:
-        self._t["total"].append((time.perf_counter() - t0) * 1000.0)
+    def frame_end(self, t0: float, extra: dict | None = None) -> None:
+        total = (time.perf_counter() - t0) * 1000.0
+        self._t["total"].append(total)
         self._n_frames += 1
+        cur, self._cur = self._cur, None
+        if cur is not None and self.frame_sink is not None:
+            cur["total_ms"] = total
+            cur["t_wall_s"] = time.time()
+            if extra:
+                cur.update(extra)
+            self.frame_sink(cur)
         if self._n_frames >= PROFILE_EVERY:
             self._report()
             self.reset()
@@ -413,6 +438,240 @@ class _FrameProfile:
             + exposure
             + "|  mean/max ms: " + "  ".join(parts)
         )
+
+
+# ============================================================
+# Per-frame log (Evaluation mode)
+# ============================================================
+
+# The profile lines are means per window; for the evaluation every frame is
+# kept as well, from the same session: one row per processed tracking
+# result (worker timing, the engine's own stage timings and counters, the
+# path it took, pose and drawn tip) and one row per shown frame (the display
+# stages of _FrameProfile, the frame's camera time). The rows stay in memory
+# and go to the session folder as .npz when a tracking run ends (every
+# _stop_tracking: Stop, reference plane, error, page change) and when the
+# page is left: <label>_tracking.npz (that run's results) and
+# <label>_display.npz (the frames shown since the last write). Arrays are
+# built and written in a thread of their own; the live loop only appends.
+FRAME_LOG_VERSION = 1
+
+_FRAME_LOG_CLOCKS = (
+    "t_s, t_frame, t_start, t_done, t_drain: time.perf_counter() [s] "
+    "(t_frame = poll of the frame); t_host_s: time.time() at the poll [s]; "
+    "t_wall_s: time.time() at the end of the display [s]; color_ts_ms: the "
+    "RealSense colour frame timestamp (frame.get_timestamp()) [ms]"
+)
+
+
+def _keys_values(d) -> tuple[tuple, np.ndarray | None]:
+    """A dict of numbers as (keys, float64 values), for the timing and
+    counter dicts of a result; non-numbers become NaN."""
+    if not d:
+        return (), None
+    keys = tuple(d.keys())
+    try:
+        values = np.fromiter(d.values(), dtype=np.float64, count=len(keys))
+    except (TypeError, ValueError):
+        values = np.full(len(keys), np.nan)
+        for i, v in enumerate(d.values()):
+            try:
+                values[i] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return keys, values
+
+
+def _frame_rows_to_arrays(rows: list[dict]) -> dict[str, np.ndarray]:
+    """Column arrays of per-frame rows: bool / str / number (NaN where a
+    row lacks it) / vector (n, m); "_name" entries are (keys, values) pairs
+    and become name_keys + name_values (union of keys, NaN = absent)."""
+    out: dict[str, np.ndarray] = {}
+    n = len(rows)
+    names: dict[str, None] = {}
+    for r in rows:
+        for k in r:
+            names.setdefault(k, None)
+    for k in names:
+        if k.startswith("_"):
+            groups: dict[tuple, list[int]] = {}
+            for i, r in enumerate(rows):
+                kv = r.get(k)
+                if kv is not None and kv[0]:
+                    groups.setdefault(kv[0], []).append(i)
+            keys = sorted(set().union(*groups)) if groups else []
+            col = {key: j for j, key in enumerate(keys)}
+            mat = np.full((n, len(keys)), np.nan)
+            for ks, idx in groups.items():
+                cols = np.array([col[key] for key in ks], dtype=np.int64)
+                mat[np.ix_(idx, cols)] = np.vstack([rows[i][k][1] for i in idx])
+            out[f"{k[1:]}_keys"] = np.array(keys, dtype=str)
+            out[f"{k[1:]}_values"] = mat
+            continue
+        sample = next((r[k] for r in rows if r.get(k) is not None), None)
+        if sample is None:
+            continue
+        if isinstance(sample, (bool, np.bool_)):
+            out[k] = np.array([bool(r.get(k, False)) for r in rows], dtype=bool)
+        elif isinstance(sample, str):
+            out[k] = np.array([r.get(k) or "" for r in rows], dtype=str)
+        elif np.ndim(sample) > 0:
+            m = int(np.asarray(sample).size)
+            a = np.full((n, m), np.nan)
+            for i, r in enumerate(rows):
+                v = r.get(k)
+                if v is not None:
+                    v = np.asarray(v, dtype=np.float64).reshape(-1)
+                    if v.size == m:
+                        a[i] = v
+            out[k] = a
+        else:
+            out[k] = np.array(
+                [np.nan if r.get(k) is None else float(r[k]) for r in rows],
+                dtype=np.float64,
+            )
+    return out
+
+
+class _EvalFrameLog:
+    """Per-frame rows of the live loop for the evaluation (see above).
+    Used by the GUI thread only; a writer thread gets lists the page no
+    longer touches."""
+
+    # without a tracking stop, the display rows are written every ~5 min
+    DISPLAY_FLUSH_FRAMES = 9000
+
+    def __init__(self, ev, fps: int):
+        self._ev = ev
+        self._fps = int(fps)
+        self._track: list[dict] = []
+        self._display: list[dict] = []
+        # frame_index -> (colour timestamp ms, time.time() of the poll)
+        self._frames: dict[int, tuple[float, float]] = {}
+        self._run = 0
+
+    def note_frame(self, frame) -> None:
+        """Camera time of a polled frame, for the rows of its result and of
+        its display (the last ~2 s of frames are kept)."""
+        index = int(frame.frame_index)
+        ts = (frame.metadata or {}).get("color_time_ms")
+        self._frames[index] = (
+            float("nan") if ts is None else float(ts), float(frame.timestamp_s)
+        )
+        if len(self._frames) > 4 * self._fps:
+            self._frames = {
+                i: v for i, v in self._frames.items() if i > index - 2 * self._fps
+            }
+
+    def add_display(self, row: dict) -> None:
+        """_FrameProfile.frame_sink: one shown frame."""
+        ts, t_host = self._frames.get(int(row.get("frame_idx", -1)), (np.nan, np.nan))
+        row["color_ts_ms"] = ts
+        row["t_host_s"] = t_host
+        self._display.append(row)
+        if len(self._display) >= self.DISPLAY_FLUSH_FRAMES:
+            self.flush("display rows", tracking=False)
+
+    def add_track(self, out, step, t_drain: float, overlay, session, tl) -> None:
+        """One processed tracking result, including those of an older epoch
+        the session ignored (current False). overlay: the TrackingOverlay
+        after this result (None: nothing drawn from it)."""
+        res = out.result
+        ts, t_host = self._frames.get(int(out.frame_index), (np.nan, np.nan))
+        row = {
+            "frame_idx": int(out.frame_index),
+            "epoch": int(out.epoch),
+            "t_frame": out.t_frame,
+            "t_start": out.t_start,
+            "t_done": out.t_done,
+            "t_drain": t_drain,
+            "track_ms": (out.t_done - out.t_start) * 1000.0,
+            "lag_ms": (out.t_done - out.t_frame) * 1000.0,
+            "color_ts_ms": ts,
+            "t_host_s": t_host,
+            "skipped": int(out.skipped),
+            "reset_before": bool(out.reset),
+            "frame_dropped": bool(out.frame_dropped),
+            "has_ir": bool(out.has_ir),
+            "current": bool(step.current),
+            "fresh": bool(step.fresh),
+            "locked_now": bool(step.locked_now),
+            "relock": bool(step.relock),
+            "reentry": bool(step.reentry),
+            "lost_reset": bool(step.reset),
+            "locked": bool(getattr(session, "locked", False)),
+            "points_kind": out.points_kind or "",
+            "points_marked": bool(out.points_marked),
+        }
+        if res is not None:
+            vis = res.timings_ms.get("visible_cell_fraction")
+            row.update({
+                "success": bool(res.success),
+                "mode": str(getattr(res.mode, "value", res.mode)),
+                "pose_source": str(tl.pose_source_value(res)),
+                "num_points": int(res.num_points),
+                "num_inliers": int(res.num_inliers),
+                "mean_reproj_px": float(res.mean_reprojection_error_px),
+                "visible_frac": None if vis is None else float(vis),
+                "rvec": None if res.rvec is None else np.asarray(res.rvec, dtype=np.float64).reshape(-1),
+                "tvec": None if res.tvec is None else np.asarray(res.tvec, dtype=np.float64).reshape(-1),
+                "_timings": _keys_values(res.timings_ms),
+                "_debug": _keys_values(res.debug_counters),
+            })
+        if out.points is not None:
+            pts = np.asarray(out.points, dtype=np.float64).reshape(-1, 3)
+            row["tip_cam_mm"] = pts[0]
+            row["back_cam_mm"] = pts[1]
+        drawn = None if overlay is None else overlay.snapshot_record()
+        if drawn is not None:
+            row["tip_uv"] = np.asarray(drawn["tip_uv"], dtype=np.float64)
+            row["back_uv"] = np.asarray(drawn["back_uv"], dtype=np.float64)
+        self._track.append(row)
+
+    def flush(self, reason: str, tracking: bool) -> None:
+        """Write the rows collected so far: the tracking run that just ended
+        (tracking True) and the shown frames. Files are reserved here (the
+        label in force now), written in a thread."""
+        jobs = []
+        if tracking and self._track:
+            self._run += 1
+            rows, self._track = self._track, []
+            jobs.append(self._job("tracking", rows, reason, run=self._run))
+        if self._display:
+            rows, self._display = self._display, []
+            jobs.append(self._job("display", rows, reason))
+        jobs = [j for j in jobs if j is not None]
+        if jobs:
+            threading.Thread(
+                target=self._write, args=(jobs,), name="frame-log-writer"
+            ).start()
+
+    def _job(self, kind: str, rows: list[dict], reason: str, run: int = 0):
+        try:
+            path = self._ev.path_for(kind, ".npz")
+            path.touch()          # reserved: the next flush gets _2, _3, ...
+            summary = {"frames": len(rows), "reason": reason}
+            if run:
+                summary["run"] = run
+            self._ev.log("overlay_live", path.name, summary)
+        except Exception as e:
+            print(f"[WARN] Frame log: could not reserve the {kind} file: {e}")
+            return None
+        meta = {
+            "log_version": FRAME_LOG_VERSION, "kind": kind, "reason": reason,
+            "run": run, "clocks": _FRAME_LOG_CLOCKS,
+        }
+        return path, rows, meta
+
+    @staticmethod
+    def _write(jobs) -> None:
+        for path, rows, meta in jobs:
+            try:
+                arrays = _frame_rows_to_arrays(rows)
+                arrays["meta_json"] = np.array(json.dumps(meta))
+                np.savez_compressed(path, **arrays)
+            except Exception as e:
+                print(f"[WARN] Frame log: writing {path.name} failed: {e}")
 
 
 # ============================================================
@@ -1166,6 +1425,9 @@ class OverlayLivePage(QWidget):
         # PROFILE_LOG_NAME); the session is attached later, so the profile
         # is created in on_enter.
         self._profile: _FrameProfile | None = None
+        # Evaluation mode: every processed result and every shown frame
+        # (_EvalFrameLog), also created in on_enter.
+        self._frame_log: _EvalFrameLog | None = None
 
         # --- colour exposure while tracking (color_exposure.py) ---
         # "marker": the marker exposure control runs from the tracking
@@ -1567,6 +1829,8 @@ class OverlayLivePage(QWidget):
                     prof.add("poll", t_frame - t_poll)
                     prof.note_camera_frame(self._camera_frame_number())
                 self._note_frame_exposure(frame)
+                if self._frame_log is not None:
+                    self._frame_log.note_frame(frame)
                 worker = self._track_worker
                 if worker is not None:
                     n_dry = worker.n_pool_exhausted
@@ -1613,7 +1877,12 @@ class OverlayLivePage(QWidget):
             if prof:
                 prof.add("age", time.perf_counter() - self._shown_t_frame)
                 prof.count("shown_pose" if pose_out is not None else "shown_live")
-                prof.frame_end(t0)
+                prof.frame_end(t0, {
+                    "frame_idx": self._shown_index,
+                    "pose": pose_out is not None,
+                    "tracking": self._tracking_active,
+                    "xray": self._overlay_cache is not None,
+                })
 
         except Exception as e:
             self._end_plane_acquire("error")
@@ -2041,6 +2310,9 @@ class OverlayLivePage(QWidget):
                 reason += " — engine still busy"
         self.controls.btn_track.setText("Start tracking")
         self.controls.lbl_track_status.setText(reason)
+        if self._frame_log is not None:
+            # this run's results and the frames shown so far go to disk
+            self._frame_log.flush(reason, tracking=True)
 
     def _on_track_result_ready(self) -> None:
         # a result between two ticks: drain and show it now, no poll
@@ -2104,8 +2376,13 @@ class OverlayLivePage(QWidget):
             self._exposure_step(out.metering)
 
         step = self._track_session.update(out)
+        log = self._frame_log
         if not step.current:
             # computed before the last engine reset: neither shown nor logged
+            # (only the evaluation's frame log keeps it: the engine ran on it)
+            if log is not None:
+                log.add_track(out, step, t_drain, None, self._track_session,
+                              self._tracker_log_module)
             self._release_out(out)
             return
 
@@ -2114,6 +2391,10 @@ class OverlayLivePage(QWidget):
             self._tool_overlay.update(out.points, marked=out.points_marked)
         else:
             self._tool_overlay.clear()
+        if log is not None:
+            log.add_track(out, step, t_drain,
+                          self._tool_overlay if step.fresh else None,
+                          self._track_session, self._tracker_log_module)
         previous = (self._pose_out, self._live_out)
         self._pose_out = self._live_out = None
         # only the newest result of a batch still has its frame
@@ -2852,6 +3133,9 @@ class OverlayLivePage(QWidget):
                 # the session header follows the camera start (it names the
                 # colour options read back); the first window counts from here
                 self._profile.reset()
+            self._frame_log = None if ev is None else _EvalFrameLog(ev, self.FPS)
+            if self._profile is not None and self._frame_log is not None:
+                self._profile.frame_sink = self._frame_log.add_display
             if self._tracking_only and ev is not None:
                 # which drill the tracking test runs with
                 ir_path = getattr(self.state, "ir_calibration_path", None)
@@ -2905,6 +3189,12 @@ class OverlayLivePage(QWidget):
         self._withheld = None              # its view ends with the camera
         self._stop_timer()
         self._stop_realsense()
+        log, self._frame_log = self._frame_log, None
+        if log is not None:
+            # the frames shown since the last tracking stop
+            if self._profile is not None:
+                self._profile.frame_sink = None
+            log.flush("page left", tracking=True)
 
     def closeEvent(self, event) -> None:
         self.on_leave()
