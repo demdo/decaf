@@ -116,7 +116,32 @@ def main() -> None:
         b = plain[cy - 2:cy + 3, cx - 2:cx + 3].astype(int)
         print(f"    at the principal point: max |diff| = {np.abs(a - b).max()} grey levels")
 
+    check_fov_mask_keeps_objects()
     print("all checks passed")
+
+
+def check_fov_mask_keeps_objects() -> None:
+    """(d) A radiopaque object inside the field stays in the FOV mask: a pin
+    (a hole) and a drill bit that enters the field from its edge (no hole -
+    before the convex hull it was cut out of the overlay, 11.10.)."""
+    from overlay.tools.warp import _detect_xray_fov_mask
+
+    xray = _synthetic_xray()
+    size = xray.shape[0]
+    c = size // 2
+    cv2.circle(xray, (c + 150, c + 150), 6, 0, -1)                   # pin
+    cv2.rectangle(xray, (c - 12, 0), (c + 12, c), 0, -1)             # bit from the edge
+    field = _synthetic_xray() > 0
+    fov = _detect_xray_fov_mask(xray) > 0
+    assert fov[c + 150, c + 150], "pin cut out of the FOV mask"
+    bit = np.zeros_like(fov)
+    bit[0:c, c - 12:c + 13] = True
+    inside = bit & field
+    assert fov[inside].mean() > 0.99, f"bit cut out: {fov[inside].mean():.3f} kept"
+    extra = (fov & ~field).sum() / field.sum()
+    assert extra < 0.01, f"mask grew beyond the field: {extra:.4f}"
+    print(f"(d) FOV mask keeps pin and edge-entering bit: ok "
+          f"(bit {fov[inside].mean():.3f} kept, beyond field {extra:.4f})")
 
 
 if __name__ == "__main__":

@@ -129,9 +129,27 @@ def _largest_inscribed_circle_mask(mask_u8: np.ndarray, margin_px: int = 0) -> n
     return circle_mask
 
 
+def _convex_hull_mask(mask_u8: np.ndarray) -> np.ndarray:
+    """The filled convex hull of the largest outer contour of a 0/255 mask."""
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        raise RuntimeError("Foreground mask is empty.")
+    largest = max(contours, key=cv2.contourArea)
+    out = np.zeros_like(mask_u8)
+    cv2.fillConvexPoly(out, cv2.convexHull(largest), 255)
+    return out
+
+
 def _detect_xray_fov_mask(xray_gray_u8: np.ndarray) -> np.ndarray:
     """
     Detect visible X-ray FOV region via segmentation.
+
+    The thresholded field is closed to its convex hull at the end: the
+    collimated field (circle / octagon) is convex, and a radiopaque object
+    that enters it from its edge - the drill bit - is no hole that
+    _fill_holes could close, so it would be cut out of the overlay (on the
+    X-rays of 11.10. the whole bit was). On X-rays without such an object the
+    hull only adds a sub-pixel band along the boundary.
     """
     xray_gray_u8 = np.asarray(xray_gray_u8)
     if xray_gray_u8.ndim != 2:
@@ -143,8 +161,9 @@ def _detect_xray_fov_mask(xray_gray_u8: np.ndarray) -> np.ndarray:
     raw = _threshold_fov_region(blur)
     largest = _largest_connected_component(raw)
     filled = _fill_holes(largest)
-    final = _morph_cleanup(filled)
-    
+    cleaned = _morph_cleanup(filled)
+    final = _convex_hull_mask(cleaned)
+
     return final
     
     #circle = _largest_inscribed_circle_mask(final, margin_px=2)
