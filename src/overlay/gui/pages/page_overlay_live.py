@@ -36,6 +36,7 @@ from overlay.tools.pointer_depth import PointerDepthEstimator, depth_capture_arr
 from overlay.tools.tracking_overlay import TrackingOverlay
 from overlay.tools.warp import prepare_live_overlay
 from overlay.tools.xray_io import read_xray_gray_u8
+from overlay.tools.xray_view import XrayField, XrayView
 
 # The camera is owned by the tracking hardware boundary so the tuned
 # RealSense options (auto_exposure_priority=0 for guaranteed fps, emitter
@@ -295,6 +296,10 @@ class _FrameProfile:
     the SDK keeps only the newest frame for poll(), or the camera dropped
     them).
 
+    'xview' is the X-ray view's drawing per shown frame, 'xview_up' its
+    geometry per fresh pose (TrackingOverlay.update, in the drain); both with
+    three decimals, because they are below the 0.1 ms of the other stages.
+
     frame_sink (Evaluation mode, _EvalFrameLog.add_display): also gets one
     row per shown frame, the stages added between frame_start and frame_end
     as "<stage>_ms" (summed if a stage comes twice), plus interval_ms,
@@ -394,7 +399,8 @@ class _FrameProfile:
         for stage in sorted(self._t):
             v = self._t[stage]
             if v:
-                parts.append(f"{stage.strip()} {np.mean(v):6.1f}/{np.max(v):6.1f}")
+                d = 3 if stage.startswith("xview") else 1
+                parts.append(f"{stage.strip()} {np.mean(v):6.{d}f}/{np.max(v):6.{d}f}")
 
         empty_pct = 100.0 * self._n_empty / max(1, self._n_polls)
 
@@ -454,7 +460,10 @@ class _FrameProfile:
 # page is left: <label>_tracking.npz (that run's results) and
 # <label>_display.npz (the frames shown since the last write). Arrays are
 # built and written in a thread of their own; the live loop only appends.
-FRAME_LOG_VERSION = 1
+# Version 2: the tracking rows carry the X-ray view (d_x_mm, tip_x_mm,
+# tip_uv_x, back_uv_x, tip_uv_on_plane, off_plane_mm, inclination_deg,
+# tip_in_field, xview_update_ms), the display rows xview_ms.
+FRAME_LOG_VERSION = 2
 
 _FRAME_LOG_CLOCKS = (
     "t_s, t_frame, t_start, t_done, t_drain: time.perf_counter() [s] "
@@ -626,6 +635,17 @@ class _EvalFrameLog:
         if drawn is not None:
             row["tip_uv"] = np.asarray(drawn["tip_uv"], dtype=np.float64)
             row["back_uv"] = np.asarray(drawn["back_uv"], dtype=np.float64)
+            xv = drawn["xray_view"]
+            if xv is not None:
+                row["d_x_mm"] = xv["d_x_mm"]
+                row["tip_x_mm"] = np.asarray(xv["tip_x_mm"], dtype=np.float64)
+                row["tip_uv_x"] = np.asarray(xv["tip_uv_x"], dtype=np.float64)
+                row["back_uv_x"] = np.asarray(xv["back_uv_x"], dtype=np.float64)
+                row["tip_uv_on_plane"] = np.asarray(xv["tip_uv_on_plane"], dtype=np.float64)
+                row["off_plane_mm"] = xv["off_plane_mm"]
+                row["inclination_deg"] = xv["inclination_deg"]
+                row["tip_in_field"] = xv["tip_in_field"]
+                row["xview_update_ms"] = overlay.xray_update_s * 1000.0
         self._track.append(row)
 
     def flush(self, reason: str, tracking: bool) -> None:
@@ -752,14 +772,14 @@ class _OverlayControlRail(QFrame):
 
     HANDLE_W = int(round(34 * SCALE))
     PANEL_W = int(round(380 * SCALE))
-    PANEL_H = int(round(452 * SCALE))
+    PANEL_H = int(round(486 * SCALE))
     # Extra panel height while the tool-tracking card is visible.
     TRACK_EXTRA_H = int(round(186 * SCALE))
     # Extra panel height while the reference-plane card is visible.
     PLANE_EXTRA_H = int(round(150 * SCALE))
     # Without an X-ray (set_tracking_only): the alpha and plane-depth cards
-    # and the pointer-tip box go, the Back card comes.
-    XRAY_H = int(round(250 * SCALE))
+    # and the pointer-tip and X-ray-view boxes go, the Back card comes.
+    XRAY_H = int(round(284 * SCALE))
     BACK_H = int(round(100 * SCALE))
     GAP = int(round(10 * SCALE))
 
@@ -839,16 +859,30 @@ class _OverlayControlRail(QFrame):
         self.slider_dx.setTracking(True)
         self.slider_dx.setMinimumHeight(self._s(28))
 
-        # ---------------- Tip / axis ----------------
+        # ---------------- Tip / drill views ----------------
         self.chk_show_tip = QCheckBox("Show pointer tip")
         self.chk_show_tip.setObjectName("overlayRailCheck")
         self.chk_show_tip.setChecked(True)
         self.chk_show_tip.setMinimumHeight(self._s(26))
 
-        self.chk_show_axis = QCheckBox("Show drill axis")
-        self.chk_show_axis.setObjectName("overlayRailCheck")
-        self.chk_show_axis.setChecked(True)
-        self.chk_show_axis.setMinimumHeight(self._s(26))
+        # The two views of the drill (tracking_overlay.TrackingOverlay).
+        # NoFocus: SPACE accepts the pointer pose and must not toggle them.
+        self.chk_show_camera_view = QCheckBox("Show camera view")
+        self.chk_show_camera_view.setObjectName("overlayRailCheck")
+        self.chk_show_camera_view.setChecked(True)
+        self.chk_show_camera_view.setMinimumHeight(self._s(26))
+        self.chk_show_camera_view.setFocusPolicy(Qt.NoFocus)
+        self.chk_show_camera_view.setToolTip("Green: the drill as the camera sees it")
+
+        self.chk_show_xray_view = QCheckBox("Show X-ray view")
+        self.chk_show_xray_view.setObjectName("overlayRailCheck")
+        self.chk_show_xray_view.setChecked(True)
+        self.chk_show_xray_view.setMinimumHeight(self._s(26))
+        self.chk_show_xray_view.setFocusPolicy(Qt.NoFocus)
+        self.chk_show_xray_view.setToolTip(
+            "Magenta: the drill moved along the source rays onto the reference "
+            "plane, where the X-ray shows its shadow; only inside the X-ray field"
+        )
 
         # ---------------- Tool tracking ----------------
         # Only shown when a tool is loaded (set_tracking_visible). Tracking
@@ -916,7 +950,8 @@ class _OverlayControlRail(QFrame):
         )
         tip_layout.setSpacing(self._s(8))
         tip_layout.addWidget(self.chk_show_tip)
-        tip_layout.addWidget(self.chk_show_axis)
+        tip_layout.addWidget(self.chk_show_camera_view)
+        tip_layout.addWidget(self.chk_show_xray_view)
 
         # ---------------- Snapshot ----------------
         # Saves pixel-aligned presentation layers of the current frame
@@ -1063,7 +1098,7 @@ class _OverlayControlRail(QFrame):
 
     def set_tracking_only(self, on: bool) -> None:
         """Camera image + drill, no X-ray: the X-ray controls (alpha, plane
-        depth, pointer tip) are hidden and the Back card is shown."""
+        depth, pointer tip, X-ray view) are hidden and the Back card is shown."""
         on = bool(on)
         if on == self._tracking_only:
             return
@@ -1071,6 +1106,7 @@ class _OverlayControlRail(QFrame):
         self.alpha_card.setVisible(not on)
         self.dx_card.setVisible(not on)
         self.chk_show_tip.setVisible(not on)
+        self.chk_show_xray_view.setVisible(not on)
         self.back_card.setVisible(on)
         self.title_label.setText("Tracking Controls" if on else "Overlay Controls")
         self.handle.setToolTip(self._handle_tooltip())
@@ -1387,13 +1423,16 @@ class OverlayLivePage(QWidget):
 
         self._xray_gray_u8: np.ndarray | None = None
         self._xray_working_u8: np.ndarray | None = None
+        # (XrayView, XrayField) of the current X-ray, _attach_xray_view
+        self._xray_geometry: tuple[XrayView, XrayField] | None = None
         self._overlay_cache = None
         self._frame_buf: np.ndarray | None = None
         self._scaled_buf: np.ndarray | None = None
 
         self._alpha: float = 0.50
         self._show_tip: bool = True
-        self._show_axis: bool = True
+        self._show_camera_view: bool = True
+        self._show_xray_view: bool = True
 
         self._base_d_x_mm: float | None = None
         self._current_d_x_mm: float | None = None
@@ -1495,7 +1534,8 @@ class OverlayLivePage(QWidget):
         self.controls.slider_alpha.valueChanged.connect(self._on_alpha_changed)
         self.controls.slider_dx.valueChanged.connect(self._on_dx_offset_changed)
         self.controls.chk_show_tip.toggled.connect(self._on_show_tip_toggled)
-        self.controls.chk_show_axis.toggled.connect(self._on_show_axis_toggled)
+        self.controls.chk_show_camera_view.toggled.connect(self._on_show_camera_view_toggled)
+        self.controls.chk_show_xray_view.toggled.connect(self._on_show_xray_view_toggled)
         self.controls.btn_track.clicked.connect(self._on_track_button)
         self.controls.chk_marker_exposure.setChecked(self._exposure_mode == MODE_MARKER)
         self.controls.chk_marker_exposure.toggled.connect(self._on_marker_exposure_toggled)
@@ -1533,6 +1573,7 @@ class OverlayLivePage(QWidget):
         page (state is left as it is)."""
         self._xray_gray_u8 = None
         self._xray_working_u8 = None
+        self._xray_geometry = None
         self._overlay_cache = None
         self._frame_buf = None
         self._reset_dx()
@@ -1546,6 +1587,7 @@ class OverlayLivePage(QWidget):
         self.controls.lbl_dx_value.setText("-")
 
     def _load_xray_from_state(self) -> None:
+        self._xray_geometry = None
         if self.state.xray_image_anatomy is None:
             self._xray_gray_u8 = None
             self._xray_working_u8 = None
@@ -1713,10 +1755,17 @@ class OverlayLivePage(QWidget):
         if draw_tool and self._tool_overlay is not None:
             t = time.perf_counter()
             self._tool_overlay.draw_into(
-                self._frame_buf, show_tip=True, show_axis=self._show_axis
+                self._frame_buf, show_camera=self._show_camera_view, show_xray=False
             )
             if prof:
                 prof.add("drill", time.perf_counter() - t)
+            if self._show_xray_view and self._tool_overlay.has_xray_view:
+                t = time.perf_counter()
+                self._tool_overlay.draw_into(
+                    self._frame_buf, show_camera=False, show_xray=True
+                )
+                if prof:
+                    prof.add("xview", time.perf_counter() - t)
 
         return self._frame_buf
 
@@ -2168,6 +2217,44 @@ class OverlayLivePage(QWidget):
             tracker.set_ir_calibration(ir_path)
         return tracker
 
+    def _new_tool_overlay(self) -> TrackingOverlay:
+        """The drill's overlay, with the X-ray view as the page shows it now."""
+        overlay = TrackingOverlay(
+            self.state.K_rgb,
+            self.state.dist_rgb,
+            self._tool.p_tip_mm,
+            self._tool.axis_dir,
+        )
+        self._attach_xray_view(overlay)
+        return overlay
+
+    def _attach_xray_view(self, overlay: TrackingOverlay) -> None:
+        """Give the overlay the current X-ray and d_x; in the tracking test,
+        or without the X-ray chain, no X-ray view. The field's hull is computed
+        once per X-ray (_load_xray_from_state drops it). A failure costs only
+        the X-ray view: the camera view and the overlay keep running."""
+        d_x = self._current_d_x_mm
+        if (
+            self._tracking_only
+            or self._xray_working_u8 is None
+            or d_x is None
+            or self.state.T_xc is None
+            or self.state.K_xray is None
+        ):
+            overlay.set_xray_view(None)
+            return
+        try:
+            if self._xray_geometry is None:
+                view = XrayView(self.state.T_xc, self.state.K_xray)
+                h, w = self._xray_working_u8.shape[:2]
+                self._xray_geometry = (view, XrayField.from_image(
+                    self._xray_working_u8, overlay.field_inset_px(view, (w, h), d_x)
+                ))
+            overlay.set_xray_view(*self._xray_geometry, d_x)
+        except Exception as e:
+            print(f"[WARN] Live page: no X-ray view of the drill: {e}")
+            overlay.set_xray_view(None)
+
     def _start_tracking(self) -> None:
         if self._tracking_active or self._tool is None or self.camera is None:
             return
@@ -2185,12 +2272,10 @@ class OverlayLivePage(QWidget):
         try:
             self._tracker = self._make_tracker()
             if self._tool_overlay is None:
-                self._tool_overlay = TrackingOverlay(
-                    self.state.K_rgb,
-                    self.state.dist_rgb,
-                    self._tool.p_tip_mm,
-                    self._tool.axis_dir,
-                )
+                self._tool_overlay = self._new_tool_overlay()
+            else:
+                # a new reference plane may have come in since the last run
+                self._attach_xray_view(self._tool_overlay)
         except Exception as e:
             QMessageBox.critical(
                 self,
@@ -2389,6 +2474,8 @@ class OverlayLivePage(QWidget):
         # the overlay first: if it raises, no result has changed hands yet
         if step.fresh:
             self._tool_overlay.update(out.points, marked=out.points_marked)
+            if prof and self._tool_overlay.has_xray_view:
+                prof.add("xview_up", self._tool_overlay.xray_update_s)
         else:
             self._tool_overlay.clear()
         if log is not None:
@@ -2601,12 +2688,17 @@ class OverlayLivePage(QWidget):
         self.state.H_xc = self._H_xc_lookup.get(self._dx_offset_mm)
 
         self._overlay_cache = None
+        if self._tool_overlay is not None:
+            self._tool_overlay.set_plane_depth(self._current_d_x_mm)
 
     def _on_show_tip_toggled(self, checked: bool) -> None:
         self._show_tip = bool(checked)
 
-    def _on_show_axis_toggled(self, checked: bool) -> None:
-        self._show_axis = bool(checked)
+    def _on_show_camera_view_toggled(self, checked: bool) -> None:
+        self._show_camera_view = bool(checked)
+
+    def _on_show_xray_view_toggled(self, checked: bool) -> None:
+        self._show_xray_view = bool(checked)
 
     def _on_save_snapshot(self) -> None:
         """Save the current frame as stacked presentation layers.
@@ -2617,8 +2709,11 @@ class OverlayLivePage(QWidget):
             00_xray.png               raw anatomical X-ray (reference)
             01_rgb.png                camera image only
             02_rgb_overlay.png        + X-ray overlay at the current alpha
-            03_rgb_overlay_drill.png  + drill tip and axis (only while a
-                                        tracked pose is on screen)
+            03_rgb_overlay_drill.png  + drill tip and axis, camera view (only
+                                        while a tracked pose is on screen)
+            04_rgb_overlay_drill_xrayview.png
+                                      + the X-ray view of the drill (only while
+                                        there is one)
             snapshot.json             the numbers behind the layers: alpha,
                                         d_x and its offset, H_xc, camera
                                         model, reference-plane point, and
@@ -2629,9 +2724,10 @@ class OverlayLivePage(QWidget):
                                         instead of recovering them from the
                                         burnt-in pixels
 
-        Without an X-ray (tracking only) 00 and 02 are left out: 03 is the
-        drill on the bare camera image, snapshot.json says tracking_only
-        and its X-ray fields are null (show_tip false).
+        Without an X-ray (tracking only) 00, 02 and 04 are left out: 03 is
+        the drill on the bare camera image, snapshot.json says tracking_only
+        and its X-ray fields are null (show_tip false). Like 03, layer 04 does
+        not follow the rail's switches; snapshot.json records them.
 
         The frame is the one on screen: the tracker's copy of the frame a
         result came from, the page's copy of a polled frame, or the view of
@@ -2682,16 +2778,15 @@ class OverlayLivePage(QWidget):
             drawn = self._drawn_out
             drill = None
             if drawn is not None:
-                drill = TrackingOverlay(
-                    self.state.K_rgb,
-                    self.state.dist_rgb,
-                    self._tool.p_tip_mm,
-                    self._tool.axis_dir,
-                )
+                drill = self._new_tool_overlay()
                 # as on the screen: a pose drawn marked stays marked
                 drill.update(drawn.points, marked=bool(drawn.points_marked))
-                drill.draw_into(comp, show_tip=True, show_axis=True)
+                drill.draw_into(comp, show_camera=True, show_xray=False)
                 layers.append(("03_rgb_overlay_drill", cv2.cvtColor(comp, cv2.COLOR_BGRA2BGR)))
+                if drill.has_xray_view:
+                    drill.draw_into(comp, show_camera=False, show_xray=True)
+                    layers.append(("04_rgb_overlay_drill_xrayview",
+                                   cv2.cvtColor(comp, cv2.COLOR_BGRA2BGR)))
 
             record = self._snapshot_record(out_dir.name, t_click, drawn, drill)
 
@@ -2789,7 +2884,10 @@ class OverlayLivePage(QWidget):
             "reference_plane_point_uv": arr(self.state.tip_uv_c),
             "reference_plane_point_xyz_c_mm": arr(self.state.tip_xyz_c),
             "show_tip": bool(self._show_tip),
-            "show_axis": bool(self._show_axis),
+            # the rail's switches; show_axis is the older name of the first
+            "show_axis": bool(self._show_camera_view),
+            "show_camera_view": bool(self._show_camera_view),
+            "show_xray_view": bool(self._show_xray_view),
             "tracking_active": bool(self._tracking_active),
             # "pose": the frame a drill pose was computed on, with its tip and
             # axis; "live": the newest camera frame, no drill. The age is
@@ -2814,6 +2912,7 @@ class OverlayLivePage(QWidget):
                         "reference_plane_point_uv", "reference_plane_point_xyz_c_mm"):
                 rec[key] = None
             rec["show_tip"] = False
+            rec["show_xray_view"] = False
 
         if drawn is not None:
             tool = drill.snapshot_record()
