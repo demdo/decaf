@@ -311,6 +311,16 @@ def make_live_tracker_config() -> TrackerConfig:
         dot_commit_frames=1,
         dot_revoke_frames=5,
         persistence_max_frames=8,
+        # Sub-grid fallback window (TrackerConfig default: 15 frames). False
+        # corners on the marker dots can cost the tracked identities while the
+        # marker is strongly tilted, and the decode only returns below about
+        # 40 deg: the planar thesis sequence (frames 2592-2695, 42-64 deg) froze
+        # the pose for 89 frames, up to 8.65 mm off. 120 frames bridge it. Replays
+        # of 04.11.: 89 of 89 frames fresh; tip, jitter and motion recordings of
+        # the thesis bit-identical; axis recordings 2553 -> 3467 fresh frames, axis
+        # angle 0.484 -> 0.491 deg; 147 debug takes +185 / -0 fresh frames, 4 more
+        # poses failing both photometric checks (all in K04, lens covered by hand).
+        prior_subgrid_max_age_frames=120,
         # Overlay GUI only: aggregated dropout log (cause + counter per
         # tracking loss after lock). The engine and this runner ignore it.
         failure_log_enabled=True,
