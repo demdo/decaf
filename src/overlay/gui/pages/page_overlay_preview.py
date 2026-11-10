@@ -21,8 +21,9 @@ from overlay.gui.pages.templates.templ_live_image import LiveImagePage
 
 from overlay.tools.homography import estimate_plane_induced_homography
 from overlay.tools.warp import blend_xray_overlay
-from overlay.tools.xray_io import read_xray_gray_u8
+from overlay.tools.xray_io import read_xray_gray_u8, xray_pixel_md5
 from overlay.gui.widgets.widget_flow_layout import FlowLayout
+from overlay.gui.widgets.widget_xray_waiting import XrayWaitingOverlay
 
 
 # ============================================================
@@ -92,8 +93,9 @@ class OverlayPreviewPage(LiveImagePage):
     --------
     - Live RGB video is shown on this page.
     - SPACE stores a frozen RGB snapshot locally on this page.
-    - Then the user can load an anatomical X-ray image.
-    - Then the user can compute the overlay.
+    - An X-ray sent from the C-arm (accept_received_xray) freezes the
+      current frame if SPACE was not pressed yet, and is overlaid at once.
+    - Fallback: load the X-ray from a file, then compute the overlay.
     - Alpha changes reuse the cached warped X-ray only.
     - Save Image stores the main overlay result data as NPZ.
 
@@ -150,11 +152,11 @@ class OverlayPreviewPage(LiveImagePage):
 
         self.instructions_label.setText(
             "1) Live RGB video is shown automatically\n"
-            "2) Press SPACE to freeze the current RGB frame\n"
-            "3) Click 'Load X-ray Image'\n"
-            "4) Click 'Overlay' to warp X-ray onto the frozen RGB frame\n"
-            "5) Adjust alpha with the slider\n"
-            "6) Click 'Next' to continue to the live overlay page"
+            "2) Send the X-ray to CONQUEST on the C-arm - the frame freezes and the\n"
+            "   overlay appears (SPACE before freezes an earlier frame)\n"
+            "   Fallback: SPACE, 'Load from file (USB)', then 'Overlay'\n"
+            "3) Adjust alpha with the slider\n"
+            "4) Click 'Next' to continue to the live overlay page"
         )
 
         self._build_controls()
@@ -169,7 +171,8 @@ class OverlayPreviewPage(LiveImagePage):
     # ---------------------------------------------------------
 
     def _build_controls(self) -> None:
-        self.btn_load_xray = QPushButton("Load X-ray Image")
+        self.btn_load_xray = QPushButton("Load from file (USB)")
+        self.btn_load_xray.setObjectName("SecondaryBtn")
         self.btn_load_xray.clicked.connect(self.load_xray_image)
         self.btn_load_xray.setFocusPolicy(Qt.NoFocus)
         self.btn_load_xray.setMinimumHeight(44)
@@ -209,6 +212,9 @@ class OverlayPreviewPage(LiveImagePage):
         self.slider_alpha.setTracking(True)
         self.slider_alpha.valueChanged.connect(self._on_alpha_changed)
         self.controls_content.addWidget(self.slider_alpha)
+
+        # small "waiting for the X-ray" pill over the video, until one is loaded
+        self.wait_overlay = XrayWaitingOverlay(self.image_label, compact=True)
 
     def _update_panels(self) -> None:
         rows = self.stats_rows()
@@ -271,6 +277,10 @@ class OverlayPreviewPage(LiveImagePage):
         self.slider_alpha.setEnabled(self._overlay_done)
 
         self.lbl_alpha.setText(f"Alpha {self._alpha:.3f}")
+
+        self.wait_overlay.setVisible(
+            prereq_ok and self._mode in ("preview", "frozen") and not self._xray_loaded
+        )
 
     def _compute_H_xc(self) -> np.ndarray:
         T_xc = np.asarray(self.state.T_xc, dtype=np.float64)
@@ -460,6 +470,9 @@ class OverlayPreviewPage(LiveImagePage):
             )
             return
 
+        self._freeze_snapshot()
+
+    def _freeze_snapshot(self) -> None:
         self._snapshot_rgb_bgr = self._live_color.copy()
         self._snapshot_taken = True
 
@@ -517,34 +530,60 @@ class OverlayPreviewPage(LiveImagePage):
 
         try:
             img = read_xray_gray_u8(path)
-
-            self._xray_gray_u8 = img
-            self._xray_gray_working_u8 = None
-            self.state.xray_image_anatomy = img.copy()
-            self.state.xray_image_anatomy_path = path
-
-            self._overlay_cache = None
-            self._overlay_bgr = None
-            self._overlay_done = False
-            self._xray_loaded = True
-            self._alpha = 0.5
-
-            self.slider_alpha.blockSignals(True)
-            self.slider_alpha.setValue(int(round(self._alpha * self.ALPHA_SLIDER_MAX)))
-            self.slider_alpha.blockSignals(False)
-
-            self.state.H_xc = None
-            self._mode = "frozen"
-
-            self._update_controls()
-            self._update_panels()
-            self.update_view()
-
-            if callable(self.on_complete_changed):
-                self.on_complete_changed()
-
         except Exception as e:
             QMessageBox.critical(self, "Failed to load X-ray image", str(e))
+            return
+        self._set_xray(img, path)
+
+    def accept_received_xray(self, path: str) -> bool:
+        """An X-ray from the C-arm (MainWindow, while this page is shown):
+        freezes the current frame if SPACE was not pressed yet, then the
+        overlay is computed at once - only the result appears. The same
+        exposure again is dropped silently. False = not taken (no live view,
+        prerequisites missing)."""
+        if not self._has_prerequisites() or self._mode == "idle":
+            return False
+        if not self._snapshot_taken and (self._mode != "preview" or self._live_color is None):
+            return False
+        try:
+            img = read_xray_gray_u8(path)
+        except Exception as e:
+            print(f"[OverlayPreview] received X-ray not readable: {path}: {e}")
+            return True
+        if self._xray_gray_u8 is not None and xray_pixel_md5(self._xray_gray_u8) == xray_pixel_md5(img):
+            print(f"[OverlayPreview] received X-ray already shown, dropped: {path}")
+            return True
+        if not self._snapshot_taken:
+            self._freeze_snapshot()
+        self._set_xray(img, path)
+        self.overlay_clicked()
+        return True
+
+    def _set_xray(self, img: np.ndarray, path: str) -> None:
+        self._xray_gray_u8 = img
+        self._xray_gray_working_u8 = None
+        self.state.xray_image_anatomy = img.copy()
+        self.state.xray_image_anatomy_path = path
+
+        self._overlay_cache = None
+        self._overlay_bgr = None
+        self._overlay_done = False
+        self._xray_loaded = True
+        self._alpha = 0.5
+
+        self.slider_alpha.blockSignals(True)
+        self.slider_alpha.setValue(int(round(self._alpha * self.ALPHA_SLIDER_MAX)))
+        self.slider_alpha.blockSignals(False)
+
+        self.state.H_xc = None
+        self._mode = "frozen"
+
+        self._update_controls()
+        self._update_panels()
+        self.update_view()
+
+        if callable(self.on_complete_changed):
+            self.on_complete_changed()
 
     def overlay_clicked(self) -> None:
         if not self._has_prerequisites():

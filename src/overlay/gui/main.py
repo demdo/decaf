@@ -33,7 +33,7 @@
 import re
 import sys
 from pathlib import Path
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 )
 
 from overlay.gui.state import SessionState
+from overlay.gui.xray_link import xray_link
 from overlay.gui.evaluation import (
     EvalBar,
     EvaluationSession,
@@ -340,6 +341,13 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(self.IDX_XRAY)
         self._call_page_enter(self.IDX_XRAY)
         self.update_ui()
+
+        # C-arm link: X-rays sent from the C-arm (DICOM over Ethernet) go to
+        # the page on screen if it is waiting for one (accept_received_xray);
+        # otherwise they stay on disk only (data/xray_received/).
+        self.xray_link = xray_link()
+        self.xray_link.received.connect(self._on_xray_received)
+        self.xray_link.start()
 
         if self.tracking_test:
             self._start_tracking_test()
@@ -932,7 +940,19 @@ class MainWindow(QMainWindow):
 
         self.update_ui()
 
+    def _on_xray_received(self, path: str) -> None:
+        # A dialog is open (file dialog, a question): hand the image over
+        # once it is closed, so no page swaps its X-ray under an open question.
+        if QApplication.activeModalWidget() is not None:
+            QTimer.singleShot(250, lambda: self._on_xray_received(path))
+            return
+        page = self.pages.widget(self.current_step)
+        take = getattr(page, "accept_received_xray", None)
+        if take is None or not take(path):
+            print(f"[XrayLink] X-ray received, no step waiting for one: {path}")
+
     def closeEvent(self, event):
+        self.xray_link.stop()
         for i in range(self.pages.count()):
             self._call_page_leave(i)
         super().closeEvent(event)

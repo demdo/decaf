@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-import pydicom
 
 from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QMessageBox, QSizePolicy
@@ -11,9 +10,10 @@ from PySide6.QtWidgets import (
 from overlay.gui.state import SessionState
 from overlay.gui.pages.templates.templ_static_image import StaticImagePage
 from overlay.gui.widgets.widget_xray_marker_selection import XrayMarkerSelectionWidget
+from overlay.gui.widgets.widget_xray_waiting import XrayWaitingOverlay
 
 from overlay.tools.blob_detection import HoughCircleParams
-from overlay.tools.xray_io import xray_pixel_md5
+from overlay.tools.xray_io import read_xray_gray_u8, xray_pixel_md5
 from overlay.tools.xray_marker_selection import (
     run_xray_marker_detection,
     compute_roi_from_grid,
@@ -98,10 +98,15 @@ class XrayMarkerSelectionPage(StaticImagePage):
         self.marker_widget.setGeometry(0, 0, self.image_label.width(), self.image_label.height())
         self.marker_widget.show()
 
+        # Shown while no X-ray is loaded: the image arrives from the C-arm
+        # by itself (accept_received_xray); the file button is the fallback.
+        self.wait_overlay = XrayWaitingOverlay(self.image_label)
+
         # ======================================================
         # RIGHT: controls
         # ======================================================
-        self.btn_load = QPushButton("Load X-ray Image")
+        self.btn_load = QPushButton("Load from file (USB)")
+        self.btn_load.setObjectName("SecondaryBtn")
         self.btn_load.clicked.connect(self.load_xray_image)
 
         self.btn_detect = QPushButton("Detect markers")
@@ -118,7 +123,8 @@ class XrayMarkerSelectionPage(StaticImagePage):
         # Instructions
         # ======================================================
         self.instructions_label.setText(
-            "1) Load an X-ray image\n"
+            "1) Take the X-ray and send it to CONQUEST on the C-arm - it appears here\n"
+            "   (fallback: 'Load from file (USB)')\n"
             "2) Click 'Detect markers'\n"
             "3) Select 3 anchor markers corresponding to:\n"
             "   TL, TR, BL in CAMERA VIEW\n"
@@ -155,6 +161,7 @@ class XrayMarkerSelectionPage(StaticImagePage):
 
     def refresh(self):
         img_raw = self.state.xray_image
+        self.wait_overlay.setVisible(img_raw is None)
 
         # --------------------------------------------------
         # Case 1: no image loaded yet
@@ -230,53 +237,73 @@ class XrayMarkerSelectionPage(StaticImagePage):
             return
 
         try:
-            if path.lower().endswith((".dcm", ".ima")):
-                ds = pydicom.dcmread(path)
-                img = ds.pixel_array.astype(np.float32)
-                img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-                img = img.astype(np.uint8)
-            else:
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-
-            if img is None:
-                raise ValueError("Could not read image.")
-
-            # Cam2X series: every height needs its own exposure. The same
-            # image again (e.g. exported twice) would pair the old hole
-            # positions with the new camera pose.
-            md5 = xray_pixel_md5(img)
-            for i, h in enumerate(self.state.cam2x_heights):
-                if h.xray_md5 == md5:
-                    QMessageBox.warning(
-                        self,
-                        "Same X-ray",
-                        f"This is the X-ray of height {i + 1} (identical pixel data).\n\n"
-                        "Every height needs its own X-ray, taken after raising the "
-                        "table. Please load the new image.",
-                    )
-                    return
-
-            self.state.xray_image = img
-            self.state.xray_image_path = path
-
-            self.state.xray_points_uv = None
-            self.state.xray_points_confirmed = False
-            self.state.xray_marker_overlay_bgr = None
-            self.state.marker_radius_px = None
-
-            self._circles = None
-            self._pick_radius_px = None
-            self._last_roi_uv_raw = None
-
-            self.marker_widget.clear_selection()
-            self.marker_widget.set_roi_indices([])
-            self.marker_widget.set_locked(False)
-
-            self.refresh()
-            self.on_complete_changed()
-
+            img = read_xray_gray_u8(path)
         except Exception as e:
             QMessageBox.critical(self, "Failed to load X-ray image", str(e))
+            return
+
+        i = self._height_of(img)
+        if i is not None:
+            QMessageBox.warning(
+                self,
+                "Same X-ray",
+                f"This is the X-ray of height {i + 1} (identical pixel data).\n\n"
+                "Every height needs its own X-ray, taken after raising the "
+                "table. Please load the new image.",
+            )
+            return
+        self._set_xray(img, path)
+
+    def accept_received_xray(self, path: str) -> bool:
+        """An X-ray from the C-arm (MainWindow, while this page is shown).
+        Only the image appears; the checks stay silent: until the markers
+        are confirmed a new exposure replaces the current one, the same
+        exposure again (sent twice, or the X-ray of an earlier height) is
+        dropped. False = not taken (markers already confirmed)."""
+        if self.state.xray_points_confirmed:
+            return False
+        try:
+            img = read_xray_gray_u8(path)
+        except Exception as e:
+            print(f"[XrayMarkerSelection] received X-ray not readable: {path}: {e}")
+            return True
+        md5 = xray_pixel_md5(img)
+        cur = self.state.xray_image
+        if self._height_of(img) is not None or (cur is not None and xray_pixel_md5(cur) == md5):
+            print(f"[XrayMarkerSelection] received X-ray already used, dropped: {path}")
+            return True
+        self._set_xray(img, path)
+        return True
+
+    def _height_of(self, img: np.ndarray) -> int | None:
+        """Cam2X series: every height needs its own exposure. The same image
+        again (e.g. exported twice) would pair the old hole positions with
+        the new camera pose. Index of the height that already has it."""
+        md5 = xray_pixel_md5(img)
+        for i, h in enumerate(self.state.cam2x_heights):
+            if h.xray_md5 == md5:
+                return i
+        return None
+
+    def _set_xray(self, img: np.ndarray, path: str) -> None:
+        self.state.xray_image = img
+        self.state.xray_image_path = path
+
+        self.state.xray_points_uv = None
+        self.state.xray_points_confirmed = False
+        self.state.xray_marker_overlay_bgr = None
+        self.state.marker_radius_px = None
+
+        self._circles = None
+        self._pick_radius_px = None
+        self._last_roi_uv_raw = None
+
+        self.marker_widget.clear_selection()
+        self.marker_widget.set_roi_indices([])
+        self.marker_widget.set_locked(False)
+
+        self.refresh()
+        self.on_complete_changed()
 
     # ---------------- Marker detection ----------------
 
