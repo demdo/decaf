@@ -5,6 +5,7 @@ hydramarker/tests/
 hydramarker/docs/
 
 # Generated calibration outputs stay local; calibration scripts remain tracked.
+hydramarker/calib/pivot_session_frames/
 hydramarker/calib/camera_calibration*.npz
 hydramarker/calib/hydramarker_camera_calibration_*.npz
 hydramarker/calib/hydramarker_camera_calibration_*_model_comparison.csv
