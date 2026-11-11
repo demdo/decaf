@@ -134,6 +134,8 @@ class XrayField:
         normal[flip] *= -1.0
         # n . x >= offset inside, per edge
         self._edges = list(zip(*normal.T.tolist(), (normal * hull).sum(axis=1).tolist()))
+        unit = normal / np.maximum(np.hypot(normal[:, 0], normal[:, 1]), 1e-12)[:, None]
+        self._unit_edges = list(zip(*unit.T.tolist(), (unit * hull).sum(axis=1).tolist()))
 
     @classmethod
     def from_image(cls, working_u8: np.ndarray, inset_px: float = 0.0,
@@ -158,6 +160,10 @@ class XrayField:
     def contains(self, uv) -> bool:
         u, v = float(uv[0]), float(uv[1])
         return all(nx * u + ny * v >= off for nx, ny, off in self._edges)
+
+    def inner_distance(self, u: float, v: float) -> float:
+        """Distance to the nearest edge in pixels, negative outside."""
+        return min(nx * u + ny * v - off for nx, ny, off in self._unit_edges)
 
     def clip_line(self, a, b) -> Optional[tuple[float, float]]:
         """Part of the infinite line a + s (b - a) inside the field: (s_in, s_out),

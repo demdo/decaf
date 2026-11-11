@@ -133,7 +133,7 @@ class TrackOutput:
         "slot", "frame_index", "t_frame", "meta", "has_ir", "epoch",
         "result", "t_start", "t_done", "skipped", "reset",
         "error", "traceback", "frame_dropped", "points", "points_kind",
-        "points_marked", "metering",
+        "points_marked", "metering", "marks",
     )
 
     def __init__(self, slot: FrameSlot, epoch: int, *, result=None,
@@ -141,7 +141,7 @@ class TrackOutput:
                  reset: bool = False, error: BaseException | None = None,
                  traceback_text: str | None = None, points=None,
                  points_kind: str | None = None, points_marked: bool = False,
-                 metering=None) -> None:
+                 metering=None, marks=None) -> None:
         self.slot: FrameSlot | None = slot
         self.frame_index = slot.frame_index
         self.t_frame = slot.t_frame
@@ -159,6 +159,8 @@ class TrackOutput:
         self.points_kind = points_kind
         self.points_marked = points_marked
         self.metering = metering
+        # tool_marks.ToolMarks of points, ready to draw (marks_builder), or None
+        self.marks = marks
         # eval mode: the slot was taken back for a newer frame before the
         # output was drained (its image is gone, the result is not)
         self.frame_dropped = False
@@ -218,6 +220,12 @@ class TrackingWorker:
     exception in it costs only that metering (n_meter_errors), never the
     tracking.
 
+    marks_builder: tool_marks.MarkBuilder or None. Builds the panels' marks
+    from the tool points in this thread, so the GUI thread only draws
+    (TrackOutput.marks). Its settings may change from the GUI thread
+    meanwhile (MarkBuilder.configure swaps one tuple). An exception in it
+    costs only that result's marks (n_marks_errors).
+
     The tracker belongs to this thread while it runs: nobody else may call
     it until stop() returned True.
     """
@@ -227,9 +235,10 @@ class TrackingWorker:
     def __init__(self, tracker, *, pool_size: int, keep_every_frame: bool = False,
                  notify: Callable[[], None] | None = None, tool_points=None,
                  frame_timing: Callable[[dict], tuple] | None = None,
-                 meter=None) -> None:
+                 meter=None, marks_builder=None) -> None:
         self._tracker = tracker
         self._tool_points = tool_points
+        self._marks_builder = marks_builder
         self._meter = meter
         self._frame_timing = frame_timing
         self._pool = _FramePool(pool_size)
@@ -256,6 +265,7 @@ class TrackingWorker:
         self.n_outbox_dropped = 0
         self.n_frame_dropped = 0
         self.n_meter_errors = 0
+        self.n_marks_errors = 0
         # A frame not taken for want of a free slot. Not part of the design
         # (the page's pool covers every owner at once); counted so a log
         # shows it. GUI thread only.
@@ -394,7 +404,7 @@ class TrackingWorker:
                     epoch = self._epoch
 
                 t_start = time.perf_counter()
-                points = points_kind = metering = None
+                points = points_kind = metering = marks = None
                 points_marked = False
                 meter = self._meter            # set_meter() may swap it meanwhile
                 try:
@@ -418,6 +428,14 @@ class TrackingWorker:
                         points = self._tool_points.update(result, slot.t_frame)
                         points_kind = self._tool_points.kind
                         points_marked = self._tool_points.marked
+                        if points is not None and self._marks_builder is not None:
+                            try:
+                                marks = self._marks_builder.build(
+                                    points, marked=points_marked, t_pose=slot.t_frame,
+                                    kind=points_kind,
+                                )
+                            except Exception:
+                                self.n_marks_errors += 1
                     if meter is not None:
                         try:
                             if reset:
@@ -440,7 +458,7 @@ class TrackingWorker:
                     slot, epoch, result=result, t_start=t_start,
                     t_done=time.perf_counter(), skipped=skipped, reset=reset,
                     points=points, points_kind=points_kind,
-                    points_marked=points_marked, metering=metering,
+                    points_marked=points_marked, metering=metering, marks=marks,
                 )
                 slot = None
                 self._publish(out)

@@ -696,7 +696,9 @@ class _Tracker:
         )
 
 
-def _make_page(rec, work_raw, distortion, poses, *, tracking_test=False, ev=None):
+def _make_page(rec, work_raw, distortion, poses, *, tracking_test=False, ev=None, panels=False):
+    """panels False: the full-frame image with the rail (these checks read
+    page._display_bgra); True: the study's panels (test_live_panels)."""
     from overlay.gui.pages.page_overlay_live import OverlayLivePage
     from overlay.gui.state import SessionState
     from tracking.hydramarker import tracker_log
@@ -715,6 +717,7 @@ def _make_page(rec, work_raw, distortion, poses, *, tracking_test=False, ev=None
     st.eval = ev
     page = OverlayLivePage(st)
     page.tracking_test = tracking_test
+    page.use_panels = panels
     page._exposure_mode = "auto"
     bgra = cv2.cvtColor(cv2.imread(str(rec.dir / "01_rgb.png")), cv2.COLOR_BGR2BGRA)
 

@@ -33,10 +33,18 @@ tenths of a pixel, which goes straight into the image remap.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+# XrayFieldDistortion.working_remap: (model, w, h) -> (map_u, map_v). One
+# detector size in practice; the lock keeps a background precompute and the
+# GUI thread from computing the same maps twice.
+_REMAP_CACHE: dict = {}
+_REMAP_CACHE_MAX = 4
+_REMAP_LOCK = threading.Lock()
 
 
 def _poly_features(uv: np.ndarray, centre: np.ndarray, scale: float,
@@ -81,20 +89,43 @@ class XrayFieldDistortion:
         ideal = self.undistort(self._to_raw(uv))
         return np.column_stack([self.width - 1 - ideal[:, 0], ideal[:, 1]])
 
-    def undistort_image_working(self, img: np.ndarray) -> np.ndarray:
-        """Resample a WORKING-space image into the ideal frame."""
-        h, w = img.shape[:2]
+    def working_remap(self, w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
+        """The maps of undistort_image_working, float32: several seconds for
+        1024 x 1024 (~19 s on the laptop's battery), and the same for every
+        image of that size. Computed once per model and size and kept
+        (_REMAP_CACHE); the maps are shared, read them only."""
+        key = (self._model_key(), int(w), int(h))
+        with _REMAP_LOCK:
+            maps = _REMAP_CACHE.get(key)
+            if maps is None:
+                maps = self._compute_working_remap(int(w), int(h))
+                for m in maps:
+                    m.setflags(write=False)
+                if len(_REMAP_CACHE) >= _REMAP_CACHE_MAX:
+                    _REMAP_CACHE.pop(next(iter(_REMAP_CACHE)))
+                _REMAP_CACHE[key] = maps
+        return maps
+
+    def _model_key(self) -> tuple:
+        return (np.asarray(self.coeff, dtype=np.float64).tobytes(), int(self.degree),
+                np.asarray(self.centre, dtype=np.float64).tobytes(), float(self.scale),
+                int(self.width))
+
+    def _compute_working_remap(self, w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
         uu, vv = np.meshgrid(np.arange(w, dtype=np.float64),
                              np.arange(h, dtype=np.float64))
         ideal_work = np.stack([uu.ravel(), vv.ravel()], axis=1)
         src_raw = self.distort(self._to_raw(ideal_work))
         src_u = self.width - 1 - src_raw[:, 0]
-        return cv2.remap(
-            img,
-            np.ascontiguousarray(src_u.reshape(h, w).astype(np.float32)),
-            np.ascontiguousarray(src_raw[:, 1].reshape(h, w).astype(np.float32)),
-            cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-        )
+        return (np.ascontiguousarray(src_u.reshape(h, w).astype(np.float32)),
+                np.ascontiguousarray(src_raw[:, 1].reshape(h, w).astype(np.float32)))
+
+    def undistort_image_working(self, img: np.ndarray) -> np.ndarray:
+        """Resample a WORKING-space image into the ideal frame."""
+        h, w = img.shape[:2]
+        map_u, map_v = self.working_remap(w, h)
+        return cv2.remap(img, map_u, map_v, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
     # ---------------- diagnostics ----------------
 

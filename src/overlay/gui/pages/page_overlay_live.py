@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import traceback
@@ -10,7 +11,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer, QRect, Signal
+from PySide6.QtCore import QLineF, Qt, QTimer, QRect, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -29,13 +30,25 @@ from PySide6.QtWidgets import (
 
 from overlay.calib.calib_xray_to_pointer import extract_depth
 from overlay.gui.state import SessionState
+from overlay.gui.widgets.widget_live_panels import (
+    POSE_HOLD_S,
+    STATUS_BAD,
+    STATUS_GOOD,
+    STATUS_NEUTRAL,
+    STATUS_WARN,
+    VIEW_LIVE,
+    WORKFLOW_SINGLE,
+    LivePanelsView,
+    readout_int,
+)
 from overlay.tools.display_exposure import AutoExposureLook
 from overlay.tools.homography import estimate_plane_induced_homography
 from overlay.tools.live_tracking import STATUS_SEARCHING, TrackingSession, TrackingWorker
 from overlay.tools.pointer_depth import PointerDepthEstimator, depth_capture_arrays
+from overlay.tools.tool_marks import MarkBuilder
 from overlay.tools.tracking_overlay import TrackingOverlay
 from overlay.tools.warp import prepare_live_overlay
-from overlay.tools.xray_io import read_xray_gray_u8
+from overlay.tools.xray_io import read_xray_gray_u8, xray_pixel_md5
 from overlay.tools.xray_view import XrayField, XrayView
 
 # The camera is owned by the tracking hardware boundary so the tuned
@@ -73,6 +86,18 @@ PROFILE_LOG_NAME = "live_profile.log"
 # mode: overlay/data/snapshots/; Evaluation mode: <label>_live/ in the
 # session folder.
 SNAPSHOT_DIR = Path(__file__).resolve().parents[2] / "data" / "snapshots"
+
+# The study's panels (gui/widgets/widget_live_panels.py, user study DHS): video
+# crop, X-ray view 1 with the drill and its ruler, read-outs and control cards
+# below, on the page with an X-ray. The tracking test (no X-ray) keeps the
+# full-frame image with the rail. DECAF_LIVE_RAIL=1 brings back the rail with
+# the X-ray as well (the page before 10.11.), as a fallback in the lab.
+LIVE_PANELS = os.environ.get("DECAF_LIVE_RAIL", "") != "1"
+# Read-out tiles and the status line: at most this often (each new text is a
+# new pixmap).
+PANEL_READOUT_S = 0.2
+# A message in the status line (plane set, snapshot saved, ...) stays this long.
+PANEL_STATUS_HOLD_S = 5.0
 
 
 # ============================================================
@@ -752,6 +777,20 @@ def _bgra_to_qpixmap(img_bgra: np.ndarray) -> QPixmap:
     h, w = img_bgra.shape[:2]
     qimg = QImage(img_bgra.data, w, h, 4 * w, QImage.Format_RGB32)
     return QPixmap.fromImage(qimg)
+
+
+def _signed_mm(value: float) -> str:
+    """+0.6 / −0.6 with a real minus sign, for the status line."""
+    return f"{value:+.1f}".replace("-", "−")
+
+
+def _xray_link_ready() -> bool:
+    """The C-arm link listens (overlay.gui.xray_link); True if unknown."""
+    try:
+        from overlay.gui.xray_link import xray_link
+        return bool(getattr(xray_link().status, "ready", True))
+    except Exception:
+        return True
 
 
 # ============================================================
@@ -1482,6 +1521,32 @@ class OverlayLivePage(QWidget):
         # frame on screen, which may be an older frame of a tracking result
         self._frame_exposure: dict[int, dict | None] = {}
 
+        # --- the study's panels (LIVE_PANELS, page with an X-ray) ---
+        # use_panels: the page with an X-ray shows them (tests switch it off
+        # to check the rail); _panels_mode: they are on screen now (on_enter).
+        self.use_panels = LIVE_PANELS
+        self._panels_mode = False
+        self._builder: MarkBuilder | None = None   # marks, built in the tracking thread
+        self._panel_marks = None           # ToolMarks of the newest fresh pose
+        self._panel_buf: np.ndarray | None = None   # LUT / pointer frame for panel 1
+        self._t_readout = 0.0
+        self._t_age = 0.0
+        self._t_fps = 0.0
+        self._n_shown = 0
+        self._fps = 0.0
+        # a message in the status line: (text, colour, until perf_counter or None)
+        self._status_msg: tuple | None = None
+        self._resume_tracking = False      # tracking ran when the plane search began
+        self._xray_waiting = False         # Load X-ray: the next C-arm image is taken
+        self._xray_pending: str | None = None   # an image that came without the button
+        self._xray_t_acquired: tuple | None = None   # (path, time) of one loaded here
+        # Evaluation: a new X-ray on this page opened the label of the next
+        # plane; the plane set after it belongs to that label (_apply_plane).
+        self._xray_starts_label = False
+        # the running pointer search came with a new X-ray (single view: a new
+        # X-ray starts it by itself, 11.11.); ESC then keeps the plane before
+        self._plane_new_xray = False
+
         self._build_ui()
         self._connect_signals()
         self._load_xray_from_state()
@@ -1500,9 +1565,17 @@ class OverlayLivePage(QWidget):
         self.image_label.setStyleSheet("background: black;")
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.controls = _OverlayControlRail(self)
+        self._rail = _OverlayControlRail(self)
         # the main window wires a page's btn_back (shown in tracking only)
-        self.btn_back = self.controls.btn_back
+        self.btn_back = self._rail.btn_back
+
+        # The study's panels, single view (two views come with the
+        # X-ray Acquisition step). Their widgets carry the rail's names, so
+        # self.controls is whichever of the two is on screen (on_enter).
+        self.panels = LivePanelsView(self)
+        self.panels.set_workflow(WORKFLOW_SINGLE)
+        self.panels.hide()
+        self.controls = self._rail
 
         self.setStyleSheet(
             """
@@ -1516,31 +1589,53 @@ class OverlayLivePage(QWidget):
         super().resizeEvent(event)
 
         self.image_label.setGeometry(self.rect())
+        self.panels.setGeometry(self.rect())
         self._position_controls()
-        self._update_image_label()
+        if not self._panels_mode:
+            self._update_image_label()
 
     def _position_controls(self) -> None:
         margin_top = 18
         margin_right = 18
-        size = self.controls.size()
+        rail = self._rail
+        size = rail.size()
 
         x = self.width() - size.width() - margin_right - 8
         y = margin_top
 
-        self.controls.setGeometry(QRect(x, y, size.width(), size.height()))
-        self.controls.raise_()
+        rail.setGeometry(QRect(x, y, size.width(), size.height()))
+        rail.raise_()
 
     def _connect_signals(self) -> None:
-        self.controls.slider_alpha.valueChanged.connect(self._on_alpha_changed)
-        self.controls.slider_dx.valueChanged.connect(self._on_dx_offset_changed)
-        self.controls.chk_show_tip.toggled.connect(self._on_show_tip_toggled)
-        self.controls.chk_show_camera_view.toggled.connect(self._on_show_camera_view_toggled)
-        self.controls.chk_show_xray_view.toggled.connect(self._on_show_xray_view_toggled)
-        self.controls.btn_track.clicked.connect(self._on_track_button)
-        self.controls.chk_marker_exposure.setChecked(self._exposure_mode == MODE_MARKER)
-        self.controls.chk_marker_exposure.toggled.connect(self._on_marker_exposure_toggled)
-        self.controls.btn_save.clicked.connect(self._on_save_snapshot)
-        self.controls.btn_plane.clicked.connect(self._on_plane_button)
+        rail = self._rail
+        rail.slider_alpha.valueChanged.connect(self._on_alpha_changed)
+        rail.slider_dx.valueChanged.connect(self._on_dx_offset_changed)
+        rail.chk_show_tip.toggled.connect(self._on_show_tip_toggled)
+        rail.chk_show_camera_view.toggled.connect(self._on_show_camera_view_toggled)
+        rail.chk_show_xray_view.toggled.connect(self._on_show_xray_view_toggled)
+        rail.btn_track.clicked.connect(self._on_track_button)
+        rail.chk_marker_exposure.setChecked(self._exposure_mode == MODE_MARKER)
+        rail.chk_marker_exposure.toggled.connect(self._on_marker_exposure_toggled)
+        rail.btn_save.clicked.connect(self._on_save_snapshot)
+        rail.btn_plane.clicked.connect(self._on_plane_button)
+
+        # the panels: the same handlers; the card's buttons as decided 10.11.
+        p = self.panels
+        p.slider_alpha.valueChanged.connect(self._on_alpha_changed)
+        p.slider_dx.valueChanged.connect(self._on_dx_offset_changed)
+        p.chk_show_camera_view.toggled.connect(self._on_show_camera_view_toggled)
+        p.chk_show_xray_view.toggled.connect(self._on_show_xray_view_toggled)
+        p.btn_track.clicked.connect(self._on_track_button)
+        p.chk_marker_exposure.setChecked(self._exposure_mode == MODE_MARKER)
+        p.chk_marker_exposure.toggled.connect(self._on_marker_exposure_toggled)
+        p.btn_save.clicked.connect(self._on_save_snapshot)
+        p.btn_plane.clicked.connect(self.start_plane_only)
+        p.btn_load_xray.clicked.connect(self._on_load_xray_button)
+        p.btn_usb.clicked.connect(self._on_usb_button)
+        p.panel_live.roi_changed.connect(self._on_panel_roi_changed)
+        p.view_changed.connect(lambda _view: self._on_panel_roi_changed())
+        p.panel_view1.map_changed.connect(self._on_panel_map_changed)
+
         self._track_result_ready.connect(self._on_track_result_ready, Qt.QueuedConnection)
         self._snapshot_saved.connect(self._on_snapshot_saved, Qt.QueuedConnection)
 
@@ -1903,6 +1998,11 @@ class OverlayLivePage(QWidget):
                 if prof:
                     prof.add("plane", time.perf_counter() - t)
 
+            if self._panels_mode:
+                # X-ray panel, read-outs, status: per tick, they only repaint
+                # what changed
+                self._tick_panels()
+
             shown = self._choose_frame(frame, t_frame)
             if shown is None:
                 return
@@ -1910,18 +2010,21 @@ class OverlayLivePage(QWidget):
 
             t0 = prof.frame_start() if prof else 0.0
             self._live_color = img
-            self._display_bgra = self._compose_frame(
-                img, draw_tool=pose_out is not None,
-                exposure=self._frame_exposure.get(self._shown_index),
-            )
-            # the result whose drill is now on screen (the snapshot redraws it)
-            ov = self._tool_overlay
-            self._drawn_out = (
-                pose_out if pose_out is not None and ov is not None and ov.has_pose else None
-            )
-            if self._plane_acquiring:
-                self._draw_plane_acquire(self._display_bgra)
-            self._update_image_label()
+            if self._panels_mode:
+                self._show_on_panels(img, pose_out, self._frame_exposure.get(self._shown_index))
+            else:
+                self._display_bgra = self._compose_frame(
+                    img, draw_tool=pose_out is not None,
+                    exposure=self._frame_exposure.get(self._shown_index),
+                )
+                # the result whose drill is now on screen (the snapshot redraws it)
+                ov = self._tool_overlay
+                self._drawn_out = (
+                    pose_out if pose_out is not None and ov is not None and ov.has_pose else None
+                )
+                if self._plane_acquiring:
+                    self._draw_plane_acquire(self._display_bgra)
+                self._update_image_label()
 
             if prof:
                 prof.add("age", time.perf_counter() - self._shown_t_frame)
@@ -1931,6 +2034,7 @@ class OverlayLivePage(QWidget):
                     "pose": pose_out is not None,
                     "tracking": self._tracking_active,
                     "xray": self._overlay_cache is not None,
+                    "panels": self._panels_mode,
                 })
 
         except Exception as e:
@@ -2144,6 +2248,358 @@ class OverlayLivePage(QWidget):
             prof.add("qpixmap", time.perf_counter() - t)
 
     # --------------------------------------------------------
+    # The study's panels (page with an X-ray, LIVE_PANELS)
+    # --------------------------------------------------------
+    #
+    # Panel 1 draws the camera frame straight from its memory and blends only
+    # the X-ray field's box (CameraPanel.show_frame); X-ray view 1 repaints
+    # only around the drill. The marks come finished from the tracking
+    # thread (TrackOutput.marks, MarkBuilder); here they are only handed on.
+    # Drill on panel 1 only on the frame its pose came from (as before); the
+    # X-ray panel and the read-outs keep the newest pose for POSE_HOLD_S.
+
+    def _setup_panels(self) -> None:
+        """on_enter, X-ray and prerequisites there: builder, panels, the X-ray."""
+        p = self.panels
+        st = self.state
+        self._builder = MarkBuilder(st.K_rgb, st.dist_rgb, line_factory=QLineF)
+        self._panel_marks = None
+        self._status_msg = None
+        self._xray_waiting = False
+        self._xray_pending = None
+        self._resume_tracking = False
+        self._xray_starts_label = False
+        p.btn_load_xray.setText("Load X-ray")
+        p.panel_live.set_frame_size(self.COLOR_SIZE)
+        p.panel_live.alpha = self._alpha
+        p.panel_live.show_camera_view = self._show_camera_view
+        p.panel_live.show_xray_view = self._show_xray_view
+        prof = self._profile
+        p.panel_live.prof = prof.add if prof is not None else None
+        p.panel_view1.prof = prof.add if prof is not None else None
+        p.slider_alpha.blockSignals(True)
+        p.slider_alpha.setValue(int(round(self._alpha * self.ALPHA_SLIDER_MAX)))
+        p.slider_alpha.blockSignals(False)
+        p.lbl_alpha_value.setText(f"{self._alpha:.2f}")
+        p.btn_track.setEnabled(self._tool is not None)
+        if self._tool is None:
+            p.lbl_track_status.setText("no tool loaded")
+        p.tile_off_plane.set_value(None)
+        p.tile_inclination.set_value(None)
+        p.plane_view.set_state(None, None)
+
+        # the age in the header: since it came in here, else since the file was written
+        path = st.xray_image_anatomy_path
+        loaded = self._xray_t_acquired
+        if loaded is not None and loaded[0] == path:
+            t_acquired = loaded[1]
+        else:
+            try:
+                t_acquired = Path(path).stat().st_mtime if path else time.time()
+            except OSError:
+                t_acquired = time.time()
+        self._panels_new_xray(t_acquired)
+        self._on_panel_map_changed()
+        self._t_readout = self._t_age = 0.0
+        self._n_shown = 0
+
+    def _panels_new_xray(self, t_acquired: float) -> None:
+        """X-ray view 1, the marks' X-ray frame and panel 1's blend and crop
+        for the X-ray now on the page."""
+        p = self.panels
+        working = self._xray_working_u8
+        if working is None or self._builder is None or self._current_d_x_mm is None:
+            return
+        p.panel_view1.set_xray(working, t_acquired,
+                               time.strftime("%H:%M", time.localtime(t_acquired)))
+        view, field = self._xray_view_and_field(self._current_d_x_mm, self._tool_overlay)
+        h, w = working.shape[:2]
+        self._builder.set_xray(view, field, self._current_d_x_mm, (w, h))
+        self._panels_plane_changed(recentre=True)
+
+    def _panels_plane_changed(self, recentre: bool) -> None:
+        """A new d_x (slider, new plane, new X-ray): the marks' plane, panel
+        1's blend, and with recentre the crop on the field (fixed per X-ray
+        and plane: a crop following the drill would move the whole picture)."""
+        b = self._builder
+        p = self.panels
+        if b is None or self._xray_working_u8 is None or self._current_d_x_mm is None:
+            return
+        h, w = self._xray_working_u8.shape[:2]
+        b.set_plane_depth(self._current_d_x_mm, (w, h))
+        overlay = self._ensure_overlay()
+        p.panel_live.set_overlay(overlay)
+        if recentre:
+            fw, fh = self.COLOR_SIZE
+            b.set_camera_panel((0, 0, fw, fh))
+            outline = b.field_outline_on_camera()
+            if outline:
+                cx = sum(u for u, _ in outline) / len(outline)
+                cy = sum(v for _, v in outline) / len(outline)
+            else:
+                cx, cy = fw / 2.0, fh / 2.0
+            p.panel_live.set_centre(cx, cy)
+        self._on_panel_roi_changed()
+
+    def _ensure_overlay(self):
+        """The X-ray blend of the current d_x (prepare_live_overlay), as
+        _compose_frame builds it, but at once (panel 1 wants it now)."""
+        if (self._overlay_cache is None and self._xray_working_u8 is not None
+                and self._H_xc_lookup):
+            H_xc = self._get_current_H_xc()
+            self.state.H_xc = H_xc
+            self._overlay_cache = prepare_live_overlay(
+                xray_gray_u8=self._xray_working_u8,
+                H_xc=H_xc,
+                camera_size_wh=self.COLOR_SIZE,
+                K_camera=self.state.K_rgb,
+                dist_coeffs=self.state.dist_rgb,
+            )
+        return self._overlay_cache
+
+    def _on_panel_roi_changed(self) -> None:
+        b = self._builder
+        if b is None:
+            return
+        p = self.panels
+        b.set_camera_panel(p.panel_live.roi if p.view == VIEW_LIVE else None)
+        p.panel_live.set_field_outline(b.field_outline_on_camera())
+
+    def _on_panel_map_changed(self) -> None:
+        if self._builder is None:
+            return
+        v1 = self.panels.panel_view1
+        self._builder.set_xray_panel(v1.panel_map, v1.mark_scale)
+
+    def _show_on_panels(self, img: np.ndarray, pose_out, exposure: dict | None) -> None:
+        """Panel 1, one shown frame: straight from the frame's memory; a copy
+        only under the marker exposure's display LUT or while the pointer is
+        searched (its corners are drawn into the copy)."""
+        p = self.panels
+        prof = self._profile
+        frame, stays = img, not self._screen_view
+        t = time.perf_counter()
+        look = self._display_look
+        look.update(img, exposure)
+        if look.lut() is not None or self._plane_acquiring:
+            buf = self._panel_buf
+            if buf is None or buf.shape != img.shape:
+                buf = self._panel_buf = np.empty_like(img)
+            look.apply(img, buf)
+            if self._plane_acquiring:
+                self._draw_plane_acquire(buf, with_text=False)
+            frame, stays = buf, True
+            if prof:
+                prof.add("lut", time.perf_counter() - t)
+        marks = None
+        self._drawn_out = None
+        if pose_out is not None and pose_out.points is not None:
+            # the result whose drill is now on screen (the snapshot redraws it)
+            self._drawn_out = pose_out
+            marks = pose_out.marks
+        live = p.panel_live
+        live.set_marks(marks)
+        if live.isVisible():
+            live.show_frame(frame, stays_valid=stays)
+        self._n_shown += 1
+
+    def _tick_panels(self) -> None:
+        """Per timer tick: X-ray view 1 with the newest pose (repaints only
+        around the drill, and only when it changed), the side view, and at
+        PANEL_READOUT_S the tiles and the status line."""
+        p = self.panels
+        now = time.perf_counter()
+        m = self._panel_marks
+        if m is not None and (not self._tracking_active or now - m.t_pose > POSE_HOLD_S):
+            m = None
+        p.panel_view1.set_marks(m)
+        p.panel_view1.set_lost(self._tracking_active and m is None)
+        if m is None:
+            p.plane_view.set_state(None, None)
+        else:
+            p.plane_view.set_state(m.off_plane_mm, m.rise_deg)
+        if now - self._t_readout >= PANEL_READOUT_S:
+            self._t_readout = now
+            if m is None:
+                p.tile_off_plane.set_value(None)
+                p.tile_inclination.set_value(None)
+            else:
+                # whole numbers (user 10.11.)
+                p.tile_off_plane.set_value(readout_int(m.off_plane_mm, signed=True))
+                p.tile_inclination.set_value(readout_int(m.inclination_deg))
+            p.lbl_status.setText(*self._panel_status_line(m, now))
+        if now - self._t_age >= 1.0:
+            dt = now - self._t_age
+            self._fps = self._n_shown / dt if self._t_age > 0.0 and dt > 0.0 else 0.0
+            self._n_shown = 0
+            self._t_age = now
+            if not self._xray_waiting:
+                p.panel_view1.tick(time.time())
+
+    def _panel_status_line(self, m, now: float) -> tuple:
+        """(text, colour) of the status line (texts decided 10.11.)."""
+        if self._plane_acquiring:
+            d = self._plane_d_x_mm
+            head, esc = (("New X-ray", "ESC keep plane") if self._plane_new_xray
+                         else ("Plane", "ESC cancel"))
+            if self._plane_res is None or d is None:
+                return f"{head}: pointer not found  ·  {esc}", STATUS_BAD
+            old = self._base_d_x_mm
+            delta = "" if old is None else f" (Δ {_signed_mm(d - old)})"
+            return (f"{head}: pointer found  ·  d_x {d:.1f} mm{delta}  ·  SPACE accept  ·  {esc}",
+                    STATUS_GOOD)
+        msg = self._status_msg
+        if msg is not None:
+            text, colour, until = msg
+            if until is None or now < until:
+                return text, colour
+            self._status_msg = None
+        if self._xray_waiting:
+            return "Waiting for the X-ray from the C-arm  ·  ESC cancel", STATUS_NEUTRAL
+        if not self._tracking_active:
+            return "Tracking off", STATUS_NEUTRAL
+        if m is None:
+            return "No tracking", STATUS_NEUTRAL
+        text = f"Tracking active  ·  {m.kind or '–'}  ·  {self._fps:.0f} fps"
+        if m.marked:
+            text += "  ·  marker partly occluded"
+        return text, STATUS_NEUTRAL
+
+    def _panel_status(self, text: str, colour=STATUS_NEUTRAL,
+                      hold_s: float | None = PANEL_STATUS_HOLD_S) -> None:
+        """A message in the status line, at once; hold_s None: until another
+        one replaces it."""
+        until = None if hold_s is None else time.perf_counter() + hold_s
+        self._status_msg = (text, colour, until)
+        if self._panels_mode:
+            self.panels.lbl_status.setText(text, colour)
+
+    # ---------------- Load X-ray (decided 10.11.) ----------------
+    #
+    # Single view: "Load X-ray" waits for the next image from the C-arm
+    # (MainWindow -> accept_received_xray); "From folder (USB)" takes one
+    # from a folder, the way when the link is down. An image that comes
+    # without the button waits until the button is pressed. The new image
+    # replaces X-ray view 1 and the pointer search for its plane starts by
+    # itself (11.11.): SPACE sets the plane, ESC keeps the one before.
+
+    def _on_load_xray_button(self) -> None:
+        if not self._panels_mode:
+            return
+        if self._xray_waiting:
+            self._cancel_xray_wait()
+            return
+        if self._xray_pending is not None:
+            path, self._xray_pending = self._xray_pending, None
+            self._status_msg = None
+            self._take_xray_file(path, "C-arm")
+            self.setFocus()
+            return
+        self._xray_waiting = True
+        p = self.panels
+        p.btn_load_xray.setText("Cancel")
+        p.panel_view1.set_right_text("Waiting for the X-ray…")
+        if not _xray_link_ready():
+            self._panel_status("C-arm link not ready  ·  From folder (USB) loads from a folder",
+                               STATUS_WARN, None)
+        else:
+            self._status_msg = None
+            p.lbl_status.setText("Waiting for the X-ray from the C-arm  ·  ESC cancel", STATUS_NEUTRAL)
+        self.setFocus()
+
+    def _cancel_xray_wait(self, status: str = "No new X-ray (cancelled)") -> None:
+        self._xray_waiting = False
+        self.panels.btn_load_xray.setText("Load X-ray")
+        self.panels.panel_view1.tick(time.time())
+        if status:
+            self._panel_status(status)
+
+    def _on_usb_button(self) -> None:
+        if not self._panels_mode:
+            return
+        if self._xray_waiting:
+            self._cancel_xray_wait(status="")
+        path = self._ask_xray_path("Load X-ray from a folder (USB)")
+        if path:
+            self._take_xray_file(path, "USB")
+        self.setFocus()
+
+    def accept_received_xray(self, path: str) -> bool:
+        """MainWindow, while this page is shown: an X-ray from the C-arm.
+        Panels only: after Load X-ray it replaces X-ray view 1 at once;
+        without the button it waits until the button is pressed. False: not
+        taken (the rail page, no live view)."""
+        if not self._panels_mode or self.camera is None or self._xray_gray_u8 is None:
+            return False
+        if self._xray_waiting:
+            self._xray_waiting = False
+            self.panels.btn_load_xray.setText("Load X-ray")
+            self._take_xray_file(path, "C-arm")
+            return True
+        self._xray_pending = path
+        self._panel_status("X-ray received  ·  press Load X-ray to show it", STATUS_WARN, None)
+        return True
+
+    def _take_xray_file(self, path: str, source: str) -> bool:
+        try:
+            img = read_xray_gray_u8(path)
+        except Exception as e:
+            print(f"[live] X-ray not readable ({source}): {path}: {e}")
+            if source == "USB":
+                QMessageBox.critical(self, "Load X-ray", f"Could not read the X-ray.\n\n{e}")
+            else:
+                self._panel_status(f"X-ray not readable: {Path(path).name}", STATUS_BAD)
+            return False
+        if self._xray_gray_u8 is not None and xray_pixel_md5(self._xray_gray_u8) == xray_pixel_md5(img):
+            self._panel_status("Same X-ray as on screen  ·  nothing changed")
+            return True
+        self._set_new_xray(img, str(path), source)
+        return True
+
+    def _set_new_xray(self, img: np.ndarray, path: str, source: str) -> None:
+        """A new X-ray in X-ray view 1 and panel 1, then the pointer search for
+        its plane (single view, 11.11.); the drill stays, tracking pauses for
+        the search and comes back after SPACE / ESC."""
+        t0 = time.perf_counter()
+        self.state.xray_image_anatomy = img
+        self.state.xray_image_anatomy_path = path
+        self._load_xray_from_state()       # flip + undistortion (maps kept)
+        self._invalidate_overlay_cache()
+        t_acquired = time.time()
+        self._xray_t_acquired = (path, t_acquired)
+        if self._tool_overlay is not None:
+            self._attach_xray_view(self._tool_overlay)
+        self._panels_new_xray(t_acquired)
+        ev = self.state.eval
+        if ev is not None:
+            try:
+                # one plane = new X-ray + pointer + snapshot under one label (as
+                # the rail's plane button): the X-ray comes first here, so it
+                # opens the next label and the plane after it stays on it
+                ev.set_label(ev.next_label(ev.label))
+                self._xray_starts_label = True
+                ev.copy_file("xray", path, page="overlay_live_xray")
+                ev.log("overlay_live", Path(path).name,
+                       {"new_xray": source, "d_x_mm": self._current_d_x_mm})
+            except Exception as e:
+                print(f"[WARN] Could not record the new X-ray: {e}")
+        # a new X-ray is a new plane: no "Set reference plane" needed (11.11.)
+        if not self._plane_acquiring:
+            self.start_plane_only()
+        if self._plane_acquiring:
+            self._plane_new_xray = True
+            self.panels.lbl_status.setText(*self._panel_status_line(None, time.perf_counter()))
+        else:
+            d = self._current_d_x_mm
+            kept = "" if d is None else f" (d_x {d:.1f} mm)"
+            self._panel_status(
+                f"New X-ray  ·  Π kept{kept}  ·  pointer search not possible",
+                STATUS_WARN, hold_s=2.0 * PANEL_STATUS_HOLD_S,
+            )
+        print(f"[live] new X-ray from {source}: {path} "
+              f"({(time.perf_counter() - t0) * 1000.0:.0f} ms)")
+
+    # --------------------------------------------------------
     # Tool tracking (button-driven, own thread)
     # --------------------------------------------------------
     #
@@ -2244,16 +2700,26 @@ class OverlayLivePage(QWidget):
             overlay.set_xray_view(None)
             return
         try:
-            if self._xray_geometry is None:
-                view = XrayView(self.state.T_xc, self.state.K_xray)
-                h, w = self._xray_working_u8.shape[:2]
-                self._xray_geometry = (view, XrayField.from_image(
-                    self._xray_working_u8, overlay.field_inset_px(view, (w, h), d_x)
-                ))
-            overlay.set_xray_view(*self._xray_geometry, d_x)
+            overlay.set_xray_view(*self._xray_view_and_field(d_x, overlay), d_x)
         except Exception as e:
             print(f"[WARN] Live page: no X-ray view of the drill: {e}")
             overlay.set_xray_view(None)
+
+    def _xray_view_and_field(self, d_x: float, overlay: TrackingOverlay | None = None):
+        """(XrayView, XrayField) of the X-ray on the page, once per X-ray
+        (_load_xray_from_state drops it): the drill's overlay and the panels'
+        marks use the same field. The inset only needs the camera model, so
+        without a drill overlay one without a tool does."""
+        if self._xray_geometry is None:
+            if overlay is None:
+                overlay = TrackingOverlay(self.state.K_rgb, self.state.dist_rgb,
+                                          np.zeros(3), np.array([0.0, 0.0, 1.0]))
+            view = XrayView(self.state.T_xc, self.state.K_xray)
+            h, w = self._xray_working_u8.shape[:2]
+            self._xray_geometry = (view, XrayField.from_image(
+                self._xray_working_u8, overlay.field_inset_px(view, (w, h), d_x)
+            ))
+        return self._xray_geometry
 
     def _start_tracking(self) -> None:
         if self._tracking_active or self._tool is None or self.camera is None:
@@ -2303,7 +2769,10 @@ class OverlayLivePage(QWidget):
                 mark_below_visible_frac=self._mark_below_visible_frac,
             ),
             frame_timing=self._tracker.ir_frame_timing,
+            # the panels' marks are built in the tracking thread
+            marks_builder=self._builder if self._panels_mode else None,
         )
+        self._panel_marks = None
         self._track_session = TrackingSession(
             self._has_fresh_pose,
             self._track_worker.request_reset,
@@ -2379,6 +2848,7 @@ class OverlayLivePage(QWidget):
         if self._tool_overlay is not None:
             self._tool_overlay.clear()
         self._overlay_out = None
+        self._panel_marks = None
         if self._tracker is not None:
             if stopped:
                 try:
@@ -2471,11 +2941,17 @@ class OverlayLivePage(QWidget):
             self._release_out(out)
             return
 
-        # the overlay first: if it raises, no result has changed hands yet
+        # the overlay first: if it raises, no result has changed hands yet.
+        # On the panels the marks come from the tracking thread (out.marks);
+        # the full-frame overlay is then only kept for the evaluation's
+        # frame log (its projected tip / axis).
         if step.fresh:
-            self._tool_overlay.update(out.points, marked=out.points_marked)
-            if prof and self._tool_overlay.has_xray_view:
-                prof.add("xview_up", self._tool_overlay.xray_update_s)
+            if not self._panels_mode or log is not None:
+                self._tool_overlay.update(out.points, marked=out.points_marked)
+                if prof and self._tool_overlay.has_xray_view:
+                    prof.add("xview_up", self._tool_overlay.xray_update_s)
+            if self._panels_mode:
+                self._panel_marks = out.marks
         else:
             self._tool_overlay.clear()
         if log is not None:
@@ -2674,6 +3150,7 @@ class OverlayLivePage(QWidget):
     def _on_alpha_changed(self, value: int) -> None:
         self._alpha = float(value) / float(self.ALPHA_SLIDER_MAX)
         self.controls.lbl_alpha_value.setText(f"{self._alpha:.2f}")
+        self.panels.panel_live.alpha = self._alpha
 
     def _on_dx_offset_changed(self, value: int) -> None:
         if self._base_d_x_mm is None:
@@ -2690,15 +3167,19 @@ class OverlayLivePage(QWidget):
         self._overlay_cache = None
         if self._tool_overlay is not None:
             self._tool_overlay.set_plane_depth(self._current_d_x_mm)
+        if self._panels_mode:
+            self._panels_plane_changed(recentre=False)
 
     def _on_show_tip_toggled(self, checked: bool) -> None:
         self._show_tip = bool(checked)
 
     def _on_show_camera_view_toggled(self, checked: bool) -> None:
         self._show_camera_view = bool(checked)
+        self.panels.panel_live.show_camera_view = self._show_camera_view
 
     def _on_show_xray_view_toggled(self, checked: bool) -> None:
         self._show_xray_view = bool(checked)
+        self.panels.panel_live.show_xray_view = self._show_xray_view
 
     def _on_save_snapshot(self) -> None:
         """Save the current frame as stacked presentation layers.
@@ -2846,11 +3327,17 @@ class OverlayLivePage(QWidget):
                 numbers["layers"] = len(written)
                 ev.log("overlay_live", out_dir.name + "/", numbers)
 
-            QMessageBox.information(
-                self,
-                "Save snapshot",
-                f"Saved {len(written)} layer(s):\n{', '.join(written)}\n\n{out_dir}",
-            )
+            if self._panels_mode:
+                # in the status line: a box would stop the work and hold back
+                # an X-ray from the C-arm (MainWindow waits for open dialogs)
+                self._panel_status(f"Snapshot saved  ·  {out_dir.name}  ·  {len(written)} files")
+                print(f"[live] snapshot saved: {out_dir} ({', '.join(written)})")
+            else:
+                QMessageBox.information(
+                    self,
+                    "Save snapshot",
+                    f"Saved {len(written)} layer(s):\n{', '.join(written)}\n\n{out_dir}",
+                )
         except Exception as e:
             QMessageBox.critical(self, "Save snapshot", f"Saving failed.\n\n{e}")
 
@@ -2982,7 +3469,63 @@ class OverlayLivePage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Failed to load X-ray image", str(e))
             return
+        self._begin_plane_acquire(xray, path)
 
+    def start_plane_only(self) -> None:
+        """A new pointer plane for the X-ray on screen, nothing else: no file
+        dialog, the image, its field and its age stay. What the button
+        "Set reference plane" of the study's panels does; today's rail still
+        asks for a new X-ray (_on_plane_button)."""
+        if self._plane_acquiring:
+            self._cancel_plane()
+            return
+        if self._tracking_only or self.camera is None or not self._has_prerequisites():
+            return
+        # on the panels tracking comes back by itself after the plane (10.11.)
+        self._resume_tracking = self._panels_mode and self._tracking_active
+        self._begin_plane_acquire(None, None)
+
+    def _cancel_plane(self) -> None:
+        """Button "Cancel" or ESC while the pointer is searched."""
+        self._end_plane_acquire("cancelled")
+        if self._panels_mode:
+            if self._plane_new_xray:
+                d = self._current_d_x_mm
+                self._panel_status(f"New X-ray  ·  plane kept (d_x {d:.1f} mm)")
+            else:
+                self._panel_status("Plane unchanged (cancelled)")
+            self._resume_tracking_after_plane()
+
+    def _accept_plane_now(self) -> None:
+        """Panels, SPACE: the plane of the pointer found on this frame, without
+        a question (decided 10.11.); the status line says what changed."""
+        res, raw, d_new = self._plane_res, self._plane_raw, self._plane_d_x_mm
+        if res is None or d_new is None or self._plane_rgb is None:
+            return      # the status line says: pointer not found
+        rgb = self._plane_rgb.copy()
+        old = self._base_d_x_mm
+        try:
+            self._apply_plane(res, raw, rgb, d_new)
+        except Exception as e:
+            QMessageBox.critical(self, "Set reference plane", f"Failed.\n\n{e}")
+            return
+        ev = self.state.eval
+        label = "" if ev is None else f"{ev.sanitize_label(ev.label)}: "
+        was = "" if old is None else f" (was {old:.1f})"
+        which = "new X-ray" if self._plane_new_xray else "same X-ray"
+        self._panel_status(f"{label}Plane set  ·  d_x {d_new:.1f} mm{was}  ·  {which}")
+        # another plane is another place in the camera image: the crop follows
+        self._panels_plane_changed(recentre=True)
+        self._resume_tracking_after_plane()
+        self.setFocus()
+
+    def _resume_tracking_after_plane(self) -> None:
+        if self._resume_tracking:
+            self._resume_tracking = False
+            self._start_tracking()
+
+    def _begin_plane_acquire(self, xray, path) -> None:
+        """xray, path None: the current X-ray stays."""
         # The drill tracker and the pointer solve do not share the frame
         # budget; tracking restarts with its button afterwards.
         if self._tracking_active:
@@ -2997,21 +3540,28 @@ class OverlayLivePage(QWidget):
         self._plane_res = None
         self._plane_raw = None
         self._plane_d_x_mm = None
+        self._plane_new_xray = False      # _set_new_xray sets it after this
         self._plane_acquiring = True
 
         self.controls.btn_plane.setText("Cancel")
         self.controls.btn_track.setEnabled(False)
-        self.controls.lbl_plane_status.setText(
-            f"X-ray: {Path(path).name}\npointer: SPACE accept · ESC cancel"
-        )
+        if self._panels_mode:
+            # the status line follows the search (_panel_status_line)
+            self._status_msg = None
+            self.panels.lbl_status.setText(*self._panel_status_line(None, time.perf_counter()))
+        else:
+            which = "same image" if path is None else Path(path).name
+            self.controls.lbl_plane_status.setText(
+                f"X-ray: {which}\npointer: SPACE accept · ESC cancel"
+            )
         self.setFocus()
 
-    def _ask_xray_path(self) -> str | None:
+    def _ask_xray_path(self, title: str = "Select X-ray image of the new plane") -> str | None:
         # Start where the last X-ray came from (the USB-stick copy folder).
         last = self.state.xray_image_anatomy_path or self.state.xray_image_path
         start_dir = str(Path(last).parent) if last else ""
 
-        dlg = QFileDialog(self.window(), "Select X-ray image of the new plane", start_dir)
+        dlg = QFileDialog(self.window(), title, start_dir)
         dlg.setFileMode(QFileDialog.ExistingFile)
         dlg.setNameFilter(
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.dcm *.ima);;All Files (*)"
@@ -3045,7 +3595,10 @@ class OverlayLivePage(QWidget):
             self._plane_rgb = np.empty((h, w, 3), dtype=np.uint8)
         cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR, dst=self._plane_rgb)
 
-    def _draw_plane_acquire(self, frame_bgra: np.ndarray) -> None:
+    def _draw_plane_acquire(self, frame_bgra: np.ndarray, with_text: bool = True) -> None:
+        """Pointer corners (yellow) and tip (green) into the frame; with_text
+        the old block top left (the rail page; on the panels it lies outside
+        the crop, the status line says it instead)."""
         res = self._plane_res
         if res is None:
             lines = ["REFERENCE PLANE: pointer NOT FOUND"]
@@ -3066,6 +3619,8 @@ class OverlayLivePage(QWidget):
             ]
             color = (0, 255, 0, 255)
 
+        if not with_text:
+            return
         font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2
         x, y = 24, 24
         line_h = 40
@@ -3087,13 +3642,14 @@ class OverlayLivePage(QWidget):
         self._stop_timer()
         old = self._base_d_x_mm
         delta = "" if old is None else f"\nprevious: {old:.1f} mm  (Δ {d_new - old:+.1f} mm)"
+        which = "same image" if self._plane_xray_path is None else Path(self._plane_xray_path).name
         ans = QMessageBox.question(
             self,
             "Set reference plane",
             f"New reference plane\n\n"
             f"d_x: {d_new:.1f} mm{delta}\n"
             f"reprojection: {float(getattr(res, 'reproj_mean_px', np.nan)):.2f} px\n"
-            f"X-ray: {Path(self._plane_xray_path).name}\n\n"
+            f"X-ray: {which}\n\n"
             "Use this plane?",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -3111,16 +3667,22 @@ class OverlayLivePage(QWidget):
     def _apply_plane(self, res, raw, rgb_bgr: np.ndarray, d_x_mm: float) -> None:
         ev = self.state.eval
         if ev is not None:
-            ev.set_label(ev.next_label(ev.label))
+            if self._xray_starts_label:
+                # the X-ray loaded just before opened this plane's label
+                self._xray_starts_label = False
+            else:
+                ev.set_label(ev.next_label(ev.label))
 
         self.state.d_x = float(d_x_mm)
         self.state.tip_uv_c = np.asarray(res.tip_uv, dtype=np.float64).copy()
         self.state.tip_xyz_c = np.asarray(res.tip_point_camera_mm, dtype=np.float64).copy()
         self.state.T_tc = np.asarray(res.T_4x4, dtype=np.float64).copy()
-        self.state.xray_image_anatomy = self._plane_xray
-        self.state.xray_image_anatomy_path = self._plane_xray_path
+        new_xray = self._plane_xray is not None
+        if new_xray:
+            self.state.xray_image_anatomy = self._plane_xray
+            self.state.xray_image_anatomy_path = self._plane_xray_path
+            self._load_xray_from_state()
 
-        self._load_xray_from_state()
         self._initialize_dx()
         self._precompute_H_xc_lookup()
         self._invalidate_overlay_cache()
@@ -3140,10 +3702,11 @@ class OverlayLivePage(QWidget):
                 ev.save_npz("depth", arrays, page="overlay_live_plane", summary=summary)
             except Exception as e:
                 print(f"[WARN] Could not save pointer depth capture: {e}")
-            try:
-                ev.copy_file("xray", self._plane_xray_path, page="overlay_live_plane")
-            except Exception as e:
-                print(f"[WARN] Could not copy X-ray image: {e}")
+            if new_xray:
+                try:
+                    ev.copy_file("xray", self._plane_xray_path, page="overlay_live_plane")
+                except Exception as e:
+                    print(f"[WARN] Could not copy X-ray image: {e}")
 
         label = "" if ev is None else f"{ev.sanitize_label(ev.label)}: "
         self._end_plane_acquire(f"{label}d_x {d_x_mm:.1f} mm — save snapshot")
@@ -3156,19 +3719,31 @@ class OverlayLivePage(QWidget):
         self._plane_xray = None
         self._plane_xray_path = None
         self.controls.btn_plane.setText("Set reference plane")
-        self.controls.btn_track.setEnabled(True)
-        self.controls.lbl_plane_status.setText(status)
+        if self._panels_mode:
+            # the status line: the caller (cancel, accept) says what happened
+            self.controls.btn_track.setEnabled(self._tool is not None)
+        else:
+            self.controls.btn_track.setEnabled(True)
+            self.controls.lbl_plane_status.setText(status)
 
     def keyPressEvent(self, event) -> None:
+        key = event.key()
         if self._plane_acquiring:
-            if event.key() == Qt.Key_Space:
-                self._confirm_plane()
+            if key == Qt.Key_Space:
+                if self._panels_mode:
+                    self._accept_plane_now()
+                else:
+                    self._confirm_plane()
                 event.accept()
                 return
-            if event.key() == Qt.Key_Escape:
-                self._end_plane_acquire("cancelled")
+            if key == Qt.Key_Escape:
+                self._cancel_plane()
                 event.accept()
                 return
+        if self._panels_mode and self._xray_waiting and key == Qt.Key_Escape:
+            self._cancel_xray_wait()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     # --------------------------------------------------------
@@ -3182,11 +3757,19 @@ class OverlayLivePage(QWidget):
         # The tracking test with a tool: camera image + drill only (no
         # X-ray blend, no homographies, no reference plane).
         self._tracking_only = self._is_tracking_only()
-        self.controls.set_tracking_visible(self._tool is not None)
-        self.controls.set_tracking_only(self._tracking_only)
+        # With an X-ray the study's panels, in the tracking test the rail
+        # over the full frame (LIVE_PANELS).
+        self._panels_mode = self.use_panels and not self._tracking_only
+        self.controls = self.panels if self._panels_mode else self._rail
+        self.image_label.setVisible(not self._panels_mode)
+        self._rail.setVisible(not self._panels_mode)
+        self.panels.setVisible(self._panels_mode)
+        self.panels.setGeometry(self.rect())
+        self._rail.set_tracking_visible(self._tool is not None)
+        self._rail.set_tracking_only(self._tracking_only)
         self.controls.btn_track.setText("Start tracking")
         self.controls.lbl_track_status.setText("idle")
-        self.controls.set_plane_visible(self.state.eval is not None and not self._tracking_only)
+        self._rail.set_plane_visible(self.state.eval is not None and not self._tracking_only)
         self._end_plane_acquire("")
         self._planes_set = 0
         # a new camera counts its frames from 0 again
@@ -3235,6 +3818,8 @@ class OverlayLivePage(QWidget):
             self._frame_log = None if ev is None else _EvalFrameLog(ev, self.FPS)
             if self._profile is not None and self._frame_log is not None:
                 self._profile.frame_sink = self._frame_log.add_display
+            if self._panels_mode:
+                self._setup_panels()
             if self._tracking_only and ev is not None:
                 # which drill the tracking test runs with
                 ir_path = getattr(self.state, "ir_calibration_path", None)
@@ -3278,6 +3863,9 @@ class OverlayLivePage(QWidget):
 
     def on_leave(self) -> None:
         self._end_plane_acquire("")
+        self._resume_tracking = False
+        self._xray_waiting = False
+        self._xray_pending = None
         if self._tracking_active:
             # joins the tracking thread, so the tracker is free to be
             # dropped below
