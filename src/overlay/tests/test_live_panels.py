@@ -21,6 +21,7 @@ import numpy as np
 
 from overlay.tests import test_xray_view as xv
 from overlay.tools.tool_marks import (
+    DASH_ON_PX,
     ORIENT_C_ARM,
     ORIENT_CAMERA,
     RULER_FIELD,
@@ -30,6 +31,7 @@ from overlay.tools.tool_marks import (
     MarkBuilder,
     PanelMap,
     clip_ray_to_rect,
+    dash_ranges,
 )
 from overlay.tools.tracking_overlay import TrackingOverlay
 from overlay.tools.warp import LiveOverlay
@@ -188,17 +190,33 @@ def test_same_as_chat1() -> None:
         b, view, field, ov, m = _builder_of(rec, work)
         marks = b.build(rec.pts)
         cam = marks.camera
-        # green: same tip, same dashes (rounded as TrackingOverlay draws them)
+        # green: same tip; the drill behind it on the same line, in dashes of a fixed
+        # length on screen from the tip (11.11.; TrackingOverlay keeps its 7 pieces)
         assert np.abs(np.array(cam.green_tip) - 0.5 - ov._tip_uv).max() < 1e-9
         tip, back = ov._tip_uv, ov._back_uv
-        for i, q in zip(range(0, ov.DASH_PIECES, 2), cam.green_lines):
-            a = tip + (back - tip) * (i / ov.DASH_PIECES)
-            assert np.abs(np.array(q[:2]) - 0.5 - a).max() < 1e-9
-        # magenta: same segments, same tip
+        want = dash_ranges(float(np.hypot(*(back - tip))), 0.0, 1.0, 1.0)
+        assert len(cam.green_lines) == len(want) + 1          # + the trajectory ahead
+        for (a, b), q in zip(want, cam.green_lines):
+            assert np.abs(np.array(q[:2]) - 0.5 - (tip + (back - tip) * a)).max() < 1e-9
+            assert np.abs(np.array(q[2:]) - 0.5 - (tip + (back - tip) * b)).max() < 1e-9
+        # magenta: the same trajectory ahead, the dashes on the line of TrackingOverlay's
+        # pieces, from the same start, not beyond their end
         rec_v = ov.snapshot_record()["xray_view"]
-        got = [[[int(round(q[0] - 0.5)), int(round(q[1] - 0.5))],
-                [int(round(q[2] - 0.5)), int(round(q[3] - 0.5))]] for q in cam.magenta_lines]
-        assert got == rec_v["segments_px"], (sess, snap, got, rec_v["segments_px"])
+        old = [np.array(s, dtype=float) for s in rec_v["segments_px"]]
+        got = [np.array([[q[0] - 0.5, q[1] - 0.5], [q[2] - 0.5, q[3] - 0.5]]) for q in cam.magenta_lines]
+        assert bool(old) == bool(got), (sess, snap)
+        if old:
+            ahead = np.abs(np.rint(got[0]) - old[0]).max() == 0
+            if ahead:
+                old, got = old[1:], got[1:]
+            p0, p1 = old[0][0], old[-1][1]
+            u = (p1 - p0) / np.linalg.norm(p1 - p0)
+            for g in got:
+                for pt in g:
+                    d = pt - p0
+                    assert abs(d[0] * u[1] - d[1] * u[0]) < 1.5, (sess, snap, "off the line")
+                    assert -1.0 < d @ u < np.linalg.norm(p1 - p0) + 1.0, (sess, snap, "beyond the drill")
+            assert np.abs(got[0][0] - old[0][0]).max() < 1.0, (sess, snap, "not from the tip")
         assert marks.tip_in_field == rec_v["tip_in_field"]
         if cam.magenta_tip is not None:
             assert np.abs(np.array(cam.magenta_tip) - 0.5 - np.array(rec_v["tip_uv_on_plane"])).max() < 1e-9
@@ -212,6 +230,39 @@ def test_same_as_chat1() -> None:
             assert math.hypot(marks.xray.tip[0] - want[0], marks.xray.tip[1] - want[1]) < 1e-9
         n += 1
     print(f"  (d) same geometry as TrackingOverlay on {n} snapshots")
+
+
+def test_fixed_dashes() -> None:
+    """The dashed drill has the same rhythm on screen at any distance to the plane (user
+    11.11.): lifted along the beam axis towards the source, its dashes keep their length in
+    panels 1 and 2 while the ruler (metric) changes its spacing."""
+    assert dash_ranges(0.0) == [] and dash_ranges(5.0) == [(0.0, 1.0)]
+    r = dash_ranges(100.0, 0.0, 1.0, 1.0)
+    assert r[0] == (0.0, DASH_ON_PX / 100.0) and len(r) == 10
+    assert np.allclose(dash_ranges(100.0, 0.25, 0.55, 1.0), [(0.25, 0.26), (0.3, 0.36), (0.4, 0.46), (0.5, 0.55)])
+
+    rec, work = _case()
+    b, view, field, ov, m = _builder_of(rec, work, side=900)
+    b.set_camera_panel((0, 0, 1920, 1080), 1.44)
+    b.set_xray_panel(m, 1.44)
+    R = np.asarray(rec.T, dtype=np.float64)[:3, :3]
+    lens = {"green": [], "magenta": [], "xray": []}
+    gaps = []
+    for h in (0.0, 60.0, 120.0):
+        marks = b.build(np.asarray(rec.pts) - h * R[:, 2])     # towards the source
+        cam, xm = marks.camera, marks.xray
+        for key, lines in (("green", cam.green_lines[:-1]), ("magenta", cam.magenta_lines[1:]),
+                           ("xray", xm.lines[1:])):
+            full = [math.hypot(q[2] - q[0], q[3] - q[1]) for q in lines[:-1]]   # the last may be cut
+            assert full, (key, h)
+            lens[key] += full
+        major = xm.ticks_major
+        gaps.append(math.hypot(major[1][0] - major[0][0], major[1][1] - major[0][1]))
+    for key, v in lens.items():
+        assert np.allclose(v, DASH_ON_PX * 1.44, rtol=0.03), (key, min(v), max(v))
+    assert max(gaps) / min(gaps) > 1.1, gaps          # the ruler follows the distance
+    print("  (d2) fixed dashes: the same length on screen at 0, 60, 120 mm towards the source; "
+          "the ruler follows the distance")
 
 
 # ------------------------------------------------------------ (e)
@@ -1314,7 +1365,7 @@ def test_page_panels_multi() -> None:
 def main() -> int:
     tests = (
         test_camera_model, test_panel_map, test_clip_and_ruler_synthetic,
-        test_same_as_chat1, test_ruler_real, test_overlay_in_roi, test_camera_panel_direct,
+        test_same_as_chat1, test_fixed_dashes, test_ruler_real, test_overlay_in_roi, test_camera_panel_direct,
         test_xray_panel, test_design_window,
         test_view_at_start, test_readout_tile, test_readout_int, test_plane_side_view,
         test_page_plane_only, test_page_panels, test_page_panels_multi,

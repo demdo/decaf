@@ -2410,7 +2410,9 @@ class OverlayLivePage(QWidget):
         if b is None:
             return
         p = self.panels
-        b.set_camera_panel(p.panel_live.roi if p.view == VIEW_LIVE else None)
+        # one camera pixel per device pixel; the dashes scale with the panel's marks
+        b.set_camera_panel(p.panel_live.roi if p.view == VIEW_LIVE else None,
+                           p.panel_live.mark_scale)
         p.panel_live.set_field_outline(b.field_outline_on_camera())
 
     def _on_panel_map_changed(self) -> None:

@@ -465,7 +465,8 @@ class DesignWindow(QWidget):
 
     def _on_roi_changed(self) -> None:
         panel = self.view.panel_live
-        self.builder.set_camera_panel(panel.roi if self.view.view == VIEW_LIVE else None)
+        self.builder.set_camera_panel(panel.roi if self.view.view == VIEW_LIVE else None,
+                                      panel.mark_scale)
         panel.set_field_outline(self.builder.field_outline_on_camera())
 
     def _on_map_changed(self) -> None:

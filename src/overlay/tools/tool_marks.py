@@ -74,6 +74,31 @@ _MAX_DEPTH_MM = 300.0
 
 _LABELS = [str(i) for i in range(0, 1001, 5)]
 
+# The drill behind the tip (TrackingOverlay.AXIS_BACK_MM) dashed with a fixed length on
+# screen (user 11.11.): the same rhythm in every panel and at every distance; times the
+# panel's mark scale. Its extent stays geometric, the ruler stays metric.
+DASH_ON_PX = 6.0
+DASH_OFF_PX = 4.0
+
+
+def dash_ranges(length_px: float, lo: float = 0.0, hi: float = 1.0, scale: float = 1.0) -> list:
+    """The dashes of a segment length_px long on screen, from its start (lam = 0, the
+    tip) to its end (lam = 1): (lam_a, lam_b) pairs, clipped to [lo, hi]."""
+    out = []
+    if not length_px > 1e-9:
+        return out
+    on = DASH_ON_PX * scale / length_px
+    period = (DASH_ON_PX + DASH_OFF_PX) * scale / length_px
+    if not period > 0.0:
+        return out
+    n = int(math.ceil(1.0 / period))
+    for i in range(n):
+        a, b = i * period, min(1.0, i * period + on)
+        a, b = max(lo, a), min(hi, b)
+        if a < b:
+            out.append((a, b))
+    return out
+
 
 class CameraModel:
     """cv2.projectPoints of one point on plain floats, ~5 x cheaper next to the
@@ -195,6 +220,7 @@ class ToolMarks:
 class _Config(NamedTuple):
     camera: CameraModel
     roi: Optional[tuple]        # x0, y0, w, h of panel 1 in camera pixels, None: no video
+    camera_mark_scale: float    # panel 1: device px per px of the dash sizes
     view: Optional[XrayView]
     field: Optional[XrayField]
     R_T: tuple                  # R^T of T_xc, rows, plain floats
@@ -245,15 +271,16 @@ def clip_ray_to_rect(x0, y0, dx, dy, w, h):
 
 class MarkBuilder:
     """Turns poses into ToolMarks. build() may run in another thread than
-    configure(); one thread only for build() (the label side has hysteresis)."""
+    configure(); one thread only for build() (the label side has hysteresis).
+    The drill behind the tip is dashed with a fixed length on screen (dash_ranges);
+    TrackingOverlay (the rail, the snapshot layers) keeps its DASH_PIECES."""
 
     AXIS_BACK_MM = TrackingOverlay.AXIS_BACK_MM
-    DASH_PIECES = TrackingOverlay.DASH_PIECES
     TIP_GLYPH_REACH_PX = TrackingOverlay.TIP_GLYPH_REACH_PX
 
     def __init__(self, K_c, dist_c, line_factory: Callable = _as_is) -> None:
         self._cfg = _Config(
-            camera=CameraModel(K_c, dist_c), roi=(0, 0, 1920, 1080),
+            camera=CameraModel(K_c, dist_c), roi=(0, 0, 1920, 1080), camera_mark_scale=1.0,
             view=None, field=None, R_T=(), t_mm=(), pixel=None, fx_x=0.0, plane=(), d_x_mm=0.0,
             near_edge_px=0.0, xmap=None, xray_mark_scale=1.0, ruler_mode=RULER_FIELD, zero_cam=None,
             line_factory=line_factory,
@@ -276,10 +303,14 @@ class MarkBuilder:
     def set_camera(self, K_c, dist_c) -> None:
         self._cfg = self._cfg._replace(camera=CameraModel(K_c, dist_c))
 
-    def set_camera_panel(self, roi) -> None:
+    def set_camera_panel(self, roi, mark_scale: Optional[float] = None) -> None:
         """The crop of panel 1 in camera pixels; None: the video is not shown, no
-        camera marks are computed."""
-        self._cfg = self._cfg._replace(roi=None if roi is None else tuple(int(v) for v in roi))
+        camera marks are computed. mark_scale: panel 1's device px per px of the
+        dash sizes (one camera pixel per device pixel); None keeps it."""
+        cfg = self._cfg._replace(roi=None if roi is None else tuple(int(v) for v in roi))
+        if mark_scale is not None:
+            cfg = cfg._replace(camera_mark_scale=float(mark_scale))
+        self._cfg = cfg
 
     def set_xray(self, view: Optional[XrayView], field: Optional[XrayField] = None,
                  d_x_mm: Optional[float] = 0.0, working_wh=(1024, 1024)) -> None:
@@ -435,11 +466,8 @@ class MarkBuilder:
         xb, yb = u - x0r + 0.5, v - y0r + 0.5
         dx, dy = xb - x, yb - y
 
-        lines = []
-        pieces = self.DASH_PIECES
-        for i in range(0, pieces, 2):
-            a, b = i / pieces, (i + 1) / pieces
-            lines.append((x + a * dx, y + a * dy, x + b * dx, y + b * dy))
+        lines = [(x + a * dx, y + a * dy, x + b * dx, y + b * dy)
+                 for a, b in dash_ranges(math.hypot(dx, dy), 0.0, 1.0, cfg.camera_mark_scale)]
         if dx != 0.0 or dy != 0.0:
             # forward, away from the back point, to the panel edge
             cut = clip_ray_to_rect(x, y, -dx, -dy, float(w), float(h))
@@ -489,11 +517,11 @@ class MarkBuilder:
             end = min(lam_out, 0.0)
             if lam_forward < end:
                 lines.append(panel(lam_forward) + panel(end))
-            pieces = self.DASH_PIECES
-            for i in range(0, pieces, 2):
-                a, b = max(lam_in, i / pieces), min(lam_out, (i + 1) / pieces)
-                if a < b:
-                    lines.append(panel(a) + panel(b))
+            # the drill on Pi through the camera: nearly linear over its 50 mm
+            (ta, tb), (ba, bb) = panel(0.0), panel(1.0)
+            for a, b in dash_ranges(math.hypot(ba - ta, bb - tb), lam_in, lam_out,
+                                    cfg.camera_mark_scale):
+                lines.append(panel(a) + panel(b))
         tip = panel(0.0) if tip_in else None
         near_edge = tip_in and cfg.field.inner_distance(u0, v0) <= cfg.near_edge_px
         return lines, tip, near_edge
@@ -517,11 +545,8 @@ class MarkBuilder:
             segs = []
             if lam_forward < end:
                 segs.append((lam_forward, end))
-            pieces = self.DASH_PIECES
-            for i in range(0, pieces, 2):
-                p, q = max(lam_in, i / pieces), min(lam_out, (i + 1) / pieces)
-                if p < q:
-                    segs.append((p, q))
+            # the panel map is affine: the drill's length on screen is that of (du, dv)
+            segs += dash_ranges(math.hypot(a * du + b * dv, d * du + e * dv), lam_in, lam_out, k)
             for p, q in segs:
                 u, v = u0 + p * du, v0 + p * dv
                 xa, ya = a * u + b * v + c, d * u + e * v + f
