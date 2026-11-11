@@ -18,6 +18,11 @@
 # The dialog before the window opens (gui/evaluation.py) also asks for the
 # workflow, in both modes: Single View (one AP X-ray) or Multi-View (lateral
 # and AP X-ray, each with a ChArUco board pose) -> state.workflow.
+# Mode B, Single View: Pointer Tool Depth -> Overlay Preview -> Tool Tracking
+# -> Overlay Live. Multi-View: the same with X-ray Acquisition (View 2 lateral,
+# View 1 AP, each X-ray with its board pose) between Overlay Preview and Tool
+# Tracking; Pointer Tool Depth and Overlay Preview are then only a check of
+# the overlay and can be skipped with Next.
 #
 # Two modes, chosen in a dialog before the window opens (gui/evaluation.py):
 #   Normal      - nothing is written to disk.
@@ -72,6 +77,7 @@ from overlay.gui.pages.page_camera_to_xray_calibration import (
 )
 from overlay.gui.pages.page_pointer_tool_depth import PointerToolDepthPage
 from overlay.gui.pages.page_overlay_preview import OverlayPreviewPage
+from overlay.gui.pages.page_xray_acquisition import XrayAcquisitionPage
 from overlay.gui.pages.page_tool_tracking import ToolTrackingPage
 from overlay.gui.pages.page_overlay_live import OverlayLivePage
 
@@ -136,6 +142,9 @@ class MainWindow(QMainWindow):
         self.IDX_OVERLAY_PREVIEW = 6
         self.IDX_TOOL_TRACKING = 7
         self.IDX_OVERLAY_LIVE = 8
+        # Multi-View only; last in the stack, so the indices above stay
+        self.IDX_XRAY_ACQ = 9
+        self.multi_view = self.state.is_multi_view
 
         self.mode_a_indices = [
             self.IDX_XRAY,
@@ -151,6 +160,10 @@ class MainWindow(QMainWindow):
             self.IDX_TOOL_TRACKING,
             self.IDX_OVERLAY_LIVE,
         ]
+        if self.multi_view:
+            self.mode_b_indices.insert(2, self.IDX_XRAY_ACQ)
+        # title prefix of the Mode B pages
+        self._b_head = "Multi-View" if self.multi_view else "Mode B"
 
         self.current_step = self.IDX_XRAY
         self.mode_b_active = False
@@ -205,7 +218,9 @@ class MainWindow(QMainWindow):
             self.step_list.addItem(it)
 
         runtime_title = QLabel(
-            "Runtime (Mode B) — tracking test" if self.tracking_test else "Runtime (Mode B)"
+            "Runtime (Mode B) — tracking test" if self.tracking_test
+            else "Runtime (Mode B) — Multi-View" if self.multi_view
+            else "Runtime (Mode B)"
         )
         runtime_title.setStyleSheet("color: #495057; font-weight: 600; margin-left: 8px;")
         sidebar_layout.addWidget(runtime_title)
@@ -222,6 +237,10 @@ class MainWindow(QMainWindow):
         self.item_overlay_preview = QListWidgetItem("Overlay Preview")
         self.runtime_list.addItem(self.item_overlay_preview)
 
+        self.item_xray_acq = QListWidgetItem("X-ray Acquisition")
+        if self.multi_view:
+            self.runtime_list.addItem(self.item_xray_acq)
+
         self.item_tool_tracking = QListWidgetItem("Tool Tracking")
         self.runtime_list.addItem(self.item_tool_tracking)
 
@@ -229,7 +248,7 @@ class MainWindow(QMainWindow):
         self.runtime_list.addItem(self.item_overlay_live)
 
         # The QListWidget default size hint is a fixed 256x192 regardless of
-        # content — with four entries that clips "Overlay Live" and grows
+        # content — with four (five) entries that clips "Overlay Live" and grows
         # scrollbars. Scrollbars off here; the height is set after the QSS
         # is applied (see below), because the item padding comes from it.
         self.runtime_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -303,6 +322,8 @@ class MainWindow(QMainWindow):
         self.page_overlay_live = OverlayLivePage(self.state, self.on_complete_changed)
         # camera image + drill without the X-ray chain only in the tracking test
         self.page_overlay_live.tracking_test = self.tracking_test
+        # Multi-View only (not in the Single View sequence, never entered there)
+        self.page_xray_acq = XrayAcquisitionPage(self.state, self.on_complete_changed)
 
         self.pages.addWidget(self.page_xray)
         self.pages.addWidget(self.page_cam_calib)
@@ -313,6 +334,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.page_overlay_preview)
         self.pages.addWidget(self.page_tool_tracking)
         self.pages.addWidget(self.page_overlay_live)
+        self.pages.addWidget(self.page_xray_acq)
 
         self._wire_nav(self.page_xray, idx=self.IDX_XRAY)
         self._wire_nav(self.page_cam_calib, idx=self.IDX_CAM_CALIB)
@@ -323,6 +345,7 @@ class MainWindow(QMainWindow):
         self._wire_nav(self.page_overlay_preview, idx=self.IDX_OVERLAY_PREVIEW)
         self._wire_nav(self.page_tool_tracking, idx=self.IDX_TOOL_TRACKING)
         self._wire_nav(self.page_overlay_live, idx=self.IDX_OVERLAY_LIVE)
+        self._wire_nav(self.page_xray_acq, idx=self.IDX_XRAY_ACQ)
 
         self.page_cam2xray.btn_next_height.clicked.connect(self.next_height)
         self.page_plane.on_redo_height = lambda: self.redo_height(confirm=False)
@@ -615,6 +638,9 @@ class MainWindow(QMainWindow):
             return self.state.has_d_x
         if idx == self.IDX_OVERLAY_PREVIEW:
             return self.state.has_H_xc and self.state.has_xray_image_anatomy
+        if idx == self.IDX_XRAY_ACQ:
+            # View 1 (AP) set and newer than View 2 (View 2 is optional)
+            return self.state.has_current_view_ap
         if idx == self.IDX_TOOL_TRACKING:
             return self.state.has_tool
         if idx == self.IDX_OVERLAY_LIVE:
@@ -792,6 +818,8 @@ class MainWindow(QMainWindow):
                 _set_item_text(self.item_ptr_depth, done_b[pos], locked, "Pointer Tool Depth")
             elif idx == self.IDX_OVERLAY_PREVIEW:
                 _set_item_text(self.item_overlay_preview, done_b[pos], locked, "Overlay Preview")
+            elif idx == self.IDX_XRAY_ACQ:
+                _set_item_text(self.item_xray_acq, done_b[pos], locked, "X-ray Acquisition")
             elif idx == self.IDX_TOOL_TRACKING:
                 _set_item_text(self.item_tool_tracking, done_b[pos], locked, "Tool Tracking")
             elif idx == self.IDX_OVERLAY_LIVE:
@@ -811,13 +839,15 @@ class MainWindow(QMainWindow):
         elif self.current_step == self.IDX_CAM2XRAY:
             self.lbl_step_title.setText(f"Step 5 — Camera → X-ray {k}")
         elif self.current_step == self.IDX_PTR_DEPTH:
-            self.lbl_step_title.setText("Mode B — Pointer Tool Depth")
+            self.lbl_step_title.setText(f"{self._b_head} — Pointer Tool Depth")
         elif self.current_step == self.IDX_OVERLAY_PREVIEW:
-            self.lbl_step_title.setText("Mode B — Overlay Preview")
+            self.lbl_step_title.setText(f"{self._b_head} — Overlay Preview")
+        elif self.current_step == self.IDX_XRAY_ACQ:
+            self.lbl_step_title.setText(f"{self._b_head} — X-ray Acquisition")
         elif self.current_step == self.IDX_TOOL_TRACKING:
             self.lbl_step_title.setText(
                 "Tracking test — Tool Tracking" if self.tracking_test
-                else "Mode B — Tool Tracking"
+                else f"{self._b_head} — Tool Tracking"
             )
         elif self.current_step == self.IDX_OVERLAY_LIVE:
             self.lbl_step_title.setText("")
@@ -868,14 +898,21 @@ class MainWindow(QMainWindow):
         if self.current_step in seq:
             b_pos = seq.index(self.current_step)
 
+            # X-ray Acquisition: nothing while a view is captured (ESC first);
+            # Next once View 1 (AP) is set and newer than View 2
+            acq = self.current_step == self.IDX_XRAY_ACQ
+            acq_busy = acq and self.page_xray_acq.busy
+
             if hasattr(p, "btn_back"):
-                p.btn_back.setEnabled(b_pos > 0)
+                p.btn_back.setEnabled(b_pos > 0 and not acq_busy)
 
             if hasattr(p, "btn_next"):
                 allow = b_pos < len(seq) - 1
                 if allow and self.tracking_test:
                     # Overlay Live needs the camera intrinsics and the tool
                     allow = self.step_complete(seq[b_pos + 1])
+                if allow and acq:
+                    allow = self.page_xray_acq.can_continue()
                 p.btn_next.setEnabled(allow)
             return
 

@@ -10,6 +10,11 @@ import numpy as np
 WORKFLOW_SINGLE = "single"
 WORKFLOW_MULTI = "multi"
 
+# The X-ray views of the Multi-View workflow (X-ray Acquisition page): View 1
+# is AP, the stance the C-arm ends in and tracking runs in; View 2 is lateral.
+VIEW_AP = "view1"
+VIEW_LAT = "view2"
+
 
 @dataclass(frozen=True)
 class Cam2XHeight:
@@ -26,6 +31,31 @@ class Cam2XHeight:
     K_xray: Optional[np.ndarray] = None  # K_xray of T_cx_single (not part of the capture)
     eval_label: str = ""           # file label of its captures in Evaluation mode ("cal_h2")
     eval_file: str = ""            # its <label>_cam2x.npz in Evaluation mode
+
+
+@dataclass
+class XrayViewCapture:
+    """One X-ray view of the Multi-View workflow (X-ray Acquisition page):
+    the X-ray and the ChArUco board pose of the C-arm stance it was taken in.
+    For the X-ray frame of this view in the camera as it is now, see
+    overlay.tools.view_registration.xray_view_matrix(T_cw, T_cw_now, T_xc,
+    phi_deg)."""
+
+    view: str                  # VIEW_AP | VIEW_LAT
+    image: np.ndarray          # RAW X-ray, uint8, as read (xray_io.read_xray_gray_u8)
+    path: str
+    T_cw: np.ndarray           # (4,4) board -> camera in this stance, METRES
+    pose_summary: dict         # view_registration.BoardPose.summary
+    t_acquired: float          # time.time() when the X-ray was taken over
+    seq: int                   # order of acquisition: a higher seq is newer
+    phi_deg: float = 0.0       # image rotation of the view's X-ray frame (PHI_LATERAL_DEG lateral)
+    # median shift of the board corners between the board pose and the camera
+    # frame at the X-ray's arrival [px]; NaN = not checked (board not in view)
+    board_shift_px: float = float("nan")
+    # view_registration.BoardPose (all arrays, for saving), kept as object
+    pose: Optional[object] = None
+    # flipped + undistorted working image for display; None until prepared
+    working: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -117,12 +147,37 @@ class SessionState:
     # --- Workflow (start dialog): WORKFLOW_SINGLE or WORKFLOW_MULTI ---
     workflow: str = WORKFLOW_SINGLE
 
+    # --- Multi-View: X-ray views (X-ray Acquisition page) ---
+    # VIEW_AP / VIEW_LAT -> XrayViewCapture. View 1 (AP) is also written to
+    # xray_image_anatomy(_path) above, so the live page shows it.
+    xray_views: dict = field(default_factory=dict)
+
     # ----------------
     # Convenience flags
     # ----------------
     @property
     def is_multi_view(self) -> bool:
         return self.workflow == WORKFLOW_MULTI
+
+    @property
+    def xray_view_ap(self) -> Optional[XrayViewCapture]:
+        return self.xray_views.get(VIEW_AP)
+
+    @property
+    def xray_view_lat(self) -> Optional[XrayViewCapture]:
+        return self.xray_views.get(VIEW_LAT)
+
+    @property
+    def view_ap_out_of_date(self) -> bool:
+        """View 1 (AP) is older than View 2 (lateral): the C-arm was turned
+        lateral after it, so it no longer shows the stance tracking runs in."""
+        ap, lat = self.xray_view_ap, self.xray_view_lat
+        return ap is not None and lat is not None and ap.seq < lat.seq
+
+    @property
+    def has_current_view_ap(self) -> bool:
+        """View 1 (AP) is set and newer than View 2 (View 2 is optional)."""
+        return self.xray_view_ap is not None and not self.view_ap_out_of_date
 
     @property
     def has_rgb_intrinsics(self) -> bool:
