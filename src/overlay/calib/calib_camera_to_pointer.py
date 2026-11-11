@@ -437,6 +437,11 @@ class CameraToPointerResult:
     raw_pnp_flag: int
     ippe_solution_index: int | None
 
+    # "linear": marker corners found in linear light (overlay.tools.
+    # linear_light_corners, 11.11.2026); "camera": in the camera's grey values
+    # (ArUco + cornerSubPix, as before; also the fallback)
+    corner_light: str = "camera"
+
 
 def get_default_pointer_tool_model() -> PointerToolModel:
     """
@@ -471,9 +476,21 @@ def calibrate_camera_to_pointer(
     use_extrinsic_guess: bool = False,
     pose_method: str = "iterative",
     refine_with_iterative: bool = True,
+    corner_light: str = "linear",
 ) -> CameraToPointerResult:
     """
     Estimate the rigid pose of the pointer TOOL TIP relative to the camera.
+
+    Marker corners (corner_light)
+    -----------------------------
+    "linear" (default since 11.11.2026): the corners of the ArUco squares are
+    refined in linear light (overlay.tools.linear_light_corners). The camera's
+    tone curve moves the edges of dark squares into the dark, so in its grey
+    values the pointer looked ~0.4 % too far, more with distance: the reference
+    plane came out 2.7 mm too shallow at 563 mm (pin planes of 11.11.).
+    Markers whose edges cannot be found (glare, cut off) are left out; with
+    fewer than LINEAR_MIN_MARKERS left, the camera-grey corners are used
+    (result.corner_light says which). "camera": as before.
 
     Final returned pose
     -------------------
@@ -527,6 +544,14 @@ def calibrate_camera_to_pointer(
 
     if ids is None or len(ids) == 0:
         raise RuntimeError("No ArUco markers detected.")
+
+    used_light = "camera"
+    if corner_light == "linear":
+        corners, ids, used_light = _corners_in_linear_light(
+            image_bgr, corners, ids, K, dist, pointer_model
+        )
+    elif corner_light != "camera":
+        raise ValueError(f"corner_light must be 'linear' or 'camera', not {corner_light!r}")
 
     object_points_pointer_xyz, image_points_uv, marker_ids_used = _build_correspondences_pointer(
         corners=corners,
@@ -633,4 +658,26 @@ def calibrate_camera_to_pointer(
         pose_method=pose_result.method,
         raw_pnp_flag=raw_pnp_flag,
         ippe_solution_index=ippe_solution_index,
+        corner_light=used_light,
     )
+
+
+# with fewer markers refined than this, the camera-grey corners are used
+LINEAR_MIN_MARKERS = 4
+
+
+def _corners_in_linear_light(image, corners, ids, K, dist, model: "PointerToolModel"):
+    """The detected markers' corners refined in linear light (see
+    calibrate_camera_to_pointer). Returns (corners, ids, "linear") with the
+    markers whose four edges were found, or the input and "camera"."""
+    from overlay.tools.linear_light_corners import refine_quads_linear
+
+    gray = _ensure_gray(image)
+    quads = [np.asarray(c, dtype=np.float64).reshape(4, 2) for c in corners]
+    refined = refine_quads_linear(gray, quads, K, dist, float(model.marker_length_mm))
+    keep = [i for i, r in enumerate(refined) if r is not None]
+    if len(keep) < min(LINEAR_MIN_MARKERS, len(quads)):
+        return corners, ids, "camera"
+    new_corners = [refined[i].reshape(1, 4, 2).astype(np.float32) for i in keep]
+    new_ids = np.asarray(ids).reshape(-1, 1)[keep]
+    return new_corners, new_ids, "linear"

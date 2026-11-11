@@ -136,6 +136,9 @@ def depth_capture_arrays(
         reproj_errors_px=opt(getattr(res, "reproj_errors_px", None)),
         reproj_mean_px=np.array(float(getattr(res, "reproj_mean_px", np.nan))),
         pose_method=np.array(str(getattr(res, "pose_method", ""))),
+        # "linear" / "camera": marker corners in linear light or camera grey
+        # (calibrate_camera_to_pointer, 11.11.2026); image_points_uv are those
+        corner_light=np.array(str(getattr(raw, "corner_light", "camera"))),
         tip_xyz_c_raw_mm=opt(getattr(raw, "tip_point_camera_mm", None)),
         tip_xyz_c_filtered_mm=opt(getattr(res, "tip_point_camera_mm", None)),
         tip_uv_c=opt(getattr(res, "tip_uv", None)),
@@ -155,5 +158,6 @@ def depth_capture_arrays(
         "d_x_mm": float(d_x_mm),
         "d_x_raw_mm": d_x_raw,
         "reproj_px": float(getattr(res, "reproj_mean_px", np.nan)),
+        "corners": str(getattr(raw, "corner_light", "camera")),
     }
     return arrays, summary
