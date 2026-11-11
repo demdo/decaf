@@ -164,16 +164,21 @@ class XrayMarks:
 
 class ToolMarks:
     """One pose, ready to draw and to read off. xray is None without an X-ray
-    or with the tool at or behind the source."""
+    or with the tool at or behind the source. Without the plane Pi (no d_x)
+    the readings against it are None. second: the ToolMarks of the same pose
+    in a second X-ray view (MarkBuilder.set_second), or None."""
 
     __slots__ = ("t_pose", "marked", "kind", "tip_cam", "forward_cam", "camera", "xray",
-                 "off_plane_mm", "inclination_deg", "depth_mm", "tip_in_field", "rise_deg")
+                 "off_plane_mm", "inclination_deg", "depth_mm", "tip_in_field", "rise_deg",
+                 "second")
 
     def __init__(self, t_pose, marked, kind, tip_cam, forward_cam, camera, xray,
-                 off_plane_mm, inclination_deg, depth_mm, tip_in_field, rise_deg=None) -> None:
+                 off_plane_mm, inclination_deg, depth_mm, tip_in_field, rise_deg=None,
+                 second=None) -> None:
         # rise_deg: inclination with its sign, positive when the drill behind the tip lies
         # farther from the source than the tip (the shaft rises away from Pi); |rise| = inclination
         self.rise_deg = rise_deg
+        self.second = second
         self.t_pose = t_pose
         self.marked = marked
         self.kind = kind
@@ -196,8 +201,8 @@ class _Config(NamedTuple):
     t_mm: tuple
     pixel: Optional[Callable]
     fx_x: float                 # K_x[0, 0]
-    plane: tuple                # plane_matrix(d_x), rows
-    d_x_mm: float
+    plane: tuple                # plane_matrix(d_x), rows; () without the plane
+    d_x_mm: Optional[float]     # None: no plane Pi (Multi-View before it is set)
     near_edge_px: float         # working pixels: the glyph of panel 1 may reach the edge
     xmap: Optional[PanelMap]
     xray_mark_scale: float
@@ -254,10 +259,19 @@ class MarkBuilder:
             line_factory=line_factory,
         )
         self._label_side = 1.0
+        self._second: Optional["MarkBuilder"] = None
 
     # ------------------------------------------------------------------
     # Settings, GUI thread
     # ------------------------------------------------------------------
+
+    def set_second(self, builder: Optional["MarkBuilder"]) -> None:
+        """A builder for a second X-ray view (Multi-View: panel 3, lateral), run
+        by build() on the same pose: ToolMarks.second. Set it up without video
+        (set_camera_panel(None)); None removes it."""
+        if builder is self:
+            raise ValueError("a builder cannot be its own second view")
+        self._second = builder
 
     def set_camera(self, K_c, dist_c) -> None:
         self._cfg = self._cfg._replace(camera=CameraModel(K_c, dist_c))
@@ -268,7 +282,9 @@ class MarkBuilder:
         self._cfg = self._cfg._replace(roi=None if roi is None else tuple(int(v) for v in roi))
 
     def set_xray(self, view: Optional[XrayView], field: Optional[XrayField] = None,
-                 d_x_mm: float = 0.0, working_wh=(1024, 1024)) -> None:
+                 d_x_mm: Optional[float] = 0.0, working_wh=(1024, 1024)) -> None:
+        """d_x_mm None: no plane Pi; the X-ray panel's marks need none, panel 1's
+        X-ray view and the readings against Pi stay empty."""
         if view is None:
             self._cfg = self._cfg._replace(view=None, field=None, pixel=None, xmap=None)
             return
@@ -281,9 +297,12 @@ class MarkBuilder:
         )
         self.set_plane_depth(d_x_mm, working_wh)
 
-    def set_plane_depth(self, d_x_mm: float, working_wh=(1024, 1024)) -> None:
+    def set_plane_depth(self, d_x_mm: Optional[float], working_wh=(1024, 1024)) -> None:
         cfg = self._cfg
         if cfg.view is None:
+            return
+        if d_x_mm is None:
+            self._cfg = cfg._replace(d_x_mm=None, plane=(), near_edge_px=0.0)
             return
         self._cfg = cfg._replace(
             d_x_mm=float(d_x_mm),
@@ -323,7 +342,7 @@ class MarkBuilder:
         """The field as panel 1 shows it, in panel pixels; for clipping the tip
         glyph at the edge. Once per X-ray, d_x and panel size."""
         cfg = self._cfg
-        if cfg.view is None or cfg.roi is None:
+        if cfg.view is None or cfg.roi is None or cfg.d_x_mm is None:
             return []
         x0, y0 = cfg.roi[0], cfg.roi[1]
         out = []
@@ -377,9 +396,11 @@ class MarkBuilder:
             x1 = r[0] * dx + r[1] * dy + r[2] * dz
             y1 = r[3] * dx + r[4] * dy + r[5] * dz
             z1 = r[6] * dx + r[7] * dy + r[8] * dz
-            off_plane = z0 - cfg.d_x_mm
-            rise = math.degrees(math.asin(max(-1.0, min(1.0, (z1 - z0) / length))))
-            inclination = abs(rise)
+            plane = cfg.d_x_mm is not None
+            if plane:
+                off_plane = z0 - cfg.d_x_mm
+                rise = math.degrees(math.asin(max(-1.0, min(1.0, (z1 - z0) / length))))
+                inclination = abs(rise)
             if z0 > 0.0 and z1 > 0.0:
                 g = self._axis_in_image(cfg, x0, y0, z0, x1, y1, z1)
                 tip_in_field = g[7]
@@ -389,16 +410,20 @@ class MarkBuilder:
                     s_entry = _s_of_lam(g[5], z0, z1, az, length)
                     if abs(s_entry) <= _MAX_DEPTH_MM:
                         depth = -s_entry
-                if video:
+                if video and plane:
                     magenta_lines, magenta_tip, near_edge = self._magenta(cfg, g)
                 if cfg.xmap is not None:
                     xray = self._xray_panel(cfg, g, z0, z1, az, length, depth)
+
+        second = self._second
+        if second is not None:
+            second = second.build(points, marked=marked, t_pose=t_pose, kind=kind)
 
         return ToolMarks(
             t_pose, bool(marked), kind, (tx, ty, tz), (fx, fy, fz),
             CameraMarks([lf(*q) for q in green_lines], green_tip,
                         [lf(*q) for q in magenta_lines], magenta_tip, near_edge),
-            xray, off_plane, inclination, depth, tip_in_field, rise,
+            xray, off_plane, inclination, depth, tip_in_field, rise, second,
         )
 
     def _green(self, cfg, tx, ty, tz, bx, by, bz):

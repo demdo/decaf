@@ -1261,8 +1261,10 @@ class LivePanelsView(QWidget):
 
     set_workflow (decided 10.11.):
 
-        WORKFLOW_MULTI    the above; card [Load X-ray View 2 (Lat) | Load X-ray View 1 (AP)]
-                          [Set reference plane | Snapshot] [From folder (USB)]
+        WORKFLOW_MULTI    the above; card [Load X-ray View 1 (AP) | From folder (USB)]
+                          [Set reference plane | Snapshot] [New views with board] (11.11.:
+                          the board is off the table after X-ray Acquisition; a new AP X-ray
+                          is taken here as in single view, new views on X-ray Acquisition)
         WORKFLOW_SINGLE   no view 2 and no selector: X-ray view 1 square and as high as
                           the window allows on the right, the video beside it, the area
                           below over the full width; card [Load X-ray | From folder (USB)]
@@ -1357,7 +1359,9 @@ class LivePanelsView(QWidget):
         self.btn_plane = self._button("Set reference plane")
         self.btn_save = self._button("Snapshot")
         self.btn_load_xray = self._button("Load X-ray View 1 (AP)")
-        self.btn_lateral = self._button("Load X-ray View 2 (Lat)")
+        self.btn_lateral = self._button("New views with board")
+        # multi only: both views again, on X-ray Acquisition (the same button object)
+        self.btn_new_views = self.btn_lateral
         self.btn_usb = self._button("From folder (USB)")
 
         track = QVBoxLayout()
@@ -1406,7 +1410,7 @@ class LivePanelsView(QWidget):
         outer.addLayout(self.footer, 0)
 
     def _arrange_buttons(self) -> None:
-        """The card "Acquisition and measurement" of the workflow (decided 10.11.)."""
+        """The card "Acquisition and measurement" of the workflow (decided 10.11., multi 11.11.)."""
         g = self._acts
         for b in (self.btn_plane, self.btn_save, self.btn_load_xray, self.btn_lateral, self.btn_usb):
             g.removeWidget(b)
@@ -1419,10 +1423,11 @@ class LivePanelsView(QWidget):
             self.btn_lateral.hide()
         else:
             self.btn_load_xray.setText("Load X-ray View 1 (AP)")
-            rows = [[(self.btn_lateral, 1), (self.btn_load_xray, 1)],
+            self.btn_new_views.setText("New views with board")
+            rows = [[(self.btn_load_xray, 1), (self.btn_usb, 1)],
                     [(self.btn_plane, 1), (self.btn_save, 1)],
-                    [(self.btn_usb, 2)]]
-            self.btn_lateral.show()
+                    [(self.btn_new_views, 2)]]
+            self.btn_new_views.show()
         for r, row in enumerate(rows):
             c = 0
             for b, span in row:

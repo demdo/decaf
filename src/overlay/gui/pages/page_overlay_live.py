@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import threading
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from overlay.calib.calib_xray_to_pointer import extract_depth
-from overlay.gui.state import SessionState
+from overlay.gui.state import VIEW_AP, SessionState
 from overlay.gui.widgets.widget_live_panels import (
     POSE_HOLD_S,
     STATUS_BAD,
@@ -37,6 +38,7 @@ from overlay.gui.widgets.widget_live_panels import (
     STATUS_NEUTRAL,
     STATUS_WARN,
     VIEW_LIVE,
+    WORKFLOW_MULTI,
     WORKFLOW_SINGLE,
     LivePanelsView,
     readout_int,
@@ -47,6 +49,7 @@ from overlay.tools.live_tracking import STATUS_SEARCHING, TrackingSession, Track
 from overlay.tools.pointer_depth import PointerDepthEstimator, depth_capture_arrays
 from overlay.tools.tool_marks import MarkBuilder
 from overlay.tools.tracking_overlay import TrackingOverlay
+from overlay.tools.view_registration import camera_motion, xray_view_matrix
 from overlay.tools.warp import prepare_live_overlay
 from overlay.tools.xray_io import read_xray_gray_u8, xray_pixel_md5
 from overlay.tools.xray_view import XrayField, XrayView
@@ -1397,6 +1400,8 @@ class OverlayLivePage(QWidget):
     # queued to the GUI thread: (folder, written layers, eval numbers,
     # error text or "").
     _snapshot_saved = Signal(object)
+    # Multi-View: "New views with board" - the main window shows X-ray Acquisition
+    new_views_requested = Signal()
 
     def __init__(self, state: SessionState, on_complete_changed=None, parent=None):
         super().__init__(parent)
@@ -1546,6 +1551,15 @@ class OverlayLivePage(QWidget):
         # the running pointer search came with a new X-ray (single view: a new
         # X-ray starts it by itself, 11.11.); ESC then keeps the plane before
         self._plane_new_xray = False
+        # Multi-View (start dialog) on the panels: X-ray View 2 in panel 3 and the
+        # plane set here after entering; _plane_entry: the search started at entry
+        self._multi_view = False
+        self._plane_entry = False
+        self._builder2: MarkBuilder | None = None   # panel 3, chained to _builder
+        self._builder_has_plane = False            # _builder was given a d_x
+        # Multi-View: View 1's board pose (T_cw bytes) the plane was set for; the plane
+        # stays when the page is entered again with the same View 1 stance
+        self._plane_stance: bytes | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -1632,9 +1646,11 @@ class OverlayLivePage(QWidget):
         p.btn_plane.clicked.connect(self.start_plane_only)
         p.btn_load_xray.clicked.connect(self._on_load_xray_button)
         p.btn_usb.clicked.connect(self._on_usb_button)
+        p.btn_new_views.clicked.connect(self._on_new_views_button)
         p.panel_live.roi_changed.connect(self._on_panel_roi_changed)
         p.view_changed.connect(lambda _view: self._on_panel_roi_changed())
         p.panel_view1.map_changed.connect(self._on_panel_map_changed)
+        p.panel_view2.map_changed.connect(self._on_panel_map_changed)
 
         self._track_result_ready.connect(self._on_track_result_ready, Qt.QueuedConnection)
         self._snapshot_saved.connect(self._on_snapshot_saved, Qt.QueuedConnection)
@@ -1644,13 +1660,16 @@ class OverlayLivePage(QWidget):
     # --------------------------------------------------------
 
     def _has_prerequisites(self) -> bool:
-        return (
+        chain = (
             self.state.K_rgb is not None
             and self.state.K_xray is not None
             and self.state.T_xc is not None
-            and self.state.d_x is not None
-            and self.state.tip_uv_c is not None
         )
+        if self._multi_view:
+            # Multi-View: the plane is set on this page (on_enter), the one of
+            # the check before X-ray Acquisition is not taken (user 11.11.)
+            return chain
+        return chain and self.state.d_x is not None and self.state.tip_uv_c is not None
 
     def _is_tracking_only(self) -> bool:
         """The Evaluation tracking test (tracking_test, set by the main
@@ -1699,6 +1718,12 @@ class OverlayLivePage(QWidget):
         # Keep stored image RAW. It is converted to the X-ray working image space
         # only immediately before warping, so H_xc remains unchanged.
         self._xray_gray_u8 = img
+
+        ap = self.state.xray_view_ap if self._multi_view else None
+        if ap is not None and ap.working is not None and self.state.xray_image_anatomy is ap.image:
+            # X-ray Acquisition prepared it already, the same flip and undistortion
+            self._xray_working_u8 = ap.working
+            return
 
         # Flip and detector undistortion are frame independent, so they happen
         # once here instead of per frame. Same treatment as the preview page:
@@ -2269,7 +2294,8 @@ class OverlayLivePage(QWidget):
         self._xray_pending = None
         self._resume_tracking = False
         self._xray_starts_label = False
-        p.btn_load_xray.setText("Load X-ray")
+        self._builder_has_plane = False
+        self._panels_buttons()
         p.panel_live.set_frame_size(self.COLOR_SIZE)
         p.panel_live.alpha = self._alpha
         p.panel_live.show_camera_view = self._show_camera_view
@@ -2277,6 +2303,7 @@ class OverlayLivePage(QWidget):
         prof = self._profile
         p.panel_live.prof = prof.add if prof is not None else None
         p.panel_view1.prof = prof.add if prof is not None else None
+        p.panel_view2.prof = prof.add if prof is not None else None
         p.slider_alpha.blockSignals(True)
         p.slider_alpha.setValue(int(round(self._alpha * self.ALPHA_SLIDER_MAX)))
         p.slider_alpha.blockSignals(False)
@@ -2299,6 +2326,7 @@ class OverlayLivePage(QWidget):
             except OSError:
                 t_acquired = time.time()
         self._panels_new_xray(t_acquired)
+        self._setup_view2()
         self._on_panel_map_changed()
         self._t_readout = self._t_age = 0.0
         self._n_shown = 0
@@ -2308,27 +2336,47 @@ class OverlayLivePage(QWidget):
         for the X-ray now on the page."""
         p = self.panels
         working = self._xray_working_u8
-        if working is None or self._builder is None or self._current_d_x_mm is None:
+        if working is None or self._builder is None:
             return
         p.panel_view1.set_xray(working, t_acquired,
                                time.strftime("%H:%M", time.localtime(t_acquired)))
-        view, field = self._xray_view_and_field(self._current_d_x_mm, self._tool_overlay)
-        h, w = working.shape[:2]
-        self._builder.set_xray(view, field, self._current_d_x_mm, (w, h))
+        self._panels_set_builder_xray()
         self._panels_plane_changed(recentre=True)
+
+    def _panels_set_builder_xray(self) -> None:
+        """The marks' X-ray frame and field for the X-ray on the page. Without a
+        plane (Multi-View before it is set) X-ray view 1 still gets its marks,
+        on a field without the inset of panel 1's tip glyph (that needs d_x)."""
+        working = self._xray_working_u8
+        d_x = self._current_d_x_mm
+        h, w = working.shape[:2]
+        if d_x is None:
+            view = XrayView(self.state.T_xc, self.state.K_xray)
+            field = XrayField.from_image(working)
+        else:
+            view, field = self._xray_view_and_field(d_x, self._tool_overlay)
+        self._builder.set_xray(view, field, d_x, (w, h))
+        self._builder_has_plane = d_x is not None
 
     def _panels_plane_changed(self, recentre: bool) -> None:
         """A new d_x (slider, new plane, new X-ray): the marks' plane, panel
         1's blend, and with recentre the crop on the field (fixed per X-ray
-        and plane: a crop following the drill would move the whole picture)."""
+        and plane: a crop following the drill would move the whole picture).
+        Without a plane (Multi-View before it is set): no blend, the crop in
+        the middle of the frame."""
         b = self._builder
         p = self.panels
-        if b is None or self._xray_working_u8 is None or self._current_d_x_mm is None:
+        if b is None or self._xray_working_u8 is None:
             return
-        h, w = self._xray_working_u8.shape[:2]
-        b.set_plane_depth(self._current_d_x_mm, (w, h))
+        d_x = self._current_d_x_mm
+        if (d_x is not None) != self._builder_has_plane:
+            self._panels_set_builder_xray()
+        elif d_x is not None:
+            h, w = self._xray_working_u8.shape[:2]
+            b.set_plane_depth(d_x, (w, h))
         overlay = self._ensure_overlay()
         p.panel_live.set_overlay(overlay)
+        p.slider_dx.setEnabled(d_x is not None)
         if recentre:
             fw, fh = self.COLOR_SIZE
             b.set_camera_panel((0, 0, fw, fh))
@@ -2370,6 +2418,105 @@ class OverlayLivePage(QWidget):
             return
         v1 = self.panels.panel_view1
         self._builder.set_xray_panel(v1.panel_map, v1.mark_scale)
+        if self._builder2 is not None:
+            v2 = self.panels.panel_view2
+            self._builder2.set_xray_panel(v2.panel_map, v2.mark_scale)
+
+    def _panels_buttons(self) -> None:
+        """The card's X-ray buttons of the workflow. Multi-View (user 11.11.): the
+        board is off the table after X-ray Acquisition, so a new AP X-ray is taken
+        here as in single view (View 1's board pose stays: the C-arm stays in AP);
+        'New views with board' goes back to X-ray Acquisition for both views."""
+        p = self.panels
+        p.btn_load_xray.setText(self._load_button_text())
+        for b in (p.btn_load_xray, p.btn_usb, p.btn_new_views):
+            b.setEnabled(True)
+            b.setToolTip("")
+
+    def _load_button_text(self) -> str:
+        return "Load X-ray View 1 (AP)" if self._multi_view else "Load X-ray"
+
+    def _on_new_views_button(self) -> None:
+        """Multi-View: lateral and AP again with the board, on X-ray Acquisition;
+        the main window switches the page, this one is left as usual (on_leave)."""
+        if self._panels_mode and self._multi_view:
+            self.new_views_requested.emit()
+
+    def _view_ap_stance(self) -> bytes | None:
+        ap = self.state.xray_view_ap if self._multi_view else None
+        return None if ap is None else np.asarray(ap.T_cw, dtype=np.float64).tobytes()
+
+    def _plane_kept(self) -> bool:
+        """Multi-View, entering: the plane set here before is still the one of
+        View 1's stance (back from X-ray Acquisition without new views)."""
+        stance = self._view_ap_stance()
+        return (self.state.d_x is not None and stance is not None
+                and self._plane_stance == stance)
+
+    def _replace_view_ap(self, img: np.ndarray, path: str, t_acquired: float) -> None:
+        """Multi-View: a new AP X-ray taken here replaces View 1's image. Its board
+        pose stays (user 11.11.: the C-arm does not move in AP, the board is off the
+        table), so panel 3 keeps its frame; newer than View 2 (seq)."""
+        ap = self.state.xray_view_ap
+        if ap is None:
+            return
+        seq = max((c.seq for c in self.state.xray_views.values()), default=0) + 1
+        self.state.xray_views[VIEW_AP] = dataclasses.replace(
+            ap, image=img, path=str(path), t_acquired=t_acquired, seq=seq,
+            board_shift_px=float("nan"), working=self._xray_working_u8,
+        )
+
+    def _setup_view2(self) -> None:
+        """Multi-View: X-ray View 2 (lateral) of X-ray Acquisition in panel 3.
+        Its marks come from a second MarkBuilder chained to the first
+        (MarkBuilder.set_second), in the tracking thread, on the same pose:
+
+            T_xc of view 2 = T_cw_AP @ inv(T_cw_lat) @ T_xc @ Rz(-phi)
+
+        (view_registration.xray_view_matrix): the lateral X-ray frame seen from
+        the camera as it is now, which is the stance of View 1 (AP) as long as
+        the C-arm has not moved since. Without view 2 a placeholder."""
+        p = self.panels
+        if self._builder is not None:
+            self._builder.set_second(None)
+        self._builder2 = None
+        if not self._multi_view:
+            return
+        st = self.state
+        ap, lat = st.xray_view_ap, st.xray_view_lat
+        if ap is None or lat is None or st.view_ap_out_of_date:
+            p.panel_view2.set_placeholder("X-RAY VIEW 2", "not acquired")
+            p.panel_view2.set_right_text("")
+            return
+        work = lat.working
+        try:
+            if work is None:
+                work = np.ascontiguousarray(cv2.flip(lat.image, 1))
+                field_model = getattr(st, "xray_dist_field", None)
+                if field_model is not None:
+                    work = field_model.undistort_image_working(work)
+                lat.working = work
+            view = XrayView(xray_view_matrix(lat.T_cw, ap.T_cw, st.T_xc, lat.phi_deg), st.K_xray)
+            field = XrayField.from_image(work)
+            turned = camera_motion(lat.T_cw, ap.T_cw)["angle_deg"]
+        except Exception as e:
+            print(f"[WARN] Live page: X-ray View 2 not shown: {e}")
+            p.panel_view2.set_placeholder("X-RAY VIEW 2", "could not be shown")
+            p.panel_view2.set_right_text("")
+            return
+        # no age in the header (it would tick): when, and the turn as a plausibility check
+        p.panel_view2.set_xray(work)
+        p.panel_view2.set_right_text(
+            f"Acquired {time.strftime('%H:%M', time.localtime(lat.t_acquired))}"
+            f"  ·  C-arm turned {turned:.1f}°"
+        )
+        b2 = MarkBuilder(st.K_rgb, st.dist_rgb, line_factory=QLineF)
+        b2.set_camera_panel(None)
+        h, w = work.shape[:2]
+        b2.set_xray(view, field, None, (w, h))
+        self._builder2 = b2
+        self._on_panel_map_changed()
+        self._builder.set_second(b2)
 
     def _show_on_panels(self, img: np.ndarray, pose_out, exposure: dict | None) -> None:
         """Panel 1, one shown frame: straight from the frame's memory; a copy
@@ -2414,6 +2561,10 @@ class OverlayLivePage(QWidget):
             m = None
         p.panel_view1.set_marks(m)
         p.panel_view1.set_lost(self._tracking_active and m is None)
+        if self._builder2 is not None:
+            m2 = None if m is None else m.second
+            p.panel_view2.set_marks(m2)
+            p.panel_view2.set_lost(self._tracking_active and m2 is None)
         if m is None:
             p.plane_view.set_state(None, None)
         else:
@@ -2440,8 +2591,13 @@ class OverlayLivePage(QWidget):
         """(text, colour) of the status line (texts decided 10.11.)."""
         if self._plane_acquiring:
             d = self._plane_d_x_mm
-            head, esc = (("New X-ray", "ESC keep plane") if self._plane_new_xray
-                         else ("Plane", "ESC cancel"))
+            if self._plane_entry:
+                head, esc = "View 1 (AP)", "ESC skip"
+            elif self._plane_new_xray:
+                head, esc = "New X-ray", ("ESC keep plane" if self._current_d_x_mm is not None
+                                          else "ESC skip")
+            else:
+                head, esc = "Plane", "ESC cancel"
             if self._plane_res is None or d is None:
                 return f"{head}: pointer not found  ·  {esc}", STATUS_BAD
             old = self._base_d_x_mm
@@ -2456,6 +2612,9 @@ class OverlayLivePage(QWidget):
             self._status_msg = None
         if self._xray_waiting:
             return "Waiting for the X-ray from the C-arm  ·  ESC cancel", STATUS_NEUTRAL
+        if self._multi_view and self._current_d_x_mm is None:
+            # skipped at entry (user 11.11.): X-ray panels and camera view run
+            return "No plane Π  ·  Set reference plane", STATUS_WARN
         if not self._tracking_active:
             return "Tracking off", STATUS_NEUTRAL
         if m is None:
@@ -2509,7 +2668,7 @@ class OverlayLivePage(QWidget):
 
     def _cancel_xray_wait(self, status: str = "No new X-ray (cancelled)") -> None:
         self._xray_waiting = False
-        self.panels.btn_load_xray.setText("Load X-ray")
+        self.panels.btn_load_xray.setText(self._load_button_text())
         self.panels.panel_view1.tick(time.time())
         if status:
             self._panel_status(status)
@@ -2533,11 +2692,12 @@ class OverlayLivePage(QWidget):
             return False
         if self._xray_waiting:
             self._xray_waiting = False
-            self.panels.btn_load_xray.setText("Load X-ray")
+            self.panels.btn_load_xray.setText(self._load_button_text())
             self._take_xray_file(path, "C-arm")
             return True
         self._xray_pending = path
-        self._panel_status("X-ray received  ·  press Load X-ray to show it", STATUS_WARN, None)
+        self._panel_status(f"X-ray received  ·  press {self._load_button_text()} to show it",
+                           STATUS_WARN, None)
         return True
 
     def _take_xray_file(self, path: str, source: str) -> bool:
@@ -2567,6 +2727,8 @@ class OverlayLivePage(QWidget):
         self._invalidate_overlay_cache()
         t_acquired = time.time()
         self._xray_t_acquired = (path, t_acquired)
+        if self._multi_view:
+            self._replace_view_ap(img, path, t_acquired)
         if self._tool_overlay is not None:
             self._attach_xray_view(self._tool_overlay)
         self._panels_new_xray(t_acquired)
@@ -2580,7 +2742,8 @@ class OverlayLivePage(QWidget):
                 self._xray_starts_label = True
                 ev.copy_file("xray", path, page="overlay_live_xray")
                 ev.log("overlay_live", Path(path).name,
-                       {"new_xray": source, "d_x_mm": self._current_d_x_mm})
+                       {"new_xray": source, "d_x_mm": self._current_d_x_mm,
+                        **({"view1_board_pose": "kept"} if self._multi_view else {})})
             except Exception as e:
                 print(f"[WARN] Could not record the new X-ray: {e}")
         # a new X-ray is a new plane: no "Set reference plane" needed (11.11.)
@@ -3489,7 +3652,11 @@ class OverlayLivePage(QWidget):
         """Button "Cancel" or ESC while the pointer is searched."""
         self._end_plane_acquire("cancelled")
         if self._panels_mode:
-            if self._plane_new_xray:
+            if self._current_d_x_mm is None:
+                # skipped: the status line says "No plane" until one is set
+                self._status_msg = None
+                self.panels.lbl_status.setText(*self._panel_status_line(None, time.perf_counter()))
+            elif self._plane_new_xray:
                 d = self._current_d_x_mm
                 self._panel_status(f"New X-ray  ·  plane kept (d_x {d:.1f} mm)")
             else:
@@ -3512,7 +3679,8 @@ class OverlayLivePage(QWidget):
         ev = self.state.eval
         label = "" if ev is None else f"{ev.sanitize_label(ev.label)}: "
         was = "" if old is None else f" (was {old:.1f})"
-        which = "new X-ray" if self._plane_new_xray else "same X-ray"
+        which = ("new X-ray" if self._plane_new_xray
+                 else "View 1 (AP)" if self._plane_entry else "same X-ray")
         self._panel_status(f"{label}Plane set  ·  d_x {d_new:.1f} mm{was}  ·  {which}")
         # another plane is another place in the camera image: the crop follows
         self._panels_plane_changed(recentre=True)
@@ -3541,6 +3709,7 @@ class OverlayLivePage(QWidget):
         self._plane_raw = None
         self._plane_d_x_mm = None
         self._plane_new_xray = False      # _set_new_xray sets it after this
+        self._plane_entry = False         # _start_entry_plane sets it after this
         self._plane_acquiring = True
 
         self.controls.btn_plane.setText("Cancel")
@@ -3674,6 +3843,7 @@ class OverlayLivePage(QWidget):
                 ev.set_label(ev.next_label(ev.label))
 
         self.state.d_x = float(d_x_mm)
+        self._plane_stance = self._view_ap_stance()
         self.state.tip_uv_c = np.asarray(res.tip_uv, dtype=np.float64).copy()
         self.state.tip_xyz_c = np.asarray(res.tip_point_camera_mm, dtype=np.float64).copy()
         self.state.T_tc = np.asarray(res.T_4x4, dtype=np.float64).copy()
@@ -3760,6 +3930,10 @@ class OverlayLivePage(QWidget):
         # With an X-ray the study's panels, in the tracking test the rail
         # over the full frame (LIVE_PANELS).
         self._panels_mode = self.use_panels and not self._tracking_only
+        # Multi-View (start dialog): X-ray View 1 (AP) and View 2 (lateral) of
+        # the X-ray Acquisition step in panels 2 and 3
+        self._multi_view = self._panels_mode and bool(getattr(self.state, "is_multi_view", False))
+        self.panels.set_workflow(WORKFLOW_MULTI if self._multi_view else WORKFLOW_SINGLE)
         self.controls = self.panels if self._panels_mode else self._rail
         self.image_label.setVisible(not self._panels_mode)
         self._rail.setVisible(not self._panels_mode)
@@ -3780,8 +3954,16 @@ class OverlayLivePage(QWidget):
         self._t_withheld = None
         self._screen_view = False
 
+        if self._multi_view:
+            self._take_view_ap()
         self._load_xray_from_state()
-        self._initialize_dx()
+        if self._multi_view and not self._plane_kept():
+            # the check's plane before X-ray Acquisition, or one of earlier views,
+            # is not the one of this View 1
+            self._plane_stance = None
+            self._reset_dx()
+        else:
+            self._initialize_dx()
 
         if not self._tracking_only and not self._has_prerequisites():
             QMessageBox.information(
@@ -3850,6 +4032,8 @@ class OverlayLivePage(QWidget):
                     f"{format_realsense_color(self._camera_color) or 'not read back'}"
                 )
             self._start_timer()
+            if self._multi_view and self._current_d_x_mm is None:
+                self._start_entry_plane()
             self.setFocus()
 
         except Exception as e:
@@ -3860,6 +4044,26 @@ class OverlayLivePage(QWidget):
                 "Camera",
                 f"Could not open RealSense camera.\n\n{e}",
             )
+
+    def _take_view_ap(self) -> None:
+        """Multi-View: X-ray View 1 (AP) of X-ray Acquisition is the X-ray of
+        panels 1 and 2, aged from its acquisition (a check before X-ray
+        Acquisition, or a step back to it, may have loaded another one)."""
+        ap = self.state.xray_view_ap
+        if ap is None:
+            return
+        self.state.xray_image_anatomy = ap.image
+        self.state.xray_image_anatomy_path = ap.path
+        self._xray_t_acquired = (ap.path, ap.t_acquired)
+
+    def _start_entry_plane(self) -> None:
+        """Multi-View, entering: the pointer search for the plane of View 1
+        (AP) starts by itself (user 11.11.); SPACE sets it, ESC goes on without
+        a plane (the X-ray panels and the camera view still run)."""
+        self.start_plane_only()
+        if self._plane_acquiring:
+            self._plane_entry = True
+            self.panels.lbl_status.setText(*self._panel_status_line(None, time.perf_counter()))
 
     def on_leave(self) -> None:
         self._end_plane_acquire("")

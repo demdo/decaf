@@ -300,6 +300,8 @@ class XrayAcquisitionPage(LiveImagePage):
         self._t_preview = 0.0
         self._pending: Optional[_Pending] = None
         self._seq = 0
+        # new views from Overlay Live (begin_new_views): View 2 before View 1
+        self._lat_first = False
         self._messages: dict = {VIEW_AP: None, VIEW_LAT: None}   # (text, colour) per card
         self._camera_ok = False
         self._draw_count = 0
@@ -393,8 +395,23 @@ class XrayAcquisitionPage(LiveImagePage):
         """'Next': View 1 (AP) set and newer than View 2, nothing running."""
         return not self.busy and self.state.has_current_view_ap
 
+    def begin_new_views(self) -> None:
+        """Overlay Live, 'New views with board' (user 11.11.): the board was off the
+        table after the last acquisition and comes back, so a new View 1 needs a new
+        View 2 of the same board placement first; View 1 is locked until then. The
+        views on screen stay valid meanwhile (their relative pose, which panel 3 of
+        Overlay Live uses, no longer depends on the board)."""
+        self._lat_first = True
+        self._refresh()
+
+    @property
+    def lat_first(self) -> bool:
+        return self._lat_first
+
     def start_view(self, view: str) -> None:
         if self.busy or not self._camera_ok:
+            return
+        if view == VIEW_AP and self._lat_first:
             return
         self._active = view
         self._phase = POSE
@@ -607,6 +624,8 @@ class XrayAcquisitionPage(LiveImagePage):
             pose=pose,
         )
         self.state.xray_views[view] = cap
+        if view == VIEW_LAT:
+            self._lat_first = False
         if view == VIEW_AP:
             # the live page shows xray_image_anatomy (as after the Overlay Preview)
             self.state.xray_image_anatomy = img
@@ -796,7 +815,7 @@ class XrayAcquisitionPage(LiveImagePage):
 
     def _suggested(self) -> Optional[str]:
         ap, lat = self.state.xray_view_ap, self.state.xray_view_lat
-        if ap is None and lat is None:
+        if self._lat_first or (ap is None and lat is None):
             return VIEW_LAT
         if ap is None or self.state.view_ap_out_of_date:
             return VIEW_AP
@@ -824,7 +843,14 @@ class XrayAcquisitionPage(LiveImagePage):
 
         lines: list = []
         lat = self.state.xray_view_lat
-        if view == VIEW_AP and self.state.view_ap_out_of_date:
+        if self._lat_first:
+            if view == VIEW_AP:
+                lines = [("Locked until View 2 (Lat) is retaken: the board has moved since.", ORANGE)]
+                if cap is not None:
+                    lines.insert(0, ("✓ X-ray from before (still shown in Live)", GREY))
+                return (meta["retake"] if cap is not None else meta["load"]), lines, False, False
+            lines = [("Board back on the table? Turn lateral, then retake.", BLUE)]
+        elif view == VIEW_AP and self.state.view_ap_out_of_date:
             lines = [("Out of date: older than View 2.", ORANGE), ("Turn back to AP and retake it.", BLUE)]
         elif cap is not None:
             s = cap.pose_summary
@@ -895,11 +921,18 @@ class XrayAcquisitionPage(LiveImagePage):
                     f"Without the C-arm link: 'From folder (USB)'. ESC cancels "
                     f"(an earlier {_VIEWS[self._active]['name']} stays).")
         ap, lat = self.state.xray_view_ap, self.state.xray_view_lat
+        # with the tool loaded, 'Next' goes straight back to Overlay Live (MainWindow)
+        nxt = "Overlay Live" if self.state.has_tool else "Tool Tracking"
+        if self._lat_first:
+            return ("New views: put the board back on the table, where the camera sees it in both stances.\n"
+                    "1) Turn the C-arm lateral and retake View 2 (Lat)\n"
+                    "2) Turn back to AP and retake View 1 (AP); it stays locked until View 2 is new\n"
+                    f"3) Remove the board again and click 'Next' to return to {nxt}.")
         if ap is None and lat is None:
             return ("1) Turn the C-arm lateral, click 'Load X-ray View 2 (Lat)', hold it still for 1 s (board pose)\n"
                     "2) Send the lateral X-ray to CONQUEST on the C-arm\n"
                     "3) Turn back to AP, click 'Load X-ray View 1 (AP)', hold still 1 s, send the AP X-ray\n"
-                    "4) Click 'Next' (Tool Tracking). ESC cancels a running view; the board must not move")
+                    f"4) Remove the board, click 'Next' ({nxt}). ESC cancels a running view; the board must not move")
         if self.state.view_ap_out_of_date:
             return ("View 2 (Lat) was retaken, so View 1 (AP) is out of date.\n"
                     "Turn back to AP and retake View 1 (AP); 'Next' is locked until then.")
@@ -907,13 +940,14 @@ class XrayAcquisitionPage(LiveImagePage):
             return ("View 2 (Lat) is set. Turn the C-arm back to AP, click 'Load X-ray View 1 (AP)',\n"
                     "hold still 1 s and send the AP X-ray. 'Next' follows once View 1 (AP) is set.")
         if lat is None:
-            return ("View 1 (AP) is set; View 2 (Lat) is optional.\n"
-                    "Click 'Next' to continue to Tool Tracking. For View 2: turn lateral, load View 2,\n"
-                    "then turn back and retake View 1 (AP is always last).")
-        return ("Both views are set: check the X-rays.\n"
-                "Not satisfied? Retake a view: board pose and X-ray again (the camera comes back for it).\n"
-                "Retaking View 2 (Lat) needs View 1 (AP) again afterwards (AP is always last).\n"
-                "Click 'Next' to continue to Tool Tracking.")
+            return ("View 1 (AP) is set; View 2 (Lat) is optional. For View 2: turn lateral, load View 2,\n"
+                    "then turn back and retake View 1 (AP is always last).\n"
+                    "Then REMOVE THE BOARD from the table: it is only needed for new views.\n"
+                    f"Click 'Next' to continue to {nxt}.")
+        return ("Both views are set: check the X-rays. Not satisfied? Retake a view (board pose and X-ray again;\n"
+                "retaking View 2 (Lat) needs View 1 (AP) again afterwards, AP is always last).\n"
+                "Then REMOVE THE BOARD from the table: it is only needed for new views.\n"
+                f"Click 'Next' to continue to {nxt}.")
 
     def _refresh_instructions(self) -> None:
         text = self._instructions()

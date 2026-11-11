@@ -346,6 +346,7 @@ class MainWindow(QMainWindow):
         self._wire_nav(self.page_tool_tracking, idx=self.IDX_TOOL_TRACKING)
         self._wire_nav(self.page_overlay_live, idx=self.IDX_OVERLAY_LIVE)
         self._wire_nav(self.page_xray_acq, idx=self.IDX_XRAY_ACQ)
+        self.page_overlay_live.new_views_requested.connect(self._on_new_views)
 
         self.page_cam2xray.btn_next_height.clicked.connect(self.next_height)
         self.page_plane.on_redo_height = lambda: self.redo_height(confirm=False)
@@ -647,6 +648,10 @@ class MainWindow(QMainWindow):
             if self.tracking_test:
                 # camera image + drill: no H_xc, X-ray or d_x
                 return self.state.has_rgb_intrinsics and self.state.has_tool
+            if self.state.is_multi_view:
+                # View 1 (AP) of X-ray Acquisition; the plane is set on the page
+                # itself, the check before it may be skipped (user 11.11.)
+                return self.state.has_current_view_ap and self.state.has_tool
             # Checked only once the Tool Tracking step before it is done.
             return (
                 self.state.has_H_xc
@@ -704,12 +709,30 @@ class MainWindow(QMainWindow):
                 self.go_to(idx + 1)
             return
 
+        target = self._next_b_target(idx)
+        if target is not None:
+            self.go_to(target)
+
+    def _next_b_target(self, idx: int):
+        """The Mode B step 'Next' leads to from idx, or None. Multi-View: with the
+        tool loaded, X-ray Acquisition goes straight back to Overlay Live (new views
+        are taken from there, 11.11.)."""
         seq = self._b_sequence()
-        if idx in seq:
-            b_pos = seq.index(idx)
-            if b_pos < len(seq) - 1:
-                self.go_to(seq[b_pos + 1])
+        if idx not in seq:
+            return None
+        if (idx == self.IDX_XRAY_ACQ and self.state.has_tool and not self.tracking_test
+                and self.IDX_OVERLAY_LIVE in seq):
+            return self.IDX_OVERLAY_LIVE
+        b_pos = seq.index(idx)
+        return seq[b_pos + 1] if b_pos < len(seq) - 1 else None
+
+    def _on_new_views(self) -> None:
+        """Overlay Live, Multi-View: 'New views with board'. X-ray Acquisition with
+        View 2 before View 1 (the board was off the table since)."""
+        if self.IDX_XRAY_ACQ not in self._b_sequence():
             return
+        self.page_xray_acq.begin_new_views()
+        self.go_to(self.IDX_XRAY_ACQ)
 
     # ------------------------------------------------------------------
     # Callbacks

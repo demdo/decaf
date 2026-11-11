@@ -298,6 +298,39 @@ def test_evaluation_files() -> None:
     print("  (c) evaluation files ok")
 
 
+# ------------------------------------------------------------ (f) new views from Overlay Live
+
+def test_new_views() -> None:
+    """'New views with board' in Overlay Live (11.11.): the board was off the table, so
+    View 1 is locked until View 2 is retaken with the board back; then AP last as always."""
+    from overlay.gui.state import VIEW_AP, VIEW_LAT
+    app = _app()
+    K, dist, xr = _data()
+    state, page, _ = _page(K, dist)
+    page.frame_source = Feed(LAT_DIR)
+    page.on_enter()
+    page.stop_timer()
+    _take_view(app, page, VIEW_LAT, Feed(LAT_DIR), xr[0])
+    _take_view(app, page, VIEW_AP, Feed(AP_DIR), xr[1])
+    assert "REMOVE THE BOARD" in page.instructions_label.text(), page.instructions_label.text()
+    assert "Tool Tracking" in page.instructions_label.text()     # no tool yet
+    ap_before = state.xray_view_ap
+    page.begin_new_views()
+    assert page.lat_first and page.can_continue()        # the views on screen stay valid
+    assert "put the board back" in page.instructions_label.text()
+    assert not page.cards[VIEW_AP].button.isEnabled() and page.cards[VIEW_LAT].button.isEnabled()
+    page.start_view(VIEW_AP)
+    assert page.phase == "idle" and state.xray_view_ap is ap_before, "View 1 must wait for View 2"
+    _take_view(app, page, VIEW_LAT, Feed(LAT_DIR), xr[2])
+    assert not page.lat_first and state.view_ap_out_of_date and not page.can_continue()
+    assert page.cards[VIEW_AP].button.isEnabled()
+    _take_view(app, page, VIEW_AP, Feed(AP_DIR), xr[3])
+    assert page.can_continue() and state.xray_view_ap is not ap_before
+    page.on_leave()
+    page.close()
+    print("  (f) new views from Live: View 1 locked until View 2 is retaken")
+
+
 # ------------------------------------------------------------ (d) wizard, Multi-View
 
 def test_main_multi() -> None:
@@ -340,9 +373,22 @@ def test_main_multi() -> None:
         win.state.xray_views[VIEW_AP] = XrayViewCapture(VIEW_AP, img + 1, "b", np.eye(4), summ, 0.0, 2)
         win.update_ui()
         assert page.btn_next.isEnabled() and win.step_complete(win.IDX_XRAY_ACQ)
+        # Overlay Live in Multi: View 1 and a tool, no plane from the check (user 11.11.)
+        assert win.state.H_xc is None and not win.step_complete(win.IDX_OVERLAY_LIVE)
+        win.state.tool_assets = object()
+        assert win.step_complete(win.IDX_OVERLAY_LIVE)
         win.state.xray_views[VIEW_LAT] = XrayViewCapture(VIEW_LAT, img + 2, "c", np.eye(4), summ, 0.0, 3)
         win.update_ui()
         assert not page.btn_next.isEnabled(), "View 1 out of date must lock Next"
+        assert not win.step_complete(win.IDX_OVERLAY_LIVE)
+        # 'Next' straight back to Overlay Live once the tool is loaded (11.11.)
+        assert win._next_b_target(win.IDX_XRAY_ACQ) == win.IDX_OVERLAY_LIVE
+        win.state.tool_assets = None
+        assert win._next_b_target(win.IDX_XRAY_ACQ) == win.IDX_TOOL_TRACKING
+        # 'New views with board' in Overlay Live: X-ray Acquisition, View 2 first
+        win.page_overlay_live.new_views_requested.emit()
+        assert win.current_step == win.IDX_XRAY_ACQ and page.lat_first
+        assert not page.cards[VIEW_AP].button.isEnabled()
         page.on_leave()
     finally:
         win.close()
@@ -376,7 +422,8 @@ def test_main_single() -> None:
 
 
 def main() -> int:
-    tests = (test_main_single, test_main_multi, test_page_flow, test_escape_key, test_evaluation_files)
+    tests = (test_main_single, test_main_multi, test_page_flow, test_escape_key, test_evaluation_files,
+             test_new_views)
     skipped = 0
     for test in tests:
         try:
