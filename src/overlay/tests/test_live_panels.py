@@ -1360,6 +1360,145 @@ def test_page_panels_multi() -> None:
           "X-ray keeps View 1's board pose, the plane stays with the stance, New views with board")
 
 
+# ------------------------------------------------------------ (n)
+
+def test_target_trajectory() -> None:
+    """Set target trajectory (11.11.): the drill axis at the press as the target, light blue,
+    only inside the X-ray field; its point on the slider counts from the mask entry like the
+    ruler; pressing again replaces it and ESC within 5 s brings the earlier one back; the box
+    in the Overlay card hides it; snapshot.json records it; Multi-View: new views drop it."""
+    import dataclasses
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QMessageBox
+
+    from overlay.gui.state import VIEW_AP, VIEW_LAT, WORKFLOW_MULTI, XrayViewCapture
+    from overlay.gui.widgets.widget_live_panels import STATUS_WARN
+    from overlay.tools.view_registration import rot_z, to_T
+
+    # ---- geometry: the same entry as the ruler, the line through the drill's own marks ----
+    rec, work = _case()
+    b, view, field, ov, m = _builder_of(rec, work, side=900)
+    tip, back = np.asarray(rec.pts[0], float), np.asarray(rec.pts[1], float)
+    fwd = (tip - back) / np.linalg.norm(tip - back)
+    marks = b.build(rec.pts)
+    depth = b.ruler_depth_mm(tip, fwd)
+    assert abs(depth - marks.depth_mm) < 1e-9, (depth, marks.depth_mm)
+    point = tip + (75.0 - depth) * fwd
+    assert abs(b.ruler_depth_mm(point, fwd) - 75.0) < 1e-9
+    tm = b.target_marks(tip, fwd, point)
+    x0, y0, x1, y1 = tm.xray_line
+    ux, uy = (x1 - x0), (y1 - y0)
+    n = math.hypot(ux, uy)
+    for px, py in (marks.xray.tip, tm.xray_ring):     # on the target's line
+        assert abs((px - x0) * uy - (py - y0) * ux) / n < 1e-6
+    assert len(tm.camera_line) > 2 and tm.camera_ring is not None and tm.xray_ring_radius > 0
+    mt = marks.camera.magenta_tip                         # panel 1: on its X-ray view
+    d_min = min(math.hypot(mt[0] - x, mt[1] - y) for x, y in tm.camera_line)
+    assert d_min < 2.0, d_min
+    b.set_plane_depth(None)                               # no plane: no X-ray view in panel 1
+    tm = b.target_marks(tip, fwd, point)
+    assert not tm.camera_line and tm.camera_ring is None and tm.xray_line is not None
+
+    # ---- the real page, single view ----
+    distortion = xv._field_distortion()
+    z = np.load(xv.DATA / "Evaluation_Integrated_System" / "B_2_tracking.npz")
+    ok = np.isfinite(z["rvec"]).all(axis=1)
+    app = _app()
+    errors, info = [], []
+    boxes = (QMessageBox.critical, QMessageBox.information)
+    QMessageBox.critical = staticmethod(lambda *a, **k: errors.append(a[2:]))
+    QMessageBox.information = staticmethod(lambda *a, **k: info.append(a[2:]))
+    try:
+        page = xv._make_page(rec, rec.raw, distortion, (z["rvec"][ok], z["tvec"][ok]), panels=True)
+        page.on_enter()
+        p = page.panels
+        assert p.btn_target.isEnabled() and not p.slider_target.isEnabled()
+        assert not p.chk_show_target.isEnabled() and p.lbl_target_value.text() == "–"
+        p.btn_target.click()                               # no pose yet
+        assert page._target is None and "No drill pose" in p.lbl_status.text()
+        assert p.lbl_status.colour().rgb() == STATUS_WARN.rgb()
+        p.btn_track.click()
+        assert _spin(app, 5.0, lambda: page._panel_marks is not None), "no marks"
+        p.btn_target.click()
+        t1 = page._target
+        assert t1 is not None and p.slider_target.isEnabled() and p.chk_show_target.isChecked()
+        d1 = page._builder.ruler_depth_mm(t1["tip"], t1["fwd"])
+        assert t1["point_mm"] == int(round(d1)) == p.slider_target.value()
+        assert p.lbl_target_value.text() == f"{t1['point_mm']} mm"
+        assert "Target trajectory set" in p.lbl_status.text()
+        assert p.panel_view1._target is not None and p.panel_live._target_line is not None
+        ring_before = p.panel_view1._target[1]
+        p.slider_target.setValue(t1["point_mm"] + 15)          # the point moves along it
+        assert t1["point_mm"] == p.slider_target.value() and p.panel_view1._target[1] != ring_before
+        pt = page._target_point_c()
+        assert abs(page._builder.ruler_depth_mm(pt, t1["fwd"]) - t1["point_mm"]) < 1e-6
+        rec_t = page._target_record()
+        assert rec_t["target_point_mm"] == t1["point_mm"] and rec_t["shown"]
+        # again: replaced; ESC within 5 s brings the earlier one back
+        p.btn_target.click()
+        assert page._target is not t1 and "ESC within 5 s" in p.lbl_status.text()
+        QTest.keyClick(page, Qt.Key_Escape)
+        assert page._target is t1 and p.slider_target.value() == t1["point_mm"]
+        assert "Earlier target" in p.lbl_status.text()
+        p.btn_target.click()
+        t2 = page._target
+        page._target_undo = (t1, time.perf_counter() - 1.0)    # too late: ESC changes nothing
+        QTest.keyClick(page, Qt.Key_Escape)
+        assert page._target is t2
+        # hidden: kept, nothing drawn; shown again
+        p.chk_show_target.setChecked(False)
+        assert page._target is t2 and p.panel_view1._target is None and p.panel_live._target_line is None
+        p.chk_show_target.setChecked(True)
+        assert p.panel_view1._target is not None
+        p.btn_track.click()
+        page.on_leave()
+        page.on_enter()                                         # single view: it stays
+        assert page._target is t2 and p.panel_view1._target is not None
+        page.on_leave()
+        page.close()
+
+        # ---- multi-view: new views with the board drop it ----
+        page = xv._make_page(rec, rec.raw, distortion, (z["rvec"][ok], z["tvec"][ok]), panels=True)
+        st = page.state
+        st.workflow = WORKFLOW_MULTI
+        T_cw = to_T(rot_z(25.0)[:3, :3], np.array([0.04, -0.02, 0.6]))
+        now = time.time()
+        st.xray_views = {
+            VIEW_LAT: XrayViewCapture(VIEW_LAT, rec.raw.copy(), "lat.dcm", T_cw, {}, now - 300.0, 1),
+            VIEW_AP: XrayViewCapture(VIEW_AP, rec.raw, "ap.dcm", T_cw, {}, now - 60.0, 2),
+        }
+        page.on_enter()
+        p = page.panels
+        QTest.keyClick(page, Qt.Key_Escape)                     # on without a plane
+        p.btn_track.click()
+        assert _spin(app, 5.0, lambda: page._panel_marks is not None), "no marks (multi)"
+        p.btn_target.click()
+        tm_ = page._target
+        assert tm_ is not None and p.panel_view2._target is not None   # panel 3 too
+        assert p.panel_live._target_line is None                       # no plane: no X-ray view
+        p.btn_track.click()
+        page.on_leave()
+        page.on_enter()                                         # the same stance: kept
+        assert page._target is tm_
+        QTest.keyClick(page, Qt.Key_Escape)
+        page.on_leave()
+        st.xray_views[VIEW_AP] = dataclasses.replace(
+            st.xray_views[VIEW_AP], T_cw=to_T(rot_z(40.0)[:3, :3], np.array([0.05, 0.0, 0.6])))
+        page.on_enter()                                         # new views: dropped
+        assert page._target is None and not p.slider_target.isEnabled()
+        assert p.panel_view1._target is None and p.panel_view2._target is None
+        QTest.keyClick(page, Qt.Key_Escape)
+        page.on_leave()
+        assert not errors, errors
+        page.close()
+    finally:
+        QMessageBox.critical, QMessageBox.information = boxes
+    print("  (n) target trajectory: the ruler's entry, on the drill's line in panels 1 and 2, slider, "
+          "replace and ESC back, hidden, snapshot record, kept in single view, dropped by new views")
+
+
 # ------------------------------------------------------------ main
 
 def main() -> int:
@@ -1368,7 +1507,7 @@ def main() -> int:
         test_same_as_chat1, test_fixed_dashes, test_ruler_real, test_overlay_in_roi, test_camera_panel_direct,
         test_xray_panel, test_design_window,
         test_view_at_start, test_readout_tile, test_readout_int, test_plane_side_view,
-        test_page_plane_only, test_page_panels, test_page_panels_multi,
+        test_page_plane_only, test_page_panels, test_page_panels_multi, test_target_trajectory,
     )
     skipped = 0
     for test in tests:

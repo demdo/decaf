@@ -49,6 +49,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QPolygon,
+    QPolygonF,
     QRegion,
 )
 from PySide6.QtWidgets import (
@@ -79,6 +80,8 @@ GREEN = _rgb(TrackingOverlay.AXIS_COLOR)
 MAGENTA = _rgb(TrackingOverlay.XRAY_COLOR)
 ORANGE = _rgb(TrackingOverlay.MARKED_COLOR)
 DIM_MAGENTA = _rgb(TrackingOverlay.XRAY_MARKED_COLOR)
+# the target trajectory (Set target trajectory, 11.11.), under the drill
+TARGET_BLUE = QColor(110, 190, 255)
 
 BG_WINDOW = QColor(8, 10, 13)
 BG_HEADER = QColor(18, 22, 28)
@@ -348,8 +351,18 @@ class CameraPanel(_Panel):
         self._clip: Optional[QRegion] = None
         self._glyphs = _GlyphCache()
         self._pens: dict[tuple, QPen] = {}
+        # the target trajectory's X-ray view (TargetMarks.camera_line / camera_ring)
+        self._target_line: Optional[QPolygonF] = None
+        self._target_ring: Optional[tuple] = None
 
     # ---------------- GUI thread, once ----------------
+
+    def set_target(self, line=None, ring=None) -> None:
+        """The target trajectory, panel pixels: its X-ray view on the plane inside the
+        field (a polyline) and the target point; drawn under the drill. None: none."""
+        self._target_line = QPolygonF([QPointF(x, y) for x, y in line]) if line else None
+        self._target_ring = None if ring is None else (float(ring[0]), float(ring[1]))
+        self.update()
 
     def set_frame_size(self, wh) -> None:
         self._frame_wh = (int(wh[0]), int(wh[1]))
@@ -465,14 +478,18 @@ class CameraPanel(_Panel):
             p.drawImage(self._box_pos, self._box_img)
         t2 = time.perf_counter()
         m = self._marks
-        if m is not None:
+        target = self._target_line is not None or self._target_ring is not None
+        if m is not None or target:
             # Marks stay on the picture. A letterboxed panel (taller or wider
             # than the frame, e.g. the laptop at dpr 2) is filled only once
             # (WA_OpaquePaintEvent): a tip glyph beyond the crop would be left
             # behind there and pile up (lab 10.11.).
             p.setClipRect(QRect(0, 0, w, h))
             p.setRenderHint(QPainter.Antialiasing)
-            self._paint_marks(p, m)
+            if target:
+                self._paint_target(p)
+            if m is not None:
+                self._paint_marks(p, m)
         t3 = time.perf_counter()
         p.end()
         if prof:
@@ -480,6 +497,16 @@ class CameraPanel(_Panel):
             prof("p1 painter", (t1 - t0) + (t4 - t3))
             prof("p1 blit", t2 - t1)
             prof("p1 marks", t3 - t2)
+
+    def _paint_target(self, p: QPainter) -> None:
+        k = self.mark_scale
+        p.setPen(self._pen(TARGET_BLUE, self.DASH_WIDTH * k))
+        if self._target_line is not None:
+            p.drawPolyline(self._target_line)
+        if self._target_ring is not None:
+            p.setBrush(Qt.NoBrush)
+            r = self.TIP_RADIUS * k
+            p.drawEllipse(QPointF(*self._target_ring), r, r)
 
     def _paint_marks(self, p: QPainter, m: ToolMarks) -> None:
         cm = m.camera
@@ -544,6 +571,8 @@ class XrayToolPanel(_Panel):
         self._gain_lut: Optional[np.ndarray] = None
         self._side = 0
         self._bg: Optional[np.ndarray] = None
+        self._bg_plain: Optional[np.ndarray] = None    # without the target
+        self._target: Optional[tuple] = None             # (line, ring, radius) in panel px
         self._qimg: Optional[QImage] = None
         self._placeholder = ("", "")
         self.panel_map: Optional[PanelMap] = None
@@ -563,7 +592,8 @@ class XrayToolPanel(_Panel):
 
     def set_placeholder(self, title: str, subtitle: str) -> None:
         self._working = None
-        self._bg = self._qimg = None
+        self._bg = self._qimg = self._bg_plain = None
+        self._target = None
         self._placeholder = (title, subtitle)
         self._marks = self._xm = None
         self._t_acquired = None
@@ -615,7 +645,8 @@ class XrayToolPanel(_Panel):
         self._ox = (self._nw - side) // 2
         self._oy = int(round(self._header_h * self._dpr)) + (self._nh - side) // 2
         if self._working is None or side <= 1:
-            self._bg = self._qimg = None
+            self._bg = self._qimg = self._bg_plain = None
+            self._target = None
             self.panel_map = None
             return
         h, w = self._working.shape[:2]
@@ -624,12 +655,51 @@ class XrayToolPanel(_Panel):
         interp = cv2.INTER_AREA if side < max(w, h) else cv2.INTER_CUBIC
         img = cv2.resize(img, (side, side), interpolation=interp)
         img = cv2.LUT(img, self._gain_lut)
-        self._bg = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
-        self._qimg = QImage(self._bg.data, side, side, 4 * side, QImage.Format_RGB32)
+        self._bg_plain = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+        # the target's pixels belong to the old map; the page sets it again on map_changed
+        self._target = None
+        self._compose_background()
         self.panel_map = PanelMap.of(self._orientation, (w, h), side)
         self._old_bbox = None
         self._lost_pm = None
         self.map_changed.emit()
+
+    def set_target(self, line=None, ring=None, radius: float = 0.0) -> None:
+        """The target trajectory in the panel's pixels (TargetMarks.xray_line, xray_ring,
+        xray_ring_radius), None: none. Drawn into the prepared image, once per change,
+        so it costs nothing per frame and lies under the drill."""
+        key = None if (line is None and ring is None) else (line, ring, float(radius))
+        if key == self._target:
+            return
+        self._target = key
+        if self._bg_plain is not None:
+            self._compose_background()
+            self.update()
+
+    def _compose_background(self) -> None:
+        """_bg / _qimg: the prepared image, with the target drawn into it if there is one."""
+        plain = self._bg_plain
+        side = self._side
+        if self._target is None:
+            self._bg = plain
+            self._qimg = QImage(self._bg.data, side, side, 4 * side, QImage.Format_RGB32)
+            return
+        self._bg = plain.copy()
+        img = QImage(self._bg.data, side, side, 4 * side, QImage.Format_RGB32)
+        line, ring, radius = self._target
+        k = self.mark_scale
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(TARGET_BLUE, self.LINE_WIDTH * k)
+        pen.setCapStyle(Qt.FlatCap)
+        p.setPen(pen)
+        if line is not None:
+            p.drawLine(QLineF(*line))
+        if ring is not None:
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QPointF(*ring), radius, radius)
+        p.end()
+        self._qimg = img
 
     # ---------------- GUI thread, per pose ----------------
 
@@ -1346,6 +1416,15 @@ class LivePanelsView(QWidget):
         self.btn_track = self._button("Stop tracking", primary=True)
         self.chk_marker_exposure = self._check("Marker exposure", False)
         self.lbl_track_status = StatusText("Pose: –", TEXT_WEAK, QColor(20, 24, 30), px=13.0)
+        # the target trajectory (11.11.): set from the drill; its point on the slider, mm
+        # past where it enters the X-ray mask (as the ruler); shown in the Overlay card.
+        # Grey until a target is set (the page enables them).
+        self.btn_target = self._button("Set target trajectory")
+        self.lbl_target_value = QLabel("–")
+        self.slider_target = self._slider(0, 150, 0)
+        self.slider_target.setEnabled(False)
+        self.chk_show_target = self._check("Target (light blue)", True)
+        self.chk_show_target.setEnabled(False)
 
         self.lbl_alpha_value = QLabel("0.50")
         self.slider_alpha = self._slider(0, 100, 50)
@@ -1368,6 +1447,9 @@ class LivePanelsView(QWidget):
         track.setSpacing(6)
         track.addWidget(self.btn_track)
         track.addWidget(self.chk_marker_exposure)
+        track.addWidget(self.btn_target)
+        track.addLayout(self._slider_head("Target point", self.lbl_target_value))
+        track.addWidget(self.slider_target)
         track.addWidget(self.lbl_track_status)
         track.addStretch(1)
 
@@ -1379,6 +1461,7 @@ class LivePanelsView(QWidget):
         overlay.addWidget(self.slider_dx)
         overlay.addWidget(self.chk_show_camera_view)
         overlay.addWidget(self.chk_show_xray_view)
+        overlay.addWidget(self.chk_show_target)
         overlay.addStretch(1)
 
         acts = QGridLayout()
@@ -1528,6 +1611,9 @@ class LivePanelsView(QWidget):
                 border-radius: 2px; background: transparent;
             }}
             QCheckBox::indicator:checked {{ background: rgb(46, 112, 200); }}
+            QCheckBox:disabled {{ color: rgb(110, 118, 128); }}
+            QCheckBox::indicator:disabled {{ border-color: rgb(80, 88, 98); }}
+            QCheckBox::indicator:checked:disabled {{ background: rgb(56, 64, 74); }}
             QSlider {{ background: transparent; min-height: {s(20)}px; }}
             QSlider::groove:horizontal {{ height: {s(3)}px; background: rgb(70, 78, 88); border-radius: 1px; }}
             QSlider::sub-page:horizontal {{ background: rgb(90, 150, 230); border-radius: 1px; }}
@@ -1535,6 +1621,8 @@ class LivePanelsView(QWidget):
                 width: {s(14)}px; height: {s(14)}px; margin: -{s(6)}px 0; border-radius: {s(7)}px;
                 background: rgb(90, 150, 230);
             }}
+            QSlider::sub-page:horizontal:disabled {{ background: rgb(70, 78, 88); }}
+            QSlider::handle:horizontal:disabled {{ background: rgb(90, 98, 108); }}
         """)
         margin = s(10)
         for lay in self.__dict__.get("_card_layouts", []):

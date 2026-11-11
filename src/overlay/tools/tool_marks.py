@@ -217,6 +217,19 @@ class ToolMarks:
         self.tip_in_field = tip_in_field
 
 
+class TargetMarks(NamedTuple):
+    """The target trajectory (MarkBuilder.target_marks), only inside the X-ray field and
+    read against magenta: panel 1 its X-ray view on Pi (a polyline, panel 1 pixels, empty
+    without video or plane), the X-ray panel its image; rings at the target point where
+    that lies inside the field."""
+
+    camera_line: list                   # [(x, y), ...]
+    camera_ring: Optional[tuple]        # (x, y)
+    xray_line: Optional[tuple]          # (x0, y0, x1, y1)
+    xray_ring: Optional[tuple]          # (x, y)
+    xray_ring_radius: float
+
+
 class _Config(NamedTuple):
     camera: CameraModel
     roi: Optional[tuple]        # x0, y0, w, h of panel 1 in camera pixels, None: no video
@@ -381,6 +394,102 @@ class MarkBuilder:
             u, v = cfg.camera.project(*q)
             out.append((u - x0 + 0.5, v - y0 + 0.5))
         return out
+
+    # ------------------------------------------------------------------
+    # Target trajectory, GUI thread (reads the settings only, as build())
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_xray(cfg, x: float, y: float, z: float) -> tuple:
+        """P_x = R^T (P_c - t) on plain floats."""
+        r = cfg.R_T
+        t0, t1, t2 = cfg.t_mm
+        dx, dy, dz = x - t0, y - t1, z - t2
+        return (r[0] * dx + r[1] * dy + r[2] * dz,
+                r[3] * dx + r[4] * dy + r[5] * dz,
+                r[6] * dx + r[7] * dy + r[8] * dz)
+
+    def _on_plane_px(self, cfg, u: float, v: float) -> tuple:
+        """Panel 1 pixel of the working-image pixel (u, v) on Pi (as _magenta)."""
+        m0, m1, m2, m3, m4, m5, m6, m7, m8 = cfg.plane
+        t0, t1, t2 = cfg.t_mm
+        a, b = cfg.camera.project(m0 * u + m1 * v + m2 + t0, m3 * u + m4 * v + m5 + t1,
+                                  m6 * u + m7 * v + m8 + t2)
+        return a - cfg.roi[0] + 0.5, b - cfg.roi[1] + 0.5
+
+    def _axis_of(self, cfg, tip, forward):
+        """X-ray frame tip and back point (AXIS_BACK_MM behind) of an axis and its line in
+        the working image (_axis_in_image), or None at or behind the source."""
+        tx, ty, tz = (float(v) for v in tip)
+        fx, fy, fz = (float(v) for v in forward)
+        n = math.sqrt(fx * fx + fy * fy + fz * fz)
+        if n <= 0.0:
+            return None
+        L = self.AXIS_BACK_MM / n
+        x0, y0, z0 = self._to_xray(cfg, tx, ty, tz)
+        x1, y1, z1 = self._to_xray(cfg, tx - L * fx, ty - L * fy, tz - L * fz)
+        if z0 <= 0.0 or z1 <= 0.0:
+            return None
+        return (z0, z1), self._axis_in_image(cfg, x0, y0, z0, x1, y1, z1)
+
+    def ruler_depth_mm(self, tip, forward) -> Optional[float]:
+        """What the ruler reads at a point of an axis (camera frame, mm; forward: away
+        from the drill): mm past where the axis enters the X-ray field, as build() with
+        RULER_FIELD; None outside or without an X-ray. Touches no state."""
+        cfg = self._cfg
+        if cfg.view is None or cfg.field is None:
+            return None
+        axis = self._axis_of(cfg, tip, forward)
+        if axis is None:
+            return None
+        (z0, z1), g = axis
+        if g[5] is None:
+            return None
+        length = self.AXIS_BACK_MM
+        s_entry = _s_of_lam(g[5], z0, z1, (z0 - z1) / length, length)
+        return -s_entry if abs(s_entry) <= _MAX_DEPTH_MM else None
+
+    def target_marks(self, tip, forward, point=None) -> Optional[TargetMarks]:
+        """The target trajectory through tip along forward (away from the drill), camera
+        frame, mm, and its target point (or None) ready to draw (TargetMarks). The line
+        is the visible part of the axis inside the field, both ways from the tip."""
+        cfg = self._cfg
+        if cfg.view is None or cfg.field is None:
+            return None
+        axis = self._axis_of(cfg, tip, forward)
+        if axis is None:
+            return None
+        _, (u0, v0, du, dv, lam_in, lam_out, lam_forward, _tip_in) = axis
+        ring_uv, z_ring = None, 0.0
+        if point is not None:
+            px, py, pz = self._to_xray(cfg, *(float(v) for v in point))
+            if pz > 0.0:
+                uv = cfg.pixel(px, py, pz)
+                if cfg.field.contains(uv):
+                    ring_uv, z_ring = uv, pz
+        cam_line, cam_ring = [], None
+        if cfg.roi is not None and cfg.d_x_mm is not None:
+            if lam_in is not None and lam_forward < lam_out:
+                n = 32
+                for i in range(n + 1):
+                    lam = lam_forward + (lam_out - lam_forward) * i / n
+                    cam_line.append(self._on_plane_px(cfg, u0 + lam * du, v0 + lam * dv))
+            if ring_uv is not None:
+                cam_ring = self._on_plane_px(cfg, *ring_uv)
+        x_line = x_ring = None
+        radius = 0.0
+        if cfg.xmap is not None:
+            a, b, c, d, e, f, scale = cfg.xmap
+            if lam_in is not None and lam_forward < lam_out:
+                ua, va = u0 + lam_forward * du, v0 + lam_forward * dv
+                ub, vb = u0 + lam_out * du, v0 + lam_out * dv
+                x_line = (a * ua + b * va + c, d * ua + e * va + f,
+                          a * ub + b * vb + c, d * ub + e * vb + f)
+            if ring_uv is not None:
+                u, v = ring_uv
+                x_ring = (a * u + b * v + c, d * u + e * v + f)
+                radius = TIP_RING_MM * cfg.fx_x / z_ring * scale
+        return TargetMarks(cam_line, cam_ring, x_line, x_ring, radius)
 
     # ------------------------------------------------------------------
     # Per pose, tracking thread

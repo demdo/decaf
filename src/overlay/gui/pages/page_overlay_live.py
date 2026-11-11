@@ -101,6 +101,8 @@ LIVE_PANELS = os.environ.get("DECAF_LIVE_RAIL", "") != "1"
 PANEL_READOUT_S = 0.2
 # A message in the status line (plane set, snapshot saved, ...) stays this long.
 PANEL_STATUS_HOLD_S = 5.0
+# Set target trajectory: ESC this long after a replacement brings the earlier one back.
+TARGET_UNDO_S = 5.0
 
 
 # ============================================================
@@ -1560,6 +1562,10 @@ class OverlayLivePage(QWidget):
         # Multi-View: View 1's board pose (T_cw bytes) the plane was set for; the plane
         # stays when the page is entered again with the same View 1 stance
         self._plane_stance: bytes | None = None
+        # the target trajectory (Set target trajectory, 11.11.): {"tip", "fwd" (camera
+        # frame, mm, away from the drill), "point_mm" (past the mask entry), "stance"}
+        self._target: dict | None = None
+        self._target_undo: tuple | None = None     # (earlier target, until perf_counter)
 
         self._build_ui()
         self._connect_signals()
@@ -1647,6 +1653,9 @@ class OverlayLivePage(QWidget):
         p.btn_load_xray.clicked.connect(self._on_load_xray_button)
         p.btn_usb.clicked.connect(self._on_usb_button)
         p.btn_new_views.clicked.connect(self._on_new_views_button)
+        p.btn_target.clicked.connect(self._on_set_target)
+        p.slider_target.valueChanged.connect(self._on_target_point_changed)
+        p.chk_show_target.toggled.connect(lambda _on: self._update_target())
         p.panel_live.roi_changed.connect(self._on_panel_roi_changed)
         p.view_changed.connect(lambda _view: self._on_panel_roi_changed())
         p.panel_view1.map_changed.connect(self._on_panel_map_changed)
@@ -2328,6 +2337,8 @@ class OverlayLivePage(QWidget):
         self._panels_new_xray(t_acquired)
         self._setup_view2()
         self._on_panel_map_changed()
+        self._target_controls()
+        self._update_target()
         self._t_readout = self._t_age = 0.0
         self._n_shown = 0
 
@@ -2414,6 +2425,7 @@ class OverlayLivePage(QWidget):
         b.set_camera_panel(p.panel_live.roi if p.view == VIEW_LIVE else None,
                            p.panel_live.mark_scale)
         p.panel_live.set_field_outline(b.field_outline_on_camera())
+        self._update_target()
 
     def _on_panel_map_changed(self) -> None:
         if self._builder is None:
@@ -2423,6 +2435,7 @@ class OverlayLivePage(QWidget):
         if self._builder2 is not None:
             v2 = self.panels.panel_view2
             self._builder2.set_xray_panel(v2.panel_map, v2.mark_scale)
+        self._update_target()
 
     def _panels_buttons(self) -> None:
         """The card's X-ray buttons of the workflow. Multi-View (user 11.11.): the
@@ -3536,6 +3549,7 @@ class OverlayLivePage(QWidget):
             "reference_plane_point_uv": arr(self.state.tip_uv_c),
             "reference_plane_point_xyz_c_mm": arr(self.state.tip_xyz_c),
             "show_tip": bool(self._show_tip),
+            "target_trajectory": self._target_record(),
             # the rail's switches; show_axis is the older name of the first
             "show_axis": bool(self._show_camera_view),
             "show_camera_view": bool(self._show_camera_view),
@@ -3916,6 +3930,10 @@ class OverlayLivePage(QWidget):
             self._cancel_xray_wait()
             event.accept()
             return
+        if (self._panels_mode and key == Qt.Key_Escape and self._target_undo is not None
+                and self._undo_target()):
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     # --------------------------------------------------------
@@ -3956,6 +3974,11 @@ class OverlayLivePage(QWidget):
         self._t_withheld = None
         self._screen_view = False
 
+        if (self._multi_view and self._target is not None
+                and self._target.get("stance") != self._view_ap_stance()):
+            # new views with the board: the C-arm came back to AP, never exactly
+            self._target = None
+            self._target_undo = None
         if self._multi_view:
             self._take_view_ap()
         self._load_xray_from_state()
@@ -4046,6 +4069,138 @@ class OverlayLivePage(QWidget):
                 "Camera",
                 f"Could not open RealSense camera.\n\n{e}",
             )
+
+    # ---------------- Set target trajectory (11.11.) ----------------
+    #
+    # The drill axis at the press becomes the target (camera frame, mm: the camera sits
+    # on the C-arm, so it holds while the C-arm stays), light blue under the drill and only
+    # inside the X-ray field, read against magenta. Its point on the slider counts like the
+    # ruler: mm from where the target enters View 1's X-ray mask, away from the drill.
+    # Pressing again replaces it; ESC within TARGET_UNDO_S brings the earlier one back.
+    # Hidden with its box in the Overlay card. Multi-View: new views with the board drop it.
+
+    def _on_set_target(self) -> None:
+        if not self._panels_mode or self._builder is None:
+            return
+        m = self._panel_marks
+        if (m is None or not self._tracking_active
+                or time.perf_counter() - m.t_pose > POSE_HOLD_S):
+            self._panel_status("No drill pose  ·  track the drill, then set the target", STATUS_WARN)
+            return
+        p = self.panels
+        tip = np.asarray(m.tip_cam, dtype=np.float64)
+        fwd = np.asarray(m.forward_cam, dtype=np.float64)
+        earlier = self._target
+        depth = self._builder.ruler_depth_mm(tip, fwd)
+        point_mm = 0 if depth is None else int(round(min(float(p.slider_target.maximum()), max(0.0, depth))))
+        self._target = {"tip": tip, "fwd": fwd, "point_mm": point_mm, "stance": self._view_ap_stance()}
+        self._target_undo = None if earlier is None else (earlier, time.perf_counter() + TARGET_UNDO_S)
+        p.chk_show_target.blockSignals(True)
+        p.chk_show_target.setChecked(True)
+        p.chk_show_target.blockSignals(False)
+        self._target_controls()
+        self._update_target()
+        if earlier is not None:
+            self._panel_status("Target trajectory replaced  ·  ESC within 5 s brings back the earlier one",
+                               hold_s=TARGET_UNDO_S)
+        elif depth is None:
+            self._panel_status("Target trajectory set  ·  it does not cross the X-ray field", STATUS_WARN)
+        else:
+            self._panel_status(f"Target trajectory set (light blue)  ·  target point {point_mm} mm "
+                               "from the mask entry")
+        ev = self.state.eval
+        if ev is not None:
+            try:
+                ev.log("overlay_live_target", "-", {
+                    "tip_c_mm": [round(float(v), 2) for v in tip],
+                    "dir_c": [round(float(v), 5) for v in fwd],
+                    "target_point_mm": point_mm,
+                    "replaced": earlier is not None,
+                })
+            except Exception as e:
+                print(f"[WARN] Could not log the target trajectory: {e}")
+        self.setFocus()
+
+    def _undo_target(self) -> bool:
+        """ESC right after a replacement: the earlier target again."""
+        undo, self._target_undo = self._target_undo, None
+        if undo is None or time.perf_counter() > undo[1]:
+            return False
+        self._target = undo[0]
+        self._target_controls()
+        self._update_target()
+        self._panel_status("Earlier target trajectory back")
+        return True
+
+    def _on_target_point_changed(self, value: int) -> None:
+        if self._target is None:
+            return
+        self._target["point_mm"] = int(value)
+        self.panels.lbl_target_value.setText(f"{int(value)} mm")
+        self._update_target()
+
+    def _target_controls(self) -> None:
+        """The button, the slider with its value and the show box; grey without a target."""
+        p = self.panels
+        t = self._target
+        has = t is not None
+        p.btn_target.setEnabled(self._tool is not None)
+        p.slider_target.setEnabled(has)
+        p.chk_show_target.setEnabled(has)
+        p.slider_target.blockSignals(True)
+        p.slider_target.setValue(t["point_mm"] if has else 0)
+        p.slider_target.blockSignals(False)
+        p.lbl_target_value.setText(f"{t['point_mm']} mm" if has else "–")
+
+    def _target_point_c(self):
+        """The target point, camera frame mm: point_mm past where the target enters the
+        X-ray mask of View 1 (the X-ray on the page), or None when it does not cross it."""
+        t = self._target
+        depth = self._builder.ruler_depth_mm(t["tip"], t["fwd"])
+        if depth is None:
+            return None
+        return t["tip"] + (t["point_mm"] - depth) * t["fwd"]
+
+    def _update_target(self) -> None:
+        """Panels 1-3: the target as it lies now (map, crop, plane, X-ray), or none."""
+        if not self._panels_mode:
+            return
+        p = self.panels
+        t = self._target
+        b = self._builder
+        if t is None or b is None or not p.chk_show_target.isChecked():
+            p.panel_live.set_target()
+            p.panel_view1.set_target()
+            p.panel_view2.set_target()
+            return
+        point = self._target_point_c()
+        tm = b.target_marks(t["tip"], t["fwd"], point)
+        if tm is None:
+            p.panel_live.set_target()
+            p.panel_view1.set_target()
+        else:
+            p.panel_live.set_target(tm.camera_line, tm.camera_ring)
+            p.panel_view1.set_target(tm.xray_line, tm.xray_ring, tm.xray_ring_radius)
+        b2 = self._builder2
+        tm2 = None if b2 is None else b2.target_marks(t["tip"], t["fwd"], point)
+        if tm2 is None:
+            p.panel_view2.set_target()
+        else:
+            p.panel_view2.set_target(tm2.xray_line, tm2.xray_ring, tm2.xray_ring_radius)
+
+    def _target_record(self):
+        """The target trajectory for snapshot.json, or None."""
+        t = self._target
+        if t is None:
+            return None
+        point = None if self._builder is None else self._target_point_c()
+        return {
+            "tip_c_mm": [float(v) for v in t["tip"]],
+            "dir_c": [float(v) for v in t["fwd"]],
+            "target_point_mm": int(t["point_mm"]),
+            "target_point_c_mm": None if point is None else [float(v) for v in point],
+            "shown": bool(self.panels.chk_show_target.isChecked()),
+        }
 
     def _take_view_ap(self) -> None:
         """Multi-View: X-ray View 1 (AP) of X-ray Acquisition is the X-ray of
