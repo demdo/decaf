@@ -17,6 +17,10 @@
 # tracking_test row with the camera intrinsics and, per Overlay Live entry,
 # an overlay_live row with the drill files and the IR calibration.
 #
+# Workflow (start dialog, Normal and Evaluation): Single View or Multi-View
+# (lateral and AP X-ray, each with a ChArUco board pose); session.json says
+# "workflow": "single" | "multi".
+#
 # Folder:
 #   overlay/data/Evaluation/<session>/
 #     session.json      mode, calibration files (path + md5), notes
@@ -39,12 +43,14 @@ import numpy as np
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -53,6 +59,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from overlay.gui.state import WORKFLOW_MULTI, WORKFLOW_SINGLE
 
 
 # ============================================================
@@ -115,6 +123,10 @@ class StartupChoice:
     # Evaluation only: straight to Tool Tracking, no X-ray calibration (the
     # camera intrinsics from camera_calib_path are loaded in any case)
     tracking_test: bool = False
+    # Normal and Evaluation: WORKFLOW_SINGLE (one AP X-ray) or WORKFLOW_MULTI
+    # (lateral and AP, each with a ChArUco board pose); the tracking test is
+    # always single (it has no X-ray)
+    workflow: str = WORKFLOW_SINGLE
 
 
 # ============================================================
@@ -294,16 +306,35 @@ class EvaluationSession:
 # ============================================================
 
 class StartupDialog(QDialog):
-    """Normal | Evaluation, shown before the main window."""
+    """Workflow (Single View | Multi-View) and data (Normal | Evaluation),
+    shown before the main window."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("DeCAF — start")
         self.setMinimumWidth(640)
 
+        self.workflow_box = QGroupBox("Workflow")
+        self.rb_single = QRadioButton("Single View — one AP X-ray with overlay")
+        self.rb_multi = QRadioButton("Multi-View — lateral and AP X-ray, each with a ChArUco board pose")
+        self.rb_single.setChecked(True)
+        wf = QVBoxLayout(self.workflow_box)
+        wf.addWidget(self.rb_single)
+        wf.addWidget(self.rb_multi)
+
         self.rb_normal = QRadioButton("Normal — nothing is written to disk")
         self.rb_eval = QRadioButton("Evaluation — every capture is saved to a session folder")
         self.rb_normal.setChecked(True)
+
+        # One explicit group per pair: Qt's auto-exclusivity looks for radio
+        # buttons through all children of the dialog, so without groups the
+        # workflow buttons in their box would join Normal | Evaluation.
+        self._grp_workflow = QButtonGroup(self)
+        self._grp_data = QButtonGroup(self)
+        for grp, buttons in ((self._grp_workflow, (self.rb_single, self.rb_multi)),
+                             (self._grp_data, (self.rb_normal, self.rb_eval))):
+            for b in buttons:
+                grp.addButton(b)
 
         self.ed_session = QLineEdit(time.strftime("%Y%m%d_"))
         self.ed_root = QLineEdit(str(DEFAULT_EVAL_ROOT))
@@ -363,6 +394,10 @@ class StartupDialog(QDialog):
         title = QLabel("DeCAF")
         title.setStyleSheet("font-size: 18px; font-weight: 700;")
         lay.addWidget(title)
+        lay.addWidget(self.workflow_box)
+        data = QLabel("Data")
+        data.setStyleSheet("font-weight: 600; margin-top: 4px;")
+        lay.addWidget(data)
         lay.addWidget(self.rb_normal)
         lay.addWidget(self.rb_eval)
         lay.addWidget(self.eval_box)
@@ -401,6 +436,8 @@ class StartupDialog(QDialog):
             w.setEnabled(ev and auto)
         for w in (self.ed_xray, self.btn_xray):
             w.setEnabled(ev and auto and not test)
+        # the tracking test has no X-ray, the workflow does not apply to it
+        self.workflow_box.setEnabled(not (ev and test))
 
     def _browse_root(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Output folder", self.ed_root.text())
@@ -415,6 +452,8 @@ class StartupDialog(QDialog):
             edit.setText(p)
 
     def choice(self) -> StartupChoice:
+        tracking_test = self.rb_eval.isChecked() and self.chk_tracking_test.isChecked()
+        multi = self.rb_multi.isChecked() and not tracking_test
         return StartupChoice(
             evaluation=self.rb_eval.isChecked(),
             session_name=EvaluationSession.sanitize_label(self.ed_session.text()),
@@ -423,7 +462,8 @@ class StartupDialog(QDialog):
             camera_calib_path=Path(self.ed_cam.text()),
             xray_calib_path=Path(self.ed_xray.text()),
             notes=self.ed_notes.text(),
-            tracking_test=self.rb_eval.isChecked() and self.chk_tracking_test.isChecked(),
+            tracking_test=tracking_test,
+            workflow=WORKFLOW_MULTI if multi else WORKFLOW_SINGLE,
         )
 
 

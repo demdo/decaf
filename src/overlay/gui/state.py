@@ -5,6 +5,12 @@ from typing import Optional
 import numpy as np
 
 
+# Workflow from the start dialog (same strings as LivePanelsView.set_workflow):
+# one AP X-ray, or lateral and AP X-ray each with a ChArUco board pose.
+WORKFLOW_SINGLE = "single"
+WORKFLOW_MULTI = "multi"
+
+
 @dataclass(frozen=True)
 class Cam2XHeight:
     """One finished board placement of the Cam2X series (see
@@ -108,9 +114,16 @@ class SessionState:
     # a Qt import here).
     eval: Optional[object] = None
 
+    # --- Workflow (start dialog): WORKFLOW_SINGLE or WORKFLOW_MULTI ---
+    workflow: str = WORKFLOW_SINGLE
+
     # ----------------
     # Convenience flags
     # ----------------
+    @property
+    def is_multi_view(self) -> bool:
+        return self.workflow == WORKFLOW_MULTI
+
     @property
     def has_rgb_intrinsics(self) -> bool:
         return self.K_rgb is not None

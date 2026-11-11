@@ -15,6 +15,10 @@
 # Uses the per-page template navigation buttons (btn_back / btn_next).
 # Sidebar is display-only (wizard gating), no click navigation.
 #
+# The dialog before the window opens (gui/evaluation.py) also asks for the
+# workflow, in both modes: Single View (one AP X-ray) or Multi-View (lateral
+# and AP X-ray, each with a ChArUco board pose) -> state.workflow.
+#
 # Two modes, chosen in a dialog before the window opens (gui/evaluation.py):
 #   Normal      - nothing is written to disk.
 #   Evaluation  - every capture is saved into one session folder under a
@@ -50,7 +54,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
 )
 
-from overlay.gui.state import SessionState
+from overlay.gui.state import WORKFLOW_SINGLE, SessionState
 from overlay.gui.xray_link import xray_link
 from overlay.gui.evaluation import (
     EvalBar,
@@ -107,6 +111,10 @@ class MainWindow(QMainWindow):
             self.state.eval = self.eval_session
         # tool tracking without the X-ray calibration (Evaluation only)
         self.tracking_test = self.eval_session is not None and self.choice.tracking_test
+        # Single View or Multi-View (start dialog); the tracking test is single
+        self.state.workflow = WORKFLOW_SINGLE if self.tracking_test else self.choice.workflow
+        if self.eval_session is not None:
+            self.eval_session.set_meta("workflow", self.state.workflow)
 
         title = "DeCAF Calibration — Mode A (Wizard)"
         if self.tracking_test:
