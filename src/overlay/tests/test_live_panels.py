@@ -506,6 +506,21 @@ def test_xray_panel() -> None:
     assert abs(x2.tip[1] + marks.xray.tip[1] - 640.0) < 1e-6
     panel.set_marks(b.build(rec.pts))
     assert _is_magenta(on_screen()).any()
+
+    # a new size (the other view, a maximised panel): the marks of the old map are dropped
+    # and never drawn; after the next pose exactly one drawing, no ghost (lab 11.11.)
+    held = b.build(rec.pts)                     # built for 640 px
+    panel.set_marks(held)
+    panel.resize(900, 930)
+    _spin(app, 0.1)
+    assert panel._side == 900 and panel._xm is None
+    panel.set_marks(held)                       # still the old map: not drawn
+    assert panel._xm is None and not _is_magenta(on_screen()[30:]).any()
+    b.set_xray_panel(panel.panel_map)
+    panel.set_marks(b.build(rec.pts))
+    got = on_screen()
+    ref = _qimage_to_rgb(panel.grab().toImage())
+    assert _is_magenta(got).any() and np.array_equal(got[30:], ref[30:]), int((got[30:] != ref[30:]).sum())
     panel.close()
 
     # placeholder: same class, no image
@@ -515,7 +530,8 @@ def test_xray_panel() -> None:
     assert ph.panel_map is None
     ph.set_marks(marks)     # harmless
     _ = ph.grab()
-    print("  (g) X-ray panel: partial repaints leave no residue, field, orientation, placeholder")
+    print("  (g) X-ray panel: partial repaints leave no residue, field, orientation, no ghost after a "
+          "new size, placeholder")
 
 
 def test_camera_panel_direct() -> None:
@@ -1191,9 +1207,9 @@ def test_page_panels() -> None:
 
 def test_page_panels_multi() -> None:
     """The real page in Multi-View (decided 11.11.): X-ray View 1 (AP) and View 2 (lateral) from
-    X-ray Acquisition in panels 2 and 3; the pointer search starts at entry, the check's plane is
-    not taken; ESC goes on without a plane (X-ray panels and camera view run, no blend, no
-    readings); SPACE at entry sets the plane. The board is off the table after X-ray Acquisition:
+    X-ray Acquisition in panels 2 and 3; no pointer search at entry (lab test 11.11.), the check's
+    plane is not taken: without one the X-ray panels and the camera view run, no blend, no
+    readings; Set reference plane and SPACE set it. The board is off the table after X-ray Acquisition:
     a new AP X-ray here works as in single view and keeps View 1's board pose (panel 3 keeps its
     frame); entering again with the same View 1 stance keeps the plane; 'New views with board'
     asks the main window for X-ray Acquisition. View 2 is given the pose of View 1 and phi 0, so
@@ -1250,20 +1266,16 @@ def test_page_panels_multi() -> None:
         assert p.panel_view1._t_acquired == now - 60.0
         # the card (11.11.): a new AP X-ray as in single view, new views on X-ray Acquisition
         assert [b.text() for b in (p.btn_load_xray, p.btn_usb, p.btn_plane, p.btn_save, p.btn_new_views)] == [
-            "Load X-ray View 1 (AP)", "From folder (USB)", "Cancel", "Snapshot", "New views with board"]
+            "Load X-ray View 1 (AP)", "From folder (USB)", "Set reference plane", "Snapshot", "New views with board"]
         assert all(b.isEnabled() and b.isVisible() for b in (p.btn_load_xray, p.btn_usb, p.btn_new_views))
 
-        # entry: the pointer search runs, no plane on the page yet (the check's is not taken)
-        assert page._plane_acquiring and page._plane_entry and not page._tracking_active
+        # entry: no pointer search (user 11.11.: the plane on purpose, Set reference plane);
+        # no plane on the page yet, the check's is not taken
+        assert not page._plane_acquiring and not page._tracking_active
         assert page._current_d_x_mm is None and st.d_x == d_check and not page._H_xc_lookup
         assert p.panel_live._box_overlay is None and not p.slider_dx.isEnabled()
-        assert _spin(app, 1.0, lambda: p.lbl_status.text().startswith("View 1 (AP): pointer")
-                     and "ESC skip" in p.lbl_status.text()), p.lbl_status.text()
-
-        # ESC: on without a plane
-        QTest.keyClick(page, Qt.Key_Escape)
-        assert not page._plane_acquiring and page._current_d_x_mm is None
-        assert p.lbl_status.text().startswith("No plane Π") and p.lbl_status.colour().rgb() == STATUS_WARN.rgb()
+        assert _spin(app, 1.0, lambda: p.lbl_status.text().startswith("No plane Π")
+                     and p.lbl_status.colour().rgb() == STATUS_WARN.rgb()), p.lbl_status.text()
         p.btn_track.click()
         assert _spin(app, 5.0, lambda: page._panel_marks is not None and page._panel_marks.second is not None), \
             "no marks"
@@ -1286,19 +1298,23 @@ def test_page_panels_multi() -> None:
         p.btn_track.click()
         page.on_leave()
 
-        # entering again without a plane: the search again; SPACE sets the plane of View 1
+        # entering again without a plane: still none; Set reference plane, SPACE sets it
         page.on_enter()
-        assert page._plane_acquiring and page._plane_entry and page._current_d_x_mm is None
+        assert not page._plane_acquiring and page._current_d_x_mm is None
+        assert _spin(app, 1.0, lambda: p.lbl_status.text().startswith("No plane")), p.lbl_status.text()
+        p.btn_plane.click()
+        assert page._plane_acquiring
         camera_frame = page.camera.bgra
         page.camera.bgra = pointer_frame
         assert _spin(app, 8.0, lambda: page._plane_d_x_mm is not None
                      and abs(page._plane_d_x_mm - d_recorded) < 0.05), page._plane_d_x_mm
-        assert _spin(app, 1.0, lambda: "View 1 (AP): pointer found" in p.lbl_status.text()), p.lbl_status.text()
+        assert _spin(app, 1.0, lambda: "Plane: pointer found" in p.lbl_status.text()
+                     and "ESC skip" in p.lbl_status.text()), p.lbl_status.text()
         QTest.keyClick(page, Qt.Key_Space)
         page.camera.bgra = camera_frame
         d_set = st.d_x
         assert abs(d_set - d_recorded) < 0.5 and page._current_d_x_mm == d_set
-        assert "Plane set" in p.lbl_status.text() and "View 1 (AP)" in p.lbl_status.text(), p.lbl_status.text()
+        assert "Plane set" in p.lbl_status.text(), p.lbl_status.text()
         assert page._builder_has_plane and page._builder._cfg.d_x_mm == d_set
         assert p.panel_live._box_overlay is not None and p.slider_dx.isEnabled()
         p.btn_track.click()
@@ -1342,9 +1358,8 @@ def test_page_panels_multi() -> None:
         del st.xray_views[VIEW_LAT]
         page.on_enter()
         assert page._builder2 is None and p.panel_view2._qimg is None and p.panel_view2._right_text == ""
-        assert page._plane_acquiring and page._current_d_x_mm is None
-        QTest.keyClick(page, Qt.Key_Escape)
-        assert page._current_d_x_mm is None and p.lbl_status.text().startswith("No plane")
+        assert not page._plane_acquiring and page._current_d_x_mm is None
+        assert _spin(app, 1.0, lambda: p.lbl_status.text().startswith("No plane")), p.lbl_status.text()
         p.btn_track.click()
         assert _spin(app, 5.0, lambda: page._panel_marks is not None)
         assert page._panel_marks.second is None
@@ -1355,8 +1370,8 @@ def test_page_panels_multi() -> None:
     finally:
         QMessageBox.critical, QMessageBox.information = boxes
         shutil.rmtree(tmp, ignore_errors=True)
-    print("  (m) real page, panels (multi): views from X-ray Acquisition in panels 2/3, pointer search at "
-          "entry (ESC: no plane, SPACE: plane of View 1), view 2's marks from the chained builder, a new AP "
+    print("  (m) real page, panels (multi): views from X-ray Acquisition in panels 2/3, no search at entry "
+          "(no plane until Set reference plane), view 2's marks from the chained builder, a new AP "
           "X-ray keeps View 1's board pose, the plane stays with the stance, New views with board")
 
 

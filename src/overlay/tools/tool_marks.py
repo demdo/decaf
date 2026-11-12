@@ -161,11 +161,15 @@ class CameraMarks:
 
 
 class XrayMarks:
-    """An X-ray panel. bbox: (x0, y0, x1, y1) of everything drawn."""
+    """An X-ray panel. bbox: (x0, y0, x1, y1) of everything drawn. xmap: the PanelMap
+    they were built for; a panel of another size or orientation must not draw them
+    (they would land scaled, lab 11.11.)."""
 
-    __slots__ = ("lines", "ticks_minor", "ticks_major", "labels", "tip", "tip_radius", "bbox")
+    __slots__ = ("lines", "ticks_minor", "ticks_major", "labels", "tip", "tip_radius", "bbox",
+                 "xmap")
 
-    def __init__(self, lines, ticks_minor, ticks_major, labels, tip, tip_radius, bbox) -> None:
+    def __init__(self, lines, ticks_minor, ticks_major, labels, tip, tip_radius, bbox,
+                 xmap=None) -> None:
         self.lines = lines
         self.ticks_minor = ticks_minor
         self.ticks_major = ticks_major
@@ -173,6 +177,7 @@ class XrayMarks:
         self.tip = tip
         self.tip_radius = tip_radius
         self.bbox = bbox
+        self.xmap = xmap
 
 
 class ToolMarks:
@@ -670,7 +675,7 @@ class MarkBuilder:
         bbox = (min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin)
         return XrayMarks(
             [lf(*q) for q in lines], [lf(*q) for q in minor], [lf(*q) for q in major],
-            labels, (xt, yt) if tip_in else None, radius, bbox,
+            labels, (xt, yt) if tip_in else None, radius, bbox, cfg.xmap,
         )
 
     def _ruler(self, cfg, g, z0, z1, az, length, depth, k, nx, ny,

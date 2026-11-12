@@ -1553,10 +1553,9 @@ class OverlayLivePage(QWidget):
         # the running pointer search came with a new X-ray (single view: a new
         # X-ray starts it by itself, 11.11.); ESC then keeps the plane before
         self._plane_new_xray = False
-        # Multi-View (start dialog) on the panels: X-ray View 2 in panel 3 and the
-        # plane set here after entering; _plane_entry: the search started at entry
+        # Multi-View (start dialog) on the panels: X-ray View 2 in panel 3; the plane
+        # is set here with 'Set reference plane' (no search at entry, user 11.11.)
         self._multi_view = False
-        self._plane_entry = False
         self._builder2: MarkBuilder | None = None   # panel 3, chained to _builder
         self._builder_has_plane = False            # _builder was given a d_x
         # Multi-View: View 1's board pose (T_cw bytes) the plane was set for; the plane
@@ -2606,13 +2605,11 @@ class OverlayLivePage(QWidget):
         """(text, colour) of the status line (texts decided 10.11.)."""
         if self._plane_acquiring:
             d = self._plane_d_x_mm
-            if self._plane_entry:
-                head, esc = "View 1 (AP)", "ESC skip"
-            elif self._plane_new_xray:
+            if self._plane_new_xray:
                 head, esc = "New X-ray", ("ESC keep plane" if self._current_d_x_mm is not None
                                           else "ESC skip")
             else:
-                head, esc = "Plane", "ESC cancel"
+                head, esc = "Plane", ("ESC cancel" if self._current_d_x_mm is not None else "ESC skip")
             if self._plane_res is None or d is None:
                 return f"{head}: pointer not found  ·  {esc}", STATUS_BAD
             old = self._base_d_x_mm
@@ -3695,8 +3692,7 @@ class OverlayLivePage(QWidget):
         ev = self.state.eval
         label = "" if ev is None else f"{ev.sanitize_label(ev.label)}: "
         was = "" if old is None else f" (was {old:.1f})"
-        which = ("new X-ray" if self._plane_new_xray
-                 else "View 1 (AP)" if self._plane_entry else "same X-ray")
+        which = "new X-ray" if self._plane_new_xray else "same X-ray"
         self._panel_status(f"{label}Plane set  ·  d_x {d_new:.1f} mm{was}  ·  {which}")
         # another plane is another place in the camera image: the crop follows
         self._panels_plane_changed(recentre=True)
@@ -3725,7 +3721,6 @@ class OverlayLivePage(QWidget):
         self._plane_raw = None
         self._plane_d_x_mm = None
         self._plane_new_xray = False      # _set_new_xray sets it after this
-        self._plane_entry = False         # _start_entry_plane sets it after this
         self._plane_acquiring = True
 
         self.controls.btn_plane.setText("Cancel")
@@ -4057,8 +4052,6 @@ class OverlayLivePage(QWidget):
                     f"{format_realsense_color(self._camera_color) or 'not read back'}"
                 )
             self._start_timer()
-            if self._multi_view and self._current_d_x_mm is None:
-                self._start_entry_plane()
             self.setFocus()
 
         except Exception as e:
@@ -4212,15 +4205,6 @@ class OverlayLivePage(QWidget):
         self.state.xray_image_anatomy = ap.image
         self.state.xray_image_anatomy_path = ap.path
         self._xray_t_acquired = (ap.path, ap.t_acquired)
-
-    def _start_entry_plane(self) -> None:
-        """Multi-View, entering: the pointer search for the plane of View 1
-        (AP) starts by itself (user 11.11.); SPACE sets it, ESC goes on without
-        a plane (the X-ray panels and the camera view still run)."""
-        self.start_plane_only()
-        if self._plane_acquiring:
-            self._plane_entry = True
-            self.panels.lbl_status.setText(*self._panel_status_line(None, time.perf_counter()))
 
     def on_leave(self) -> None:
         self._end_plane_acquire("")

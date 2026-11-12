@@ -660,6 +660,10 @@ class XrayToolPanel(_Panel):
         self._target = None
         self._compose_background()
         self.panel_map = PanelMap.of(self._orientation, (w, h), side)
+        # The marks held belong to the old map: dropped, so the full repaint does not
+        # draw them scaled; the next set_marks then has nothing left behind to clear
+        # (they stayed on screen as a ghost after a switch of the view, lab 11.11.).
+        self._marks = self._xm = None
         self._old_bbox = None
         self._lost_pm = None
         self.map_changed.emit()
@@ -707,7 +711,10 @@ class XrayToolPanel(_Panel):
         if marks is self._marks:
             return
         self._marks = marks
-        self._xm = None if marks is None else marks.xray
+        xm = None if marks is None else marks.xray
+        if xm is not None and xm.xmap is not None and xm.xmap != self.panel_map:
+            xm = None           # built for another size or orientation of this panel
+        self._xm = xm
         if self._qimg is None:
             return
         new = self._device_box(self._xm)
