@@ -113,7 +113,7 @@ def _field_image() -> np.ndarray:
 
 
 def _overlay(view=None, field=None, d_x=D_X) -> TrackingOverlay:
-    ov = TrackingOverlay(K_C, DIST, P_TIP, AXIS)
+    ov = TrackingOverlay(K_C, DIST, P_TIP, AXIS, dash_pieces=TrackingOverlay.DASH_PIECES)
     if view is not None:
         ov.set_xray_view(view, field, d_x)
     return ov
@@ -279,7 +279,17 @@ def test_overlay_synthetic() -> None:
     assert np.allclose(rec["tip_uv_x"], [500, 500]) and np.allclose(rec["back_uv_x"], [560, 660])
     assert abs(rec["off_plane_mm"] + 2.0) < 1e-9
     assert len(rec["segments_px"]) == 1 + (TrackingOverlay.DASH_PIECES + 1) // 2
+    assert ov.snapshot_record()["style"]["dash_pieces"] == TrackingOverlay.DASH_PIECES
     json.dumps(ov.snapshot_record())
+    # live (11.11.): dashes of a fixed length in camera pixels, the 7 pieces only on request
+    fixed = TrackingOverlay(K_C, DIST, P_TIP, AXIS)
+    spans = fixed._dash_spans(100.0, 0.0, 1.0)
+    assert spans[0][0] == 0.0 and np.allclose([b - a for a, b in spans[:-1]], fixed.DASH_ON_PX / 100.0)
+    assert np.allclose([spans[i + 1][0] - spans[i][0] for i in range(len(spans) - 1)],
+                       (fixed.DASH_ON_PX + fixed.DASH_OFF_PX) / 100.0)
+    assert ov._dash_spans(100.0, 0.0, 1.0) == [(i / 7, (i + 1) / 7) for i in range(0, 7, 2)]
+    fixed.update(np.array([[0.0, 0.0, 500.0], [0.0, 30.0, 540.0]]))
+    assert fixed.snapshot_record()["style"]["dash_px"] == [fixed.DASH_ON_PX, fixed.DASH_OFF_PX]
 
     # a new d_x moves magenta at once, green not
     green_before = ov.snapshot_record()["tip_uv"]
@@ -481,7 +491,7 @@ def _shadow_axis_deg(rec, view, work) -> float:
 def _overlay_of(rec, work, d_x=None):
     """The X-ray view as OverlayLivePage._attach_xray_view builds it."""
     view = XrayView(rec.T, rec.K_x)
-    ov = TrackingOverlay(rec.K_c, rec.dist, rec.p_tip, rec.axis)
+    ov = TrackingOverlay(rec.K_c, rec.dist, rec.p_tip, rec.axis, dash_pieces=TrackingOverlay.DASH_PIECES)
     h, w = work.shape[:2]
     field = XrayField.from_image(work, ov.field_inset_px(view, (w, h), rec.d_x))
     ov.set_xray_view(view, field, rec.d_x if d_x is None else d_x)
@@ -500,7 +510,7 @@ def test_green_pixel_identical() -> None:
         tool = s.get("tool")
         if not tool or not (d / "02_rgb_overlay.png").exists():
             continue
-        ov = TrackingOverlay(s["K_rgb"], s["dist_rgb"], tool["p_tip_mm"], tool["axis_dir"])
+        ov = TrackingOverlay(s["K_rgb"], s["dist_rgb"], tool["p_tip_mm"], tool["axis_dir"], dash_pieces=TrackingOverlay.DASH_PIECES)
         ov.update(np.array([tool["tip_cam_mm"], tool["back_cam_mm"]]),
                   marked=bool(tool.get("marked", False)))
         img = cv2.cvtColor(cv2.imread(str(d / "02_rgb_overlay.png")), cv2.COLOR_BGR2BGRA)

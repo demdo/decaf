@@ -163,7 +163,7 @@ def _case(sess="Evaluation_Integrated_System", snap="B_2_live"):
 
 def _builder_of(rec, work, side=640, orientation=ORIENT_CAMERA, roi=(0, 0, 1920, 1080)):
     view = XrayView(rec.T, rec.K_x)
-    ov = TrackingOverlay(rec.K_c, rec.dist, rec.p_tip, rec.axis)
+    ov = TrackingOverlay(rec.K_c, rec.dist, rec.p_tip, rec.axis, dash_pieces=TrackingOverlay.DASH_PIECES)
     h, w = work.shape[:2]
     field = XrayField.from_image(work, ov.field_inset_px(view, (w, h), rec.d_x))
     ov.set_xray_view(view, field, rec.d_x)

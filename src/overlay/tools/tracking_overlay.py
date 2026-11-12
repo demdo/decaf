@@ -42,6 +42,26 @@ from overlay.tools.xray_view import XrayField, XrayView, axis_inclination_deg
 _ZERO3 = np.zeros(3)
 
 
+def dash_spans(length_px: float, on_px: float, off_px: float, lo: float = 0.0, hi: float = 1.0) -> list:
+    """The dashes of a segment length_px long on screen, from its start (lam = 0, the
+    tip) to its end (lam = 1): on_px drawn, off_px gap, as (lam_a, lam_b) pairs clipped
+    to [lo, hi]. The same rhythm at any distance (user 11.11.2026)."""
+    out = []
+    if not length_px > 1e-9:
+        return out
+    on = on_px / length_px
+    period = (on_px + off_px) / length_px
+    if not period > 0.0:
+        return out
+    n = int(np.ceil(1.0 / period))
+    for i in range(n):
+        a, b = i * period, min(1.0, i * period + on)
+        a, b = max(lo, a), min(hi, b)
+        if a < b:
+            out.append((a, b))
+    return out
+
+
 class TrackingOverlay:
     """Projects tip + drill axis of one tracked tool and draws them in place.
 
@@ -53,8 +73,13 @@ class TrackingOverlay:
     # Dashed shaft segment: from the tip toward the marker (the physical
     # drill body side), in millimetres.
     AXIS_BACK_MM = 50.0
-    # Number of pieces the dashed segment is split into (odd -> starts and
-    # ends with a drawn dash).
+    # Its dashes: a fixed length in camera pixels, the rhythm of the live panels
+    # (6 / 4 px there times 1.44 on the laptop, one camera pixel per device pixel;
+    # user 11.11.2026). TrackingOverlay(..., dash_pieces=n) instead splits it into
+    # n pieces (odd -> starts and ends with a drawn dash), as the thesis' recordings
+    # were drawn with n = DASH_PIECES.
+    DASH_ON_PX = 9.0
+    DASH_OFF_PX = 6.0
     DASH_PIECES = 7
 
     TIP_COLOR = (80, 220, 80, 255)   # BGRA
@@ -78,7 +103,9 @@ class TrackingOverlay:
     # Largest distance of a tip-glyph pixel from the tip.
     TIP_GLYPH_REACH_PX = TIP_CROSS // 2 + THICKNESS
 
-    def __init__(self, K, dist, p_tip_mm, axis_dir) -> None:
+    def __init__(self, K, dist, p_tip_mm, axis_dir, dash_pieces: Optional[int] = None) -> None:
+        # None: dashes of DASH_ON_PX / DASH_OFF_PX; n: n pieces (the thesis' recordings)
+        self.dash_pieces = None if dash_pieces is None else int(dash_pieces)
         self._K = np.asarray(K, dtype=np.float64)
         self._dist = None if dist is None else np.asarray(dist, dtype=np.float64)
 
@@ -270,11 +297,14 @@ class TrackingOverlay:
             end = min(s_out, 0.0)
             if s_forward < end:
                 ss += [s_forward, end]
-            pieces = self.DASH_PIECES
-            for i in range(0, pieces, 2):
-                a, b = max(s_in, i / pieces), min(s_out, (i + 1) / pieces)
-                if a < b:
-                    ss += [a, b]
+            length = 0.0
+            if not self.dash_pieces:
+                # the drill on the plane through the camera: nearly linear over its 50 mm
+                q = np.array([(u0, v0, 1.0), (u0 + du, v0 + dv, 1.0)]) @ self._plane_M_T + view.t_mm
+                pa, pb = self._project(q)
+                length = float(np.hypot(*(pb - pa)))
+            for a, b in self._dash_spans(length, s_in, s_out):
+                ss += [a, b]
 
         S_c = np.array([(u0 + s * du, v0 + s * dv, 1.0) for s in ss]) @ self._plane_M_T + view.t_mm
         px = self._project(S_c).tolist()
@@ -331,7 +361,8 @@ class TrackingOverlay:
                 "tip_radius_px": int(self.TIP_RADIUS),
                 "tip_cross_px": int(self.TIP_CROSS),
                 "thickness_px": int(self.THICKNESS),
-                "dash_pieces": int(self.DASH_PIECES),
+                **({"dash_pieces": int(self.dash_pieces)} if self.dash_pieces
+                   else {"dash_px": [float(self.DASH_ON_PX), float(self.DASH_OFF_PX)]}),
                 "colour_bgra": [int(c) for c in
                                 (self.MARKED_COLOR if self._marked else self.AXIS_COLOR)],
             },
@@ -405,12 +436,10 @@ class TrackingOverlay:
             if ok:
                 cv2.line(img, p1, p2, colour, self.THICKNESS, cv2.LINE_AA)
 
-        # Dashed shaft segment: tip -> marker side (AXIS_BACK_MM), drawn as
-        # alternating pieces.
-        pieces = self.DASH_PIECES
-        for i in range(0, pieces, 2):
-            a = tip + (back - tip) * (i / pieces)
-            b = tip + (back - tip) * ((i + 1) / pieces)
+        # Dashed shaft segment: tip -> marker side (AXIS_BACK_MM).
+        for sa, sb in self._dash_spans(float(np.hypot(*(back - tip))), 0.0, 1.0):
+            a = tip + (back - tip) * sa
+            b = tip + (back - tip) * sb
             cv2.line(
                 img,
                 (int(round(a[0])), int(round(a[1]))),
@@ -419,6 +448,18 @@ class TrackingOverlay:
                 self.THICKNESS,
                 cv2.LINE_AA,
             )
+
+    def _dash_spans(self, length_px: float, lo: float, hi: float) -> list:
+        """(lam_a, lam_b) of the drawn dashes on tip (0) -> back (1), clipped to [lo, hi]."""
+        n = self.dash_pieces
+        if n:
+            out = []
+            for i in range(0, n, 2):
+                a, b = max(lo, i / n), min(hi, (i + 1) / n)
+                if a < b:
+                    out.append((a, b))
+            return out
+        return dash_spans(length_px, self.DASH_ON_PX, self.DASH_OFF_PX, lo, hi)
 
     def _draw_tip(self, img: np.ndarray, tip: np.ndarray) -> None:
         u, v = int(round(tip[0])), int(round(tip[1]))

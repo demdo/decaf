@@ -51,7 +51,7 @@ from typing import Callable, NamedTuple, Optional
 
 import numpy as np
 
-from overlay.tools.tracking_overlay import TrackingOverlay
+from overlay.tools.tracking_overlay import TrackingOverlay, dash_spans
 from overlay.tools.xray_view import XrayField, XrayView
 
 RULER_FIELD = "field"
@@ -83,21 +83,9 @@ DASH_OFF_PX = 4.0
 
 def dash_ranges(length_px: float, lo: float = 0.0, hi: float = 1.0, scale: float = 1.0) -> list:
     """The dashes of a segment length_px long on screen, from its start (lam = 0, the
-    tip) to its end (lam = 1): (lam_a, lam_b) pairs, clipped to [lo, hi]."""
-    out = []
-    if not length_px > 1e-9:
-        return out
-    on = DASH_ON_PX * scale / length_px
-    period = (DASH_ON_PX + DASH_OFF_PX) * scale / length_px
-    if not period > 0.0:
-        return out
-    n = int(math.ceil(1.0 / period))
-    for i in range(n):
-        a, b = i * period, min(1.0, i * period + on)
-        a, b = max(lo, a), min(hi, b)
-        if a < b:
-            out.append((a, b))
-    return out
+    tip) to its end (lam = 1): (lam_a, lam_b) pairs, clipped to [lo, hi]; the panels'
+    sizes times scale (tracking_overlay.dash_spans, which the rail and snapshots use)."""
+    return dash_spans(length_px, DASH_ON_PX * scale, DASH_OFF_PX * scale, lo, hi)
 
 
 class CameraModel:
