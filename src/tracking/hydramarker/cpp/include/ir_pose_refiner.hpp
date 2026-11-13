@@ -305,6 +305,16 @@ public:
     };
     const IrPairDump& lastPairDump() const { return pair_dump_; }
 
+    // The last pair dump re-triangulated for the drill pose estimator
+    // (const, no effect on the fusion): X = marker xyz (mm), Y = the IR
+    // point in the RGB frame (mm) WITHOUT the IR time-offset shift, S = its
+    // stereo covariance (mm^2) as fuseAttempt builds it, with sig_ir_px,
+    // WITHOUT the QF quality scale and NOT inverted. Empty without a dump.
+    void lastPairsForEstimator(double sig_ir_px,
+                               std::vector<cv::Vec3d>& X,
+                               std::vector<cv::Vec3d>& Y,
+                               std::vector<cv::Matx33d>& S) const;
+
     // Reference-free corner measurement in ONE IR view under an EXPLICIT pose,
     // with the operator selected by config.corner_method. Public for the offline
     // model-refinement post-pass (refine_model_ir): observation stills have no

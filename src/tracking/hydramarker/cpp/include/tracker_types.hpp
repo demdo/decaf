@@ -89,6 +89,26 @@ struct TrackerFrameResult {
     // propagate a rigidly attached point p (marker frame) to its camera-frame
     // uncertainty via J * P * J^T with J = d(R(rvec)*p + tvec)/d(rvec, tvec).
     std::vector<double> pose_covariance;
+    // ---- Drill pose estimator (TrackerConfig::drill_est_enabled) ----
+    // Written only with the estimator on and on a fresh frame (success and
+    // a pose that is not held); never into rvec / tvec / T_marker_camera /
+    // pose_covariance. The vectors are empty unless drill_est_valid (then
+    // all of them are complete); drill_est_tip_mm is set also while the
+    // frame is hidden (drill_est_shown false).
+    bool drill_est_valid = false;     // posterior present (event 0 or 1)
+    bool drill_est_shown = false;     // start-up gate over (and sigma_tip <= hide_sig)
+    bool drill_est_chained = false;   // prior of the previous frame used
+    int drill_est_since = 0;          // chained frames since the chain start
+    std::vector<double> drill_est_rvec;              // 3 [rad], marker -> colour camera
+    std::vector<double> drill_est_tvec;              // 3 [mm]
+    std::vector<double> drill_est_T_marker_camera;   // 16, row-major like T_marker_camera,
+                                                     // R as estimated, last row 0 0 0 1
+    std::vector<double> drill_est_tip_mm;            // 3, camera frame, also if hidden
+    double drill_est_sigma_tip_mm = std::numeric_limits<double>::quiet_NaN();
+    // 6x6 covariance, row-major, tangent [omega (rad); tau (mm)], right
+    // perturbation in the MARKER frame (not the [rvec; tvec] chart of
+    // pose_covariance)
+    std::vector<double> drill_est_cov;
     int num_points = 0;
     int num_inliers = 0;
     double mean_reprojection_error_px = -1.0;

@@ -127,13 +127,19 @@ class TrackOutput:
     .marked for this result (None / None / False without tool_points or
     without a pose). metering: the worker's meter for this frame
     (color_exposure.Metering), None without a meter.
+    With the drill estimator (ToolPoints estimator=True): points_hidden the
+    estimator's points of a hidden frame (points_kind "est_hidden"; else
+    None), points_sigma_mm its sigma_tip (NaN without an estimator pose);
+    points_a / points_a_kind the old drawing (the worker's tool_points_a,
+    for the logs; None / None without it).
     """
 
     __slots__ = (
         "slot", "frame_index", "t_frame", "meta", "has_ir", "epoch",
         "result", "t_start", "t_done", "skipped", "reset",
         "error", "traceback", "frame_dropped", "points", "points_kind",
-        "points_marked", "metering", "marks",
+        "points_marked", "metering", "marks", "points_hidden",
+        "points_sigma_mm", "points_a", "points_a_kind",
     )
 
     def __init__(self, slot: FrameSlot, epoch: int, *, result=None,
@@ -141,7 +147,9 @@ class TrackOutput:
                  reset: bool = False, error: BaseException | None = None,
                  traceback_text: str | None = None, points=None,
                  points_kind: str | None = None, points_marked: bool = False,
-                 metering=None, marks=None) -> None:
+                 metering=None, marks=None, points_hidden=None,
+                 points_sigma_mm: float = float("nan"), points_a=None,
+                 points_a_kind: str | None = None) -> None:
         self.slot: FrameSlot | None = slot
         self.frame_index = slot.frame_index
         self.t_frame = slot.t_frame
@@ -161,6 +169,10 @@ class TrackOutput:
         self.metering = metering
         # tool_marks.ToolMarks of points, ready to draw (marks_builder), or None
         self.marks = marks
+        self.points_hidden = points_hidden
+        self.points_sigma_mm = points_sigma_mm
+        self.points_a = points_a
+        self.points_a_kind = points_a_kind
         # eval mode: the slot was taken back for a newer frame before the
         # output was drained (its image is gone, the result is not)
         self.frame_dropped = False
@@ -205,8 +217,19 @@ class TrackingWorker:
 
     tool_points: tracking_overlay.ToolPoints or None. Runs in this thread
     on every result, right after the tracker, with the frame time
-    (TrackOutput.points / points_kind / points_marked), and is reset with
-    the tracker.
+    (TrackOutput.points / points_kind / points_marked, with the drill
+    estimator points_hidden / points_sigma_mm), and is reset with the
+    tracker.
+
+    tool_points_a: a second ToolPoints or None - with the drill estimator
+    the old drawing (estimator=False), run after tool_points on every result
+    for the logs only (TrackOutput.points_a / points_a_kind) and reset with
+    the tracker. An exception in it costs only that result's points_a
+    (n_points_a_errors).
+
+    drill_est_counters(): with the drill estimator (tool_points.estimator)
+    the run's error counters for the logs, all expected 0; None without it,
+    and then the worker counts nothing of it.
 
     frame_timing: HydraTracker.ir_frame_timing or None. Called in submit()
     with the frame's metadata, before a slot is taken (if it raises, no
@@ -235,9 +258,10 @@ class TrackingWorker:
     def __init__(self, tracker, *, pool_size: int, keep_every_frame: bool = False,
                  notify: Callable[[], None] | None = None, tool_points=None,
                  frame_timing: Callable[[dict], tuple] | None = None,
-                 meter=None, marks_builder=None) -> None:
+                 meter=None, marks_builder=None, tool_points_a=None) -> None:
         self._tracker = tracker
         self._tool_points = tool_points
+        self._tool_points_a = tool_points_a
         self._marks_builder = marks_builder
         self._meter = meter
         self._frame_timing = frame_timing
@@ -266,6 +290,14 @@ class TrackingWorker:
         self.n_frame_dropped = 0
         self.n_meter_errors = 0
         self.n_marks_errors = 0
+        self.n_points_a_errors = 0
+        # Drill estimator only (P-K3, drill_est_counters): ToolPoints.reset()
+        # zeroes its n_est_bad_T at every tracker reset, so the run's earlier
+        # count is kept here; the engine's drill_est_exceptions (timings_ms)
+        # of the last result. Worker thread; read after stop().
+        self._est_counters = bool(getattr(tool_points, "estimator", False))
+        self._n_est_bad_T_reset = 0
+        self.drill_est_exceptions: float | None = None
         # A frame not taken for want of a free slot. Not part of the design
         # (the page's pool covers every owner at once); counted so a log
         # shows it. GUI thread only.
@@ -360,6 +392,32 @@ class TrackingWorker:
         """Give a slot back (slots of another worker are ignored)."""
         self._pool.release(slot)
 
+    def drill_est_counters(self) -> dict | None:
+        """The run's error counters with the drill estimator, all expected 0
+        (P-K3), after stop(): n_est_bad_T (valid estimator results without a
+        usable T, summed over the tracker resets), n_points_a_errors,
+        n_marks_errors, and the tracker's own since it was built (the page
+        keeps it across runs while config.LIVE_DRILL_ESTIMATOR is unchanged):
+        drill_est_exceptions (the engine's, last result; None if no result
+        had it) and drill_est_export_errors (HydraTracker; None without it).
+        None without the estimator."""
+        if not self._est_counters:
+            return None
+
+        def count(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        return {
+            "n_est_bad_T": self._n_est_bad_T_reset + int(getattr(self._tool_points, "n_est_bad_T", 0)),
+            "n_points_a_errors": int(self.n_points_a_errors),
+            "n_marks_errors": int(self.n_marks_errors),
+            "drill_est_exceptions": count(self.drill_est_exceptions),
+            "drill_est_export_errors": count(getattr(self._tracker, "drill_est_export_errors", None)),
+        }
+
     def stop(self, timeout_s: float = 2.0) -> bool:
         """Stop after the current frame and join. False: the thread did not
         end within timeout_s (engine hung); it is abandoned, and its tracker
@@ -405,13 +463,19 @@ class TrackingWorker:
 
                 t_start = time.perf_counter()
                 points = points_kind = metering = marks = None
+                points_hidden = points_a = points_a_kind = None
+                points_sigma_mm = float("nan")
                 points_marked = False
                 meter = self._meter            # set_meter() may swap it meanwhile
                 try:
                     if reset:
                         self._tracker.reset()
                         if self._tool_points is not None:
+                            if self._est_counters:
+                                self._n_est_bad_T_reset += int(getattr(self._tool_points, "n_est_bad_T", 0))
                             self._tool_points.reset()
+                        if self._tool_points_a is not None:
+                            self._tool_points_a.reset()
                     timing = {}
                     if slot.timing is not None:
                         timing = dict(zip(("frame_time_ms", "ir_time_offset_ms"),
@@ -424,10 +488,23 @@ class TrackingWorker:
                         t_frame=slot.t_frame,
                         **timing,
                     )
+                    if self._est_counters:
+                        n_exc = (getattr(result, "timings_ms", None) or {}).get("drill_est_exceptions")
+                        if n_exc is not None:
+                            self.drill_est_exceptions = n_exc
                     if self._tool_points is not None:
                         points = self._tool_points.update(result, slot.t_frame)
                         points_kind = self._tool_points.kind
                         points_marked = self._tool_points.marked
+                        points_hidden = getattr(self._tool_points, "hidden_points", None)
+                        points_sigma_mm = getattr(self._tool_points, "sigma_mm", float("nan"))
+                        if self._tool_points_a is not None:
+                            try:
+                                points_a = self._tool_points_a.update(result, slot.t_frame)
+                                points_a_kind = self._tool_points_a.kind
+                            except Exception:
+                                points_a = points_a_kind = None
+                                self.n_points_a_errors += 1
                         if points is not None and self._marks_builder is not None:
                             try:
                                 marks = self._marks_builder.build(
@@ -459,6 +536,8 @@ class TrackingWorker:
                     t_done=time.perf_counter(), skipped=skipped, reset=reset,
                     points=points, points_kind=points_kind,
                     points_marked=points_marked, metering=metering, marks=marks,
+                    points_hidden=points_hidden, points_sigma_mm=points_sigma_mm,
+                    points_a=points_a, points_a_kind=points_a_kind,
                 )
                 slot = None
                 self._publish(out)

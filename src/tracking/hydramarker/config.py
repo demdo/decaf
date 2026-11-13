@@ -13,7 +13,8 @@ runtime at startup.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -841,6 +842,315 @@ class TrackerConfig:
     # 0 = never marked.
     drawn_pose_mark_below_visible_frac: float = 0.75
 
+    # Drill pose estimator (iterated EKF in the C++ engine, output stage;
+    # cpp/include/tracker_config.hpp). Off by default: the engine computes
+    # nothing and adds no result fields or timings keys. On: own result fields
+    # drill_est_* in TrackerResult (rvec / tvec stay the engine pose), and the
+    # engine forces the output pose filter off (pose_kf_enabled reads back
+    # False). Not switched on in make_live_tracker_config(): the Live page sets
+    # it and its additions itself, so the repository scripts keep the old
+    # behaviour. Defaults = the validated frozen state (variant co_alt_eb);
+    # gap 0.5 s, prior_max 0 and hide_sig 0 keep it. Same types as in C++
+    # (int stays int: tracker_config_from_python drops a mismatch silently,
+    # check_drill_est_config finds it). w3d / sigma_ir_px / row_ms are the
+    # estimator's own copies of ir_w3d / ir_sigma_ir_px /
+    # ir_time_offset_row_ms (s_rgb / s_ir were fitted with these values;
+    # drill_est_fingerprint compares them with the engine fields).
+    drill_est_enabled: bool = False
+    drill_est_sig_t_mm: float = 0.02          # base noise per T0 = 1/30 s [mm]
+    drill_est_sig_r_deg: float = 0.008        # base noise per T0 [deg]
+    drill_est_adapt_px: float = 1.0           # dead band of nu1 [px/frame]
+    drill_est_db3_px: float = 0.3             # dead band of nu3 [px/frame]
+    drill_est_gain_t: float = 2.0             # gain_t * nu * Z / f in mm
+    drill_est_gain_r_deg: float = 0.5         # [deg per px/frame]
+    drill_est_vmin: int = 4                   # matched corners for nu
+    drill_est_s_rgb: float = 7.57             # RGB sigma scale
+    drill_est_s_ir: float = 11.08             # IR sigma scale
+    drill_est_huber_k: float = 1.5            # Huber threshold
+    drill_est_n_iter: int = 3                 # Gauss-Newton steps
+    drill_est_gap_s: float = 0.5              # chain break after a gap [s]
+    drill_est_rs_px: float = 3.0              # rolling-shutter dead band; < 0: off
+    drill_est_ir_gated: float = 1.0           # sigma factor, IR of a not applied fusion
+    drill_est_ir_fit_max_mm: float = 6.0      # IR switch-off above the fit RMS; 0: off
+    drill_est_ir_fit_fac: float = 1000.0      # sigma factor of switched-off IR pairs
+    drill_est_min_start: int = 12             # RGB corners for a chain start
+    drill_est_warm: int = 5                   # start-up gate at most [frames]
+    drill_est_sig_tip_max_mm: float = 2.0     # start-up gate ends at sigma_tip <=
+    drill_est_w3d: float = 4.0                # copy of ir_w3d
+    drill_est_sigma_ir_px: float = 0.05       # copy of ir_sigma_ir_px
+    drill_est_row_ms: float = 0.0278          # copy of ir_time_offset_row_ms
+    drill_est_prior_max_mm: float = 0.0       # chain restart above the prior sigma; 0: off
+    drill_est_hide_sig_mm: float = 0.0        # hide frames with sigma_tip above; 0: off
+
+
+# ---- Drill pose estimator: read-back and validation checks ----
+# Used only while the estimator is switched on (Live page, tool eval), not in
+# tracker_config_from_python: with an older module every script would warn.
+DRILL_EST_FIELDS = tuple(
+    f.name for f in fields(TrackerConfig) if f.name.startswith("drill_est_")
+)
+# Engine values the scales s_rgb / s_ir of the estimator were validated with
+# (meta of the co_base dumps; sigma_px_eff = 0.100 px at rest) and the IR
+# calibration file of that validation (realsense_ir_calibration.npz).
+DRILL_EST_VALIDATION = {
+    "ir_sigma_px": 0.10,
+    "ir_sigma_px_motion_coeff": 0.20,
+    "ir_sigma_px_motion_rot_px_per_deg": 8.0,
+    "ir_depth_scale": 1.00197,
+    "ir_min_pairs": 6,
+    "ir_sigma_ir_px": 0.05,
+    "ir_w3d": 4.0,
+    "ir_time_offset_row_ms": 0.0278,
+}
+DRILL_EST_VALIDATION_IRCAL_MD5 = "e0c6420a7bf84be6ca1069695736be4d"
+# the estimator's own copies of engine fields (copy, engine field)
+DRILL_EST_COPIES = (
+    ("drill_est_w3d", "ir_w3d"),
+    ("drill_est_sigma_ir_px", "ir_sigma_ir_px"),
+    ("drill_est_row_ms", "ir_time_offset_row_ms"),
+)
+DRILL_EST_KF_WARNING = "Ausgabe-KF aus, weil Schaetzer aktiv"
+
+
+def _same_config_value(have, want) -> bool:
+    """Equal as the engine holds it: bool and int fields with the same type
+    (a float for an int field is not taken over), float fields by value."""
+    if isinstance(have, bool) or isinstance(want, bool):
+        return type(have) is type(want) and have == want
+    if isinstance(have, int):
+        return type(want) is int and have == want
+    try:
+        return float(have) == float(want)
+    except (TypeError, ValueError):
+        return False
+
+
+def check_drill_est_config(engine_cfg, py_cfg) -> list:
+    """Read-back check of the drill estimator configuration: every drill_est_*
+    field of the engine's configuration (HydraTracker._engine.config, the
+    copy the engine runs with) against the Python value. A field the loaded
+    module lacks, or a value it did not take (wrong type), is a deviation.
+    The output pose filter is compared too: while the estimator is on the
+    engine forces it off, so a requested filter that reads back off is not a
+    deviation (drill_est_kf_warning gives the warning line). Returns the
+    deviations as text lines, empty = all taken over."""
+    dev = []
+    for name in DRILL_EST_FIELDS:
+        want = getattr(py_cfg, name)
+        if not hasattr(engine_cfg, name):
+            dev.append(f"{name}: not in the loaded module")
+            continue
+        have = getattr(engine_cfg, name)
+        if not _same_config_value(have, want):
+            dev.append(f"{name}: engine {have!r} != python {want!r}")
+    want_kf = getattr(py_cfg, "pose_kf_enabled", None)
+    have_kf = getattr(engine_cfg, "pose_kf_enabled", None)
+    if want_kf is not None and have_kf is not None and bool(have_kf) != bool(want_kf):
+        forced = (
+            bool(want_kf)
+            and not bool(have_kf)
+            and bool(getattr(engine_cfg, "drill_est_enabled", False))
+        )
+        if not forced:
+            dev.append(f"pose_kf_enabled: engine {have_kf!r} != python {want_kf!r}")
+    return dev
+
+
+def drill_est_kf_warning(engine_cfg, py_cfg) -> Optional[str]:
+    """Warning line when the output pose filter was requested but the engine
+    runs it off because the drill estimator is on; None otherwise."""
+    if (
+        bool(getattr(py_cfg, "pose_kf_enabled", False))
+        and bool(getattr(engine_cfg, "drill_est_enabled", False))
+        and not bool(getattr(engine_cfg, "pose_kf_enabled", True))
+    ):
+        return DRILL_EST_KF_WARNING
+    return None
+
+
+def drill_est_fingerprint(engine_cfg, ircal_path=None) -> list:
+    """Validation fingerprint of the drill estimator (only with it on): the
+    engine values its scales depend on but it cannot copy, the IR calibration
+    file (MD5) and the equality of its three copies with the engine fields.
+    Returns the deviations from the validated state as text lines (a warning:
+    the estimator runs anyway)."""
+    dev = []
+    for name, ref in DRILL_EST_VALIDATION.items():
+        have = getattr(engine_cfg, name, None)
+        if have is None or not _same_config_value(have, ref):
+            dev.append(f"{name}: {have!r} (validated {ref!r})")
+    for copy_name, engine_name in DRILL_EST_COPIES:
+        a = getattr(engine_cfg, copy_name, None)
+        b = getattr(engine_cfg, engine_name, None)
+        if a is None or b is None or float(a) != float(b):
+            dev.append(f"{copy_name} {a!r} != {engine_name} {b!r}")
+    if ircal_path is None:
+        dev.append("IR calibration: no file")
+    else:
+        try:
+            digest = hashlib.md5(Path(ircal_path).read_bytes()).hexdigest()
+        except OSError as exc:
+            dev.append(f"IR calibration {ircal_path}: {exc}")
+        else:
+            if digest != DRILL_EST_VALIDATION_IRCAL_MD5:
+                dev.append(
+                    f"IR calibration {ircal_path}: MD5 {digest} "
+                    f"(validated {DRILL_EST_VALIDATION_IRCAL_MD5})"
+                )
+    return dev
+
+
+# ---- Drill pose estimator on the Live page and in the tool evaluation ----
+# The switch: LIVE_DRILL_ESTIMATOR, read (drill_est_requested) whenever the
+# page (or test_tracker_tool_eval) builds its tracker. True (default): the
+# estimator with the Live additions (DRILL_EST_LIVE) and the start checks
+# S1-S8; an engine without it (S1-S4 failed) tracks as before, with a red
+# message. False: the tracker exactly as before the estimator (no start
+# checks, no tool tip). make_live_tracker_config() and the TrackerConfig
+# default (drill_est_enabled False) never set it.
+LIVE_DRILL_ESTIMATOR = True
+# The additions the Live page runs the estimator with (validated on TUNE):
+# a chain break after 0.2 s instead of 0.5 s, the prior bound 20 mm and frames
+# hidden above sigma_tip 5 mm. The TrackerConfig defaults keep the frozen state.
+DRILL_EST_LIVE = (
+    ("drill_est_gap_s", 0.2),
+    ("drill_est_prior_max_mm", 20.0),
+    ("drill_est_hide_sig_mm", 5.0),
+)
+# Start check S7: K_rgb of the GUI against K_rgb of the IR calibration file [px].
+DRILL_EST_K_TOL_PX = 1e-6
+
+
+def drill_est_requested() -> bool:
+    """The drill estimator is asked for (Live page, test_tracker_tool_eval):
+    LIVE_DRILL_ESTIMATOR, read at every call (a test may set it)."""
+    return bool(LIVE_DRILL_ESTIMATOR)
+
+
+def apply_drill_est_live(config):
+    """Switch the estimator on in a TrackerConfig, with the Live additions
+    (DRILL_EST_LIVE); returns the config."""
+    config.drill_est_enabled = True
+    for name, value in DRILL_EST_LIVE:
+        setattr(config, name, value)
+    return config
+
+
+def drill_est_start_checks(module, engine, py_cfg, *, tip_set, ir_path=None,
+                           K_rgb=None) -> dict:
+    """Start checks of the drill estimator (only with it requested), against
+    the loaded module (hydramarker_cpp), the engine (TrackerEngine) and the
+    Python config it was built from:
+      S1 the module has the estimator (TrackerConfig field, BUILD_INFO)
+      S2 read-back: every drill_est_* of the engine equals the Python value
+      S3 the engine's parameter check passed (drill_est_config_valid)
+      S4 the tool tip is set (tip_set: set_tool_tip and has_tool_tip)
+      S5 IR on (ir_refine_enabled and an IR calibration file)
+      S6 validation fingerprint (drill_est_fingerprint)
+      S7 K_rgb of the GUI = K_rgb of the IR calibration file
+      S8 a release build (BUILD_INFO ndebug)
+    S1-S4 failed: the caller builds the tracker with the estimator off; S5-S8
+    failed: a warning, the estimator runs. Returns {"checks": [{id, ok (None:
+    not checked), fatal, text}], "fatal": [...], "warnings": [...],
+    "readback": [...], "fingerprint": [...]} (texts "S<n> ...")."""
+    checks = []
+
+    def add(cid: str, ok, fatal: bool, text: str) -> None:
+        checks.append({"id": cid, "ok": ok, "fatal": fatal, "text": text})
+
+    ir_path = ir_path or None
+    engine_cfg = getattr(engine, "config", None)
+    try:
+        has_field = hasattr(module.TrackerConfig(), "drill_est_enabled")
+    except Exception:
+        has_field = False
+    build = getattr(module, "BUILD_INFO", None)
+    build = {} if build is None else dict(build)
+    ok = has_field and bool(build.get("drill_est", False))
+    add("S1", ok, True, "estimator in the loaded module" if ok else
+        f"the loaded module has no drill estimator (TrackerConfig field "
+        f"{'yes' if has_field else 'missing'}, BUILD_INFO drill_est {build.get('drill_est')!r})")
+
+    if engine_cfg is None:
+        readback = ["the engine has no configuration"]
+    else:
+        readback = check_drill_est_config(engine_cfg, py_cfg)
+    more = f" (+{len(readback) - 3} more)" if len(readback) > 3 else ""
+    add("S2", not readback, True, "read-back of drill_est_* complete" if not readback
+        else "read-back: " + "; ".join(readback[:3]) + more)
+
+    ok = bool(getattr(engine, "drill_est_config_valid", False))
+    add("S3", ok, True, "parameters valid" if ok else
+        "parameters rejected by the engine (or no parameter check in the module)")
+
+    add("S4", bool(tip_set), True, "tool tip set" if tip_set else "tool tip not set")
+
+    ok = bool(getattr(py_cfg, "ir_refine_enabled", False)) and bool(ir_path)
+    add("S5", ok, False, "IR on" if ok else
+        "IR off: the estimator runs on the colour corners only (weakest case)")
+
+    if engine_cfg is None:
+        fingerprint = ["the engine has no configuration"]
+    else:
+        fingerprint = drill_est_fingerprint(engine_cfg, ir_path)
+    add("S6", not fingerprint, False, "validation fingerprint unchanged" if not fingerprint
+        else "fingerprint: " + "; ".join(fingerprint))
+
+    if not ir_path or K_rgb is None:
+        add("S7", None, False, "K_rgb not compared (no IR calibration file)"
+            if not ir_path else "K_rgb not compared (no GUI intrinsics)")
+    else:
+        try:
+            import numpy as np
+
+            with np.load(ir_path, allow_pickle=False) as z:
+                k_ir = np.asarray(z["K_rgb"], dtype=np.float64).reshape(3, 3)
+            k_gui = np.asarray(K_rgb, dtype=np.float64).reshape(3, 3)
+            d = float(np.max(np.abs(k_gui - k_ir)))
+        except Exception as exc:
+            add("S7", False, False, f"K_rgb of the IR calibration not compared: {exc!r}")
+        else:
+            ok = d <= DRILL_EST_K_TOL_PX
+            add("S7", ok, False, "K_rgb of the GUI = K_rgb of the IR calibration" if ok else
+                f"K_rgb of the GUI differs from the IR calibration's by up to {d:.6g} px")
+
+    ndebug = build.get("ndebug")
+    add("S8", bool(ndebug), False, "release build" if ndebug else
+        f"not a release build (BUILD_INFO ndebug {ndebug!r}): timings not usable")
+
+    return {
+        "checks": checks,
+        "fatal": [f"{c['id']} {c['text']}" for c in checks if c["fatal"] and not c["ok"]],
+        "warnings": [f"{c['id']} {c['text']}" for c in checks
+                     if not c["fatal"] and c["ok"] is False],
+        "readback": readback,
+        "fingerprint": fingerprint,
+    }
+
+
+def drill_est_summary(requested: bool, active: bool, report: Optional[dict],
+                      engine_cfg=None) -> str:
+    """One line on the estimator at a tracking start: on (with the Live
+    additions) or off and why, then the warnings of the start checks.
+    engine_cfg: the configuration read back from the engine; the additions
+    are then its values (None: the DRILL_EST_LIVE values)."""
+    if not requested:
+        return "drill estimator off (LIVE_DRILL_ESTIMATOR False)"
+    fatal = (report or {}).get("fatal") or []
+    if not active:
+        why = "; ".join(fatal) if fatal else "not active in the engine"
+        return f"drill estimator OFF although requested: {why}"
+    extra = ", ".join(
+        f"{name[len('drill_est_'):]} "
+        f"{float(value if engine_cfg is None else getattr(engine_cfg, name, float('nan'))):g}"
+        for name, value in DRILL_EST_LIVE
+    )
+    text = f"drill estimator on ({extra})"
+    warnings = (report or {}).get("warnings") or []
+    if warnings:
+        text += "; warnings: " + "; ".join(warnings)
+    return text
+
 
 __all__ = [
     "CAMERA_BACKENDS",
@@ -850,4 +1160,14 @@ __all__ = [
     "LiveTrackerConfig",
     "LoggingConfig",
     "TrackerConfig",
+    "DRILL_EST_FIELDS",
+    "DRILL_EST_LIVE",
+    "LIVE_DRILL_ESTIMATOR",
+    "apply_drill_est_live",
+    "check_drill_est_config",
+    "drill_est_fingerprint",
+    "drill_est_kf_warning",
+    "drill_est_requested",
+    "drill_est_start_checks",
+    "drill_est_summary",
 ]

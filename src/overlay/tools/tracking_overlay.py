@@ -141,13 +141,16 @@ class TrackingOverlay:
         self.xray_update_s = 0.0
 
     def tool_points(self, los_offset_mm: Optional[float] = None,
-                    mark_below_visible_frac: float = 0.0) -> "ToolPoints":
+                    mark_below_visible_frac: float = 0.0,
+                    estimator: bool = False) -> "ToolPoints":
         """A ToolPoints of this tool's tip and back point, for the tracking
         thread; los_offset_mm None: ToolPoints.LOS_OFFSET_MM (the page's);
-        mark_below_visible_frac: see ToolPoints.marked. Its line-of-sight
+        mark_below_visible_frac: see ToolPoints.marked; estimator: draw the
+        engine's drill estimator pose (ToolPoints). Its line-of-sight
         shift is the one snapshot_record reports from now on."""
         tp = ToolPoints(self._p_tip, self._p_back, los_offset_mm=los_offset_mm,
-                        mark_below_visible_frac=mark_below_visible_frac)
+                        mark_below_visible_frac=mark_below_visible_frac,
+                        estimator=estimator)
         self._los_offset_mm = float(tp.los_offset_mm)
         return tp
 
@@ -542,6 +545,18 @@ class ToolPoints:
     contrast) is below mark_below_visible_frac - a pose the engine kept
     under a partial occlusion (TrackerConfig.drawn_pose_mark_below_visible_frac
     on the Live page; 0 = never).
+
+    estimator=True (the engine's drill estimator is on, TrackerConfig
+    drill_est_enabled): the points come from the estimator's own pose
+    (result.drill_est_T_marker_camera; rvec / tvec stay the engine pose), no
+    offset is carried. kind "est": shown; "est_hidden": the estimator has a
+    pose but hides it (start-up gate after a chain start, sigma rule) - no
+    points, hidden_points holds them; "est_none": a result with a pose but
+    no estimator pose (chain start gate, a hold result, ...) - no points;
+    None: no pose. sigma_mm: the estimator's sigma_tip of the pose (NaN
+    without one). A valid estimator result without a usable T counts in
+    n_est_bad_T (never expected) and gives no points. marked as above (the
+    engine pose's visible cells).
     """
 
     # Replays of the live runs: a carried offset is off from the fused one
@@ -560,7 +575,8 @@ class ToolPoints:
 
     def __init__(self, p_tip_mm, p_back_mm, max_carry_s: Optional[float] = None,
                  los_offset_mm: Optional[float] = None,
-                 mark_below_visible_frac: float = 0.0) -> None:
+                 mark_below_visible_frac: float = 0.0,
+                 estimator: bool = False) -> None:
         # rows: tip, marker-side end of the dashed shaft segment
         self._p = np.stack([
             np.asarray(p_tip_mm, dtype=np.float64).reshape(3),
@@ -569,6 +585,7 @@ class ToolPoints:
         self.max_carry_s = self.MAX_CARRY_S if max_carry_s is None else float(max_carry_s)
         self.los_offset_mm = self.LOS_OFFSET_MM if los_offset_mm is None else float(los_offset_mm)
         self.mark_below_visible_frac = float(mark_below_visible_frac)
+        self.estimator = bool(estimator)
         self.reset()
 
     def reset(self) -> None:
@@ -576,6 +593,10 @@ class ToolPoints:
         self._t_offset = 0.0
         self.kind: Optional[str] = None
         self.marked = False
+        # estimator path (None / NaN on the old path)
+        self.hidden_points: Optional[np.ndarray] = None
+        self.sigma_mm = float("nan")
+        self.n_est_bad_T = 0
 
     def _points(self, rvec, tvec) -> np.ndarray:
         R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
@@ -591,16 +612,21 @@ class ToolPoints:
         if pts is None or not self.los_offset_mm:
             return pts
         # ray to the marker origin: of the drawn pose, or of the RGB-only
-        # pose under the carried offset (pre-fusion pose on fused frames)
+        # pose under the carried offset (pre-fusion pose on fused frames;
+        # the estimator's pose on its frames)
         t = None
         if self.kind == "fused":
             t = getattr(result, "tvec_prefusion", None)
+        elif self.kind == "est":
+            t = getattr(result, "drill_est_tvec", None)
         if t is None:
             t = result.tvec
         t = np.asarray(t, dtype=np.float64).reshape(3)
         return pts - self.los_offset_mm * t / max(float(np.linalg.norm(t)), 1e-9)
 
     def _update(self, result, t_frame: float) -> Optional[np.ndarray]:
+        if self.estimator:
+            return self._update_estimator(result)
         self.kind = None
         rvec = getattr(result, "rvec", None)
         tvec = getattr(result, "tvec", None)
@@ -625,4 +651,29 @@ class ToolPoints:
             self.kind = "carry"
             return pts + self._offset
         self.kind = "rgb"
+        return pts
+
+    def _update_estimator(self, result) -> Optional[np.ndarray]:
+        """The estimator path (see the class doc); never raises on a result
+        without the estimator fields (an older engine: "est_none")."""
+        self.kind, self.hidden_points, self.sigma_mm = None, None, float("nan")
+        if getattr(result, "rvec", None) is None:
+            return None
+        if not bool(getattr(result, "drill_est_valid", False)):
+            # fresh without an estimator pose, or a hold result
+            self.kind = "est_none"
+            return None
+        T = getattr(result, "drill_est_T_marker_camera", None)
+        if T is None or np.shape(T) != (4, 4) or not np.all(np.isfinite(T)):
+            self.n_est_bad_T += 1
+            self.kind = "est_none"
+            return None
+        T = np.asarray(T, dtype=np.float64)
+        # R as estimated, no Rodrigues round trip
+        pts = self._p @ T[:3, :3].T + T[:3, 3]
+        self.sigma_mm = float(getattr(result, "drill_est_sigma_tip_mm", float("nan")))
+        if not bool(getattr(result, "drill_est_shown", False)):
+            self.kind, self.hidden_points = "est_hidden", pts
+            return None
+        self.kind = "est"
         return pts

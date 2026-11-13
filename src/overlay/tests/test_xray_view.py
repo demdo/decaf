@@ -26,6 +26,21 @@ each of these skips itself when the data is missing:
 The real page, camera and tracker replaced by stubs (B_2: its image, its poses):
 (h) switches, slider, a new reference plane, tracking test without magenta,
     snapshot layer 04, frame log, profile log; prints what the X-ray view costs there
+(i) the stub with the drill estimator (est_pattern) on the rail: hidden and
+    est_none frames draw nothing, the drawn drill is the estimator's pose,
+    snapshots carry tool["drill_est"] and never a hidden pose, frame log v3
+    with every estimator column in its fixed shape
+(k) the rail: the drill estimator's start-check message (red, S1 with the
+    stub) stays on the tracking card after the first lock, stop clears it
+    (also the drawn colour: the label's palette, as before the message)
+(l) the rail with the stub's estimator: its error counters at the stop on the
+    console, in the profile log and in run_meta["counters"] (bad T summed
+    over a tracker reset); (h) without the estimator has none of them
+
+Without data:
+(j) start checks S1-S8 of the drill estimator with fakes, and the page's
+    _make_tracker with a fake run_tracker: config.LIVE_DRILL_ESTIMATOR, a new tracker on a
+    change of it, a failed S1-S4 tracks without the estimator, warnings keep it
 
 Run from src/:
 
@@ -676,27 +691,65 @@ class _Camera:
         pass
 
 
+def est_pattern(k: int) -> str:
+    """The drill estimator's state on the k-th processed frame (stub): 30
+    shown, the sigma rule hides 20, the chain start gate 2 (no estimator
+    pose), the start-up gate after the chain start hides 5, then 33 shown."""
+    m = k % 90
+    if m < 30 or m >= 57:
+        return "shown"
+    if m < 50 or m >= 52:
+        return "hidden"
+    return "none"
+
+
+# the stub estimator's pose: the engine pose turned by EST_TURN_DEG about its z
+# axis and shifted by EST_SHIFT_MM (camera frame), so a drawing shows which pose it is
+EST_TURN_DEG = 2.0
+EST_SHIFT_MM = np.array([0.4, -0.3, 0.8])
+
+
 class _Tracker:
     """Replays the recorded poses of a tracking run. The blur stands in for the
-    engine's load: like the engine it runs in C++ on all cores, without the GIL."""
+    engine's load: like the engine it runs in C++ on all cores, without the GIL.
+    est: None (no drill estimator, as an engine without it) or a pattern
+    k -> "shown" / "hidden" / "none" (/ "bad": valid without T) of the
+    estimator per processed frame; p_tip: the tool tip for drill_est_tip_mm."""
 
     ir_frame_timing = None
 
-    def __init__(self, rvec: np.ndarray, tvec: np.ndarray) -> None:
-        self.config = SimpleNamespace(drawn_pose_mark_below_visible_frac=0.75)
+    def __init__(self, rvec: np.ndarray, tvec: np.ndarray, est=None, p_tip=None) -> None:
+        self.config = SimpleNamespace(drawn_pose_mark_below_visible_frac=0.75,
+                                      drill_est_enabled=est is not None)
+        if est is not None:
+            from tracking.hydramarker.config import DRILL_EST_LIVE, TrackerConfig
+            defaults = TrackerConfig()
+            for name in ("drill_est_gap_s", "drill_est_warm", "drill_est_sig_tip_max_mm"):
+                setattr(self.config, name, getattr(defaults, name))
+            for name, value in DRILL_EST_LIVE:
+                setattr(self.config, name, value)
+        self.drill_estimator_active = est is not None
+        self.pose_kf_forced_off = est is not None
+        self.est = est
+        self.p_tip = np.zeros(3) if p_tip is None else np.asarray(p_tip, np.float64)
         self.rvec, self.tvec = rvec, tvec
         self.i = 0
+        self.states: list[str] = []      # the estimator state of every processed frame
+        # k -> the engine's drill_est_exceptions in timings_ms (None: not reported)
+        self.exceptions = None
+        self.n_resets = 0
 
     def reset(self) -> None:
-        pass
+        self.n_resets += 1
 
     def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None,
                       t_frame=None, **timing):
         cv2.GaussianBlur(color, (31, 31), 0)
+        k = self.i
         i = self.i % len(self.rvec)
         self.i += 1
         source = SimpleNamespace(value="decode", name="decode")
-        return SimpleNamespace(
+        r = SimpleNamespace(
             success=True, pose_source=source, pose_converged=True, message="",
             mode=SimpleNamespace(value="tracking"), rvec=self.rvec[i], tvec=self.tvec[i],
             rvec_prefusion=None, tvec_prefusion=None, num_points=100, num_inliers=100,
@@ -704,11 +757,41 @@ class _Tracker:
             timings_ms={ACCEPTED_KEY: 1.0, "visible_cell_fraction": 1.0},
             debug_counters={}, corners=(), detection_corners=(),
         )
+        if self.est is not None:
+            self._add_estimator(r, self.est(k))
+        if self.exceptions is not None:
+            r.timings_ms["drill_est_exceptions"] = float(self.exceptions(k))
+        return r
+
+    def _add_estimator(self, r, state: str) -> None:
+        self.states.append(state)
+        r.rvec_prefusion = np.asarray(r.rvec, np.float64).copy()
+        r.tvec_prefusion = np.asarray(r.tvec, np.float64).copy()
+        valid = state != "none"
+        R, _ = cv2.Rodrigues(np.asarray(r.rvec, np.float64).reshape(3, 1))
+        a = np.radians(EST_TURN_DEG)
+        R_e = R @ np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+        t_e = np.asarray(r.tvec, np.float64).reshape(3) + EST_SHIFT_MM
+        T = np.eye(4)
+        T[:3, :3], T[:3, 3] = R_e, t_e
+        r.drill_est_valid = valid
+        r.drill_est_shown = state == "shown"
+        r.drill_est_chained = valid
+        r.drill_est_since = len(self.states)
+        r.drill_est_rvec = cv2.Rodrigues(R_e)[0].reshape(3) if valid else None
+        r.drill_est_tvec = t_e if valid else None
+        # "bad": valid without a usable T (never expected; counted, nothing drawn)
+        r.drill_est_T_marker_camera = T if valid and state != "bad" else None
+        r.drill_est_tip_mm = R_e @ self.p_tip + t_e if valid else None
+        r.drill_est_sigma_tip_mm = (0.8 if state == "shown" else 6.0) if valid else float("nan")
+        r.drill_est_cov = None
 
 
-def _make_page(rec, work_raw, distortion, poses, *, tracking_test=False, ev=None, panels=False):
+def _make_page(rec, work_raw, distortion, poses, *, tracking_test=False, ev=None, panels=False,
+               est=None):
     """panels False: the full-frame image with the rail (these checks read
-    page._display_bgra); True: the study's panels (test_live_panels)."""
+    page._display_bgra); True: the study's panels (test_live_panels).
+    est: the stub's drill estimator pattern (None: without it)."""
     from overlay.gui.pages.page_overlay_live import OverlayLivePage
     from overlay.gui.state import SessionState
     from tracking.hydramarker import tracker_log
@@ -738,7 +821,7 @@ def _make_page(rec, work_raw, distortion, poses, *, tracking_test=False, ev=None
         page._has_fresh_pose = tracker_log.has_fresh_pose
         page._tracker_log_module = tracker_log
         page._track_fail_log = None
-        return _Tracker(*poses)
+        return _Tracker(*poses, est=est, p_tip=rec.p_tip)
 
     page._start_realsense = start_camera
     page._make_tracker = make_tracker
@@ -875,8 +958,15 @@ def test_page(seconds: float = 6.0) -> None:
                     "off_plane_mm", "inclination_deg", "tip_in_field", "xview_update_ms"):
             assert key in tr.files, key
         meta = json.loads(str(tr["meta_json"]))
-        assert meta["log_version"] == live.FRAME_LOG_VERSION == 2
+        assert meta["log_version"] == live.FRAME_LOG_VERSION == 3
+        # without the drill estimator: its columns empty, the run says so
+        assert not tr["est_valid"].any() and "est_rvec" not in tr.files
+        assert "a_tip_cam_mm" not in tr.files and not any(tr["a_kind"])
+        assert meta["run_meta"]["drill_estimator"]["active"] is False
+        assert meta["run_meta"]["tool_points"]["estimator"] is False
+        assert "counters" not in meta["run_meta"], meta["run_meta"]["counters"]
         di = np.load(next(tmp.glob("session/test_display*.npz")))
+        assert "est_shown" in di.files and not di["est_shown"].any()
         assert "xview_ms" in di.files
 
         draw = di["xview_ms"][np.isfinite(di["xview_ms"])]
@@ -885,6 +975,7 @@ def test_page(seconds: float = 6.0) -> None:
         log_lines = (tmp / "session" / live.PROFILE_LOG_NAME).read_text(encoding="utf-8").splitlines()
         with_view = [ln for ln in log_lines if " xview " in ln and "xview_up" in ln]
         assert with_view, "no X-ray view stages in the profile log"
+        assert not [ln for ln in log_lines if "drill estimator counters" in ln]   # (l): only with it
         print(f"      frame log, {len(draw)} shown frames / {len(up)} poses (stub camera + engine):")
         print(f"        magenta drawing {draw.mean():.4f} ms mean, {np.percentile(draw, 95):.4f} p95, {draw.max():.4f} max")
         print(f"        magenta geometry per pose {up.mean():.4f} ms mean, {np.percentile(up, 95):.4f} p95, {up.max():.4f} max")
@@ -924,6 +1015,598 @@ def test_page(seconds: float = 6.0) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _est_pts(R_rvec, tvec, p):
+    """Camera-frame point p (marker frame) under the stub estimator's pose."""
+    R, _ = cv2.Rodrigues(np.asarray(R_rvec, np.float64).reshape(3, 1))
+    a = np.radians(EST_TURN_DEG)
+    R_e = R @ np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+    return R_e @ np.asarray(p, np.float64) + np.asarray(tvec, np.float64).reshape(3) + EST_SHIFT_MM
+
+
+def test_page_estimator(seconds: float = 6.0) -> None:
+    """The real page on the rail with the stub's drill estimator (est_pattern):
+    hidden and est_none frames draw nothing, the drawn drill is the estimator's
+    pose, a snapshot never holds a hidden pose and carries tool["drill_est"],
+    the frame log (version 3) has every estimator column in its fixed shape."""
+    _need_data()
+    distortion = _field_distortion()
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+    except ImportError:
+        _skip("no PySide6")
+    from overlay.gui.evaluation import EvaluationSession
+    from overlay.gui.pages import page_overlay_live as live
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    errors, info = [], []
+    box_critical, box_information = QMessageBox.critical, QMessageBox.information
+    QMessageBox.critical = staticmethod(lambda *a, **k: errors.append(a[2:]))
+    QMessageBox.information = staticmethod(lambda *a, **k: info.append(a[2:]))
+
+    rec = _load("Evaluation_Integrated_System", "B_2_live")
+    track = DATA / "Evaluation_Integrated_System" / "B_2_tracking.npz"
+    if not track.exists():
+        _skip(f"no {track}")
+    z = np.load(track)
+    ok = np.isfinite(z["rvec"]).all(axis=1)
+    poses = (z["rvec"][ok], z["tvec"][ok])
+    p_tip = rec.p_tip
+    p_back = p_tip + TrackingOverlay.AXIS_BACK_MM * rec.axis / np.linalg.norm(rec.axis)
+
+    tmp = Path(tempfile.mkdtemp(prefix="xray_view_est_"))
+    try:
+        ev = EvaluationSession(tmp, "session")
+        ev.set_label("est")
+        page = _make_page(rec, rec.raw, distortion, poses, ev=ev, est=est_pattern)
+        page.on_enter()
+        assert page.camera is not None and not errors, errors
+        seen = []
+        orig = page._on_track_output
+
+        def spy(out, t_drain):
+            orig(out, t_drain)
+            seen.append((out.points_kind, page._tool_overlay.has_pose))
+
+        page._on_track_output = spy
+        drawn_kinds = set()
+
+        def watch():
+            d = page._drawn_out
+            drawn_kinds.add(None if d is None else d.points_kind)
+            return False
+
+        page.controls.btn_track.click()
+        w = page._track_worker
+        assert page._tracking_active and page._drill_est_active
+        assert w._tool_points.estimator and w._tool_points_a is not None
+        assert not w._tool_points_a.estimator
+        assert page._drill_est_run["summary"].startswith("drill estimator on")
+        _spin(app, seconds, watch)
+        kinds = [k for k, _ in seen]
+        assert {"est", "est_hidden", "est_none"} <= set(kinds), set(kinds)
+        # the overlay has a pose exactly after an estimator frame that is shown
+        bad = [(k, h) for k, h in seen if h != (k == "est")]
+        assert not bad, bad[:5]
+        # the display never takes a hidden frame's result as the drawn one
+        assert drawn_kinds <= {None, "est"} and "est" in drawn_kinds, drawn_kinds
+
+        def colours():
+            buf = page._display_bgra
+            return (_is(buf, [TrackingOverlay.AXIS_COLOR]).sum(),
+                    _is(buf, [TrackingOverlay.XRAY_COLOR]).sum())
+
+        # on a hidden frame nothing of the drill is drawn
+        checked = False
+        for _ in range(4):
+            assert _spin(app, 4.0, lambda: seen and seen[-1][0] == "est_hidden"
+                         and page._drawn_out is None), "no hidden frame on screen"
+            page._on_timer()
+            if seen[-1][0] != "est":
+                assert colours() == (0, 0), colours()
+                checked = True
+                break
+        assert checked
+        # ... and a shown one is drawn
+        assert _spin(app, 4.0, lambda: page._drawn_out is not None
+                     and page._drawn_out.points_kind == "est")
+        page._on_timer()
+        if seen[-1][0] == "est":
+            assert colours()[0] > 50, colours()
+
+        # snapshot of a shown frame: the estimator's pose drawn, tool["drill_est"]
+        assert _spin(app, 4.0, lambda: page._drawn_out is not None
+                     and page._drawn_out.points_kind == "est")
+        drawn = page._drawn_out
+        page.controls.btn_save.click()
+        assert _spin(app, 10.0, lambda: page.controls.btn_save.isEnabled() and info)
+        snap = sorted(tmp.glob("session/est_live*"))[-1]
+        js = json.loads((snap / "snapshot.json").read_text())
+        tool = js["tool"]
+        assert js["shown"] == "pose" and tool["points_kind"] == "est"
+        est = tool["drill_est"]
+        assert est is not None and est["shown"] is True and np.shape(est["T"]) == (4, 4)
+        T = np.array(est["T"])
+        assert np.allclose(tool["tip_cam_mm"], T[:3, :3] @ p_tip + T[:3, 3], atol=1e-9)
+        assert np.allclose(tool["tip_cam_mm"], _est_pts(drawn.result.rvec, drawn.result.tvec, p_tip),
+                           atol=1e-9)
+        # "pose" stays the engine's
+        assert np.allclose(tool["pose"]["tvec"], np.ravel(drawn.result.tvec))
+        assert np.allclose(np.array(est["tvec"]) - np.array(tool["pose"]["tvec"]), EST_SHIFT_MM)
+        cfg = tool["drill_est_config"]
+        assert cfg["enabled"] is True and cfg["drill_est_hide_sig_mm"] == 5.0
+        # snapshot while a hidden frame is on screen: no drill, no pose
+        info.clear()
+        assert _spin(app, 4.0, lambda: seen and seen[-1][0] in ("est_hidden", "est_none")
+                     and page._drawn_out is None), "no hidden frame on screen"
+        page.controls.btn_save.click()
+        assert _spin(app, 10.0, lambda: page.controls.btn_save.isEnabled() and info)
+        snap2 = sorted(tmp.glob("session/est_live*"))[-1]
+        assert snap2 != snap
+        js2 = json.loads((snap2 / "snapshot.json").read_text())
+        assert js2["shown"] == "live" and js2["tool"] is None
+        assert not (snap2 / "03_rgb_overlay_drill.png").exists()
+
+        page.controls.btn_track.click()
+        page.on_leave()
+        assert _spin(app, 10.0, lambda: list(tmp.glob("session/est_tracking*.npz"))
+                     and not any(t.name == "frame-log-writer" for t in _threads())), "no frame log"
+        tr = np.load(next(tmp.glob("session/est_tracking*.npz")))
+        meta = json.loads(str(tr["meta_json"]))
+        assert meta["log_version"] == live.FRAME_LOG_VERSION == 3
+        run = meta["run_meta"]
+        assert run["drill_estimator"]["active"] is True
+        assert run["tool_points"]["estimator"] is True and run["tool_points"]["a_parallel"] is True
+        assert np.allclose(run["tool"]["p_tip_mm"], p_tip)
+        # (l): the counters at the stop; the stub reports no engine count, has no export counter
+        assert run["counters"] == {"n_est_bad_T": 0, "n_points_a_errors": 0, "n_marks_errors": 0,
+                                   "drill_est_exceptions": None, "drill_est_export_errors": None}, \
+            run["counters"]
+        n = len(tr["points_kind"])
+        for key in ("est_rvec", "est_tvec", "est_tip_cam_mm", "est_back_cam_mm", "rvec_prefusion",
+                    "tvec_prefusion", "a_tip_cam_mm", "a_back_cam_mm", "tip_cam_mm"):
+            assert tr[key].shape == (n, 3), (key, tr[key].shape)
+        assert tr["est_T"].shape == (n, 16)
+        assert not [k for k in tr.files if tr[k].ndim == 2 and tr[k].shape[1] == 0
+                            and not k.endswith("_values")]  # stub: no debug counters
+        for key in ("est_valid", "est_shown", "est_chained"):
+            assert tr[key].shape == (n,) and tr[key].dtype == bool, key
+        for key in ("est_since", "est_sigma_tip_mm", "a_kind"):
+            assert tr[key].shape == (n,), key
+        kind = tr["points_kind"]
+        fin = lambda a: np.isfinite(a).all(axis=1)  # noqa: E731
+        shown, hidden, none = kind == "est", kind == "est_hidden", kind == "est_none"
+        assert shown.any() and hidden.any() and none.any()
+        assert (shown | hidden | none).all(), set(kind)
+        assert (tr["est_shown"] == shown).all() and (tr["est_valid"] == (shown | hidden)).all()
+        assert fin(tr["tip_cam_mm"])[shown].all() and not fin(tr["tip_cam_mm"])[~shown].any()
+        assert np.array_equal(tr["tip_cam_mm"][shown], tr["est_tip_cam_mm"][shown])
+        assert fin(tr["est_tip_cam_mm"])[hidden].all() and not fin(tr["est_tip_cam_mm"])[none].any()
+        assert fin(tr["tip_uv"])[shown].all() and not fin(tr["tip_uv"])[~shown].any()
+        T = tr["est_T"].reshape(-1, 4, 4)
+        v = shown | hidden
+        want = np.einsum("nij,j->ni", T[v, :3, :3], p_tip) + T[v, :3, 3]
+        assert np.abs(want - tr["est_tip_cam_mm"][v]).max() < 1e-9
+        want_back = np.einsum("nij,j->ni", T[v, :3, :3], p_back) + T[v, :3, 3]
+        assert np.abs(want_back - tr["est_back_cam_mm"][v]).max() < 1e-9
+        # A, the old drawing: the engine pose (no IR in the stub: "rgb")
+        assert (tr["a_kind"] == "rgb").all()
+        R = np.array([cv2.Rodrigues(r.reshape(3, 1))[0] for r in tr["rvec"]])
+        want_a = np.einsum("nij,j->ni", R, p_tip) + tr["tvec"]
+        assert np.abs(want_a - tr["a_tip_cam_mm"]).max() < 1e-9
+        di = np.load(next(tmp.glob("session/est_display*.npz")))
+        assert di["est_shown"].any() and (di["pose"] & ~di["est_shown"]).any()
+        assert not errors, errors
+        page.close()
+        print(f"  (i) estimator on the rail (stub, {len(seen)} results): hidden / est_none draw nothing, "
+              "its own pose drawn, snapshots with tool.drill_est and without a hidden pose, "
+              "frame log v3 columns")
+    finally:
+        QMessageBox.critical, QMessageBox.information = box_critical, box_information
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_rail_est_message(seconds: float = 3.0) -> None:
+    """(k) The rail has no status line: the drill estimator's start-check
+    message (E18) stays on the tracking card for the whole run. The stub
+    tracker without an estimator stands for a module without it (S1): the
+    run asked for it, the card carries the red tag before every status,
+    also after the first lock, and the full message as its tooltip; stop
+    clears it; a run without a message leaves the card as before."""
+    _need_data()
+    distortion = _field_distortion()
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+    except ImportError:
+        _skip("no PySide6")
+    from overlay.gui.pages import page_overlay_live as live
+    from overlay.tools.live_tracking import STATUS_SETTLING, STATUS_TRACKING
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    errors = []
+    box_critical = QMessageBox.critical
+    QMessageBox.critical = staticmethod(lambda *a, **k: errors.append(a[2:]))
+    rec = _load("Evaluation_Integrated_System", "B_2_live")
+    track = DATA / "Evaluation_Integrated_System" / "B_2_tracking.npz"
+    if not track.exists():
+        _skip(f"no {track}")
+    z = np.load(track)
+    ok = np.isfinite(z["rvec"]).all(axis=1)
+    poses = (z["rvec"][ok], z["tvec"][ok])
+    fatal = "S1 the loaded module has no drill estimator (stub)"
+    locked = (STATUS_TRACKING, STATUS_SETTLING)
+    try:
+        page = _make_page(rec, rec.raw, distortion, poses)    # no estimator in the stub
+        inner = page._make_tracker
+        asked = {"on": True}
+
+        def make_tracker():
+            # as _make_tracker after a failed S1-S4: asked for, built without it
+            tracker = inner()
+            page._tracker_drill_requested = asked["on"]
+            page._drill_est_report = {"fatal": [fatal], "warnings": []} if asked["on"] else None
+            return tracker
+
+        page._make_tracker = make_tracker
+        page.on_enter()
+        assert page.camera is not None and not page._panels_mode and not errors, errors
+        lbl = page._rail.lbl_track_status
+
+        def looks():
+            # what the card is drawn with: the palette's text colour (the
+            # stylesheet alone does not say it) and the font
+            f = lbl.font()
+            return lbl.palette().color(lbl.foregroundRole()).name(), f.pixelSize(), f.weight()
+
+        assert lbl.styleSheet() == "" and lbl.toolTip() == ""
+        before = looks()                                    # the rail's QSS, no message yet
+        tag = live.OverlayLivePage.RAIL_EST_TAG_OFF
+        red = live.STATUS_BAD.name()
+        assert before[0] != red, before
+        page.controls.btn_track.click()
+        assert page._tracking_active and not page._drill_est_active
+        assert page._drill_est_run["requested"] and not page._drill_est_run["active"]
+        assert lbl.text().startswith(tag), lbl.text()
+        assert lbl.toolTip() == "Drill estimator off: " + fatal, lbl.toolTip()
+        assert red in lbl.styleSheet(), lbl.styleSheet()
+        assert looks()[0] == red, looks()
+        # the first lock writes the session's status: the tag stays before it
+        assert _spin(app, 10.0, lambda: lbl.text().endswith(locked)), lbl.text()
+        _spin(app, seconds)
+        assert lbl.text().startswith(tag) and lbl.text().endswith(locked), lbl.text()
+        assert red in lbl.styleSheet() and lbl.toolTip().startswith("Drill estimator off: S1")
+        assert looks()[0] == red, looks()
+        page.controls.btn_track.click()                     # stop clears it
+        assert not page._tracking_active and page._rail_est_note is None
+        assert not lbl.text().startswith(tag), lbl.text()
+        assert lbl.styleSheet() == "" and lbl.toolTip() == ""
+        _spin(app, 0.2)
+        assert looks() == before, (looks(), before)         # drawn as before the message
+        asked["on"] = False                                 # without a message: as before
+        page.controls.btn_track.click()
+        assert lbl.text() == live.STATUS_SEARCHING, lbl.text()
+        assert _spin(app, 10.0, lambda: lbl.text() in locked), lbl.text()
+        assert lbl.styleSheet() == "" and lbl.toolTip() == "" and page._rail_est_note is None
+        assert looks() == before, (looks(), before)
+        page.controls.btn_track.click()
+        assert looks() == before, (looks(), before)
+        page.on_leave()
+        assert not errors, errors
+        page.close()
+        print("  (k) rail: the start-check message (red, S1) stays on the tracking card after the first "
+              "lock (tag, colour, tooltip), stop clears it, a run without one leaves the card as before "
+              "(drawn colour and font as before the message)")
+    finally:
+        QMessageBox.critical = box_critical
+
+
+def test_page_est_counters() -> None:
+    """(l) The real page on the rail with the stub's drill estimator: at the
+    stop its error counters (TrackingWorker.drill_est_counters) in one line
+    on the console and in the profile log, and as run_meta["counters"] in the
+    run's tracking file; valid estimator results without a usable T summed
+    over a tracker reset (requested as the session's lost reset does), the
+    engine's last exception count, the tracker's export errors. (h) checks
+    that a run without the estimator has none of it."""
+    import contextlib
+    import io
+
+    _need_data()
+    distortion = _field_distortion()
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+    except ImportError:
+        _skip("no PySide6")
+    from overlay.gui.evaluation import EvaluationSession
+    from overlay.gui.pages import page_overlay_live as live
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    errors = []
+    box_critical = QMessageBox.critical
+    QMessageBox.critical = staticmethod(lambda *a, **k: errors.append(a[2:]))
+    rec = _load("Evaluation_Integrated_System", "B_2_live")
+    track = DATA / "Evaluation_Integrated_System" / "B_2_tracking.npz"
+    if not track.exists():
+        _skip(f"no {track}")
+    z = np.load(track)
+    ok = np.isfinite(z["rvec"]).all(axis=1)
+    poses = (z["rvec"][ok], z["tvec"][ok])
+
+    def pattern(k: int) -> str:
+        return "bad" if k % 15 == 7 else est_pattern(k)
+
+    tmp = Path(tempfile.mkdtemp(prefix="xray_view_counters_"))
+    try:
+        ev = EvaluationSession(tmp, "session")
+        ev.set_label("cnt")
+        page = _make_page(rec, rec.raw, distortion, poses, ev=ev, est=pattern)
+        inner = page._make_tracker
+        stubs = []
+
+        def make_tracker():
+            tracker = inner()
+            tracker.exceptions = lambda k: k // 40
+            tracker.drill_est_export_errors = 4
+            stubs.append(tracker)
+            return tracker
+
+        page._make_tracker = make_tracker
+        page.on_enter()
+        assert page.camera is not None and not page._panels_mode and not errors, errors
+        page.controls.btn_track.click()
+        w, tracker = page._track_worker, stubs[-1]
+        assert page._drill_est_active and w._tool_points.estimator and w._tool_points_a is not None
+        assert _spin(app, 10.0, lambda: tracker.states.count("bad") >= 2), tracker.states.count("bad")
+        w.request_reset()
+        n_bad = tracker.states.count("bad")
+        assert _spin(app, 10.0, lambda: tracker.states.count("bad") >= n_bad + 2)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            page.controls.btn_track.click()
+        assert not page._tracking_active and not w.alive
+        # the reset zeroed the ToolPoints' count; the worker kept the earlier ones
+        assert w._n_est_bad_T_reset >= 2 and w._tool_points.n_est_bad_T >= 1
+        want = {
+            "n_est_bad_T": tracker.states.count("bad"),
+            "n_points_a_errors": 0,
+            "n_marks_errors": 0,                             # the rail builds no marks
+            "drill_est_exceptions": (tracker.i - 1) // 40,
+            "drill_est_export_errors": 4,
+        }
+        line = ("drill estimator counters "
+                + ", ".join(f"{k} {v}" for k, v in want.items()))
+        console = [ln for ln in out.getvalue().splitlines() if "drill estimator counters" in ln]
+        assert len(console) == 1 and console[0].endswith(line), (console, line)
+        page.on_leave()
+        assert _spin(app, 10.0, lambda: list(tmp.glob("session/cnt_tracking*.npz"))
+                     and not any(t.name == "frame-log-writer" for t in _threads())), "no frame log"
+        log_lines = (tmp / "session" / live.PROFILE_LOG_NAME).read_text(encoding="utf-8").splitlines()
+        assert [ln for ln in log_lines if "drill estimator counters" in ln] == console, log_lines[-5:]
+        tr = np.load(next(tmp.glob("session/cnt_tracking*.npz")))
+        meta = json.loads(str(tr["meta_json"]))
+        assert meta["run_meta"]["counters"] == want, meta["run_meta"].get("counters")
+        assert not errors, errors
+        page.close()
+        print(f"  (l) rail with the estimator: its counters at the stop on the console, in the profile log "
+              f"and in run_meta (bad T {want['n_est_bad_T']} summed over a reset, engine exceptions, "
+              f"export errors)")
+    finally:
+        QMessageBox.critical = box_critical
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_drill_est_start_checks() -> None:
+    """Start checks S1-S8 (config.drill_est_start_checks) with fakes, and the
+    page's _make_tracker with them (E18: a failed S1-S4 builds the tracker
+    without the estimator, tracking starts anyway; the switch config.LIVE_DRILL_ESTIMATOR;
+    a change of it builds a new tracker), without the engine."""
+    import types
+
+    from tracking.hydramarker import config as C
+
+    tmp = Path(tempfile.mkdtemp(prefix="drill_est_checks_"))
+    switch_before = C.LIVE_DRILL_ESTIMATOR
+    md5_before = C.DRILL_EST_VALIDATION_IRCAL_MD5
+    rt_before = sys.modules.get("tracking.hydramarker.run_tracker")
+    try:
+        K = np.array([[1356.6, 0.0, 975.9], [0.0, 1357.5, 531.7], [0.0, 0.0, 1.0]])
+        ir = tmp / "ircal.npz"
+        np.savez(ir, K_rgb=K)
+        import hashlib
+        C.DRILL_EST_VALIDATION_IRCAL_MD5 = hashlib.md5(ir.read_bytes()).hexdigest()
+
+        def py_cfg():
+            cfg = C.apply_drill_est_live(C.TrackerConfig())
+            cfg.ir_refine_enabled = True
+            cfg.pose_kf_enabled = False
+            return cfg
+
+        def engine_of(cfg, *, old=False, valid=True, **change):
+            names = () if old else C.DRILL_EST_FIELDS
+            values = {n: getattr(cfg, n) for n in names}
+            values.update({k: v for k, v in C.DRILL_EST_VALIDATION.items()})
+            values["pose_kf_enabled"] = False
+            values.update(change)
+            e = SimpleNamespace(config=SimpleNamespace(**values))
+            if not old:
+                e.drill_est_config_valid = valid
+            return e
+
+        new_mod = SimpleNamespace(TrackerConfig=lambda: SimpleNamespace(drill_est_enabled=False),
+                                  BUILD_INFO={"drill_est": 1, "ndebug": True})
+        old_mod = SimpleNamespace(TrackerConfig=lambda: SimpleNamespace())
+
+        def check(mod, eng, cfg, **kw):
+            args = dict(tip_set=True, ir_path=str(ir), K_rgb=K)
+            args.update(kw)
+            return C.drill_est_start_checks(mod, eng, cfg, **args)
+
+        def ids(texts):
+            return [t.split()[0] for t in texts]
+
+        cfg = py_cfg()
+        r = check(new_mod, engine_of(cfg), cfg)
+        assert r["fatal"] == [] and r["warnings"] == [], r
+        assert [c["id"] for c in r["checks"]] == [f"S{i}" for i in range(1, 9)]
+        assert all(c["ok"] is True for c in r["checks"])
+        r = check(old_mod, engine_of(cfg, old=True), cfg)                 # K1 module
+        assert ids(r["fatal"]) == ["S1", "S2", "S3"], r["fatal"]
+        bad = py_cfg()
+        bad.drill_est_vmin = 4.0                                           # float for an int
+        r = check(new_mod, engine_of(cfg), bad)
+        assert ids(r["fatal"]) == ["S2"] and "drill_est_vmin" in r["fatal"][0], r["fatal"]
+        r = check(new_mod, engine_of(cfg, valid=False), cfg)
+        assert ids(r["fatal"]) == ["S3"]
+        r = check(new_mod, engine_of(cfg), cfg, tip_set=False)
+        assert ids(r["fatal"]) == ["S4"]
+        off = py_cfg()
+        off.ir_refine_enabled = False
+        r = check(new_mod, engine_of(off), off, ir_path=None)              # IR off: warnings only
+        assert r["fatal"] == [] and ids(r["warnings"]) == ["S5", "S6"], r["warnings"]
+        assert [c["ok"] for c in r["checks"] if c["id"] == "S7"] == [None]
+        r = check(new_mod, engine_of(cfg), cfg, K_rgb=K + np.diag([0.5, 0.0, 0.0]))
+        assert r["fatal"] == [] and ids(r["warnings"]) == ["S7"]
+        r = check(new_mod, engine_of(cfg, ir_sigma_px=0.12), cfg)          # engine parameter changed
+        assert r["fatal"] == [] and ids(r["warnings"]) == ["S6"] and "ir_sigma_px" in r["warnings"][0]
+        r = check(new_mod, engine_of(cfg, drill_est_w3d=3.0), py_cfg())     # copy != engine field
+        assert ids(r["fatal"]) == ["S2"] and ids(r["warnings"]) == ["S6"]
+        kf = py_cfg()                                                      # output filter asked for
+        kf.pose_kf_enabled = True
+        r = check(new_mod, engine_of(cfg), kf)                             # the engine forced it off
+        assert r["fatal"] == [] and r["warnings"] == [], r
+        assert C.drill_est_kf_warning(engine_of(cfg).config, kf) == C.DRILL_EST_KF_WARNING
+        assert C.drill_est_kf_warning(engine_of(cfg).config, cfg) is None
+        dbg = SimpleNamespace(TrackerConfig=new_mod.TrackerConfig, BUILD_INFO={"drill_est": 1, "ndebug": False})
+        r = check(dbg, engine_of(cfg), cfg)
+        assert r["fatal"] == [] and ids(r["warnings"]) == ["S8"]
+        # the switch and the summary line
+        assert isinstance(C.LIVE_DRILL_ESTIMATOR, bool) and not hasattr(C, "DRILL_EST_ENV")
+        C.LIVE_DRILL_ESTIMATOR = True                           # read at every call
+        assert C.drill_est_requested() is True
+        C.LIVE_DRILL_ESTIMATOR = False
+        assert C.drill_est_requested() is False
+        live_cfg = C.apply_drill_est_live(C.TrackerConfig())
+        assert live_cfg.drill_est_enabled and (live_cfg.drill_est_gap_s, live_cfg.drill_est_prior_max_mm,
+                                               live_cfg.drill_est_hide_sig_mm) == (0.2, 20.0, 5.0)
+        assert not C.TrackerConfig().drill_est_enabled and C.TrackerConfig().drill_est_gap_s == 0.5
+        assert C.drill_est_summary(False, False, None).startswith("drill estimator off")
+        assert "LIVE_DRILL_ESTIMATOR" in C.drill_est_summary(False, False, None)
+        assert "S1" in C.drill_est_summary(True, False, check(old_mod, engine_of(cfg, old=True), cfg))
+        assert "warnings: S8" in C.drill_est_summary(True, True, check(dbg, engine_of(cfg), cfg))
+
+        # the page's _make_tracker with a fake run_tracker (no engine)
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            _skip("no PySide6")
+        app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
+        from overlay.gui.pages import page_overlay_live as live
+        from overlay.gui.state import SessionState
+
+        built = []
+        state = {"module": new_mod}
+
+        class FakeTracker:
+            def __init__(self, cfg):
+                self.config = cfg
+                mod = state["module"]
+                has = hasattr(mod.TrackerConfig(), "drill_est_enabled")
+                self._engine = engine_of(cfg, old=not has)
+                self._engine.config.drill_est_enabled = has and cfg.drill_est_enabled
+                self.calls = []
+                self.pose_kf_forced_off = self.drill_estimator_active
+
+            @property
+            def drill_estimator_active(self):
+                return bool(getattr(self._engine.config, "drill_est_enabled", False))
+
+            def set_ir_calibration(self, path):
+                self.calls.append("ir")
+
+            def reset(self):
+                self.calls.append("reset")
+
+            def set_tool_tip(self, p):
+                self.calls.append("tip")
+                return hasattr(state["module"].TrackerConfig(), "drill_est_enabled")
+
+            def start_drill_estimator(self, p_tip, *, ir_path=None, K_rgb=None):
+                return C.drill_est_start_checks(state["module"], self._engine, self.config,
+                                                tip_set=self.set_tool_tip(p_tip),
+                                                ir_path=ir_path, K_rgb=K_rgb)
+
+        fake_rt = types.ModuleType("tracking.hydramarker.run_tracker")
+        fake_rt.make_live_tracker_config = C.TrackerConfig
+
+        def make_tracker(field, marker_json, K_, dist, cfg):
+            built.append(FakeTracker(cfg))
+            return built[-1]
+
+        fake_rt.make_tracker = make_tracker
+        sys.modules["tracking.hydramarker.run_tracker"] = fake_rt
+        st = SessionState()
+        st.K_rgb, st.dist_rgb = K, np.zeros(5)
+        st.ir_calibration_path = str(ir)
+        page = live.OverlayLivePage(st)
+        page._tool = SimpleNamespace(p_tip_mm=np.array([1.0, 2.0, 3.0]), field_path="f",
+                                     marker_json_path="m")
+
+        def start():
+            page._tracker = page._make_tracker()
+            status = page._report_drill_est()
+            return page._tracker, status
+
+        C.LIVE_DRILL_ESTIMATOR = False
+        tr, status = start()                                    # switch off: as before
+        assert len(built) == 1 and not tr.config.drill_est_enabled and status is None
+        assert page._drill_est_report is None and not page._drill_est_active
+        assert tr.calls == ["ir"]
+        import dataclasses
+        before = C.TrackerConfig()                              # the fake make_live_tracker_config
+        before.ir_refine_enabled, before.pose_kf_enabled = True, False
+        assert dataclasses.asdict(tr.config) == dataclasses.asdict(before)
+        run = page._drill_est_run
+        assert run["requested"] is False and run["requested_by"] == "config.LIVE_DRILL_ESTIMATOR"
+        assert not [k for k in run if k.startswith("env_")], sorted(run)
+        tr2, _ = start()                                        # next start: reset only
+        assert tr2 is tr and len(built) == 1 and tr.calls == ["ir", "reset"]
+        C.LIVE_DRILL_ESTIMATOR = True                           # switch changed: new tracker
+        tr, status = start()
+        assert len(built) == 2 and tr.config.drill_est_enabled and tr.drill_estimator_active
+        assert page._drill_est_active and page._drill_est_report["fatal"] == [] and status is None
+        assert tr.config.drill_est_hide_sig_mm == 5.0 and tr.config.pose_kf_enabled is False
+        tr2, _ = start()                                        # reset path sets the tip again
+        assert tr2 is tr and tr.calls[-2:] == ["reset", "tip"]
+        page._tracker = None                                    # an old module: E18
+        state["module"] = old_mod
+        tr, status = start()
+        assert len(built) == 4 and built[2].config.drill_est_enabled
+        assert tr is built[3] and not tr.config.drill_est_enabled and not tr.drill_estimator_active
+        assert not page._drill_est_active and ids(page._drill_est_report["fatal"])[0] == "S1"
+        assert status is not None and status[0].startswith("Drill estimator off: S1")
+        assert status[1] == live.STATUS_BAD
+        assert page._drill_est_run["requested"] is True and page._drill_est_run["active"] is False
+        page._tracker = None                                    # a warning: on, yellow
+        state["module"] = dbg
+        tr, status = start()
+        assert tr.drill_estimator_active and status[1] == live.STATUS_WARN and "S8" in status[0]
+        page.close()
+        print("  (j) start checks S1-S8 with fakes; the page's _make_tracker: switch, new tracker on a "
+              "change, tip on the reset path, a failed S1-S4 tracks without the estimator (red), "
+              "a warning keeps it (yellow)")
+    finally:
+        C.DRILL_EST_VALIDATION_IRCAL_MD5 = md5_before
+        C.LIVE_DRILL_ESTIMATOR = switch_before
+        if rt_before is None:
+            sys.modules.pop("tracking.hydramarker.run_tracker", None)
+        else:
+            sys.modules["tracking.hydramarker.run_tracker"] = rt_before
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _threads():
     import threading
     return threading.enumerate()
@@ -945,6 +1628,10 @@ def main() -> int:
         test_table_section_2,
         test_mask_and_slider,
         lambda: test_page(seconds),
+        lambda: test_page_estimator(seconds),
+        test_rail_est_message,
+        test_page_est_counters,
+        test_drill_est_start_checks,
     ]
     # outside pytest: a skip is reported, not raised through pytest
     global _skip

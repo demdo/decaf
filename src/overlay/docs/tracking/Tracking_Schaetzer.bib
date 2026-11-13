@@ -1,0 +1,292 @@
+% Tracking_Schaetzer.bib -- Literatur zu Tracking_Schaetzer.tex (Stand 12.11.2026)
+% Nur die im Dokument zitierten Eintraege, uebernommen aus den geprueften Arbeits-Bibs
+% (lit_theorie.bib, lit_tracking.bib). Bibliografische Daten mit DOI per Crossref abgeglichen.
+% Pruefstatus (FT = Volltext-Stelle gelesen, ABS = nur Abstract, SEC = Sekundaerquelle) steht im
+% Feld "annote" (wird von unsrt nicht gedruckt). Nicht in Thesis/Paper-Bib uebernehmen, ohne den
+% Citavi-Weg zu gehen.
+
+% ------------------------------------------------------------------ Problem: Einzelbild-Posen
+@article{lepetit2005monocular,
+  author  = {Lepetit, Vincent and Fua, Pascal},
+  title   = {Monocular Model-Based {3D} Tracking of Rigid Objects: A Survey},
+  journal = {Found. Trends Comput. Graph. Vis.},
+  year    = {2005},
+  volume  = {1},
+  number  = {1},
+  pages   = {1--89},
+  doi     = {10.1561/0600000001},
+  annote  = {FT: S. 22-24 (M-Schaetzer, Huber, IRLS), S. 26-27 (Bayes-Tracking), S. 30 (IEKF = Gauss-Newton; CV-Modell laeuft nach), S. 60-61 und 72 (Einzelbild-Posen jittern)}
+}
+
+@article{vacchetti2004stable,
+  author  = {Vacchetti, Luca and Lepetit, Vincent and Fua, Pascal},
+  title   = {Stable Real-Time {3D} Tracking Using Online and Offline Information},
+  journal = {IEEE Trans. Pattern Anal. Mach. Intell.},
+  year    = {2004},
+  volume  = {26},
+  number  = {10},
+  pages   = {1385--1391},
+  doi     = {10.1109/TPAMI.2004.92},
+  annote  = {FT (Autorenfassung): Abschn. III.A, robuster Einzelbild-Fit jittert}
+}
+
+@article{schweighofer2006robust,
+  author  = {Schweighofer, Gerald and Pinz, Axel},
+  title   = {Robust Pose Estimation from a Planar Target},
+  journal = {IEEE Trans. Pattern Anal. Mach. Intell.},
+  year    = {2006},
+  volume  = {28},
+  number  = {12},
+  pages   = {2024--2030},
+  doi     = {10.1109/TPAMI.2006.252},
+  annote  = {FT: S. 2024, 2029 (zwei lokale Minima, Posensprunge)}
+}
+
+@inproceedings{jin2017sensor,
+  author    = {Jin, Pengju and Matikainen, Pyry and Srinivasa, Siddhartha S.},
+  title     = {Sensor Fusion for Fiducial Tags: Highly Robust Pose Estimation from Single Frame {RGBD}},
+  booktitle = {Proc. IEEE/RSJ Int. Conf. Intell. Robots Syst. (IROS)},
+  year      = {2017},
+  pages     = {5770--5776},
+  doi       = {10.1109/IROS.2017.8206468},
+  annote    = {FT: S. 5772, 5775 (instabil auch bei ruhender Szene; RGB-D besser)}
+}
+
+@inproceedings{liu2021navigation,
+  author    = {Liu, Yibo and Schofield, Hunter and Shan, Jinjun},
+  title     = {Navigation of a Self-Driving Vehicle Using One Fiducial Marker},
+  booktitle = {Proc. IEEE Int. Conf. Multisensor Fusion Integr. Intell. Syst. (MFI)},
+  year      = {2021},
+  pages     = {1--6},
+  doi       = {10.1109/MFI52462.2021.9591194},
+  annote    = {FT (arXiv:2104.12954v3): Abschn. I, I-A, III-D}
+}
+
+@article{west2004designing,
+  author  = {West, Jay B. and Maurer, Jr., Calvin R.},
+  title   = {Designing Optically Tracked Instruments for Image-Guided Surgery},
+  journal = {IEEE Trans. Med. Imaging},
+  year    = {2004},
+  volume  = {23},
+  number  = {5},
+  pages   = {533--545},
+  doi     = {10.1109/TMI.2004.825614},
+  annote  = {FT: S. 535, 543}
+}
+
+@article{simpson2014computation,
+  author  = {Simpson, Amber L. and Ma, Burton and Vasarhelyi, Edward M. and Borschneck, Dan P. and Ellis, Randy E. and Stewart, A. James},
+  title   = {Computation and Visualization of Uncertainty in Surgical Navigation},
+  journal = {Int. J. Med. Robot. Comput. Assist. Surg.},
+  year    = {2014},
+  volume  = {10},
+  number  = {3},
+  pages   = {332--343},
+  doi     = {10.1002/rcs.1541},
+  annote  = {ABS (PubMed 24123606)}
+}
+
+@inproceedings{acherki2026visualization,
+  author    = {Acherki, Chaymae and Nigay, Laurence and Roy, Quentin and Salque, Thibault},
+  title     = {Visualization of Tracking Uncertainty in {AR}-based Surgical Guidance},
+  booktitle = {Proc. CHI Conf. Hum. Factors Comput. Syst.},
+  publisher = {ACM},
+  year      = {2026},
+  pages     = {1--19},
+  doi       = {10.1145/3772318.3791213},
+  annote    = {ABS}
+}
+
+% ------------------------------------------------------------------ Harte Gates vs. robuste Gewichte
+@incollection{triggs2000bundle,
+  author    = {Triggs, Bill and McLauchlan, Philip F. and Hartley, Richard I. and Fitzgibbon, Andrew W.},
+  title     = {Bundle Adjustment -- A Modern Synthesis},
+  booktitle = {Vision Algorithms: Theory and Practice},
+  series    = {LNCS},
+  volume    = {1883},
+  publisher = {Springer},
+  year      = {2000},
+  pages     = {298--372},
+  doi       = {10.1007/3-540-44480-7_21},
+  annote    = {FT: S. 308-309 (Grauzone, Gauss-ML, Gruppierung), S. 334-335 (Filtern = Reduktion)}
+}
+
+@inproceedings{kerl2013robust,
+  author    = {Kerl, Christian and Sturm, J{\"u}rgen and Cremers, Daniel},
+  title     = {Robust Odometry Estimation for {RGB-D} Cameras},
+  booktitle = {Proc. IEEE Int. Conf. Robot. Autom. (ICRA)},
+  year      = {2013},
+  pages     = {3748--3754},
+  doi       = {10.1109/ICRA.2013.6631104},
+  annote    = {FT (Autorenfassung TUM): Abschn. II, IV-A, IV-B Gl. 24}
+}
+
+@article{zhang1997parameter,
+  author  = {Zhang, Zhengyou},
+  title   = {Parameter estimation techniques: a tutorial with application to conic fitting},
+  journal = {Image Vis. Comput.},
+  year    = {1997},
+  volume  = {15},
+  number  = {1},
+  pages   = {59--76},
+  doi     = {10.1016/S0262-8856(96)01112-2},
+  annote  = {FT (Autorenfassung): Par. 9.3, 9.4, Tab. 1; Huber k = 1,345}
+}
+
+% ------------------------------------------------------------------ Schaetztheorie
+@book{saerkkae2013bayesian,
+  author    = {S{\"a}rkk{\"a}, Simo},
+  title     = {Bayesian Filtering and Smoothing},
+  publisher = {Cambridge University Press},
+  year      = {2013},
+  doi       = {10.1017/CBO9781139344203},
+  annote    = {FT (Online-Fassung des Autors): Thm. 4.1, Bsp. 4.1/4.2, Thm. 8.2, Par. 9.1}
+}
+
+@book{barfoot2017state,
+  author    = {Barfoot, Timothy D.},
+  title     = {State Estimation for Robotics},
+  publisher = {Cambridge University Press},
+  year      = {2017},
+  doi       = {10.1017/9781316671528},
+  annote    = {FT (inoffizielle Autorenfassung 2022): Par. 3.3.1, 4.2.5-4.2.6, 5.3.2}
+}
+
+@book{barfoot2024state,
+  author    = {Barfoot, Timothy D.},
+  title     = {State Estimation for Robotics},
+  edition   = {2nd},
+  publisher = {Cambridge University Press},
+  year      = {2024},
+  doi       = {10.1017/9781009299909},
+  annote    = {FT (Autorenfassung, Entwurf 2026): Par. 4.3.4 (Gegenposition Sliding-Window)}
+}
+
+@article{bell1993iterated,
+  author  = {Bell, Bradley M. and Cathey, Frederick W.},
+  title   = {The Iterated {Kalman} Filter Update as a {Gauss-Newton} Method},
+  journal = {IEEE Trans. Autom. Control},
+  year    = {1993},
+  volume  = {38},
+  number  = {2},
+  pages   = {294--297},
+  doi     = {10.1109/9.250476},
+  annote  = {ABS; gleiche Aussage im Volltext von lepetit2005monocular S. 30}
+}
+
+@misc{sola2018micro,
+  author       = {Sol{\`a}, Joan and Deray, J{\'e}r{\'e}mie and Atchuthan, Dinesh},
+  title        = {A micro {Lie} theory for state estimation in robotics},
+  howpublished = {arXiv:1812.01537},
+  year         = {2018},
+  annote       = {FT (v9): Bsp. 7, Gl. 51-52, 55, 181-183}
+}
+
+@article{matthies1987error,
+  author  = {Matthies, Larry and Shafer, Steven A.},
+  title   = {Error modeling in stereo navigation},
+  journal = {IEEE J. Robot. Autom.},
+  year    = {1987},
+  volume  = {3},
+  number  = {3},
+  pages   = {239--248},
+  doi     = {10.1109/JRA.1987.1087097},
+  annote  = {FT (Scan): Par. II}
+}
+
+@misc{meingast2005geometric,
+  author       = {Meingast, Marci and Geyer, Christopher and Sastry, Shankar},
+  title        = {Geometric Models of Rolling-Shutter Cameras},
+  howpublished = {arXiv:cs/0503076},
+  year         = {2005},
+  annote       = {FT: Par. 2}
+}
+
+@inproceedings{casiez2012oneeuro,
+  author    = {Casiez, G{\'e}ry and Roussel, Nicolas and Vogel, Daniel},
+  title     = {1 {\texteuro} Filter: A Simple Speed-Based Low-Pass Filter for Noisy Input in Interactive Systems},
+  booktitle = {Proc. SIGCHI Conf. Hum. Factors Comput. Syst. (CHI)},
+  publisher = {ACM},
+  year      = {2012},
+  pages     = {2527--2530},
+  doi       = {10.1145/2207676.2208639},
+  annote    = {ABS/SEC: Prinzip ueber Abstract und Autorenseite; Volltext nicht gelesen}
+}
+
+% ------------------------------------------------------------------ Enge Kopplung, Vorbilder
+@inproceedings{tobergte2009robust,
+  author    = {Tobergte, Andreas and Pomarlan, Mihai and Hirzinger, Gerd},
+  title     = {Robust Multi Sensor Pose Estimation for Medical Applications},
+  booktitle = {Proc. IEEE/RSJ Int. Conf. Intell. Robots Syst. (IROS)},
+  year      = {2009},
+  pages     = {492--497},
+  doi       = {10.1109/IROS.2009.5354696},
+  annote    = {FT: S. 493 (lose vs. enge Kopplung)}
+}
+
+@article{murartal2017orbslam2,
+  author  = {Mur-Artal, Ra{\'u}l and Tard{\'o}s, Juan D.},
+  title   = {{ORB-SLAM2}: An Open-Source {SLAM} System for Monocular, Stereo, and {RGB-D} Cameras},
+  journal = {IEEE Trans. Robot.},
+  year    = {2017},
+  volume  = {33},
+  number  = {5},
+  pages   = {1255--1262},
+  doi     = {10.1109/TRO.2017.2705103},
+  annote  = {FT (arXiv:1610.06475): Abschn. III-A, III-C, Gl. 2}
+}
+
+@article{drummond2002realtime,
+  author  = {Drummond, Tom and Cipolla, Roberto},
+  title   = {Real-Time Visual Tracking of Complex Structures},
+  journal = {IEEE Trans. Pattern Anal. Mach. Intell.},
+  year    = {2002},
+  volume  = {24},
+  number  = {7},
+  pages   = {932--946},
+  doi     = {10.1109/TPAMI.2002.1017620},
+  annote  = {FT: S. 936-937 (IRLS, eine Iteration je Bild)}
+}
+
+@phdthesis{welch1996scaatdiss,
+  author = {Welch, Gregory Francis},
+  title  = {{SCAAT}: Incremental Tracking with Incomplete Information},
+  school = {University of North Carolina at Chapel Hill},
+  type   = {{PhD} dissertation},
+  note   = {Technical Report TR96-051},
+  year   = {1996},
+  annote = {FT: S. 38-41}
+}
+
+@inproceedings{gsaxner2021insideout,
+  author    = {Gsaxner, Christina and Li, Jianning and Pepe, Antonio and Schmalstieg, Dieter and Egger, Jan},
+  title     = {Inside-Out Instrument Tracking for Surgical Navigation in Augmented Reality},
+  booktitle = {Proc. 27th ACM Symp. Virtual Real. Softw. Technol. (VRST)},
+  publisher = {ACM},
+  year      = {2021},
+  pages     = {1--11},
+  doi       = {10.1145/3489849.3489863},
+  annote    = {FT: S. 3, 5, 7 Tab. 1. Autorenreihenfolge nach Crossref; das PDF nennt Gsaxner, Pepe, Schmalstieg, Li, Egger}
+}
+
+@article{cai2024distributed,
+  author  = {Cai, Yu and Zhu, Mingzhu and He, Bingwei and Zhang, Jianwei},
+  title   = {Distributed Visual Positioning for Surgical Instrument Tracking},
+  journal = {Phys. Eng. Sci. Med.},
+  year    = {2024},
+  volume  = {47},
+  number  = {1},
+  pages   = {273--286},
+  doi     = {10.1007/s13246-023-01363-z},
+  annote  = {FT: S. 279-280}
+}
+
+% ------------------------------------------------------------------ Filter vs. Glaetter
+@inproceedings{kaess2012concurrent,
+  author    = {Kaess, Michael and Williams, Stephen and Indelman, Vadim and Roberts, Richard and Leonard, John J. and Dellaert, Frank},
+  title     = {Concurrent Filtering and Smoothing},
+  booktitle = {Proc. 15th Int. Conf. Inf. Fusion (FUSION)},
+  year      = {2012},
+  pages     = {1300--1307},
+  annote    = {FT: Abstract, Par. V, VII; kein DOI}
+}

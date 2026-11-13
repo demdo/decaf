@@ -7,6 +7,9 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#ifdef DRILL_EST_FAULT_INJECT
+#include <new>
+#endif
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -282,6 +285,55 @@ PoseOutputFilterConfig makePoseOutputFilterConfig(const TrackerConfig& config)
     return cfg;
 }
 
+// Drill pose estimator parameters (TrackerConfig::drill_est_*).
+DrillEstimatorConfig makeDrillEstimatorConfig(const TrackerConfig& config)
+{
+    DrillEstimatorConfig c;
+    c.sig_t_mm = config.drill_est_sig_t_mm;
+    c.sig_r_deg = config.drill_est_sig_r_deg;
+    c.adapt_px = config.drill_est_adapt_px;
+    c.db3_px = config.drill_est_db3_px;
+    c.gain_t = config.drill_est_gain_t;
+    c.gain_r_deg = config.drill_est_gain_r_deg;
+    c.vmin = config.drill_est_vmin;
+    c.s_rgb = config.drill_est_s_rgb;
+    c.s_ir = config.drill_est_s_ir;
+    c.huber_k = config.drill_est_huber_k;
+    c.n_iter = config.drill_est_n_iter;
+    c.gap_s = config.drill_est_gap_s;
+    c.rs_px = config.drill_est_rs_px;
+    c.ir_gated = config.drill_est_ir_gated;
+    c.ir_fit_max_mm = config.drill_est_ir_fit_max_mm;
+    c.ir_fit_fac = config.drill_est_ir_fit_fac;
+    c.min_start = config.drill_est_min_start;
+    c.warm = config.drill_est_warm;
+    c.sig_tip_max_mm = config.drill_est_sig_tip_max_mm;
+    c.w3d = config.drill_est_w3d;
+    c.sigma_ir_px = config.drill_est_sigma_ir_px;
+    c.row_ms = config.drill_est_row_ms;
+    c.prior_max_mm = config.drill_est_prior_max_mm;
+    c.hide_sig_mm = config.drill_est_hide_sig_mm;
+    return c;
+}
+
+// IR pairs are handed to the drill estimator only from 6 on, as in the
+// validated prototype (co_dump.py MIN_PAIRS_DUMP; fixed, not ir_min_pairs).
+constexpr size_t kDrillMinPairs = 6;
+
+// Distortion coefficients as a 1 x N row (zeros without coefficients), as
+// the IR stage passes them to cv::undistortPoints.
+cv::Mat drillDistMat(const std::vector<double>& dist)
+{
+    if (dist.empty()) {
+        return cv::Mat::zeros(1, 5, CV_64F);
+    }
+    cv::Mat m(1, static_cast<int>(dist.size()), CV_64F);
+    for (size_t i = 0; i < dist.size(); ++i) {
+        m.at<double>(0, static_cast<int>(i)) = dist[i];
+    }
+    return m;
+}
+
 cv::Matx33d skew3(const cv::Vec3d& v)
 {
     return cv::Matx33d(0.0, -v[2], v[1],
@@ -326,13 +378,22 @@ TrackerEngine::TrackerEngine(
       correspondence_builder_(makeCorrespondenceBuilderConfig(config)),
       pose_tracker_(K, dist_coeffs, makeMapPoseTrackerConfig(config)),
       tracker_geometry_(geometry_, K, dist_coeffs, config),
-      persistent_matcher_(config)
+      persistent_matcher_(config),
+      drill_estimator_(makeDrillEstimatorConfig(config))
 {
     if (field_.empty()) {
         throw std::runtime_error("TrackerEngine could not load marker field");
     }
     if (geometry_.empty()) {
         throw std::runtime_error("TrackerEngine could not load marker geometry");
+    }
+    // Drill estimator on: the output pose filter must not run. It is forced
+    // off here, before its configuration is built, so applyPoseFilter takes
+    // exactly the filter-off path and config() reads pose_kf_enabled = false
+    // back. Without the estimator the filter stays switchable as before.
+    if (config_.drill_est_enabled) {
+        config_.pose_kf_enabled = false;
+        pose_kf_forced_off_ = true;
     }
     pose_output_filter_.configure(
         makePoseOutputFilterConfig(config_), K_, dist_coeffs_);
@@ -368,6 +429,11 @@ void TrackerEngine::reset()
     dot_detector_.reset();
     pose_tracker_.reset();
     persistent_matcher_.reset();
+    // Drill estimator: chain, time reference and the image-motion
+    // predecessor are dropped; the motion history and the tool tip stay.
+    drill_estimator_.reset();
+    drill_vmed_.reset();
+    drill_input_valid_ = false;
 }
 
 TrackerFrameResult TrackerEngine::processFrame(
@@ -597,6 +663,10 @@ TrackerFrameResult TrackerEngine::processFrame(
     // with the global-shutter measurement; the anchor/filter stages then act
     // on that pose. The internal chain keeps the raw RGB pose.
     applyIrRefinement(result);
+    // Drill pose estimator (opt-in, output-only): the pose after the IR
+    // stage is its start value; it reads the frame time before the output
+    // filter consumes it and writes only its own drill_est_* fields.
+    applyDrillEstimator(result);
     // Output filter LAST: the corner anchors above must see the raw
     // pose, otherwise the filtered pose feeds back into tracking.
     applyPoseFilter(result);
@@ -1551,6 +1621,21 @@ void TrackerEngine::setFrameTime(double t_s)
     frame_time_s_ = t_s;
 }
 
+bool TrackerEngine::setToolTip(const cv::Vec3d& p_tip_mm)
+{
+    if (!drill_estimator_.setToolTip(p_tip_mm)) {
+        return false;   // not finite: the tip stays as it was
+    }
+    drill_tip_mm_ = p_tip_mm;
+    drill_tip_set_ = true;
+    return true;
+}
+
+bool TrackerEngine::hasToolTip() const
+{
+    return drill_tip_set_;
+}
+
 void TrackerEngine::resetPoseFilter()
 {
     pose_output_filter_.reset();
@@ -1981,6 +2066,242 @@ void TrackerEngine::applyIrRefinement(TrackerFrameResult& result)
         !fused.applied && (fused.ref_count > 0 || fused.pairs > 0);
     result.timings_ms["ir_fusion_rejected"] =
         ir_last_fusion_rejected_ ? 1.0 : 0.0;
+}
+
+// Drill pose estimator stage (config drill_est_enabled). Runs after the IR
+// stage, so the engine pose (fused or RGB-only) is its start value, and
+// before the output filter, which consumes frame_time_s_. It reads the
+// result, frame_time_s_, K_, dist_coeffs_ and the IR pair dump and writes
+// only its own members and, at the end in one go, the drill_est_* result
+// fields and timings keys: nothing here feeds back into tracking. The whole
+// body is guarded, no exception leaves the stage (an exception drops the
+// estimator chain, event 7).
+void TrackerEngine::applyDrillEstimator(TrackerFrameResult& result)
+{
+    if (!config_.drill_est_enabled) {
+        return;   // no computation, no result fields, no timings keys
+    }
+    const std::int64_t stage_t0 = cv::getTickCount();
+    const double kNaN = std::numeric_limits<double>::quiet_NaN();
+    bool fresh = false;
+    DrillEstimatorOutput out;   // valid = false
+    out.event = -1;             // -1: not fresh
+    double core_ms = 0.0;
+    double tri_ms = 0.0;
+    cv::Vec2d vmed(kNaN, kNaN);
+    std::vector<double> est_rvec;
+    std::vector<double> est_tvec;
+    std::vector<double> est_T;
+    std::vector<double> est_tip;
+    std::vector<double> est_cov;
+    drill_input_valid_ = false;
+    try {
+        // A2: a fresh pose (success, not held) with a finite rvec / tvec.
+        // Otherwise the estimator and its image-motion state stay untouched
+        // (held frames carry held corners).
+        fresh = result.success &&
+                result.pose_source != PoseSource::None &&
+                result.pose_source != PoseSource::Hold &&
+                result.rvec.size() == 3 && result.tvec.size() == 3;
+        for (size_t i = 0; fresh && i < 3; ++i) {
+            fresh = std::isfinite(result.rvec[i]) &&
+                    std::isfinite(result.tvec[i]);
+        }
+        if (fresh) {
+            ++drill_fresh_frames_;
+            DrillEstimatorFrame& in = drill_input_;
+            // A3: engine values of this frame, only read (find, never
+            // operator[], which would add keys)
+            const auto& tm = result.timings_ms;
+            const auto timing = [&tm, kNaN](const char* key) {
+                const auto it = tm.find(key);
+                return it == tm.end() ? kNaN : it->second;
+            };
+            in.reset_before = false;
+            in.sig_px = timing("ir_sigma_px_eff");
+            in.fdt_ms = timing("ir_frame_dt_ms");
+            in.toff_ms = timing("ir_time_offset_ms");
+            in.ir_fit_mm = timing("ir_fit_rms_mm");
+            in.ir_applied = timing("ir_applied") > 0.5;
+            const bool refs_measured = timing("ir_refs_measured") > 0.5;
+
+            // A4: the not-predicted corners in list order (young ones too;
+            // not the PnP set); an invalid id (also one whose key
+            // row * 1024 + col would not fit an int) or a non-finite value is
+            // dropped
+            in.X.clear();
+            in.row_px.clear();
+            in.id.clear();
+            drill_uv_raw_.clear();
+            int drop_rgb = 0;
+            for (const TrackerCorner& c : result.corners) {
+                if (c.predicted) {
+                    continue;
+                }
+                const bool ok = c.global_row >= 0 && c.global_col >= 0 &&
+                                c.global_row < (std::numeric_limits<int>::max() - 1023) / 1024 &&
+                                c.global_col < 1024 &&
+                                std::isfinite(c.uv[0]) && std::isfinite(c.uv[1]) &&
+                                std::isfinite(c.xyz_mm[0]) &&
+                                std::isfinite(c.xyz_mm[1]) &&
+                                std::isfinite(c.xyz_mm[2]);
+                if (!ok) {
+                    ++drop_rgb;
+                    continue;
+                }
+                in.X.emplace_back(c.xyz_mm[0], c.xyz_mm[1], c.xyz_mm[2]);
+                drill_uv_raw_.emplace_back(c.uv[0], c.uv[1]);
+                in.row_px.push_back(c.uv[1]);   // raw (distorted) row
+                in.id.push_back(c.global_row * 1024 + c.global_col);
+            }
+#ifdef DRILL_EST_FAULT_INJECT
+            if (drill_fresh_frames_ % 50 == 0) {
+                throw cv::Exception(cv::Error::StsError, "fault injection (A4)",
+                                    "applyDrillEstimator", __FILE__, __LINE__);
+            }
+#endif
+            const int n = static_cast<int>(drill_uv_raw_.size());
+            in.u.resize(static_cast<size_t>(n));
+            if (n > 0) {
+                // with the PnP intrinsics K_ / dist_coeffs_ (not calib_.K_rgb)
+                const cv::Mat src(n, 1, CV_64FC2, drill_uv_raw_.data());
+                cv::Mat dst;
+                cv::undistortPoints(src, dst, cv::Mat(K_),
+                                    drillDistMat(dist_coeffs_));
+                for (int i = 0; i < n; ++i) {
+                    in.u[static_cast<size_t>(i)] = dst.at<cv::Vec2d>(i);
+                }
+            }
+
+            // A5: image motion against the previous fresh frame, on every
+            // fresh frame before any gate of the estimator
+            vmed = drill_vmed_.update(in.id, drill_uv_raw_, result.frame_index);
+#ifdef DRILL_EST_FAULT_INJECT
+            if (drill_fresh_frames_ % 50 == 25) {
+                throw std::bad_alloc();
+            }
+#endif
+
+            // A6: IR pairs of this frame, without the time shift and the QF
+            // sigma scale of the fusion (the estimator applies its own)
+            in.Xi.clear();
+            in.Yi.clear();
+            in.Si.clear();
+            if (refs_measured &&
+                ir_pose_refiner_.lastPairDump().xyz.size() >= kDrillMinPairs) {
+                const std::int64_t tri_t0 = cv::getTickCount();
+                ir_pose_refiner_.lastPairsForEstimator(
+                    config_.drill_est_sigma_ir_px, in.Xi, in.Yi, in.Si);
+                tri_ms = elapsedMs(tri_t0);
+            }
+
+            // A7: rest of the input
+            in.t_s = frame_time_s_;   // read; applyPoseFilter consumes it
+            for (size_t i = 0; i < 3; ++i) {
+                in.rvec[i] = result.rvec[i];
+                in.tvec[i] = result.tvec[i];
+            }
+            in.vmed = vmed;
+            in.f = K_(0, 0);
+            in.fy = K_(1, 1);
+            drill_input_valid_ = true;
+
+            // A8: the estimator (checks the tip and the frame time itself)
+            const std::int64_t core_t0 = cv::getTickCount();
+            out = drill_estimator_.update(in);
+            core_ms = elapsedMs(core_t0);
+            out.n_drop_rgb += drop_rgb;
+            if (out.event == 7) {
+                // the core caught an exception itself and dropped its
+                // chain: the same state and count as the catch below
+                // (event 7: core reset, image-motion predecessor reset)
+                drill_estimator_.reset();
+                drill_vmed_.reset();
+                ++drill_est_n_exceptions_;
+            }
+
+            // A9: result vectors, only with a posterior
+            if (out.valid) {
+                cv::Vec3d rv;
+                cv::Rodrigues(out.R, rv);
+                est_rvec.assign(rv.val, rv.val + 3);
+                est_tvec.assign(out.t.val, out.t.val + 3);
+                est_T.assign(16, 0.0);
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        est_T[static_cast<size_t>(r * 4 + c)] = out.R(r, c);
+                    }
+                    est_T[static_cast<size_t>(r * 4 + 3)] = out.t[r];
+                }
+                est_T[15] = 1.0;
+                est_tip.assign(out.tip.val, out.tip.val + 3);
+                est_cov.assign(out.P.begin(), out.P.end());
+            }
+        }
+    } catch (...) {
+        // cv::Exception, std::bad_alloc, anything: drop the estimator chain
+        // and the image-motion predecessor; the old fields are never touched
+        drill_estimator_.reset();
+        drill_vmed_.reset();
+        drill_input_valid_ = false;
+        out = DrillEstimatorOutput();
+        out.event = 7;
+        fresh = true;
+        core_ms = 0.0;
+        tri_ms = 0.0;
+        vmed = cv::Vec2d(kNaN, kNaN);
+        est_rvec.clear();
+        est_tvec.clear();
+        est_T.clear();
+        est_tip.clear();
+        est_cov.clear();
+        ++drill_est_n_exceptions_;
+    }
+
+    // A10: all drill_est_* fields in one go (moves, no throw): never valid
+    // without complete vectors
+    result.drill_est_valid = out.valid;
+    result.drill_est_shown = out.valid && out.shown;
+    result.drill_est_chained = out.valid && out.chained;
+    result.drill_est_since = out.valid ? out.since : 0;
+    result.drill_est_rvec = std::move(est_rvec);
+    result.drill_est_tvec = std::move(est_tvec);
+    result.drill_est_T_marker_camera = std::move(est_T);
+    result.drill_est_tip_mm = std::move(est_tip);
+    result.drill_est_cov = std::move(est_cov);
+    result.drill_est_sigma_tip_mm = out.valid ? out.sigma_tip_mm : kNaN;
+    try {
+        auto& t = result.timings_ms;
+        const auto put = [&t](const char* key, double v) {
+            t.insert_or_assign(std::string(key), v);
+        };
+        put("drill_est_fresh", fresh ? 1.0 : 0.0);
+        put("drill_est_event", static_cast<double>(out.event));
+        put("drill_est_exceptions", static_cast<double>(drill_est_n_exceptions_));
+        if (fresh) {
+            put("drill_est_restart", static_cast<double>(out.restart));
+            put("drill_est_core_ms", core_ms);
+            put("drill_est_tri_ms", tri_ms);
+            put("drill_est_n_rgb", static_cast<double>(out.n_rgb));
+            put("drill_est_n_ir", static_cast<double>(out.n_ir));
+            put("drill_est_drop_rgb", static_cast<double>(out.n_drop_rgb));
+            put("drill_est_drop_ir", static_cast<double>(out.n_drop_ir));
+            put("drill_est_dup_id", static_cast<double>(out.n_dup_id));
+            put("drill_est_nu1", out.nu1);
+            put("drill_est_nu3", out.nu3);
+            put("drill_est_nis", out.nis);
+            put("drill_est_rs_on", out.rs_on ? 1.0 : 0.0);
+            put("drill_est_ir_off", out.ir_off ? 1.0 : 0.0);
+            put("drill_est_iters", static_cast<double>(out.iters));
+            put("drill_est_sig_px", out.sig_px_used);
+            put("drill_est_vmed_x", vmed[0]);
+            put("drill_est_vmed_y", vmed[1]);
+        }
+        put("drill_est_ms", elapsedMs(stage_t0));
+    } catch (...) {
+        // bad_alloc while adding a key: single keys may be missing, nothing
+        // leaves the stage
+    }
 }
 
 void TrackerEngine::updatePoseWarmupState(TrackerFrameResult& result)

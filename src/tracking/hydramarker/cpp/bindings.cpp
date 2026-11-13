@@ -20,6 +20,7 @@
 #include "checkerboard_detector.hpp"
 #include "checkerboard_types.hpp"
 #include "dot_detector.hpp"
+#include "drill_pose_estimator.hpp"
 #include "geometry_utils.hpp"
 
 #include "corner_detection.hpp"
@@ -223,6 +224,423 @@ std::vector<cv::Point2f> numpyToPoint2fVector(
     return points;
 }
 
+// ---- Drill pose estimator: test hook of the core class (plan 4.8) ----
+
+struct DrillCfgField {
+    const char* name;
+    double DrillEstimatorConfig::*d;
+    int DrillEstimatorConfig::*i;
+};
+
+const DrillCfgField kDrillCfgFields[] = {
+    {"sig_t_mm", &DrillEstimatorConfig::sig_t_mm, nullptr},
+    {"sig_r_deg", &DrillEstimatorConfig::sig_r_deg, nullptr},
+    {"adapt_px", &DrillEstimatorConfig::adapt_px, nullptr},
+    {"db3_px", &DrillEstimatorConfig::db3_px, nullptr},
+    {"gain_t", &DrillEstimatorConfig::gain_t, nullptr},
+    {"gain_r_deg", &DrillEstimatorConfig::gain_r_deg, nullptr},
+    {"vmin", nullptr, &DrillEstimatorConfig::vmin},
+    {"s_rgb", &DrillEstimatorConfig::s_rgb, nullptr},
+    {"s_ir", &DrillEstimatorConfig::s_ir, nullptr},
+    {"huber_k", &DrillEstimatorConfig::huber_k, nullptr},
+    {"n_iter", nullptr, &DrillEstimatorConfig::n_iter},
+    {"gap_s", &DrillEstimatorConfig::gap_s, nullptr},
+    {"rs_px", &DrillEstimatorConfig::rs_px, nullptr},
+    {"ir_gated", &DrillEstimatorConfig::ir_gated, nullptr},
+    {"ir_fit_max_mm", &DrillEstimatorConfig::ir_fit_max_mm, nullptr},
+    {"ir_fit_fac", &DrillEstimatorConfig::ir_fit_fac, nullptr},
+    {"min_start", nullptr, &DrillEstimatorConfig::min_start},
+    {"warm", nullptr, &DrillEstimatorConfig::warm},
+    {"sig_tip_max_mm", &DrillEstimatorConfig::sig_tip_max_mm, nullptr},
+    {"w3d", &DrillEstimatorConfig::w3d, nullptr},
+    {"sigma_ir_px", &DrillEstimatorConfig::sigma_ir_px, nullptr},
+    {"row_ms", &DrillEstimatorConfig::row_ms, nullptr},
+    {"prior_max_mm", &DrillEstimatorConfig::prior_max_mm, nullptr},
+    {"hide_sig_mm", &DrillEstimatorConfig::hide_sig_mm, nullptr},
+};
+
+const DrillCfgField* findDrillCfgField(const std::string& name)
+{
+    for (const auto& f : kDrillCfgFields) {
+        if (name == f.name) {
+            return &f;
+        }
+    }
+    return nullptr;
+}
+
+void setDrillCfgField(DrillEstimatorConfig& c, const DrillCfgField& f, py::handle v)
+{
+    if (f.d != nullptr) {
+        c.*(f.d) = py::cast<double>(v);
+    } else {
+        c.*(f.i) = py::cast<int>(v);   // a float is rejected (no silent truncation)
+    }
+}
+
+// cfg: None (defaults), DrillEstimatorConfig, dict without prefix (unknown
+// keys raise), or an object with all drill_est_* attributes (TrackerConfig).
+DrillEstimatorConfig drillCfgFromPy(py::handle cfg)
+{
+    if (cfg.is_none()) {
+        return DrillEstimatorConfig();
+    }
+    if (py::isinstance<DrillEstimatorConfig>(cfg)) {
+        return py::cast<DrillEstimatorConfig>(cfg);
+    }
+    DrillEstimatorConfig c;
+    if (py::isinstance<py::dict>(cfg)) {
+        for (auto item : py::reinterpret_borrow<py::dict>(cfg)) {
+            const std::string key = py::cast<std::string>(item.first);
+            const DrillCfgField* f = findDrillCfgField(key);
+            if (f == nullptr) {
+                throw py::key_error("unknown drill estimator field: " + key);
+            }
+            setDrillCfgField(c, *f, item.second);
+        }
+        return c;
+    }
+    std::string missing;
+    int found = 0;
+    for (const auto& f : kDrillCfgFields) {
+        const std::string attr = std::string("drill_est_") + f.name;
+        if (!py::hasattr(cfg, attr.c_str())) {
+            missing += (missing.empty() ? "" : ", ") + attr;
+            continue;
+        }
+        const py::object val = cfg.attr(attr.c_str());
+        setDrillCfgField(c, f, val);
+        ++found;
+    }
+    if (!missing.empty()) {
+        throw py::type_error(found == 0
+            ? std::string("cfg has no drill_est_* fields")
+            : "cfg lacks " + missing);
+    }
+    return c;
+}
+
+py::dict drillCfgToDict(const DrillEstimatorConfig& c)
+{
+    py::dict d;
+    for (const auto& f : kDrillCfgFields) {
+        if (f.d != nullptr) {
+            d[f.name] = c.*(f.d);
+        } else {
+            d[f.name] = c.*(f.i);
+        }
+    }
+    return d;
+}
+
+typedef py::array_t<double, py::array::c_style | py::array::forcecast> DrillDArr;
+
+// (n, cols) array (cols == 0: (n,)); an empty array of any shape is n = 0
+DrillDArr drillArr(py::handle v, int cols, const char* what, size_t& n)
+{
+    DrillDArr a = py::cast<DrillDArr>(v);
+    if (a.size() == 0) {
+        n = 0;
+        return a;
+    }
+    const bool ok = cols == 0
+        ? a.ndim() == 1
+        : (a.ndim() == 2 && a.shape(1) == cols);
+    if (!ok) {
+        throw py::value_error(std::string("drill estimator frame: bad shape of ") + what);
+    }
+    n = static_cast<size_t>(a.shape(0));
+    return a;
+}
+
+double drillScalar(py::handle v)
+{
+    return py::cast<double>(v);
+}
+
+bool drillBool(py::handle v)
+{
+    const int r = PyObject_IsTrue(v.ptr());
+    if (r < 0) {
+        throw py::error_already_set();
+    }
+    return r != 0;
+}
+
+DrillEstimatorFrame drillFrameFromDict(const py::dict& d)
+{
+    DrillEstimatorFrame F;
+    for (auto item : d) {
+        const std::string k = py::cast<std::string>(item.first);
+        py::handle v = item.second;
+        size_t n = 0;
+        if (k == "t_s") {
+            F.t_s = drillScalar(v);
+        } else if (k == "reset_before") {
+            F.reset_before = drillBool(v);
+        } else if (k == "rvec" || k == "tvec") {
+            DrillDArr a = py::cast<DrillDArr>(v);
+            if (a.size() != 3) {
+                throw py::value_error("drill estimator frame: rvec/tvec need 3 values");
+            }
+            std::array<double, 3>& dst = k == "rvec" ? F.rvec : F.tvec;
+            for (py::ssize_t i = 0; i < 3; ++i) dst[static_cast<size_t>(i)] = a.data()[i];
+        } else if (k == "X" || k == "Xi" || k == "Yi") {
+            DrillDArr a = drillArr(v, 3, k.c_str(), n);
+            std::vector<cv::Vec3d>& dst = k == "X" ? F.X : (k == "Xi" ? F.Xi : F.Yi);
+            dst.resize(n);
+            const double* p = a.data();
+            for (size_t i = 0; i < n; ++i) dst[i] = cv::Vec3d(p[3 * i], p[3 * i + 1], p[3 * i + 2]);
+        } else if (k == "u") {
+            DrillDArr a = drillArr(v, 2, "u", n);
+            F.u.resize(n);
+            const double* p = a.data();
+            for (size_t i = 0; i < n; ++i) F.u[i] = cv::Vec2d(p[2 * i], p[2 * i + 1]);
+        } else if (k == "row_px") {
+            DrillDArr a = drillArr(v, 0, "row_px", n);
+            F.row_px.assign(a.data(), a.data() + n);
+        } else if (k == "id") {
+            auto a = py::cast<py::array_t<long long, py::array::c_style | py::array::forcecast>>(v);
+            if (a.size() != 0 && a.ndim() != 1) {
+                throw py::value_error("drill estimator frame: bad shape of id");
+            }
+            F.id.resize(static_cast<size_t>(a.size()));
+            for (py::ssize_t i = 0; i < a.size(); ++i) {
+                const long long x = a.data()[i];
+                if (x < std::numeric_limits<int>::min() || x > std::numeric_limits<int>::max()) {
+                    throw py::value_error("drill estimator frame: id out of int range");
+                }
+                F.id[static_cast<size_t>(i)] = static_cast<int>(x);
+            }
+        } else if (k == "Si") {
+            DrillDArr a = py::cast<DrillDArr>(v);
+            if (a.size() != 0 && !(a.ndim() == 3 && a.shape(1) == 3 && a.shape(2) == 3)) {
+                throw py::value_error("drill estimator frame: bad shape of Si");
+            }
+            const size_t m = a.size() == 0 ? 0 : static_cast<size_t>(a.shape(0));
+            F.Si.resize(m);
+            const double* p = a.data();
+            for (size_t i = 0; i < m; ++i) {
+                F.Si[i] = cv::Matx33d(p + 9 * i);
+            }
+        } else if (k == "sig_px") {
+            F.sig_px = drillScalar(v);
+        } else if (k == "vmed") {
+            DrillDArr a = py::cast<DrillDArr>(v);
+            if (a.size() != 2) {
+                throw py::value_error("drill estimator frame: vmed needs 2 values");
+            }
+            F.vmed = cv::Vec2d(a.data()[0], a.data()[1]);
+        } else if (k == "fdt_ms") {
+            F.fdt_ms = drillScalar(v);
+        } else if (k == "toff_ms") {
+            F.toff_ms = drillScalar(v);
+        } else if (k == "ir_fit_mm") {
+            F.ir_fit_mm = drillScalar(v);
+        } else if (k == "ir_applied") {
+            F.ir_applied = drillBool(v);
+        } else if (k == "f") {
+            F.f = drillScalar(v);
+        } else if (k == "fy") {
+            F.fy = drillScalar(v);
+        } else {
+            throw py::key_error("unknown drill estimator frame field: " + k);
+        }
+    }
+    return F;
+}
+
+py::array_t<double> drillNumpy(const double* p, std::vector<py::ssize_t> shape)
+{
+    py::array_t<double> a(shape);
+    std::copy(p, p + a.size(), a.mutable_data());
+    return a;
+}
+
+py::dict drillOutToDict(const DrillEstimatorOutput& o)
+{
+    py::dict d;
+    d["valid"] = o.valid;
+    d["shown"] = o.shown;
+    d["chained"] = o.chained;
+    d["rs_on"] = o.rs_on;
+    d["since"] = o.since;
+    d["iters"] = o.iters;
+    d["n_rgb"] = o.n_rgb;
+    d["n_ir"] = o.n_ir;
+    d["n_drop_rgb"] = o.n_drop_rgb;
+    d["n_drop_ir"] = o.n_drop_ir;
+    d["n_dup_id"] = o.n_dup_id;
+    d["event"] = o.event;
+    d["restart"] = o.restart;
+    d["R"] = drillNumpy(o.R.val, {3, 3});
+    d["t"] = drillNumpy(o.t.val, {3});
+    d["P"] = drillNumpy(o.P.data(), {6, 6});
+    d["tip"] = drillNumpy(o.tip.val, {3});
+    d["sigma_tip_mm"] = o.sigma_tip_mm;
+    d["nu1"] = o.nu1;
+    d["nu3"] = o.nu3;
+    d["nis"] = o.nis;
+    d["sig_px_used"] = o.sig_px_used;
+    d["ir_off"] = o.ir_off;
+    return d;
+}
+
+// Estimator input of the engine's last fresh frame (TrackerEngine test hook)
+// as a NEW dict of copies, with the keys of DrillPoseEstimator.update: it
+// can be fed back into the core or saved; nothing refers to the engine's
+// buffer, which the next frame overwrites.
+py::array_t<double> drillVec3Array(const std::vector<cv::Vec3d>& v)
+{
+    py::array_t<double> a(std::vector<py::ssize_t>{static_cast<py::ssize_t>(v.size()), 3});
+    double* p = a.mutable_data();
+    for (size_t i = 0; i < v.size(); ++i) {
+        p[3 * i] = v[i][0];
+        p[3 * i + 1] = v[i][1];
+        p[3 * i + 2] = v[i][2];
+    }
+    return a;
+}
+
+py::dict drillFrameToDict(const DrillEstimatorFrame& F)
+{
+    py::dict d;
+    d["t_s"] = F.t_s;
+    d["reset_before"] = F.reset_before;
+    d["rvec"] = drillNumpy(F.rvec.data(), {3});
+    d["tvec"] = drillNumpy(F.tvec.data(), {3});
+    d["X"] = drillVec3Array(F.X);
+    {
+        py::array_t<double> a(std::vector<py::ssize_t>{static_cast<py::ssize_t>(F.u.size()), 2});
+        double* p = a.mutable_data();
+        for (size_t i = 0; i < F.u.size(); ++i) {
+            p[2 * i] = F.u[i][0];
+            p[2 * i + 1] = F.u[i][1];
+        }
+        d["u"] = a;
+    }
+    d["row_px"] = drillNumpy(F.row_px.data(), {static_cast<py::ssize_t>(F.row_px.size())});
+    {
+        py::array_t<long long> a(static_cast<py::ssize_t>(F.id.size()));
+        long long* p = a.mutable_data();
+        for (size_t i = 0; i < F.id.size(); ++i) {
+            p[i] = F.id[i];
+        }
+        d["id"] = a;
+    }
+    d["sig_px"] = F.sig_px;
+    d["vmed"] = drillNumpy(F.vmed.val, {2});
+    d["fdt_ms"] = F.fdt_ms;
+    d["toff_ms"] = F.toff_ms;
+    d["ir_fit_mm"] = F.ir_fit_mm;
+    d["ir_applied"] = F.ir_applied;
+    d["Xi"] = drillVec3Array(F.Xi);
+    d["Yi"] = drillVec3Array(F.Yi);
+    {
+        py::array_t<double> a(std::vector<py::ssize_t>{static_cast<py::ssize_t>(F.Si.size()), 3, 3});
+        double* p = a.mutable_data();
+        for (size_t i = 0; i < F.Si.size(); ++i) {
+            for (int k = 0; k < 9; ++k) {
+                p[9 * i + static_cast<size_t>(k)] = F.Si[i].val[k];
+            }
+        }
+        d["Si"] = a;
+    }
+    d["f"] = F.f;
+    d["fy"] = F.fy;
+    return d;
+}
+
+void bindDrillPoseEstimator(py::module_& m)
+{
+    py::class_<DrillEstimatorConfig> cfg_cls(m, "DrillEstimatorConfig");
+    cfg_cls.def(py::init<>());
+    for (const auto& f : kDrillCfgFields) {
+        if (f.d != nullptr) {
+            cfg_cls.def_readwrite(f.name, f.d);
+        } else {
+            cfg_cls.def_readwrite(f.name, f.i);
+        }
+    }
+    cfg_cls.def("to_dict", &drillCfgToDict);
+
+    // Test hook of the core (no engine): one dict per frame in, one dict out.
+    py::class_<DrillPoseEstimator>(m, "DrillPoseEstimator")
+        .def(py::init([](py::object cfg) {
+                 return std::make_unique<DrillPoseEstimator>(drillCfgFromPy(cfg));
+             }),
+             py::arg("cfg") = py::none())
+        .def_property_readonly("config_valid", &DrillPoseEstimator::configValid)
+        .def_property_readonly("config", [](const DrillPoseEstimator& s) { return s.config(); })
+        .def(
+            "set_tool_tip",
+            [](DrillPoseEstimator& s, DrillDArr p) {
+                if (p.size() != 3) {
+                    throw py::value_error("p_tip_mm needs 3 values");
+                }
+                return s.setToolTip(cv::Vec3d(p.data()[0], p.data()[1], p.data()[2]));
+            },
+            py::arg("p_tip_mm"))
+        .def("has_tool_tip", &DrillPoseEstimator::hasToolTip)
+        .def("reset", &DrillPoseEstimator::reset)
+        .def(
+            "update",
+            [](DrillPoseEstimator& s, const py::dict& frame) {
+                const DrillEstimatorFrame F = drillFrameFromDict(frame);
+                return drillOutToDict(s.update(F));
+            },
+            py::arg("frame"))
+        .def("debug_state", [](const DrillPoseEstimator& s) {
+            const DrillEstimatorState st = s.debugState();
+            py::dict d;
+            d["have"] = st.have;
+            d["R"] = drillNumpy(st.R.val, {3, 3});
+            d["t"] = drillNumpy(st.t.val, {3});
+            d["P"] = drillNumpy(st.P.data(), {6, 6});
+            d["prev_t"] = st.prev_t;
+            d["since"] = st.since;
+            d["starting"] = st.starting;
+            d["hist_n"] = st.hist_n;
+            return d;
+        })
+        .def(
+            "debug_set_state",
+            [](DrillPoseEstimator& s, DrillDArr R, DrillDArr t, DrillDArr P, double prev_t) {
+                if (R.size() != 9 || t.size() != 3 || P.size() != 36) {
+                    throw py::value_error("debug_set_state: R (3,3), t (3,), P (6,6)");
+                }
+                std::array<double, 36> Pa;
+                std::copy(P.data(), P.data() + 36, Pa.begin());
+                s.debugSetState(cv::Matx33d(R.data()), cv::Vec3d(t.data()[0], t.data()[1], t.data()[2]),
+                                Pa, prev_t);
+            },
+            py::arg("R"), py::arg("t"), py::arg("P"),
+            py::arg("prev_t") = std::numeric_limits<double>::quiet_NaN());
+
+    py::class_<DrillVmed>(m, "DrillVmed")
+        .def(py::init<>())
+        .def("reset", &DrillVmed::reset)
+        .def(
+            "update",
+            [](DrillVmed& s, py::array_t<long long, py::array::c_style | py::array::forcecast> id,
+               DrillDArr uv_raw, int frame_index) {
+                size_t n = 0;
+                DrillDArr a = drillArr(uv_raw, 2, "uv_raw", n);
+                if (static_cast<size_t>(id.size()) != n) {
+                    throw py::value_error("DrillVmed.update: id and uv_raw differ in length");
+                }
+                std::vector<int> ids(n);
+                std::vector<cv::Vec2d> uv(n);
+                for (size_t i = 0; i < n; ++i) {
+                    ids[i] = static_cast<int>(id.data()[i]);
+                    uv[i] = cv::Vec2d(a.data()[2 * i], a.data()[2 * i + 1]);
+                }
+                const cv::Vec2d r = s.update(ids, uv, frame_index);
+                return drillNumpy(r.val, {2});
+            },
+            py::arg("id"), py::arg("uv_raw"), py::arg("frame_index"));
+}
+
 } // namespace
 
 PYBIND11_MODULE(hydramarker_cpp, m) {
@@ -237,6 +655,29 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
     // Live page checks this flag and warns when it loads an older build,
     // which would hold the GUI thread for the whole frame.
     m.attr("PROCESS_FRAME_RELEASES_GIL") = true;
+
+    // Build facts for the protocols: a Debug build (/MDd /Od /RTC1) or a
+    // module without the drill estimator shows up in every log that records
+    // the loaded module.
+    {
+        py::dict bi;
+#ifdef NDEBUG
+        bi["ndebug"] = true;
+#else
+        bi["ndebug"] = false;
+#endif
+#ifdef _MSC_FULL_VER
+        bi["msvc"] = static_cast<long long>(_MSC_FULL_VER);
+#else
+        bi["msvc"] = py::none();
+#endif
+        bi["opencv"] = std::string(CV_VERSION);
+        bi["drill_est"] = 1;
+#ifdef DRILL_EST_FAULT_INJECT
+        bi["drill_est_fault_inject"] = true;   // test build only
+#endif
+        m.attr("BUILD_INFO") = bi;
+    }
 
     m.def(
         "opencv_threading_info",
@@ -1074,6 +1515,10 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
             py::arg("rvec"), py::arg("tvec"), py::arg("object_points")
         );
 
+    // Drill pose estimator core as a test hook (the engine runs its own
+    // instance in TrackerEngine::applyDrillEstimator).
+    bindDrillPoseEstimator(m);
+
     py::class_<GlobalCornerIdentity>(m, "GlobalCornerIdentity")
         .def(py::init<>())
         .def_readwrite("global_row", &GlobalCornerIdentity::global_row)
@@ -1608,7 +2053,33 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("prior_subgrid_max_trans_mm", &TrackerConfig::prior_subgrid_max_trans_mm)
         .def_readwrite("occlusion_guard_mode", &TrackerConfig::occlusion_guard_mode)
         .def_readwrite("occlusion_guard_max_rot_deg", &TrackerConfig::occlusion_guard_max_rot_deg)
-        .def_readwrite("occlusion_guard_max_trans_mm", &TrackerConfig::occlusion_guard_max_trans_mm);
+        .def_readwrite("occlusion_guard_max_trans_mm", &TrackerConfig::occlusion_guard_max_trans_mm)
+        // drill pose estimator (off by default; on: output pose filter forced off)
+        .def_readwrite("drill_est_enabled", &TrackerConfig::drill_est_enabled)
+        .def_readwrite("drill_est_sig_t_mm", &TrackerConfig::drill_est_sig_t_mm)
+        .def_readwrite("drill_est_sig_r_deg", &TrackerConfig::drill_est_sig_r_deg)
+        .def_readwrite("drill_est_adapt_px", &TrackerConfig::drill_est_adapt_px)
+        .def_readwrite("drill_est_db3_px", &TrackerConfig::drill_est_db3_px)
+        .def_readwrite("drill_est_gain_t", &TrackerConfig::drill_est_gain_t)
+        .def_readwrite("drill_est_gain_r_deg", &TrackerConfig::drill_est_gain_r_deg)
+        .def_readwrite("drill_est_vmin", &TrackerConfig::drill_est_vmin)
+        .def_readwrite("drill_est_s_rgb", &TrackerConfig::drill_est_s_rgb)
+        .def_readwrite("drill_est_s_ir", &TrackerConfig::drill_est_s_ir)
+        .def_readwrite("drill_est_huber_k", &TrackerConfig::drill_est_huber_k)
+        .def_readwrite("drill_est_n_iter", &TrackerConfig::drill_est_n_iter)
+        .def_readwrite("drill_est_gap_s", &TrackerConfig::drill_est_gap_s)
+        .def_readwrite("drill_est_rs_px", &TrackerConfig::drill_est_rs_px)
+        .def_readwrite("drill_est_ir_gated", &TrackerConfig::drill_est_ir_gated)
+        .def_readwrite("drill_est_ir_fit_max_mm", &TrackerConfig::drill_est_ir_fit_max_mm)
+        .def_readwrite("drill_est_ir_fit_fac", &TrackerConfig::drill_est_ir_fit_fac)
+        .def_readwrite("drill_est_min_start", &TrackerConfig::drill_est_min_start)
+        .def_readwrite("drill_est_warm", &TrackerConfig::drill_est_warm)
+        .def_readwrite("drill_est_sig_tip_max_mm", &TrackerConfig::drill_est_sig_tip_max_mm)
+        .def_readwrite("drill_est_w3d", &TrackerConfig::drill_est_w3d)
+        .def_readwrite("drill_est_sigma_ir_px", &TrackerConfig::drill_est_sigma_ir_px)
+        .def_readwrite("drill_est_row_ms", &TrackerConfig::drill_est_row_ms)
+        .def_readwrite("drill_est_prior_max_mm", &TrackerConfig::drill_est_prior_max_mm)
+        .def_readwrite("drill_est_hide_sig_mm", &TrackerConfig::drill_est_hide_sig_mm);
 
     py::class_<PersistentMatcher>(m, "PersistentMatcher")
         .def(py::init<const TrackerConfig&>(), py::arg("config") = TrackerConfig())
@@ -1803,7 +2274,18 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def_readwrite("decoded_patch_count", &TrackerFrameResult::decoded_patch_count)
         .def_readwrite("decoded_valid_patch_count", &TrackerFrameResult::decoded_valid_patch_count)
         .def_readwrite("correspondence_count", &TrackerFrameResult::correspondence_count)
-        .def_readwrite("timings_ms", &TrackerFrameResult::timings_ms);
+        .def_readwrite("timings_ms", &TrackerFrameResult::timings_ms)
+        // drill pose estimator (own pose; rvec/tvec stay the engine pose)
+        .def_readwrite("drill_est_valid", &TrackerFrameResult::drill_est_valid)
+        .def_readwrite("drill_est_shown", &TrackerFrameResult::drill_est_shown)
+        .def_readwrite("drill_est_chained", &TrackerFrameResult::drill_est_chained)
+        .def_readwrite("drill_est_since", &TrackerFrameResult::drill_est_since)
+        .def_readwrite("drill_est_rvec", &TrackerFrameResult::drill_est_rvec)
+        .def_readwrite("drill_est_tvec", &TrackerFrameResult::drill_est_tvec)
+        .def_readwrite("drill_est_T_marker_camera", &TrackerFrameResult::drill_est_T_marker_camera)
+        .def_readwrite("drill_est_tip_mm", &TrackerFrameResult::drill_est_tip_mm)
+        .def_readwrite("drill_est_sigma_tip_mm", &TrackerFrameResult::drill_est_sigma_tip_mm)
+        .def_readwrite("drill_est_cov", &TrackerFrameResult::drill_est_cov);
 
     py::class_<AppearanceCheck>(m, "AppearanceCheck")
         .def(py::init<>())
@@ -1948,6 +2430,31 @@ PYBIND11_MODULE(hydramarker_cpp, m) {
         .def("reset", &TrackerEngine::reset)
         .def("reset_ir_references", &TrackerEngine::resetIrReferences)
         .def("set_frame_time", &TrackerEngine::setFrameTime, py::arg("t_s"))
+        // Drill pose estimator. Thread contract: set_tool_tip and
+        // last_drill_est_input only while no process_frame of this engine
+        // runs (the frame calls release the GIL).
+        .def(
+            "set_tool_tip",
+            [](TrackerEngine& self, DrillDArr p) {
+                if (p.size() != 3) {
+                    throw py::value_error("p_tip_mm needs 3 values");
+                }
+                return self.setToolTip(cv::Vec3d(p.data()[0], p.data()[1], p.data()[2]));
+            },
+            py::arg("p_tip_mm"))
+        .def("has_tool_tip", &TrackerEngine::hasToolTip)
+        .def(
+            "last_drill_est_input",
+            [](const TrackerEngine& self) -> py::object {
+                // None unless the last frame was fresh and reached the
+                // estimator; otherwise a new dict of copies
+                if (!self.hasDrillEstimatorInput()) {
+                    return py::none();
+                }
+                return drillFrameToDict(self.lastDrillEstimatorInput());
+            })
+        .def_property_readonly("drill_est_config_valid", &TrackerEngine::drillEstimatorConfigValid)
+        .def_property_readonly("pose_kf_forced_off", &TrackerEngine::poseKfForcedOff)
         .def("set_ir_selfcal", &TrackerEngine::setIrSelfCal)
         .def("set_ir_selfcal_corners", &TrackerEngine::setIrSelfCalCorners)
         .def("measure_ir_view", [](

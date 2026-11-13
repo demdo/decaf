@@ -42,6 +42,18 @@ while the worker reads it fails the test.
     result's visible_cell_fraction (not without a pose, NaN or threshold 0),
     TrackOutput.points_marked from the worker, TrackingOverlay draws it in
     MARKED_COLOR and says so in the snapshot record
+(n) drill estimator path of ToolPoints (estimator=True): points from
+    drill_est_T_marker_camera, hidden -> no points (hidden_points kept),
+    est_none -> no points, no carry despite ir_applied, marked stays, LOS
+    along drill_est_tvec, a valid result without a usable T -> no points and
+    counted; reset() clears it; the old path is untouched by these fields
+(o) the worker with the estimator: points_hidden / points_sigma_mm, the old
+    drawing A next to it (points_a / points_a_kind), A reset with the tracker,
+    an exception in A costs only its points
+(p) the worker's drill estimator counters (drill_est_counters): bad T summed
+    over a tracker reset, A and marks errors, the engine's last
+    drill_est_exceptions, the tracker's export errors; None and nothing
+    counted without the estimator
 
 Run from src/:
 
@@ -783,6 +795,246 @@ def test_marked() -> None:
           "in MARKED_COLOR, in the snapshot record")
 
 
+def _rot_z(deg: float) -> np.ndarray:
+    a = np.radians(deg)
+    return np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+
+
+def _est_result(t_rgb, *, valid=True, shown=True, applied=False, d_fused=(0.0, 0.0, 0.0),
+                R_est=None, t_est=None, sigma=1.5, T="ok", frac=None):
+    """A pose result with the drill estimator's fields: engine pose as
+    _pose_result, the estimator's pose (R_est, t_est) of its own."""
+    r = _pose_result(t_rgb, applied=applied, d_fused=d_fused)
+    if frac is not None:
+        r.timings_ms["visible_cell_fraction"] = frac
+    R_est = _rot_z(10.0) if R_est is None else R_est
+    t_est = np.asarray(t_rgb, np.float64) + [0.5, -0.3, 1.0] if t_est is None else t_est
+    Tm = np.eye(4)
+    Tm[:3, :3], Tm[:3, 3] = R_est, t_est
+    r.drill_est_valid, r.drill_est_shown = valid, shown
+    r.drill_est_sigma_tip_mm = sigma if valid else float("nan")
+    r.drill_est_tvec = np.asarray(t_est, np.float64) if valid else None
+    if not valid or T is None:
+        r.drill_est_T_marker_camera = None
+    elif T == "nan":
+        Tm[0, 3] = np.nan
+        r.drill_est_T_marker_camera = Tm
+    elif T == "shape":
+        r.drill_est_T_marker_camera = Tm[:3]
+    else:
+        r.drill_est_T_marker_camera = Tm
+    return r
+
+
+def test_tool_points_estimator() -> None:
+    t0 = np.array([0.0, 0.0, 400.0])
+    d = np.array([0.1, -0.2, 2.0])
+    R = _rot_z(10.0)
+    P = np.stack([P_TIP, P_BACK])
+
+    def est_pts(t_rgb):
+        return P @ R.T + (np.asarray(t_rgb) + [0.5, -0.3, 1.0])
+
+    tp = ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, estimator=True)
+    assert tp.estimator and tp.hidden_points is None and np.isnan(tp.sigma_mm) and tp.n_est_bad_T == 0
+    # shown: the estimator's own pose, not rvec / tvec
+    pts = tp.update(_est_result(t0), 0.0)
+    assert tp.kind == "est" and np.allclose(pts, est_pts(t0), atol=1e-12)
+    assert tp.sigma_mm == 1.5 and tp.hidden_points is None
+    # a fused frame and then one without fusion: no carry, the estimator's pose
+    pts = tp.update(_est_result(t0, applied=True, d_fused=d), 0.1)
+    assert tp.kind == "est" and np.allclose(pts, est_pts(t0), atol=1e-12)
+    t1 = t0 + [1.0, 0.0, 0.0]
+    pts = tp.update(_est_result(t1), 0.2)
+    assert tp.kind == "est" and np.allclose(pts, est_pts(t1), atol=1e-12)
+    assert tp._offset is None
+    # hidden: no points, the hidden ones kept with their sigma
+    assert tp.update(_est_result(t1, shown=False, sigma=6.0), 0.3) is None
+    assert tp.kind == "est_hidden" and np.allclose(tp.hidden_points, est_pts(t1), atol=1e-12)
+    assert tp.sigma_mm == 6.0 and not tp.marked
+    # no estimator pose on a result with a pose (chain start gate, hold result)
+    assert tp.update(_est_result(t1, valid=False), 0.4) is None
+    assert tp.kind == "est_none" and tp.hidden_points is None and np.isnan(tp.sigma_mm)
+    # an engine without the estimator's fields: est_none, never an exception
+    assert tp.update(_pose_result(t1, applied=False), 0.45) is None and tp.kind == "est_none"
+    # no pose at all
+    assert tp.update(SimpleNamespace(rvec=None, tvec=None, timings_ms={}), 0.5) is None
+    assert tp.kind is None
+    # valid without a usable T: no points, counted, never raised
+    for bad in (None, "nan", "shape"):
+        assert tp.update(_est_result(t1, T=bad), 0.6) is None and tp.kind == "est_none"
+    assert tp.n_est_bad_T == 3
+    tp.reset()
+    assert tp.n_est_bad_T == 0 and tp.hidden_points is None and np.isnan(tp.sigma_mm)
+    assert tp.kind is None and not tp.marked
+    # marked: the engine pose's visible cells, as on the old path
+    tpm = ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, mark_below_visible_frac=0.75, estimator=True)
+    tpm.update(_est_result(t0, frac=0.5), 0.0)
+    assert tpm.kind == "est" and tpm.marked
+    tpm.update(_est_result(t0, frac=0.9), 0.1)
+    assert not tpm.marked
+    tpm.update(_est_result(t0, frac=0.5, shown=False), 0.2)
+    assert not tpm.marked                     # hidden: no points, nothing drawn
+    # line-of-sight shift along the ray of the drawn pose (drill_est_tvec)
+    t_est = np.array([30.0, -40.0, 400.0])
+    tpl = ToolPoints(P_TIP, P_BACK, los_offset_mm=2.0, estimator=True)
+    pts = tpl.update(_est_result(t0, applied=True, d_fused=d, t_est=t_est), 0.0)
+    ray = t_est / np.linalg.norm(t_est)
+    assert np.allclose(pts, P @ R.T + t_est - 2.0 * ray, atol=1e-12)
+    # the old path ignores the estimator's fields (fused, carry as before)
+    old = ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, max_carry_s=0.5)
+    pts = old.update(_est_result(t0, applied=True, d_fused=d), 0.0)
+    assert old.kind == "fused" and np.allclose(pts, P + t0 + d)
+    pts = old.update(_est_result(t1), 0.1)
+    assert old.kind == "carry" and np.allclose(pts, P + t1 + d)
+    assert old.hidden_points is None and np.isnan(old.sigma_mm)
+    # the factory hands the switch over
+    ov = TrackingOverlay(np.eye(3), None, P_TIP, [0.0, 2.0, 0.0])
+    assert ov.tool_points(estimator=True).estimator and not ov.tool_points().estimator
+    print("  (n) estimator path: its own pose, hidden / est_none without points, no carry, "
+          "marked, LOS along its ray, bad T counted; old path unchanged")
+
+
+def test_worker_estimator() -> None:
+    t0 = np.array([0.0, 0.0, 400.0])
+    d = np.array([0.1, -0.2, 2.0])
+    # frames 0, 1 fused + shown, 2 hidden (no fusion), 3 est_none, after a reset 4 shown
+    script = {0: dict(applied=True, d_fused=d), 1: dict(applied=True, d_fused=d),
+              2: dict(shown=False, sigma=7.0), 3: dict(valid=False), 4: dict()}
+
+    class EstTracker(FakeTracker):
+        def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None, t_frame=None):
+            v = int(color[0, 0, 0])
+            self.calls.append(("process", v, threading.get_ident()))
+            return _est_result(t0 + [v, 0.0, 0.0], **script[v])
+
+    tracker = EstTracker()
+    worker = TrackingWorker(
+        tracker, pool_size=5,
+        tool_points=ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, max_carry_s=0.5, estimator=True),
+        tool_points_a=ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, max_carry_s=0.5),
+    )
+    worker.start()
+    outs = []
+    for i in range(5):
+        if i == 4:
+            worker.request_reset()
+        worker.submit(_frame(i), 0.1 * i)
+        assert _wait_until(lambda: worker.n_processed == i + 1)
+        outs += _drain_all(worker)
+    assert worker.stop()
+    assert [o.points_kind for o in outs] == ["est", "est", "est_hidden", "est_none", "est"], \
+        [o.points_kind for o in outs]
+    # A, the old drawing: fused, fused, carry, carry; after the reset no offset to carry
+    assert [o.points_a_kind for o in outs] == ["fused", "fused", "carry", "carry", "rgb"], \
+        [o.points_a_kind for o in outs]
+    assert outs[2].points is None and outs[2].points_hidden is not None
+    assert outs[2].points_sigma_mm == 7.0
+    assert all(o.points_hidden is None for o in outs if o.points_kind != "est_hidden")
+    assert np.isnan(outs[3].points_sigma_mm) and outs[0].points_sigma_mm == 1.5
+    P = np.stack([P_TIP, P_BACK])
+    assert np.allclose(outs[2].points_a, P + t0 + [2.0, 0.0, 0.0] + d)
+    assert np.allclose(outs[4].points_a, P + t0 + [4.0, 0.0, 0.0])
+    assert [c[0] for c in tracker.calls].count("reset") == 1
+    assert worker.n_points_a_errors == 0 and _pool_balanced(worker)
+
+    # an exception in A costs only its points
+    class BrokenA:
+        kind = None
+
+        def reset(self):
+            pass
+
+        def update(self, result, t_frame):
+            raise ValueError("A broken")
+
+    worker = TrackingWorker(EstTracker(), pool_size=5,
+                            tool_points=ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, estimator=True),
+                            tool_points_a=BrokenA())
+    worker.start()
+    worker.submit(_frame(0), 0.0)
+    assert _wait_until(lambda: worker.n_processed == 1)
+    outs = _drain_all(worker)
+    assert worker.stop()
+    assert outs[0].error is None and outs[0].points_kind == "est" and outs[0].points_a is None
+    assert worker.n_points_a_errors == 1 and worker.failure is None
+    print("  (o) worker with the estimator: hidden points and sigma, the old drawing A next "
+          "to it, A reset with the tracker, an exception in A costs only its points")
+
+
+def test_worker_counters() -> None:
+    t0 = np.array([0.0, 0.0, 400.0])
+    # valid estimator results without a usable T on frames 1, 2 and, after the
+    # reset before frame 4, on frame 4; the engine's exception count v // 2
+    bad = {1: None, 2: "nan", 4: "shape"}
+
+    class CountTracker(FakeTracker):
+        drill_est_export_errors = 2
+
+        def process_frame(self, color, *, run_detection=True, ir_left=None, ir_right=None, t_frame=None):
+            v = int(color[0, 0, 0])
+            self.calls.append(("process", v, threading.get_ident()))
+            r = _est_result(t0 + [v, 0.0, 0.0], T=bad.get(v, "ok"))
+            r.timings_ms["drill_est_exceptions"] = float(v // 2)
+            return r
+
+    class BrokenA:
+        kind = None
+
+        def reset(self):
+            pass
+
+        def update(self, result, t_frame):
+            raise ValueError("A broken")
+
+    class Marks:
+        n = 0
+
+        def build(self, points, *, marked, t_pose, kind):
+            self.n += 1
+            if self.n == 1:
+                raise ValueError("marks broken")
+            return "marks"
+
+    def run(worker, n=6, reset_before=4):
+        worker.start()
+        for i in range(n):
+            if i == reset_before:
+                worker.request_reset()
+            worker.submit(_frame(i), 0.1 * i)
+            assert _wait_until(lambda: worker.n_processed == i + 1)
+            _drain_all(worker)
+        assert worker.stop() and worker.failure is None
+        return worker
+
+    tracker = CountTracker()
+    tp = ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, estimator=True)
+    marks = Marks()
+    worker = run(TrackingWorker(tracker, pool_size=5, tool_points=tp, tool_points_a=BrokenA(),
+                                marks_builder=marks))
+    assert [c[0] for c in tracker.calls].count("reset") == 1
+    # the reset zeroed the ToolPoints' own count; the worker kept the 2 before it
+    assert tp.n_est_bad_T == 1 and marks.n == 3
+    assert worker.drill_est_counters() == {
+        "n_est_bad_T": 3, "n_points_a_errors": 6, "n_marks_errors": 1,
+        "drill_est_exceptions": 2, "drill_est_export_errors": 2,
+    }, worker.drill_est_counters()
+    # a tracker without the export counter, results without the engine's count
+    plain = run(TrackingWorker(FakeTracker(), pool_size=5,
+                               tool_points=ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0, estimator=True)))
+    assert plain.drill_est_counters() == {
+        "n_est_bad_T": 0, "n_points_a_errors": 0, "n_marks_errors": 0,
+        "drill_est_exceptions": None, "drill_est_export_errors": None,
+    }, plain.drill_est_counters()
+    # without the estimator: nothing counted, None (the logs stay as before)
+    for tool_points in (ToolPoints(P_TIP, P_BACK, los_offset_mm=0.0), None):
+        old = run(TrackingWorker(CountTracker(), pool_size=5, tool_points=tool_points))
+        assert old.drill_est_counters() is None
+        assert old.drill_est_exceptions is None and old._n_est_bad_T_reset == 0
+    print("  (p) worker counters with the estimator: bad T summed over a reset, A and marks "
+          "errors, the engine's last exception count, the export errors; None without it")
+
+
 def test_frame_timing() -> None:
     class TimingTracker(FakeTracker):
         def __init__(self):
@@ -861,6 +1113,9 @@ def main() -> None:
     test_tool_points()
     test_marked()
     test_frame_timing()
+    test_tool_points_estimator()
+    test_worker_estimator()
+    test_worker_counters()
     print("all checks passed")
 
 

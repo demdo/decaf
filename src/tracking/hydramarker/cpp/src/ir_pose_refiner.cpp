@@ -352,6 +352,48 @@ void IrPoseRefiner::reset()
 {
 }
 
+void IrPoseRefiner::lastPairsForEstimator(double sig_ir_px,
+                                          std::vector<cv::Vec3d>& X,
+                                          std::vector<cv::Vec3d>& Y,
+                                          std::vector<cv::Matx33d>& S) const
+{
+    X.clear();
+    Y.clear();
+    S.clear();
+    const size_t m = pair_dump_.xyz.size();
+    if (m == 0 || !calib_.valid || pair_dump_.uvL.size() != m ||
+        pair_dump_.uvR.size() != m) {
+        return;
+    }
+    // The pairs as fuseAttempt triangulates them (metric baseline,
+    // depth_scale), moved into the RGB frame WITHOUT the IR time-offset
+    // shift; the stereo covariance as fuseAttempt builds it, with the
+    // given pixel sigma, WITHOUT the per-pair QF scale and NOT inverted.
+    const std::vector<cv::Vec3d> cam =
+        triangulateIrl(pair_dump_.uvL, pair_dump_.uvR, calib_,
+                       config_.depth_scale);
+    const cv::Matx33d R_rl = calib_.R_rgb_left;
+    const cv::Vec3d t_rl = calib_.t_rgb_left_mm;
+    const double f_ir = calib_.K_left(0, 0);
+    const double baseline = cv::norm(calib_.t_left_right_mm);
+    X.reserve(m);
+    Y.reserve(m);
+    S.reserve(m);
+    for (size_t i = 0; i < m; ++i) {
+        X.push_back(pair_dump_.xyz[i]);
+        Y.push_back(R_rl.t() * (cam[i] - t_rl));
+        const double Z = std::max(cam[i][2], 1.0);
+        const double sl = Z / f_ir * sig_ir_px;
+        const cv::Vec3d r = cam[i] * (1.0 / std::max(cv::norm(cam[i]), 1.0));
+        const double sr =
+            Z * Z / (f_ir * baseline) * sig_ir_px / std::max(r[2], 0.1);
+        const cv::Matx33d rr = r * r.t();
+        const cv::Matx33d S_irl =
+            (sl * sl) * (cv::Matx33d::eye() - rr) + (sr * sr) * rr;
+        S.push_back(R_rl.t() * S_irl * R_rl);
+    }
+}
+
 
 namespace {
 

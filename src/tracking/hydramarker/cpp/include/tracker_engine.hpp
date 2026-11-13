@@ -13,6 +13,7 @@
 #include "checkerboard_detector.hpp"
 #include "correspondence_builder.hpp"
 #include "dot_detector.hpp"
+#include "drill_pose_estimator.hpp"
 #include "ir_pose_refiner.hpp"
 #include "marker_field.hpp"
 #include "marker_geometry.hpp"
@@ -87,6 +88,31 @@ public:
     // call: the output filter's time base. Not set (or <= 0): one nominal
     // frame period per call.
     void setFrameTime(double t_s);
+
+    // ---- Drill pose estimator (config drill_est_enabled) ----
+    // Thread contract: process_frame / process_frame_ir release the GIL
+    // (bindings.cpp). setToolTip and lastDrillEstimatorInput may only be
+    // called while NO processFrame of this engine runs (the Live page sets
+    // the tip before it starts the worker; HydraTracker copies the input in
+    // the worker thread right after processFrame).
+    // Tool tip in the marker frame [mm]; false (tip unchanged) if not
+    // finite. reset() keeps it. Without a tip the estimator does not run
+    // (event 5).
+    bool setToolTip(const cv::Vec3d& p_tip_mm);
+    bool hasToolTip() const;
+    // Test hook: the estimator input of the last frame, valid only if that
+    // frame was fresh and reached the estimator (the buffer is reused).
+    const DrillEstimatorFrame& lastDrillEstimatorInput() const {
+        return drill_input_;
+    }
+    bool hasDrillEstimatorInput() const { return drill_input_valid_; }
+    // Parameter check of the estimator configuration (event 10 if false).
+    bool drillEstimatorConfigValid() const {
+        return drill_estimator_.configValid();
+    }
+    // true: drill_est_enabled, so the constructor forced the output pose
+    // filter off (config().pose_kf_enabled reads back false).
+    bool poseKfForcedOff() const { return pose_kf_forced_off_; }
 
     // Last frame's measured QF-IR stereo pairs (self-calibration input).
     const IrPoseRefiner::IrPairDump& lastIrPairDump() const {
@@ -245,6 +271,22 @@ private:
     std::array<double, 3> ir_prev_rvec_{};  // rotation gate on the shear comp.
     bool ir_prev_rvec_valid_ = false;
 
+    // ---- Drill pose estimator (output-only, opt-in; applyDrillEstimator) ----
+    // Reads the result after the IR stage, frame_time_s_ (without consuming
+    // it), K_, dist_coeffs_ and the IR pair dump; writes only these members
+    // and the drill_est_* result fields / timings keys. Nothing feeds back
+    // into tracking (start value, gates, fusion, output filter).
+    bool pose_kf_forced_off_ = false;
+    DrillPoseEstimator drill_estimator_;
+    DrillVmed drill_vmed_;
+    DrillEstimatorFrame drill_input_;        // input buffer, reused (test hook)
+    bool drill_input_valid_ = false;
+    std::vector<cv::Vec2d> drill_uv_raw_;    // scratch: raw pixels of the corners
+    cv::Vec3d drill_tip_mm_ = cv::Vec3d(0.0, 0.0, 0.0);
+    bool drill_tip_set_ = false;
+    long long drill_est_n_exceptions_ = 0;   // adapter exceptions since construction
+    long long drill_fresh_frames_ = 0;       // fresh frames seen by the adapter
+
     TrackerFrameResult processFrameInternal(
         const cv::Mat& frame,
         bool run_detection
@@ -257,6 +299,7 @@ private:
     void applyPoseFilter(TrackerFrameResult& result);
     void resetPoseFilter();
     void applyIrRefinement(TrackerFrameResult& result);
+    void applyDrillEstimator(TrackerFrameResult& result);
 
     static CheckerboardDetectorConfig makeCheckerboardConfig(
         const TrackerConfig& config

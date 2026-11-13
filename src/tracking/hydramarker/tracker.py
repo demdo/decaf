@@ -15,17 +15,70 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import sys
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from tracking.hydramarker.config import TrackerConfig
+from tracking.hydramarker.config import (
+    TrackerConfig,
+    drill_est_kf_warning,
+    drill_est_start_checks,
+)
+
+
+# A test build of the extension instead of cpp/build/Release: the full path of
+# its .pyd (its DLLs next to it). Unset: the loader below, unchanged. Set: every
+# import says on stderr which file it loaded (path + MD5), so a variable left
+# set by mistake shows; hydramarker_cpp_info() reports the loaded module.
+HYDRAMARKER_CPP_PYD_ENV = "HYDRAMARKER_CPP_PYD"
+_LOADED_FROM_ENV: Optional[str] = None
+_PYD_MD5: Dict[str, str] = {}
+
+
+def _file_md5(path) -> str:
+    key = str(path)
+    if key not in _PYD_MD5:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        _PYD_MD5[key] = h.hexdigest()
+    return _PYD_MD5[key]
+
+
+def _load_hydramarker_cpp_from_env(value: str):
+    global _LOADED_FROM_ENV
+    pyd_path = Path(value).expanduser().resolve()
+    if not pyd_path.is_file():
+        raise ImportError(f"{HYDRAMARKER_CPP_PYD_ENV}={value}: no such file")
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(str(pyd_path.parent))
+    spec = importlib.util.spec_from_file_location("hydramarker_cpp", pyd_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load hydramarker_cpp from {pyd_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _LOADED_FROM_ENV = value
+    loaded = getattr(module, "__file__", None) or str(pyd_path)
+    print(
+        f"[hydramarker_cpp] {HYDRAMARKER_CPP_PYD_ENV}: loaded {loaded} "
+        f"(md5 {_file_md5(loaded)})",
+        file=sys.stderr,
+        flush=True,
+    )
+    return module
 
 
 def _load_hydramarker_cpp():
+    override = os.environ.get(HYDRAMARKER_CPP_PYD_ENV, "").strip()
+    if override:
+        return _load_hydramarker_cpp_from_env(override)
+
     this_dir = Path(__file__).resolve().parent
     pyd_dir = this_dir / "cpp" / "build" / "Release"
 
@@ -51,6 +104,25 @@ def _load_hydramarker_cpp():
 
 hydramarker_cpp = _load_hydramarker_cpp()
 hm = hydramarker_cpp
+
+
+def hydramarker_cpp_info() -> dict:
+    """The extension this process loaded (not a search of cpp/build/Release),
+    for the session records: path, MD5, size, BUILD_INFO (None: a build
+    without it) and the HYDRAMARKER_CPP_PYD value it was loaded from (None:
+    the default loader)."""
+    path = getattr(hydramarker_cpp, "__file__", None)
+    info: dict = {"path": path, "md5": None, "size": None}
+    if path:
+        try:
+            info["md5"] = _file_md5(path)
+            info["size"] = os.path.getsize(path)
+        except OSError as exc:
+            info["error"] = repr(exc)
+    build = getattr(hydramarker_cpp, "BUILD_INFO", None)
+    info["build_info"] = None if build is None else dict(build)
+    info["env_" + HYDRAMARKER_CPP_PYD_ENV] = _LOADED_FROM_ENV
+    return info
 
 
 def __getattr__(name):
@@ -249,6 +321,28 @@ class TrackerResult:
     debug_counters: Dict[str, float] = field(default_factory=dict)
     timings_ms: Dict[str, float] = field(default_factory=dict)
 
+    # Drill pose estimator (TrackerConfig.drill_est_enabled, C++ engine): its
+    # own pose, marker -> colour camera (mm); rvec / tvec above stay the engine
+    # pose. Set only on fresh frames with the estimator on; the arrays are None
+    # unless drill_est_valid, drill_est_tip_mm (camera frame) also while the
+    # frame is hidden (drill_est_shown False). drill_est_cov: 6x6, tangent
+    # [omega (rad); tau (mm)], right perturbation in the MARKER frame (not the
+    # [rvec; tvec] chart of pose_covariance).
+    drill_est_valid: bool = False
+    drill_est_shown: bool = False
+    drill_est_chained: bool = False
+    drill_est_since: int = 0
+    drill_est_rvec: Optional[np.ndarray] = None
+    drill_est_tvec: Optional[np.ndarray] = None
+    drill_est_T_marker_camera: Optional[np.ndarray] = None
+    drill_est_tip_mm: Optional[np.ndarray] = None
+    drill_est_sigma_tip_mm: float = float("nan")
+    drill_est_cov: Optional[np.ndarray] = None
+    # Estimator input of this frame (HydraTracker.export_drill_est_input):
+    # dict of arrays with the keys of hydramarker_cpp.DrillPoseEstimator.update,
+    # None otherwise.
+    drill_est_input: Optional[dict] = None
+
 
 def tip_camera_blend(result: "TrackerResult", p_tip) -> Optional[np.ndarray]:
     """Drill tip in the CAMERA frame, blended across the two sensors' strengths.
@@ -361,6 +455,21 @@ class HydraTracker:
                 "HydraTracker requires the C++ TrackerEngine. Build/load failed."
             ) from exc
 
+        # Drill pose estimator (C++ engine, config drill_est_enabled).
+        # export_drill_est_input: process_frame copies the estimator input of
+        # every fresh frame into TrackerResult.drill_est_input (recording).
+        self.export_drill_est_input = False
+        # exceptions of that copy (the result then has no input; counted)
+        self.drill_est_export_errors = 0
+        # While the estimator is on the engine forces the output pose filter
+        # off; a requested filter is reported (warning, not an error).
+        self.drill_est_notes: list[str] = []
+        if bool(getattr(self.config, "drill_est_enabled", False)):
+            note = drill_est_kf_warning(self._engine.config, self.config)
+            if note:
+                self.drill_est_notes.append(note)
+                print(f"[WARN] {note}")
+
     @property
     def rvec(self) -> Optional[np.ndarray]:
         return self.pose_tracker.rvec
@@ -372,6 +481,46 @@ class HydraTracker:
     @property
     def T_marker_camera(self) -> Optional[np.ndarray]:
         return self.pose_tracker.T_marker_camera
+
+    # ---- Drill pose estimator (C++ engine; TrackerConfig.drill_est_*) ----
+    @property
+    def drill_estimator_active(self) -> bool:
+        """The estimator is switched on in the C++ engine, read back from the
+        engine's configuration (a module without the field: False)."""
+        return bool(getattr(self._engine.config, "drill_est_enabled", False))
+
+    @property
+    def pose_kf_forced_off(self) -> bool:
+        """The engine forced the output pose filter off because the drill
+        estimator is on (its configuration reads back pose_kf_enabled False)."""
+        return bool(getattr(self._engine, "pose_kf_forced_off", False))
+
+    def set_tool_tip(self, p_tip_mm) -> bool:
+        """Tool tip in the marker frame (mm) for the drill estimator, which
+        does not run without it. False if the module has no estimator or the
+        value is not three finite numbers. Call only while no process_frame
+        runs (thread contract of the engine)."""
+        fn = getattr(self._engine, "set_tool_tip", None)
+        p = np.asarray(p_tip_mm, dtype=np.float64).reshape(-1)
+        if fn is None or p.size != 3:
+            return False
+        return bool(fn(p))
+
+    def has_tool_tip(self) -> bool:
+        fn = getattr(self._engine, "has_tool_tip", None)
+        return bool(fn()) if fn is not None else False
+
+    def start_drill_estimator(self, p_tip_mm, *, ir_path=None, K_rgb=None) -> dict:
+        """With TrackerConfig.drill_est_enabled requested: set the tool tip and
+        run the start checks S1-S8 (config.drill_est_start_checks) against the
+        loaded module and this engine. The caller decides the consequence
+        (Live page, tool eval: S1-S4 failed -> rebuild with the estimator off).
+        Call only while no process_frame runs."""
+        tip_set = self.set_tool_tip(p_tip_mm) and self.has_tool_tip()
+        return drill_est_start_checks(
+            hydramarker_cpp, self._engine, self.config,
+            tip_set=tip_set, ir_path=ir_path, K_rgb=K_rgb,
+        )
 
     @staticmethod
     def _cpp_enum_name(value) -> str:
@@ -580,6 +729,10 @@ class HydraTracker:
             1.0 if bool(getattr(cpp_result, "has_accepted_pose", False)) else 0.0
         )
 
+        # drill estimator: its vectors are empty unless the frame is valid
+        # (result rule 4.4), so they are read and converted only then
+        est_valid = bool(getattr(cpp_result, "drill_est_valid", False))
+
         result = TrackerResult(
             success=bool(getattr(cpp_result, "success", False)),
             mode=mode,
@@ -626,6 +779,28 @@ class HydraTracker:
             ),
             debug_counters=debug_counters,
             timings_ms=timings,
+            drill_est_valid=est_valid,
+            drill_est_shown=bool(getattr(cpp_result, "drill_est_shown", False)),
+            drill_est_chained=bool(getattr(cpp_result, "drill_est_chained", False)),
+            drill_est_since=int(getattr(cpp_result, "drill_est_since", 0)),
+            drill_est_rvec=self._cpp_vector_to_array(
+                getattr(cpp_result, "drill_est_rvec", []), (3,)
+            ) if est_valid else None,
+            drill_est_tvec=self._cpp_vector_to_array(
+                getattr(cpp_result, "drill_est_tvec", []), (3,)
+            ) if est_valid else None,
+            drill_est_T_marker_camera=self._cpp_vector_to_array(
+                getattr(cpp_result, "drill_est_T_marker_camera", []), (4, 4)
+            ) if est_valid else None,
+            drill_est_tip_mm=self._cpp_vector_to_array(
+                getattr(cpp_result, "drill_est_tip_mm", []), (3,)
+            ) if est_valid else None,
+            drill_est_sigma_tip_mm=float(
+                getattr(cpp_result, "drill_est_sigma_tip_mm", float("nan"))
+            ),
+            drill_est_cov=self._cpp_vector_to_array(
+                getattr(cpp_result, "drill_est_cov", []), (6, 6)
+            ) if est_valid else None,
         )
 
         self._sync_public_state_from_cpp(
@@ -783,7 +958,19 @@ class HydraTracker:
         except Exception as exc:
             raise RuntimeError("C++ TrackerEngine.process_frame failed.") from exc
 
-        return self._tracker_result_from_cpp_engine(cpp_result)
+        result = self._tracker_result_from_cpp_engine(cpp_result)
+        if self.export_drill_est_input:
+            # in this thread, right after the engine call (thread contract)
+            fn = getattr(self._engine, "last_drill_est_input", None)
+            try:
+                result.drill_est_input = fn() if fn is not None else None
+            except Exception as exc:
+                # a recording aid: it never ends the tracking thread
+                result.drill_est_input = None
+                self.drill_est_export_errors += 1
+                if self.drill_est_export_errors == 1:
+                    print(f"[WARN] drill estimator input not exported: {exc!r}")
+        return result
 
     def ir_frame_timing(self, metadata) -> tuple[Optional[float], Optional[float]]:
         """(frame_time_ms, ir_time_offset_ms) for process_frame from the

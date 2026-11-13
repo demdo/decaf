@@ -1193,6 +1193,13 @@ def test_page_panels() -> None:
         p.btn_track.click()
         page.on_leave()
         _spin(app, 2.0, lambda: not any(t.name == "frame-log-writer" for t in xv._threads()))
+        # without the drill estimator no counters (test_xray_view (l)): run_meta, profile log
+        import json
+        runs = sorted(tmp.glob("session/*_tracking*.npz"))
+        assert runs and not [r.name for r in runs if "counters" in json.loads(
+            str(np.load(r)["meta_json"]))["run_meta"]], [r.name for r in runs]
+        log = (tmp / "session" / "live_profile.log").read_text(encoding="utf-8")
+        assert "drill estimator counters" not in log
         assert not errors, errors
         page.close()
     finally:
@@ -1363,7 +1370,13 @@ def test_page_panels_multi() -> None:
         p.btn_track.click()
         assert _spin(app, 5.0, lambda: page._panel_marks is not None)
         assert page._panel_marks.second is None
-        p.btn_track.click()
+        import contextlib
+        import io
+        console = io.StringIO()
+        with contextlib.redirect_stdout(console):
+            p.btn_track.click()
+        # without the drill estimator no counters line (test_live_panels (o) with it)
+        assert "drill estimator counters" not in console.getvalue(), console.getvalue()
         page.on_leave()
         assert not errors, errors
         page.close()
@@ -1373,6 +1386,168 @@ def test_page_panels_multi() -> None:
     print("  (m) real page, panels (multi): views from X-ray Acquisition in panels 2/3, no search at entry "
           "(no plane until Set reference plane), view 2's marks from the chained builder, a new AP "
           "X-ray keeps View 1's board pose, the plane stays with the stance, New views with board")
+
+
+# ------------------------------------------------------------ (o)
+
+def test_page_panels_estimator() -> None:
+    """The real page with the stub's drill estimator (test_xray_view.est_pattern), single and
+    multi view: a fresh frame the estimator hides (or has no pose for) keeps the last marks for
+    POSE_HOLD_S like a frame without a pose, then "no tracking" in the X-ray panels; the status
+    line says "Tracking active · settling" meanwhile (single view; multi view without a plane
+    says "No plane" first), the live card stays at "tracking"; shown frames bring the marks
+    back. The drill is the estimator's pose. Single view with the frame log (the old drawing A runs
+    next to it, frame log v3 written in panel mode), multi view without (no A). At the stop the
+    estimator's error counters in one line (console; single view also profile log and run_meta)."""
+    import contextlib
+    import io
+    import json
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QMessageBox
+
+    from overlay.gui.evaluation import EvaluationSession
+
+    from overlay.gui.state import VIEW_AP, VIEW_LAT, WORKFLOW_MULTI, XrayViewCapture
+    from overlay.gui.widgets.widget_live_panels import POSE_HOLD_S
+    from overlay.tools.live_tracking import STATUS_TRACKING
+    from overlay.tools.view_registration import rot_z, to_T
+
+    rec, _ = _case()
+    distortion = xv._field_distortion()
+    z = np.load(xv.DATA / "Evaluation_Integrated_System" / "B_2_tracking.npz")
+    ok = np.isfinite(z["rvec"]).all(axis=1)
+    poses = (z["rvec"][ok], z["tvec"][ok])
+    app = _app()
+    errors, info = [], []
+    boxes = (QMessageBox.critical, QMessageBox.information)
+    QMessageBox.critical = staticmethod(lambda *a, **k: errors.append(a[2:]))
+    QMessageBox.information = staticmethod(lambda *a, **k: info.append(a[2:]))
+    without = ("est_hidden", "est_none")
+    slack = 0.1          # the panels tick at the timer; a sample comes up to a tick later
+    tmp = Path(tempfile.mkdtemp(prefix="live_panels_est_"))
+    try:
+        for multi in (False, True):
+            ev = None
+            if not multi:
+                ev = EvaluationSession(tmp, "session")
+                ev.set_label("est")
+            page = xv._make_page(rec, rec.raw, distortion, poses, panels=True, est=xv.est_pattern, ev=ev)
+            if multi:
+                st = page.state
+                st.workflow = WORKFLOW_MULTI
+                T_cw = to_T(rot_z(25.0)[:3, :3], np.array([0.04, -0.02, 0.6]))
+                now = time.time()
+                st.xray_views = {
+                    VIEW_LAT: XrayViewCapture(VIEW_LAT, rec.raw.copy(), "lat.dcm", T_cw, {}, now - 300.0, 1),
+                    VIEW_AP: XrayViewCapture(VIEW_AP, rec.raw, "ap.dcm", T_cw, {}, now - 60.0, 2),
+                }
+            page.on_enter()
+            p = page.panels
+            assert page._multi_view == multi and not errors, errors
+            records, samples = [], []
+            orig = page._on_track_output
+
+            def spy(out, t_drain, page=page, orig=orig, records=records):
+                before = page._panel_marks
+                orig(out, t_drain)
+                records.append((out.points_kind, before, page._panel_marks, out, page._est_settling))
+
+            page._on_track_output = spy
+
+            def sample(page=page, p=p, records=records, samples=samples, multi=multi):
+                m = page._panel_marks
+                samples.append((time.perf_counter(), None if m is None else m.t_pose,
+                                p.panel_view1._lost, p.panel_view2._lost if multi else None,
+                                p.lbl_status.text(), p.lbl_track_status.text(),
+                                records[-1][0] if records else None))
+                return False
+
+            p.btn_track.click()
+            w = page._track_worker
+            assert page._drill_est_active and w._tool_points.estimator
+            assert (w._tool_points_a is None) == multi            # A only with the frame log
+            _spin(app, 7.0, sample)
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                p.btn_track.click()
+            # the estimator's counters at the stop (marks built here), in single and multi view
+            counters = [ln for ln in console.getvalue().splitlines() if "drill estimator counters" in ln]
+            assert len(counters) == 1 and counters[0].endswith(
+                "n_est_bad_T 0, n_points_a_errors 0, n_marks_errors 0, drill_est_exceptions n/a, "
+                "drill_est_export_errors n/a"), counters
+            page.on_leave()
+            page.close()
+            if not multi:
+                assert _spin(app, 10.0, lambda: list(tmp.glob("session/est_tracking*.npz"))
+                             and not any(t.name == "frame-log-writer" for t in xv._threads()))
+                tr = np.load(next(tmp.glob("session/est_tracking*.npz")))
+                n = len(tr["points_kind"])
+                assert tr["est_tip_cam_mm"].shape == (n, 3) and tr["est_T"].shape == (n, 16)
+                assert tr["a_tip_cam_mm"].shape == (n, 3) and (tr["a_kind"] == "rgb").all()
+                assert not [k for k in tr.files if tr[k].ndim == 2 and tr[k].shape[1] == 0
+                                and not k.endswith("_values")]  # stub: no debug counters
+                run_meta = json.loads(str(tr["meta_json"]))["run_meta"]
+                assert run_meta["tool_points"]["a_parallel"] is True
+                assert run_meta["counters"] == {
+                    "n_est_bad_T": 0, "n_points_a_errors": 0, "n_marks_errors": 0,
+                    "drill_est_exceptions": None, "drill_est_export_errors": None,
+                }, run_meta["counters"]
+                log = (tmp / "session" / "live_profile.log").read_text(encoding="utf-8").splitlines()
+                assert [ln for ln in log if "drill estimator counters" in ln] == counters
+
+            kinds = [r[0] for r in records]
+            assert {"est", "est_hidden", "est_none"} <= set(kinds), set(kinds)
+            for kind, before, after, out, settling in records:
+                if kind in without:
+                    # not replaced: held as without a pose
+                    assert after is before, kind
+                    assert settling
+                else:
+                    assert kind == "est" and after is out.marks and after is not None, kind
+                    assert (after.second is not None) == multi
+                    assert not settling
+                    pts = np.asarray(out.points)
+                    R, _ = cv2.Rodrigues(np.asarray(out.result.rvec, np.float64).reshape(3, 1))
+                    assert not np.allclose(pts[0], R @ rec.p_tip + out.result.tvec, atol=0.1)
+                    assert np.allclose(after.tip_cam, xv._est_pts(out.result.rvec, out.result.tvec, rec.p_tip),
+                                       atol=1e-9)
+            first = next(i for i, s in enumerate(samples) if s[1] is not None)
+            # the status line refreshes every PANEL_READOUT_S: from its first tracking text on
+            shown = next(i for i, s in enumerate(samples)
+                         if s[4].startswith(("Tracking active", "No plane")))
+            held = lost = 0
+            for j, (now, t_pose, lost1, lost2, status, card, last) in enumerate(samples[first:], first):
+                age = None if t_pose is None else now - t_pose
+                if lost1:
+                    lost += 1
+                    assert age is None or age > POSE_HOLD_S, age
+                else:
+                    assert age is not None and age <= POSE_HOLD_S + slack, age
+                    if last in without:
+                        held += 1
+                if multi:
+                    assert lost2 == lost1
+                assert card == STATUS_TRACKING, card       # the live card: the engine tracks
+                if not multi and j >= shown:
+                    assert status != "No tracking", status
+            assert held > 0 and lost > 0, (held, lost)
+            if not multi:
+                texts = [s[4] for s in samples[first:]]
+                assert "Tracking active  ·  settling" in texts, set(texts)
+                i = texts.index("Tracking active  ·  settling")
+                assert any(t.startswith("Tracking active  ·  est") for t in texts[i:]), set(texts[i:])
+            print(f"      {'multi' if multi else 'single'}: {len(records)} results, "
+                  f"{held} samples held, {lost} 'no tracking'")
+        assert not errors, errors
+    finally:
+        QMessageBox.critical, QMessageBox.information = boxes
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  (o) real page, panels (single + multi) with the drill estimator: hidden frames keep the "
+          "marks for the hold time, then no tracking; status line settling, live card tracking; "
+          "the drill is the estimator's pose; its counters at the stop")
 
 
 # ------------------------------------------------------------ (n)
@@ -1523,6 +1698,7 @@ def main() -> int:
         test_xray_panel, test_design_window,
         test_view_at_start, test_readout_tile, test_readout_int, test_plane_side_view,
         test_page_plane_only, test_page_panels, test_page_panels_multi, test_target_trajectory,
+        test_page_panels_estimator,
     )
     skipped = 0
     for test in tests:

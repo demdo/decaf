@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
+import sys
 import threading
 import time
 import traceback
@@ -70,7 +72,13 @@ from tracking.hydramarker.color_exposure import (
     MODE_MARKER,
     MarkerExposureControl,
 )
-from tracking.hydramarker.config import CameraConfig
+from tracking.hydramarker.config import (
+    DRILL_EST_FIELDS,
+    CameraConfig,
+    apply_drill_est_live,
+    drill_est_requested,
+    drill_est_summary,
+)
 
 
 # ============================================================
@@ -103,6 +111,10 @@ PANEL_READOUT_S = 0.2
 PANEL_STATUS_HOLD_S = 5.0
 # Set target trajectory: ESC this long after a replacement brings the earlier one back.
 TARGET_UNDO_S = 5.0
+# ToolPoints kinds of a fresh result the drill estimator does not show
+# (config.LIVE_DRILL_ESTIMATOR): the panels keep the last marks for POSE_HOLD_S, as
+# without a pose, and the status line says settling.
+_EST_WITHOUT_POINTS = ("est_hidden", "est_none")
 
 
 # ============================================================
@@ -493,7 +505,24 @@ class _FrameProfile:
 # Version 2: the tracking rows carry the X-ray view (d_x_mm, tip_x_mm,
 # tip_uv_x, back_uv_x, tip_uv_on_plane, off_plane_mm, inclination_deg,
 # tip_in_field, xview_update_ms), the display rows xview_ms.
-FRAME_LOG_VERSION = 2
+# Version 3 (with and without the drill estimator): the tracking rows carry
+# rvec_prefusion / tvec_prefusion and the drill estimator's fields (est_valid,
+# est_shown, est_chained, est_since, est_sigma_tip_mm, est_rvec, est_tvec,
+# est_T (4x4 row-major), est_tip_cam_mm / est_back_cam_mm of its pose, also on
+# a hidden frame) and, while it runs, the old drawing next to it (a_tip_cam_mm,
+# a_back_cam_mm, a_kind); points_kind also "est" / "est_hidden" / "est_none".
+# est_tip_cam_mm / est_back_cam_mm: on a shown frame the drawn points (with
+# the ToolPoints line-of-sight offset, live 0), on a hidden one the points of
+# the estimator's pose without it.
+# With the estimator tip_cam_mm / back_cam_mm (the drawn points) exist only on
+# shown frames (the old path has them on hold results too). The display rows
+# carry est_shown (a hidden fresh frame counts as "pose" there, nothing of the
+# drill drawn). The tracking file's meta has "run_meta": the tracker configuration,
+# the estimator's start checks, the loaded hydramarker_cpp (path, MD5,
+# BUILD_INFO), the IR and K files (path, MD5), the tool and the ToolPoints;
+# with the estimator also "counters", its error counters at the stop
+# (TrackingWorker.drill_est_counters).
+FRAME_LOG_VERSION = 3
 
 _FRAME_LOG_CLOCKS = (
     "t_s, t_frame, t_start, t_done, t_drain: time.perf_counter() [s] "
@@ -519,6 +548,15 @@ def _keys_values(d) -> tuple[tuple, np.ndarray | None]:
             except (TypeError, ValueError):
                 pass
     return keys, values
+
+
+def _fixed_vec(v, n: int) -> np.ndarray | None:
+    """A result vector as n float64 values, None if absent or of another size
+    (an empty vector would make the whole column (rows, 0))."""
+    if v is None:
+        return None
+    a = np.asarray(v, dtype=np.float64).reshape(-1)
+    return a if a.size == n else None
 
 
 def _frame_rows_to_arrays(rows: list[dict]) -> dict[str, np.ndarray]:
@@ -588,6 +626,26 @@ class _EvalFrameLog:
         # frame_index -> (colour timestamp ms, time.time() of the poll)
         self._frames: dict[int, tuple[float, float]] = {}
         self._run = 0
+        # what the current tracking run runs with (set_run_meta), JSON-ready
+        self._run_meta: dict | None = None
+
+    def set_run_meta(self, meta: dict | None) -> None:
+        """The record of the tracking run that starts now (configuration,
+        engine, files, tool); it goes into the meta of that run's tracking
+        file. Made JSON-ready here: a value json cannot write becomes text."""
+        if meta is None:
+            self._run_meta = None
+            return
+        try:
+            self._run_meta = json.loads(json.dumps(meta))
+        except (TypeError, ValueError):
+            self._run_meta = json.loads(json.dumps(meta, default=str))
+
+    def set_run_counters(self, counters: dict) -> None:
+        """The drill estimator's error counters at the stop of the run
+        (numbers or None), into its record before flush() writes it."""
+        if self._run_meta is not None:
+            self._run_meta["counters"] = dict(counters)
 
     def note_frame(self, frame) -> None:
         """Camera time of a polled frame, for the rows of its result and of
@@ -656,11 +714,33 @@ class _EvalFrameLog:
                 "tvec": None if res.tvec is None else np.asarray(res.tvec, dtype=np.float64).reshape(-1),
                 "_timings": _keys_values(res.timings_ms),
                 "_debug": _keys_values(res.debug_counters),
+                # version 3: the RGB-only pose and the drill estimator's
+                "rvec_prefusion": _fixed_vec(getattr(res, "rvec_prefusion", None), 3),
+                "tvec_prefusion": _fixed_vec(getattr(res, "tvec_prefusion", None), 3),
+                "est_valid": bool(getattr(res, "drill_est_valid", False)),
+                "est_shown": bool(getattr(res, "drill_est_shown", False)),
+                "est_chained": bool(getattr(res, "drill_est_chained", False)),
+                "est_since": int(getattr(res, "drill_est_since", 0)),
+                "est_sigma_tip_mm": float(getattr(res, "drill_est_sigma_tip_mm", float("nan"))),
+                "est_rvec": _fixed_vec(getattr(res, "drill_est_rvec", None), 3),
+                "est_tvec": _fixed_vec(getattr(res, "drill_est_tvec", None), 3),
+                "est_T": _fixed_vec(getattr(res, "drill_est_T_marker_camera", None), 16),
             })
         if out.points is not None:
             pts = np.asarray(out.points, dtype=np.float64).reshape(-1, 3)
             row["tip_cam_mm"] = pts[0]
             row["back_cam_mm"] = pts[1]
+        # the estimator's points, shown or hidden; the old drawing next to it
+        est = out.points if out.points_kind == "est" else out.points_hidden
+        if est is not None:
+            est = np.asarray(est, dtype=np.float64).reshape(-1, 3)
+            row["est_tip_cam_mm"] = est[0]
+            row["est_back_cam_mm"] = est[1]
+        if out.points_a is not None:
+            a = np.asarray(out.points_a, dtype=np.float64).reshape(-1, 3)
+            row["a_tip_cam_mm"] = a[0]
+            row["a_back_cam_mm"] = a[1]
+        row["a_kind"] = out.points_a_kind or ""
         drawn = None if overlay is None else overlay.snapshot_record()
         if drawn is not None:
             row["tip_uv"] = np.asarray(drawn["tip_uv"], dtype=np.float64)
@@ -711,6 +791,9 @@ class _EvalFrameLog:
             "log_version": FRAME_LOG_VERSION, "kind": kind, "reason": reason,
             "run": run, "clocks": _FRAME_LOG_CLOCKS,
         }
+        if kind == "tracking":
+            # what the run that just ended ran with (set_run_meta at its start)
+            meta["run_meta"] = self._run_meta
         return path, rows, meta
 
     @staticmethod
@@ -787,6 +870,40 @@ def _bgra_to_qpixmap(img_bgra: np.ndarray) -> QPixmap:
 def _signed_mm(value: float) -> str:
     """+0.6 / −0.6 with a real minus sign, for the status line."""
     return f"{value:+.1f}".replace("-", "−")
+
+
+def _loaded_engine_info() -> dict:
+    """The hydramarker_cpp this process loaded (tracker.hydramarker_cpp_info:
+    path, MD5, BUILD_INFO); {} while tracking.hydramarker.tracker is not
+    imported (the engine is only loaded by a real tracker)."""
+    mod = sys.modules.get("tracking.hydramarker.tracker")
+    info = getattr(mod, "hydramarker_cpp_info", None)
+    if info is None:
+        return {}
+    try:
+        return info()
+    except Exception as e:
+        return {"error": repr(e)}
+
+
+def _drill_est_config_of(config) -> dict | None:
+    """The drill estimator's settings of a TrackerConfig (and the output
+    filter switch the engine overrides while it runs)."""
+    if config is None:
+        return None
+    out = {name: getattr(config, name) for name in DRILL_EST_FIELDS if hasattr(config, name)}
+    if hasattr(config, "pose_kf_enabled"):
+        out["pose_kf_enabled"] = getattr(config, "pose_kf_enabled")
+    return out
+
+
+def _file_md5_or_none(path) -> str | None:
+    if not path:
+        return None
+    try:
+        return hashlib.md5(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _xray_link_ready() -> bool:
@@ -1457,6 +1574,22 @@ class OverlayLivePage(QWidget):
         # Created in _make_tracker iff TrackerConfig.failure_log_enabled and
         # Evaluation mode (the file lives in the session folder).
         self._track_fail_log: _TrackFailureLog | None = None
+        # Drill pose estimator (config.LIVE_DRILL_ESTIMATOR, _make_tracker): asked for
+        # when the tracker was built (a change builds a new one), the result
+        # of its start checks (None: not asked for), the TrackerConfig the
+        # tracker was built with; per tracking start whether it runs and, for
+        # the logs and the snapshot, the record of that run.
+        self._tracker_drill_requested: bool | None = None
+        self._drill_est_report: dict | None = None
+        self._tracker_config_used = None
+        self._drill_est_active = False
+        self._drill_est_run: dict | None = None
+        # the newest current result was fresh, but without estimator points
+        # ("est_hidden" / "est_none"): the status line says settling
+        self._est_settling = False
+        # rail only: the tag of the start-check message of this run (E18),
+        # before every status on the tracking card (None: no message)
+        self._rail_est_note: str | None = None
 
         # The image on screen (before the X-ray layer): a result's frame
         # copy, the page's copy of a polled frame, or the view of the last
@@ -2065,6 +2198,9 @@ class OverlayLivePage(QWidget):
                 prof.frame_end(t0, {
                     "frame_idx": self._shown_index,
                     "pose": pose_out is not None,
+                    # the drill estimator's pose drawn (a hidden frame counts
+                    # as "pose" above, but nothing of the drill is drawn)
+                    "est_shown": pose_out is not None and pose_out.points_kind == "est",
                     "tracking": self._tracking_active,
                     "xray": self._overlay_cache is not None,
                     "panels": self._panels_mode,
@@ -2630,6 +2766,9 @@ class OverlayLivePage(QWidget):
         if not self._tracking_active:
             return "Tracking off", STATUS_NEUTRAL
         if m is None:
+            if self._est_settling:
+                # the engine tracks, the drill estimator does not show it yet
+                return "Tracking active  ·  settling", STATUS_NEUTRAL
             return "No tracking", STATUS_NEUTRAL
         text = f"Tracking active  ·  {m.kind or '–'}  ·  {self._fps:.0f} fps"
         if m.marked:
@@ -2816,17 +2955,43 @@ class OverlayLivePage(QWidget):
         )
         tracker_log.set_run_log_dir(str(log_root / "hydramarker_tracker_runs"))
 
-        if self._tracker is not None:
+        # Drill pose estimator: config.LIVE_DRILL_ESTIMATOR (default on). The
+        # engine takes its configuration only when it is built, so a change of
+        # the switch (tests) builds a new tracker.
+        requested = drill_est_requested()
+        if self._tracker is not None and self._tracker_drill_requested == requested:
             self._tracker.reset()
+            if requested and self._tracker.drill_estimator_active:
+                self._tracker.set_tool_tip(self._tool.p_tip_mm)
             return self._tracker
 
-        config = make_live_tracker_config()
         ir_path = getattr(self.state, "ir_calibration_path", None)
-        config.ir_refine_enabled = bool(ir_path)
-        # The drill is drawn from the unfiltered pose (tracking_overlay.
-        # ToolPoints): the output filter pulls the pose off the image in
-        # motion and does not smooth at rest. On again once it is repaired.
-        config.pose_kf_enabled = False
+
+        def live_config():
+            config = make_live_tracker_config()
+            config.ir_refine_enabled = bool(ir_path)
+            # The drill is drawn from the unfiltered pose (tracking_overlay.
+            # ToolPoints): the output filter pulls the pose off the image in
+            # motion and does not smooth at rest. On again once it is repaired.
+            # (With the drill estimator the engine keeps it off anyway.)
+            config.pose_kf_enabled = False
+            return config
+
+        def build(config):
+            tracker = make_tracker(
+                self._tool.field_path,
+                self._tool.marker_json_path,
+                np.asarray(self.state.K_rgb, dtype=np.float64),
+                self.state.dist_rgb,
+                config,
+            )
+            if ir_path:
+                tracker.set_ir_calibration(ir_path)
+            return tracker
+
+        config = live_config()
+        if requested:
+            apply_drill_est_live(config)
 
         # The log file lives in the Evaluation session folder; Normal mode
         # keeps no failure log.
@@ -2837,15 +3002,20 @@ class OverlayLivePage(QWidget):
         else:
             self._track_fail_log = None
 
-        tracker = make_tracker(
-            self._tool.field_path,
-            self._tool.marker_json_path,
-            np.asarray(self.state.K_rgb, dtype=np.float64),
-            self.state.dist_rgb,
-            config,
-        )
-        if ir_path:
-            tracker.set_ir_calibration(ir_path)
+        tracker = build(config)
+        report = None
+        if requested:
+            # start checks S1-S8; S1-S4 failed: the tracker without the
+            # estimator (the old path), tracking starts anyway
+            report = tracker.start_drill_estimator(
+                self._tool.p_tip_mm, ir_path=ir_path, K_rgb=self.state.K_rgb,
+            )
+            if report["fatal"]:
+                config = live_config()
+                tracker = build(config)
+        self._tracker_drill_requested = requested
+        self._drill_est_report = report
+        self._tracker_config_used = config
         return tracker
 
     def _new_tool_overlay(self) -> TrackingOverlay:
@@ -2926,6 +3096,7 @@ class OverlayLivePage(QWidget):
             return
 
         self._check_engine_gil()
+        drill_est_status = self._report_drill_est()
         self._tool_overlay.clear()
         self._overlay_out = None
         if self._track_fail_log is not None:
@@ -2935,19 +3106,32 @@ class OverlayLivePage(QWidget):
         self._mark_below_visible_frac = float(getattr(
             self._tracker.config, "drawn_pose_mark_below_visible_frac", 0.0
         ))
+        # With the drill estimator on (read back from the engine) the drill is
+        # its pose; the old drawing runs next to it for the frame log only.
+        tool_points_a = None
+        if self._drill_est_active and self._frame_log is not None:
+            tool_points_a = self._tool_overlay.tool_points(
+                mark_below_visible_frac=self._mark_below_visible_frac,
+            )
+        tool_points = self._tool_overlay.tool_points(
+            mark_below_visible_frac=self._mark_below_visible_frac,
+            estimator=self._drill_est_active,
+        )
+        if self._frame_log is not None:
+            self._frame_log.set_run_meta(self._tracking_run_meta(tool_points, tool_points_a))
         # The worker owns the tracker from here until _stop_tracking joined it.
         self._track_worker = TrackingWorker(
             self._tracker,
             pool_size=self.TRACK_FRAME_POOL,
             notify=self._track_result_ready.emit,
-            tool_points=self._tool_overlay.tool_points(
-                mark_below_visible_frac=self._mark_below_visible_frac,
-            ),
+            tool_points=tool_points,
             frame_timing=self._tracker.ir_frame_timing,
             # the panels' marks are built in the tracking thread
             marks_builder=self._builder if self._panels_mode else None,
+            tool_points_a=tool_points_a,
         )
         self._panel_marks = None
+        self._est_settling = False
         self._track_session = TrackingSession(
             self._has_fresh_pose,
             self._track_worker.request_reset,
@@ -2960,9 +3144,150 @@ class OverlayLivePage(QWidget):
         self._track_worker.start()
         self._tracking_active = True
         self.controls.btn_track.setText("Stop tracking")
-        self.controls.lbl_track_status.setText(STATUS_SEARCHING)
+        # the rail has no status line: the message stays on the card for
+        # the whole run (_set_rail_est_note); the panels show it there
+        self._set_rail_est_note(None if self._panels_mode else drill_est_status)
+        self.controls.lbl_track_status.setText(self._track_status_text(STATUS_SEARCHING))
+        if drill_est_status is not None and self._panels_mode:
+            text, colour = drill_est_status
+            self._panel_status(text, colour)
         if self._exposure_mode == MODE_MARKER:
             self._start_exposure_control()
+
+    # rail tags of the start-check message (E18): asked for but off (S1-S4,
+    # red), on with a warning (S5-S8, yellow)
+    RAIL_EST_TAG_OFF = "est OFF"
+    RAIL_EST_TAG_WARN = "est warning"
+
+    def _set_rail_est_note(self, status: tuple | None) -> None:
+        """The rail has no status line: the drill estimator's start-check
+        message (_report_drill_est, E18) stays on the tracking card for the
+        whole run, as a short tag before every status there
+        (_track_status_text), the card text in the message's colour, the
+        full message as the card's tooltip. None (no message, the panels,
+        stop) clears it; without a message the card is never touched."""
+        lbl = self._rail.lbl_track_status
+        if status is None:
+            if self._rail_est_note is not None:
+                lbl.setStyleSheet("")
+                lbl.setToolTip("")
+                # Qt keeps the message's colour in the palette after
+                # setStyleSheet(""): polished again, the rail's QSS colour is back
+                style = lbl.style()
+                style.unpolish(lbl)
+                style.polish(lbl)
+                lbl.update()
+            self._rail_est_note = None
+            return
+        text, colour = status
+        self._rail_est_note = (self.RAIL_EST_TAG_OFF if colour == STATUS_BAD
+                               else self.RAIL_EST_TAG_WARN)
+        name = colour.name() if hasattr(colour, "name") else str(colour)
+        lbl.setStyleSheet(f"color: {name};")
+        lbl.setToolTip(text)
+
+    def _track_status_text(self, text: str) -> str:
+        """A status for the tracking card: on the rail with the tag of
+        this run's start-check message first (cut off last, if at all)."""
+        note = self._rail_est_note
+        return text if note is None else f"{note}  ·  {text}"
+
+    def _report_drill_est(self) -> tuple | None:
+        """Whether the drill estimator runs in this tracking run (read back
+        from the engine), in one line on the console and in the profile log
+        at every start (like _check_engine_gil), with the loaded
+        hydramarker_cpp (path, MD5). Returns the status-line message: red if
+        it was asked for (config.LIVE_DRILL_ESTIMATOR) but a start check turned it off,
+        yellow for a warning of the start checks, None otherwise."""
+        active = bool(getattr(self._tracker, "drill_estimator_active", False))
+        requested = self._tracker_drill_requested
+        if requested is None:
+            # a tracker not made by _make_tracker (tests): what it runs with
+            requested = active
+        report = self._drill_est_report if requested else None
+        self._drill_est_active = active
+        # the additions as the engine runs them (read back)
+        engine_cfg = getattr(getattr(self._tracker, "_engine", None), "config", None)
+        summary = drill_est_summary(bool(requested), active, report, engine_cfg)
+        # e.g. "Ausgabe-KF aus, weil Schaetzer aktiv" (HydraTracker): the
+        # output filter was asked for, the engine runs it off with the estimator
+        notes = [str(n) for n in (getattr(self._tracker, "drill_est_notes", None) or [])]
+        if notes:
+            summary += "; " + "; ".join(notes)
+        engine = _loaded_engine_info()
+        self._drill_est_run = {
+            "requested": bool(requested),
+            "active": active,
+            "requested_by": ("config.LIVE_DRILL_ESTIMATOR"
+                             if self._tracker_drill_requested is not None else "tracker"),
+            "summary": summary,
+            "start_checks": report,
+            "notes": notes,
+            "pose_kf_forced_off": bool(getattr(self._tracker, "pose_kf_forced_off", False)),
+            "config": _drill_est_config_of(self._tracker_config_used
+                                           or getattr(self._tracker, "config", None)),
+            "engine": engine,
+        }
+        line = (
+            f"[live] tracking start {time.strftime('%H:%M:%S')}: {summary}; "
+            f"hydramarker_cpp {engine.get('path') or 'not loaded'}"
+            + (f" (md5 {engine['md5']})" if engine.get("md5") else "")
+        )
+        print(line)
+        if self._profile is not None:
+            self._profile.emit(line)
+        if requested and not active:
+            fatal = (report or {}).get("fatal") or ["not active in the engine"]
+            return f"Drill estimator off: {fatal[0]}", STATUS_BAD
+        warnings = (report or {}).get("warnings") or []
+        if active and warnings:
+            more = f" (+{len(warnings) - 1} more)" if len(warnings) > 1 else ""
+            return f"Drill estimator on  ·  warning: {warnings[0]}{more}", STATUS_WARN
+        return None
+
+    def _tracking_run_meta(self, tool_points, tool_points_a) -> dict:
+        """What the tracking run that starts now runs with, for the meta of
+        its frame-log file (version 3): tracker configuration, drill
+        estimator (start checks, configuration), the loaded engine, the IR
+        and K files, the tool and the ToolPoints."""
+        config = self._tracker_config_used or getattr(self._tracker, "config", None)
+        ir_path = getattr(self.state, "ir_calibration_path", None)
+        ev = self.state.eval
+        k_file = None
+        if ev is not None:
+            k_file = (getattr(ev, "_meta", None) or {}).get("calibration_files", {}).get("K_rgb")
+        tool = self._tool
+
+        def lst(v):
+            return None if v is None else np.asarray(v, dtype=np.float64).reshape(-1).tolist()
+
+        return {
+            "tracker_config": (dataclasses.asdict(config)
+                               if dataclasses.is_dataclass(config) else None),
+            "drill_estimator": self._drill_est_run,
+            "engine": (self._drill_est_run or {}).get("engine"),
+            "ir_calibration": {"path": None if not ir_path else str(ir_path),
+                               "md5": _file_md5_or_none(ir_path)},
+            "K_rgb_file": k_file,
+            "K_rgb": lst(self.state.K_rgb),
+            "dist_rgb": lst(self.state.dist_rgb),
+            "tool": None if tool is None else {
+                "name": getattr(tool, "name", None),
+                "p_tip_mm": lst(getattr(tool, "p_tip_mm", None)),
+                "axis_dir": lst(getattr(tool, "axis_dir", None)),
+                "field_path": str(getattr(tool, "field_path", "")),
+                "marker_json_path": str(getattr(tool, "marker_json_path", "")),
+                "pivot_npz_path": str(getattr(tool, "pivot_npz_path", "")),
+            },
+            "tool_points": {
+                "estimator": bool(tool_points.estimator),
+                "los_offset_mm": float(tool_points.los_offset_mm),
+                "mark_below_visible_frac": float(tool_points.mark_below_visible_frac),
+                "max_carry_s": float(tool_points.max_carry_s),
+                "a_parallel": tool_points_a is not None,
+                "axis_back_mm": float(TrackingOverlay.AXIS_BACK_MM),
+            },
+        }
 
     def _check_engine_gil(self) -> None:
         """A build from before the tracking thread holds the GIL for the
@@ -3005,6 +3330,8 @@ class OverlayLivePage(QWidget):
                 worker.release(out.slot)
             if error is None and worker.failure is not None:
                 error = (worker.failure, worker.failure_traceback or "")
+        # the drill estimator's error counters of this run (None without it)
+        counters = None if worker is None else worker.drill_est_counters()
         if error is not None and reason != "error":
             self._report_track_error(*error)
             reason = "error"
@@ -3024,6 +3351,7 @@ class OverlayLivePage(QWidget):
             self._tool_overlay.clear()
         self._overlay_out = None
         self._panel_marks = None
+        self._est_settling = False
         if self._tracker is not None:
             if stopped:
                 try:
@@ -3039,10 +3367,28 @@ class OverlayLivePage(QWidget):
                 self._abandoned_reason = reason
                 reason += " — engine still busy"
         self.controls.btn_track.setText("Start tracking")
+        self._set_rail_est_note(None)
         self.controls.lbl_track_status.setText(reason)
+        if counters is not None:
+            self._report_drill_est_counters(counters)
         if self._frame_log is not None:
             # this run's results and the frames shown so far go to disk
             self._frame_log.flush(reason, tracking=True)
+
+    def _report_drill_est_counters(self, counters: dict) -> None:
+        """At the stop of a run with the drill estimator: its error counters
+        (TrackingWorker.drill_est_counters, all expected 0) in one line on
+        the console and in the profile log, and into the run's frame-log
+        record before the flush writes it."""
+        line = (
+            f"[live] tracking stop {time.strftime('%H:%M:%S')}: drill estimator counters "
+            + ", ".join(f"{k} {'n/a' if v is None else v}" for k, v in counters.items())
+        )
+        print(line)
+        if self._profile is not None:
+            self._profile.emit(line)
+        if self._frame_log is not None:
+            self._frame_log.set_run_counters(counters)
 
     def _on_track_result_ready(self) -> None:
         # a result between two ticks: drain and show it now, no poll
@@ -3125,10 +3471,15 @@ class OverlayLivePage(QWidget):
                 self._tool_overlay.update(out.points, marked=out.points_marked)
                 if prof and self._tool_overlay.has_xray_view:
                     prof.add("xview_up", self._tool_overlay.xray_update_s)
-            if self._panels_mode:
+            if self._panels_mode and out.points_kind not in _EST_WITHOUT_POINTS:
+                # a fresh frame the drill estimator does not show keeps the
+                # last marks for POSE_HOLD_S, like a frame without a pose
                 self._panel_marks = out.marks
         else:
             self._tool_overlay.clear()
+        # the status line says "settling" while the engine tracks but the
+        # drill estimator shows nothing (start-up gate, sigma rule)
+        self._est_settling = step.fresh and out.points_kind in _EST_WITHOUT_POINTS
         if log is not None:
             log.add_track(out, step, t_drain,
                           self._tool_overlay if step.fresh else None,
@@ -3149,7 +3500,7 @@ class OverlayLivePage(QWidget):
             self._release_out(old)
         self._release_out(out)
         if step.status is not None:
-            self.controls.lbl_track_status.setText(step.status)
+            self.controls.lbl_track_status.setText(self._track_status_text(step.status))
 
     def _on_track_error(self, error: BaseException, traceback_text: str) -> None:
         """The tracking thread ended with an exception: stop tracking only;
@@ -3210,7 +3561,7 @@ class OverlayLivePage(QWidget):
         if not ok:
             text = ("marker exposure busy — AE" if control.unavailable == "busy"
                     else "marker exposure unavailable — AE")
-            self.controls.lbl_track_status.setText(text)
+            self.controls.lbl_track_status.setText(self._track_status_text(text))
             print(f"[WARN] Marker exposure: {text} ({control.unavailable or 'start failed'})")
             if self._profile is not None:
                 self._profile.emit(f"[live] marker exposure unavailable {time.strftime('%H:%M:%S')}: "
@@ -3258,7 +3609,7 @@ class OverlayLivePage(QWidget):
             reason = control.failure
             print(f"[WARN] Marker exposure failed ({reason}): back to the camera's auto exposure")
             self._set_marker_exposure_check(False, "Marker exposure — failed, AE")
-            self.controls.lbl_track_status.setText("marker exposure failed — AE")
+            self.controls.lbl_track_status.setText(self._track_status_text("marker exposure failed — AE"))
             self._stop_exposure_control("failed: " + reason)
             return
         if prof:
@@ -3579,7 +3930,8 @@ class OverlayLivePage(QWidget):
 
         if drawn is not None:
             tool = drill.snapshot_record()
-            # fused / carry / rgb / gate: tracking_overlay.ToolPoints.kind
+            # fused / carry / rgb / gate, or est (the drill estimator's pose):
+            # tracking_overlay.ToolPoints.kind
             tool["points_kind"] = drawn.points_kind
             # drawn marked (tool["marked"]): visible_cell_fraction below the
             # threshold in force when the pose was drawn
@@ -3598,6 +3950,29 @@ class OverlayLivePage(QWidget):
                 "num_inliers": int(res.num_inliers),
                 "visible_cell_fraction": vis_frac if vis_frac == vis_frac else None,
             }
+            run = self._drill_est_run
+            if run is not None and run.get("active"):
+                # The drill estimator ran: "pose" above stays the engine pose,
+                # the drawn one is drill_est (points_kind "est"; a hidden
+                # frame is never drawn, so never in a snapshot).
+                est = None
+                if res is not None and drawn.points_kind == "est":
+                    T = getattr(res, "drill_est_T_marker_camera", None)
+                    sig = float(getattr(res, "drill_est_sigma_tip_mm", float("nan")))
+                    est = {
+                        "rvec": arr(getattr(res, "drill_est_rvec", None)),
+                        "tvec": arr(getattr(res, "drill_est_tvec", None)),
+                        "T": arr(T),
+                        "sigma_tip_mm": sig if sig == sig else None,
+                        "since": int(getattr(res, "drill_est_since", 0)),
+                        "chained": bool(getattr(res, "drill_est_chained", False)),
+                        "shown": bool(getattr(res, "drill_est_shown", False)),
+                    }
+                tool["drill_est"] = est
+                tool["drill_est_config"] = {
+                    "enabled": True,
+                    **(run.get("config") or {}),
+                }
             if self._tool is not None:
                 tool["assets"] = {
                     "name": self._tool.name,

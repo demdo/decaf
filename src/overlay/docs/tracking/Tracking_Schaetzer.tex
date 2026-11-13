@@ -1,0 +1,1070 @@
+\documentclass[11pt,a4paper,fleqn]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english,ngerman]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,calc,positioning,shapes.geometric,babel}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\pgfplotsset{compat=1.18}
+\usepackage{tcolorbox}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multicol}
+\usepackage{enumitem}
+\usepackage{etoolbox}
+\usepackage[font=small,labelfont=bf,hypcap=false]{caption}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{parskip}
+\usepackage[compact]{titlesec}
+\titlespacing*{\section}{0pt}{2.2ex plus .6ex minus .4ex}{1ex plus .2ex}
+\titlespacing*{\subsection}{0pt}{1.6ex plus .5ex minus .3ex}{0.6ex plus .2ex}
+\usepackage{fancyhdr}
+\setlength{\headheight}{14pt}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small DeCAF --- Bohrer-Tracking: heutiger Ausgabepfad und neuer Schätzer}
+\rhead{\small Stand 13.11.2026}
+\cfoot{\thepage}
+\setlist[itemize]{leftmargin=*, itemsep=1pt, topsep=2pt}
+\setlist[enumerate]{leftmargin=*, itemsep=1pt, topsep=2pt}
+\emergencystretch=2em
+% Literaturverzeichnis kompakt und zweispaltig (Ueberschrift ausserhalb der Spalten)
+\patchcmd{\thebibliography}{\section*{\refname}}{}{}{}
+\apptocmd{\thebibliography}{\setlength{\itemsep}{0.5pt}\setlength{\parsep}{0pt}}{}{}
+
+% Formelbox wie in der Arbeit (Header.tex, mybox)
+\newtcolorbox{mybox}[1]{colback=red!5!white,colframe=red!75!black,fonttitle=\bfseries,title={#1}}
+
+% Farben: Kandidaten in Abb. 2; Beschriftungen schwarz
+\definecolor{ColA}{RGB}{224,0,0}          % A heute (rot)
+\colorlet{ColB}{blue!65!black}            % B Halten
+\definecolor{ColN}{RGB}{31,163,31}        % neuer Schaetzer (gruen wie die gezeichnete Spitze)
+\colorlet{CarryC}{orange!85!black}        % Bilder der Art carry
+\colorlet{OffC}{black!45}                 % abgeschaltete Stufe
+
+% Notation wie in der Arbeit (Methods 3.3.7, 3.4)
+\newcommand{\Tcm}{\mathbf{T}_{\mathrm{cm}}}
+\newcommand{\Ptd}{\mathbf{P}^{\mathrm{tip}}_{\mathrm{d}}}
+\newcommand{\Ptc}{\mathbf{P}^{\mathrm{tip}}_{\mathrm{c}}}
+\newcommand{\Pir}{\mathbf{P}^{\mathrm{ir}}_{\mathrm{c},j}}
+\newcommand{\Sir}{\mathbf{S}^{\mathrm{ir}}_{j}}
+\newcommand{\stip}{\sigma_{\mathrm{tip}}}
+\newcommand{\spx}{\sigma_{\mathrm{px,eff}}}
+\newcommand{\xb}{\bar{\mathbf{x}}_k}
+\newcommand{\xh}{\hat{\mathbf{x}}}
+\newcommand{\Sb}{\bar{\boldsymbol{\Sigma}}_k}
+\newcommand{\Lb}{\bar{\boldsymbol{\Lambda}}_k}
+\newcommand{\Exp}{\operatorname{Exp}}
+\newcommand{\Log}{\operatorname{Log}}
+\newcommand{\cross}[1]{[\,#1\,]_{\times}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE Bohrer-Tracking: Problem und neuer Schätzer}\\[2mm]
+  {\large Warum die gezeichnete Spitze heute springt und wie ein iterierter Kalman-Filter\\[0.5mm]
+  mit allen Messungen jedes Bildes das behebt}\\[2mm]
+  {\small DeCAF --- Masterarbeit \quad$\cdot$\quad Stand 13.11.2026}
+\end{center}
+
+\begin{mybox}{Kurzfassung}
+Heute wird die Pose des Bohrers in jedem Bild für sich bestimmt. Je nachdem, ob vier harte Ja/Nein-Prüfungen
+bestanden sind, wird entweder die mit den IR-Punkten fusionierte Pose gezeichnet oder die reine Farbpose, meist
+plus dem eingefrorenen Versatz des letzten fusionierten Bildes (\emph{carry}). Beide Posen haben verschiedene
+systematische Fehler, und auf Posenebene mittelt nichts über die Zeit (nur die Eckpositionen glättet ein
+schwacher Kalman-Filter je Ecke); deshalb springt die Spitze auch bei stillstehendem Bohrer: Im Labortest am
+11.11.\ sprang sie 83-mal um mehr als 5\,mm. Der neue Schätzer ist ein iterierter Kalman-Filter auf der
+Markerpose: Er verwendet in jedem Bild alle Farbecken und alle IR-Punktpaare mit ihrer Unsicherheit, wertet
+auffällige Messungen nur ab, statt ganze Bilder zu verwerfen (nur bei einem Engine-Fit über 6\,mm bleibt die IR
+eines Bildes außen vor), und mittelt über die Zeit, solange sich das Etikett im Bild nicht bewegt. Auf
+ungesehenen Testdaten mit eingespanntem Bohrer sinkt die Streuung der Spitze von 0,657 auf 0,215\,mm und das
+Maximum von 6,07 auf 1,07\,mm (ohne das Verbergen der ersten Bilder nach dem Einrasten 2,07\,mm). In
+Bewegung läuft er auf TEST je Take bis 12,6\,ms nach, mit einer Ausnahme (K04, 166,6\,ms: Das Etikett bewegt sich im
+Bild kaum, während die Tiefe der Farbpose springt). Er ist in die Engine eingebaut und live voreingestellt an.
+Ihre Posenbestimmung bleibt unverändert; sie gibt zusätzlich die Ergebnisse des Schätzers aus und schaltet bei aktivem Schätzer
+den Ausgabe-KF ab (live ohnehin aus). Der C++-Prototyp braucht 7--19\,µs je Bild (Warmwert aus einer heißen
+Messschleife). Offen
+bleiben der Bias der Spitze von etwa 1,5--2\,mm, den ein Filter ohne zusätzliche Information nicht entfernt,
+eine Spitzen-Unsicherheit, die die Ausläufer unterschätzt, und neue Aufnahmen mit dem Etikett am Bildrand wie im
+Labortest, mit Licht und mit bewegter Referenz.
+\end{mybox}
+
+%==========================================================================================
+\section{Das heutige Tracking}
+\label{sec:heute}
+
+Die Live-Seite verarbeitet in jedem Takt das neueste Kamerabild der RealSense D435i: ein Farbbild
+(1920\,$\times$\,1080, 30\,fps, Rolling Shutter) und, wenn ein Werkzeug geladen ist, ein IR-Stereopaar
+(1280\,$\times$\,720, Global Shutter). Abbildung~\ref{fig:heute} zeigt den Ablauf.
+
+\begin{enumerate}
+  \item \textbf{Farbpose.} Die C++-Engine verfolgt die Schachbrettecken des Zylinderetiketts, glättet jede Ecke
+        mit einem Kalman-Filter im Bild (konstante Beschleunigung), ordnet die Ecken den Modellecken zu und löst
+        die Pose $\Tcm$ (Marker\,$\to$\,Farbkamera) per PnP, gestartet an der Pose des Vorbilds. Reprojektions-,
+        Bewegungs- (40\,mm, 45°) und Erscheinungsprüfungen verwerfen unplausible Posen.
+  \item \textbf{IR-Messung und MAP-Fusion.} Dieselben Ecken werden in beiden IR-Bildern neu gemessen und
+        trianguliert, mit einer Kovarianz, die entlang des IR-Sehstrahls gestreckt ist. Eine MAP-Lösung
+        (Maximum a posteriori: die Pose, die alle Messterme zusammen am besten erklärt) aus der
+        Farb-Reprojektion und den IR-3D-Punkten derselben Ecken, die ein gültiges IR-Paar haben, liefert die
+        \emph{fusionierte} Pose (Gl.~(3.27) der Arbeit; Huber-Kern 1,5; MAD-Trimmen, d.\,h.\ Paare mit einem
+        IR-Rest weit über dem Median fallen vorab heraus; IR-Gewicht $w = 4$, das die Kovarianz der IR-Terme
+        durch 4 teilt; höchstens 8 Gauß-Newton-Schritte ab der Farbpose).
+  \item \textbf{Fusions-Gates.} Vier Ja/Nein-Prüfungen entscheiden für das ganze Bild, ob die fusionierte
+        Pose ausgegeben wird: mindestens 6 IR-Paare (G5), Fit-RMS höchstens 2,5\,mm (G7), Sprung des
+        Markerursprungs gegenüber der Farbpose höchstens 6\,mm (G8), Anstieg des Reprojektionsfehlers höchstens
+        2\,px, mit der Bildbewegung aufgeweitet und bei 10\,px gedeckelt (G9).
+  \item \textbf{Ausgabe.} Der Ausgabe-Kalman-Filter der Engine ist auf der Live-Seite abgeschaltet
+        (\code{pose\_kf\_enabled} = \code{False}). In Python wählt \code{ToolPoints} die gezeichnete Spitze
+        (im Folgenden \emph{A}) nach Tabelle~\ref{tab:arten}.
+\end{enumerate}
+
+Wichtig für alles Weitere: Die Fusion wirkt \emph{nur auf die Ausgabe}. Startwert, Bewegungs-Gate und
+Startwert der nächsten MAP-Fusion kommen immer aus der Farbpose; die bessere Tiefe eines fusionierten Bildes
+hilft dem nächsten Bild nicht.
+
+\noindent\begin{minipage}{\linewidth}\centering\small
+\captionof{table}{Arten der gezeichneten Spitze in \code{ToolPoints}. Der Versatz ist ein starrer 3D-Vektor je
+Punkt (Spitze und Achspunkt) im Kamerarahmen.}
+\label{tab:arten}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  Art & Bedingung & gezeichnet & Zustand \\
+  \midrule
+  \emph{fused} & Fusion angenommen & fusionierte Pose & Versatz fused$\,-\,$Farbe merken \\
+  \emph{gate}  & Fusion von G9 verworfen & Farbpose & Versatz löschen \\
+  \emph{carry} & sonst, Versatz höchstens 1\,s alt & Farbpose + Versatz & --- \\
+  \emph{rgb}   & sonst & Farbpose & --- \\
+  \bottomrule
+\end{tabular}
+\end{minipage}
+
+\medskip
+Gezeichnet wird nur eine \emph{frische} Pose, also eine in diesem Takt neu berechnete (in der Panel-Ansicht
+hält die Röntgenansicht die letzten Marken höchstens 0,25\,s): Spitze und Achspunkt grün ins Kamerabild und
+magenta in die Röntgenansicht; unter einem Sichtanteil des Etiketts von 0,75 im Kamerabild orange statt grün und
+in der Röntgenansicht gedämpft. Das ist das einzige Unsicherheitssignal der Anzeige; die Art der Pose steht nur
+im Statustext.
+
+\begin{figure}[!htb]
+\begin{minipage}[c]{0.62\textwidth}\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  node distance=3mm,
+  box/.style={draw, rounded corners=1.5pt, align=left, text width=52mm, inner sep=2.5pt, fill=white},
+  off/.style={box, draw=OffC, text=OffC, dashed},
+  dec/.style={draw, diamond, aspect=3.2, align=center, inner sep=0.3pt},
+  arr/.style={-{Stealth[length=1.8mm]}, semithick},
+  fb/.style={-{Stealth[length=1.8mm]}, dashed, black!60},
+  lab/.style={font=\scriptsize, fill=white, inner sep=1pt, align=left}
+]
+\node[box] (K1) {\textbf{Bild}: Farbbild (Rolling Shutter) und IR-Paar (Global Shutter), das neueste};
+\node[box, below=of K1] (K2) {\textbf{Farbpose}: Ecken verfolgen, je Ecke filtern und zuordnen, PnP ab der Vorbildpose, Plausibilitätsprüfungen};
+\node[dec, below=of K2] (R1) {IR-Paar da?};
+\node[box, below=of R1] (K3) {\textbf{IR-Fusion}: Ecken in beiden IR-Bildern messen, triangulieren; MAP aus Farb- und IR-Termen ab der Farbpose};
+\node[dec, below=of K3] (R2) {Gates G5--G9 ok?};
+\node[off, below=4mm of R2] (K5) {\textbf{Ausgabe-KF}: live abgeschaltet};
+\node[box, below=of K5] (K6) {\textbf{ToolPoints und Anzeige}: Art \emph{fused}, \emph{carry}, \emph{gate} oder \emph{rgb} wählen, Spitze und Achse zeichnen};
+\coordinate (xL) at ([xshift=-4mm]K3.west);
+\coordinate (xR) at ([xshift=4mm]K3.east);
+
+\draw[arr] (K1) -- (K2);
+\draw[arr] (K2) -- (R1);
+\draw[arr] (R1) -- node[lab, right=0.5mm] {ja} (K3);
+\draw[arr] (K3) -- (R2);
+\draw[arr] (R2) -- node[lab, right=0.5mm] {ja: fusionierte Pose} (K5);
+\draw[arr] (K5) -- (K6);
+% Nein-Zweige: R1 links, R2 rechts, ausserhalb der Kaesten
+\draw[arr] (R1.west) -- node[lab, above, pos=0.5] {nein} (R1.west -| xL) -- (K5.west -| xL)
+      node[lab, pos=0.5, left] {Farbpose} -- (K5.west);
+\draw[arr] (R2.east) -- node[lab, above, pos=0.5] {nein} (R2.east -| xR) -- (K5.east -| xR)
+      node[lab, pos=0.5, right] {Farbpose\\(G9: \emph{gate})} -- (K5.east);
+% Rueckkopplungen links
+\draw[fb] ([yshift=-1.2mm]K2.west) -- ++(-4mm,0) |- ([xshift=4mm,yshift=1.5mm]K2.north west) -- ([xshift=4mm]K2.north west);
+\node[lab, anchor=east, text width=20mm, align=right] at ([xshift=-5mm]K2.west) {Startwert und Gate-Referenz für Bild $k{+}1$};
+\draw[fb] ([yshift=-1.2mm]K6.west) -- ++(-4mm,0) |- ([xshift=4mm,yshift=1.5mm]K6.north west) -- ([xshift=4mm]K6.north west);
+\node[lab, anchor=east, text width=20mm, align=right] at ([xshift=-5mm]K6.west) {Versatz des letzten fused-Bildes ($\le$\,1\,s)};
+\end{tikzpicture}
+\end{minipage}\hfill
+\begin{minipage}[c]{0.35\textwidth}
+\captionof{figure}{Heutige Verarbeitung pro Bild, vereinfacht. Ob die fusionierte Pose oder die Farbpose
+ausgegeben wird, entscheiden zwei Verzweigungen; die Gates prüfen Paarzahl, Fit der IR-Punkte, Sprung gegenüber
+der Farbpose und Anstieg des Reprojektionsfehlers. Der Ausgabe-KF (grau gestrichelt) ist live aus. Gestrichelte
+Pfeile: das einzige Gedächtnis auf Posenebene, nämlich die Farbpose als Startwert des nächsten Bildes und der
+Versatz, den \code{ToolPoints} für \emph{carry} aufbewahrt; auf Eckenebene erinnern sich Eckenverfolgung und
+Kalman-Filter je Ecke.}
+\label{fig:heute}
+\end{minipage}
+\end{figure}
+
+%==========================================================================================
+\section{Wo das Problem liegt}
+\label{sec:problem}
+
+\textbf{Datengrundlage.} (i) Offline-Replays von 50 Takes mit Rohbildern; in 35 davon steckt die Spitze in einem
+Sitz des Kalibrierbretts, dessen über das Brett gemessene Lage als Referenz dient. Klassen: \emph{eingespannt}
+(Bohrer festgeklemmt), \emph{Verdeckung}, \emph{still} (ohne Referenz, Streuung um den Median),
+\emph{hand\_seat} (handgeführt, Spitze im Sitz), \emph{Pivot} (Kippen um die Spitze im Sitz) und freie
+\emph{Bewegung} (ohne Referenz, nur für den Nachlauf). Die Takes sind in TUNE (26, zum Abstimmen) und TEST (24,
+erst nach dem Einfrieren aller Einstellungen einmal ausgewertet) geteilt. Die eingespannten Takes stammen aus zwei
+Aufnahmen vom 06.10.: TUNE enthält die erste (D01--D05, H03), TEST eine spätere Wiederholungsaufnahme mit
+denselben Take-Namen (D01--D05, H01--H03). Gleichnamige Takes sind also verschiedene Aufnahmen; ein TEST-Take
+heißt im Folgenden etwa \glqq D05~der~Wiederholung\grqq. (ii) Das Live-Log des Labortests am
+11.11.\ ohne Rohbilder. \emph{Präzision} heißt hier RMS der Abweichung der Spitze vom Mittel ihres Takes, also
+ohne den konstanten Bias; ein \emph{Sprung} ist der Abstand der gezeichneten Spitze zwischen zwei
+aufeinanderfolgenden gezeichneten Bildern (in den Replays gerechnet auf der Abweichung von der lokalen
+Sitzreferenz).
+
+Im Labortest wirkte das Folgende zusammen (Abschnitte~\ref{sec:zwei} und~\ref{sec:gate}): Die Farbpose des Etiketts am Bildrand lag
+weit daneben, die Fusion hätte sie um mehrere Millimeter korrigieren müssen und wurde deshalb meist vom
+Sprung-Gate G8 verworfen; \code{ToolPoints} zeichnete dann \emph{carry} mit dem alten Versatz, und beim Wechsel
+zurück auf \emph{fused} sprang die Spitze.
+
+\subsection{Jedes Bild steht für sich}
+
+Die Vorbildpose dient nur als Startwert und als Referenz der Gates; die MAP-Fusion hat keinen Term für frühere
+Bilder, und der Ausgabe-KF ist aus. Das Rauschen jedes Bildes geht deshalb fast ungefiltert auf die Spitze; nur
+ein Kalman-Filter je Ecke im Bild (konstante Beschleunigung) glättet die Eckpositionen leicht, ohne Ruhe
+gesondert zu behandeln. Der Hebel von 179,36\,mm zwischen Markerursprung und Spitze vergrößert jeden Kippfehler
+\cite[S.~535, 543]{west2004designing}. Dass so geschätzte Posen zittern, auch bei robustem Einzelbild-Fit, ist in
+der Tracking-Literatur bekannt \cite[S.~60--61, 72]{lepetit2005monocular}, \cite[Abschn.~III.A]{vacchetti2004stable}.
+Gemessen: Mit eingespanntem Bohrer streut die heute gezeichnete Spitze auf TEST mit einer Präzision von
+0,657\,mm, das p99 der Sprünge liegt bei 3,48\,mm. Ruhe, am Patienten mit dem Bohrer am Eintrittspunkt ein
+häufiger Fall, wird auf Posenebene nicht ausgenutzt.
+
+\subsection{Zwei Schätzer mit verschiedenen systematischen Fehlern, harte Schalter dazwischen}
+\label{sec:zwei}
+
+Die Farbpose hat die schwach bestimmte Tiefen- und Kippmode des Zylinders, die fusionierte Pose dank der
+IR-Punkte in viel geringerem Maß. Welche der beiden gezeichnet wird, entscheiden je Bild die Gates, die Arten von
+\code{ToolPoints}, die 1-s-Grenze von \emph{carry} und frisch/nicht frisch; jeder Wechsel kann die Spitze um den
+Unterschied der beiden systematischen Fehler springen lassen. \emph{carry} mildert das nur, denn der Versatz wird
+weder mit der Bewegung gedreht noch fortgeschrieben und endet abrupt nach 1\,s. Im Labortest am 11.11.\ stand
+der Bohrer still (Bildbewegung der Ecken im Median 0,41\,px/Bild); von 2063 frischen Bildern waren 286
+(13,9\,\%) \emph{carry}, meist einzeln zwischen \emph{fused}-Bildern. Die gezeichnete Spitze sprang 83-mal um
+mehr als 5\,mm, davon 75-mal beim Wechsel der Art, höchstens um 12,84\,mm; die \emph{carry}-Spitze lag im Median
+3,67\,mm und im p99 11,73\,mm neben dem Median der \emph{fused}-Spitzen, fast nur entlang der Kamera-Sichtlinie.
+Abbildung~\ref{fig:zeitreihe}a zeigt dasselbe Muster in einem Replay mit eingespanntem Bohrer: Die Ausschläge von
+A fallen auf die \emph{carry}-Bilder. Kleine, flach wirkende Ziele haben oft zwei fast gleich gute
+Posenlösungen, und die Pose springt dann auch bei ruhender Szene \cite[S.~2024, 2029]{schweighofer2006robust},
+\cite[S.~5772, 5775]{jin2017sensor}. Ob das Etikett am Bildrand eine solche Zweideutigkeit hat, wurde nicht
+geprüft; die Quellen sind nur eine Analogie. Liu et al.\ betonen, dass ein solcher Fehler kein Rauschen ist und
+sich nicht beheben lässt, indem man fertige Posen durch einen Kalman-Filter schickt
+\cite[Abschn.~I]{liu2021navigation}. Helfen kann ein \emph{Prior}, also die aus den früheren Bildern
+vorhergesagte Pose mit ihrer Unsicherheit, wenn er schon auf Merkmalsebene mitentscheidet: Liu et al.\ bewerten
+beide Kandidaten mit Reprojektionsfehler plus Abstand zur Kalman-Vorhersage und wählen den günstigeren
+\cite[Abschn.~III-D]{liu2021navigation}.
+
+\subsection{Das Sprung-Gate verwirft die Fusion, wenn sie am nötigsten ist}
+\label{sec:gate}
+
+Das Gate G8 vergleicht die Translation der MAP-Lösung mit der Farbpose. Es misst damit den Fehler der Farbpose,
+nicht die Qualität der IR-Messung: Liegt die Farbpose weit daneben, muss die Fusion weit korrigieren und wird
+gerade deshalb verworfen. Im Labortest kamen die Ablehnungen überwiegend von diesem Gate: Auf allen 286
+\emph{carry}-Bildern lagen 32 bis 50 IR-Paare vor, und G9 schlug nie an; der Fit-RMS lag im Median bei
+0,81\,mm und nur auf 61 Bildern (21,3\,\%) über 2,5\,mm. Auf den übrigen 225 Bildern (78,7\,\%) bleibt von den
+vier Gates also nur G8 als Grund. Der Markerursprung der Farbpose lag im Median 6,8\,mm vom Median der
+fusionierten Lösung entfernt. Das Etikett lag links oben, etwa 600\,px von der Bildmitte, weich und mit
+Farbsäumen; der Reprojektionsfehler der Farbpose lag im Median bei 0,93\,px gegenüber 0,35 bis 0,48\,px in
+früheren Live-Läufen. Bei einer Ablehnung geht zudem die gesamte IR-Information des Bildes verloren, und weil das
+Fit-Gate seinen RMS über alle Paare rechnet, auch die getrimmten, können wenige schlechte Paare ein Bild mit vielen
+guten kippen. Reale Messungen lassen sich selten sauber in Inlier und Ausreißer trennen
+\cite[S.~308]{triggs2000bundle}; kontinuierliche robuste Gewichtung ist die übliche Alternative zu binären
+Schwellen \cite[Abschn.~II]{kerl2013robust}, \cite[§9.3--9.4]{zhang1997parameter}.
+
+\subsection{Einrasten und Anzeige}
+
+Die größte Abweichung der heutigen Spitze liegt eingespannt auf TUNE (6,76\,mm) wie auf TEST (6,07\,mm)
+jeweils auf dem ersten Bild eines Takes, also direkt nach dem Einrasten (dem ersten Finden des Etiketts nach
+Start oder Verlust), vor der ersten Fusion und ohne Versatz (Art \emph{rgb}). Die
+Kovarianz der MAP-Lösung wird zwar berechnet, geht aber nur an den abgeschalteten Ausgabe-KF; eine Größe in mm
+für die Unsicherheit der Spitze gibt es live nicht. Die Spitze erscheint damit so, als wäre sie exakt; genau das
+kritisieren Simpson et al.\ an Navigationsanzeigen \cite{simpson2014computation}.
+
+\subsection{Warum Halten und der frühere Ausgabe-KF das nicht lösen}
+
+\textbf{Halten} (Variante B) zeichnet auf \emph{carry}-Bildern mit einer Bildbewegung unter 1\,px/Bild die letzte
+\emph{fused}-Spitze. Im Labortest senkt das das p99 der Abweichung vom Median der \emph{fused}-Spitzen von 8,09
+auf 0,69\,mm und die Sprünge über 5\,mm von 83 auf 0. Halten hilft aber nicht beim ersten Bild nach dem
+Einrasten (Maximum TEST 6,07 vorher, 6,11\,mm nachher), nicht bei Verdeckung (Präzision TUNE 1,344 vorher,
+1,336\,mm nachher), nur teilweise bei Sprüngen zwischen zwei \emph{fused}-Bildern (H02 der Wiederholung: Präzision 1,086
+vorher, 0,882\,mm nachher; Sprünge über 1\,mm 40 vorher, 30 nachher) und nicht in Bewegung. \textbf{Der Ausgabe-KF der Engine} ist seit Oktober aus: Er zog die Pose damals in Bewegung vom Bild weg (353 von 6406 photometrisch geprüften
+Bildern sichtbar daneben, ohne Filter 8), und auch nach der Reparatur brachte er live getaktet keinen belastbaren
+Gewinn gegenüber \emph{carry} (lateraler RMS gegen das Brett 1,063 gegen 1,074\,mm). Beide bearbeiten fertige
+Posen nach, sind also lose gekoppelt \cite[S.~493]{tobergte2009robust}. Die Güte der einzelnen Ecken und
+IR-Paare erreicht sie damit nicht mehr; der Ausgabe-KF sah auf fusionierten Bildern nur eine
+$6\times6$-Kovarianz der fertigen Pose.
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}
+\pgfplotsset{
+  zr/.style={
+    scale only axis, width=\linewidth-15mm, height=3.0cm,
+    /pgf/number format/use comma,
+    xlabel={Zeit im Take [s]}, ylabel={Abstand zur Referenz [mm]},
+    tick label style={font=\footnotesize}, label style={font=\footnotesize},
+    yticklabel style={text width=1.1em, align=right},
+    xlabel style={yshift=1mm},
+    unbounded coords=jump, enlarge x limits=0.01, clip mode=individual,
+    axis line style={black!70}, tick style={black!70},
+    ymajorgrids, grid style={black!12},
+  },
+  /pgfplots/table/col sep=comma,
+  /pgfplots/table/empty cells with={nan},
+}
+\begin{axis}[zr, name=pa, xmin=0, xmax=6.1, ymin=0, ymax=7, ytick={0,2,4,6},
+  legend style={font=\scriptsize, at={(0.5,1.03)}, anchor=south, legend columns=-1, draw=none,
+                /tikz/every even column/.append style={column sep=3mm}}]
+  \addplot[ColA, line width=0.55pt] table[x=t_s, y=err_A] {daten/zeitreihe_D05.csv};
+  \addlegendentry{A heute}
+  \addplot[ColB, densely dashed, line width=0.75pt] table[x=t_s, y=err_B] {daten/zeitreihe_D05.csv};
+  \addlegendentry{B Halten}
+  \addplot[ColN, line width=1.1pt] table[x=t_s, y=err_neu] {daten/zeitreihe_D05.csv};
+  \addlegendentry{neuer Schätzer}
+  \addlegendimage{only marks, mark=*, mark size=1.3pt, draw=CarryC, fill=CarryC}
+  \addlegendentry{A auf \emph{carry}-Bildern}
+  \addlegendimage{only marks, mark=square*, mark size=1.2pt, draw=black, fill=black}
+  \addlegendentry{A auf \emph{rgb}-Bildern}
+  \addplot[forget plot, only marks, scatter, scatter src=explicit symbolic,
+    scatter/classes={fused={mark=none}, gate={mark=none},
+                     carry={mark=*, mark size=1.3pt, draw=CarryC, fill=CarryC},
+                     rgb={mark=square*, mark size=1.2pt, draw=black, fill=black}}]
+    table[x=t_s, y=err_A, meta=kind_A] {daten/zeitreihe_D05.csv};
+  \node[anchor=north west, fill=white, inner sep=1.5pt, font=\small\bfseries] at (rel axis cs:0.006,0.985) {a};
+\end{axis}
+\begin{axis}[zr, at={(pa.south west)}, anchor=north west, yshift=-12mm,
+  xmin=1, xmax=10.1, ymin=0, ymax=13, ytick={0,4,8,12}]
+  \addplot[ColA, line width=0.55pt] table[x=t_s, y=err_A] {daten/zeitreihe_BN1.csv};
+  \addplot[ColB, densely dashed, line width=0.75pt] table[x=t_s, y=err_B] {daten/zeitreihe_BN1.csv};
+  \addplot[ColN, line width=1.1pt] table[x=t_s, y=err_neu] {daten/zeitreihe_BN1.csv};
+  \addplot[only marks, scatter, scatter src=explicit symbolic,
+    scatter/classes={fused={mark=none}, gate={mark=none},
+                     carry={mark=*, mark size=1.3pt, draw=CarryC, fill=CarryC},
+                     rgb={mark=square*, mark size=1.2pt, draw=black, fill=black}}]
+    table[x=t_s, y=err_A, meta=kind_A] {daten/zeitreihe_BN1.csv};
+  \node[anchor=north west, fill=white, inner sep=1.5pt, font=\small\bfseries] at (rel axis cs:0.006,0.985) {b};
+\end{axis}
+\end{tikzpicture}
+\caption{Abstand der gezeichneten Spitze von der Sitzreferenz über einem ganzen Take, samt konstantem Bias, für
+die heutige Spitze (A), das Halten der letzten fusionierten Spitze (B) und den neuen Schätzer aus
+Abschnitt~\ref{sec:neu} (Lücken: nach dem Einrasten verborgene Bilder). (a)~Bohrer eingespannt, Testdaten (TEST,
+D05 der Wiederholung):
+Die Ausschläge von A fallen auf die \emph{carry}-Bilder, Halten entfernt sie, der neue Schätzer streut
+zusätzlich weniger. (b)~Handgeführt mit der Spitze im Sitz, Abstimmdaten (TUNE), Etikett am oberen Bildrand: Der
+neue Schätzer entfernt die großen Sprünge, liegt am Anfang des Takes (bis etwa 4\,s) aber weiter von der
+Referenz als A.}
+\label{fig:zeitreihe}
+\end{figure}
+
+%==========================================================================================
+\section{Der neue Ansatz}
+\label{sec:neu}
+
+\subsection{Die Grundidee in Worten}
+
+Ein einziger probabilistischer Schätzer ersetzt \emph{carry}, Halten und den Ausgabe-KF; die Gates der Engine
+entscheiden nicht mehr über die Ausgabe, sondern nur noch über seinen Startwert. Er trägt die
+Markerpose mit ihrer Unsicherheit von Bild zu Bild, verwendet in jedem Bild \emph{alle} Farbecken und \emph{alle}
+IR-Punktpaare mit ihrer eigenen Unsicherheit und mittelt über die Zeit, solange sich das Etikett im Bild nicht
+bewegt; bewegt es sich, öffnet er die Vorhersage und folgt den Messungen. Weil er Rohmessungen statt fertiger
+Posen verwendet (enge Kopplung \cite[S.~493]{tobergte2009robust}), gibt es keinen harten Wechsel zwischen zwei
+Schätzern mehr: Wenige gute IR-Paare ziehen die Pose genau so weit, wie sie es rechtfertigen, und ein Bild ohne IR
+wird vom Prior getragen statt von einem eingefrorenen Versatz. Konfiguration und Posenbestimmung der Engine bleiben
+unverändert; der Schätzer kommt als neue letzte Stufe hinzu, nimmt die Engine-Pose als Startwert und braucht einige
+zusätzliche Exporte (Abb.~\ref{fig:filter}, Abschnitt~\ref{sec:cpp}). Folgenlos ist der Startwert nicht: Bei drei
+Gauß-Newton-Schritten beeinflusst er das Ergebnis messbar (in einer früheren Fassung stieg mit Start an der
+reinen Farbpose das p99 eingespannt von 0,43 auf 0,51\,mm); die Gates der Engine wirken so schwach weiter. Dahinter steht die Annahme, dass sehr schnelle freie Bewegungen am Patienten unwahrscheinlich
+sind; deshalb genügt ein Bewegungsmodell ohne Geschwindigkeit mit kleinem Grundrauschen. Diese Annahme ist nicht
+durch Literatur belegt; prüfen ließe sie sich mit der Bewegungsverteilung aus den Live-Logs. Als stärkster
+Vergleich dient später die \emph{GTSAM-Basis}, ein früher entwickelter Fixed-Lag-Smoother (GTSAM ist eine
+Bibliothek für Faktorgraphen) mit denselben Messtermen und Skalen, aber eigenem Bewegungsmodell
+(Abschnitt~\ref{sec:smoother}).
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  st/.style={draw, rounded corners=1.5pt, align=left, text width=33mm, minimum height=23mm, inner sep=2.5pt, fill=white},
+  inp/.style={draw, rounded corners=1.5pt, align=left, inner sep=2.5pt, fill=black!4},
+  arr/.style={-{Stealth[length=1.8mm]}, semithick},
+  fb/.style={-{Stealth[length=1.8mm]}, dashed, black!60},
+  lab/.style={font=\scriptsize, fill=white, inner sep=1pt}
+]
+\node[st] (V) at (0,0) {\textbf{1 Vorhersage}\\[1pt] $\xb = \xh_{k-1}$\\ $\Sb = \boldsymbol{\Sigma}_{k-1} + \mathbf{Q}_k$;\\ $\mathbf{Q}_k$ klein in Ruhe, groß bei Bildbewegung $\nu_k$ aus den Eckenspuren};
+\node[st, right=5mm of V] (U) {\textbf{2 Update}\\[1pt] robuste MAP: Prior + alle Farbecken + alle IR-Paare, Huber; 3 Gauß-Newton-Schritte ab der Engine-Pose};
+\node[st, right=5mm of U] (P) {\textbf{3 Posterior}\\[1pt] $\xh_k$, $\boldsymbol{\Sigma}_k$;\\ Spitze $\Ptc$ und ihre Unsicherheit $\stip$};
+\node[st, right=5mm of P] (A) {\textbf{4 Anzeige}\\[1pt] zeichnen, sobald $\stip \le 2$\,mm, spätestens 5 Bilder nach dem Kettenstart};
+\node[inp, above=9mm of $(V.north)!0.5!(P.north)$, text width=128mm] (E)
+  {\textbf{Engine, Bild $k$ (Konfiguration unverändert):} Engine-Pose (fusioniert oder Farbe), Farbecken
+   $\mathbf{u}_i$ (je Ecke gefiltert) mit $\spx$, IR-Paare $\Pir$ mit Kovarianz $\mathbf{S}_j$, Bildzeit $t_k$};
+\draw[arr] (V) -- (U);
+\draw[arr] (U) -- (P);
+\draw[arr] (P) -- (A);
+\draw[arr] (E.south -| V) -- node[lab, right=0.5mm] {Eckenspuren, $\Delta t_k$} (V.north);
+\draw[arr] (E.south -| U) -- node[lab, right=0.5mm] {Messungen, Startwert} (U.north);
+\draw[fb] (P.south) -- ++(0,-4mm) -| (V.south);
+\node[lab, anchor=north] at ($(V.south)!0.5!(P.south)+(0,-4mm)$) {$(\xh_k, \boldsymbol{\Sigma}_k)$ wird Prior für Bild $k+1$};
+\end{tikzpicture}
+\caption{Ein Schritt des neuen Schätzers hinter der Engine. Nach einem Reset oder einer Lücke beginnt eine neue
+Kette (ein zusammenhängender Filterlauf) ohne Prior; das erste Update ist dann die robuste Einzelbild-Lösung aus
+allen Messungen.}
+\label{fig:filter}
+\end{figure}
+
+\subsection{Zustand und Bewegungsmodell}
+
+Der Zustand in Bild $k$ ist allein die Pose $\mathbf{x}_k = \Tcm = (\mathbf{R}_k, \mathbf{t}_k)$, ohne
+Geschwindigkeit. Kleine Änderungen greifen rechts, also im Markerrahmen, an, Drehung zuerst:
+\begin{equation}
+  \mathbf{x} \boxplus \boldsymbol{\xi} = \bigl(\mathbf{R}\,\Exp(\boldsymbol{\omega}),\;
+     \mathbf{t} + \mathbf{R}\,\boldsymbol{\tau}\bigr),
+  \qquad
+  \mathbf{x}_b \boxminus \mathbf{x}_a = \begin{bmatrix} \Log(\mathbf{R}_a^{\top}\mathbf{R}_b) \\
+     \mathbf{R}_a^{\top}(\mathbf{t}_b - \mathbf{t}_a) \end{bmatrix},
+  \qquad \boldsymbol{\xi} = [\boldsymbol{\omega}; \boldsymbol{\tau}] .
+  \label{eq:boxplus}
+\end{equation}
+Das ist genau die Verknüpfung auf $\mathrm{T}(3)\times\mathrm{SO}(3)$ aus \cite[Bsp.~7]{sola2018micro}; die
+$6\times6$-Kovarianz $\boldsymbol{\Sigma}_k$ lebt im Tangentialraum am Schätzwert \cite[Gl.~51--52]{sola2018micro}.
+Als Bewegungsmodell dient ein Gaußscher Random Walk: Die Pose bleibt im Mittel gleich, ihre Unsicherheit wächst je
+Bild um das Prozessrauschen \cite[Bsp.~4.1, 4.2]{saerkkae2013bayesian},
+\begin{align}
+  &\xb = \xh_{k-1}, \qquad \Sb = \boldsymbol{\Sigma}_{k-1} + \mathbf{Q}_k, \qquad
+  \mathbf{Q}_k = \operatorname{diag}\bigl(\sigma_{r,k}^2\,\mathbf{I}_3,\; \sigma_{t,k}^2\,\mathbf{I}_3\bigr),
+  \label{eq:predict}\\
+  &\sigma_{t,k} = \sqrt{\sigma_t^2\,\frac{\Delta t_k}{T_0} + \Bigl(g_t\,\nu_k\,\frac{Z_k}{f_x}\Bigr)^{2}},
+  \qquad
+  \sigma_{r,k} = \sqrt{\sigma_r^2\,\frac{\Delta t_k}{T_0} + \bigl(g_r\,\nu_k\bigr)^{2}},
+  \label{eq:Q}
+\end{align}
+mit dem Grundrauschen $\sigma_t = 0{,}02$\,mm und $\sigma_r = 0{,}008^{\circ}$ je $T_0 = 1/30$\,s;
+$\sigma_{r,k}$ geht in $\mathbf{Q}_k$ in rad ein. Der zweite Anteil öffnet die Vorhersage mit der kohärenten
+Bildbewegung der Etikettecken, $\nu_k = \max(0,\, \nu_1 - 1{,}0,\, \nu_3 - 0{,}3)$ in px/Bild; $\nu_b$ ist der
+RMS eines affinen Verschiebungsfelds, angepasst an die Eckenspuren über $b = 1$ bzw.\ $b = 3$ Bilder und durch $b$
+geteilt. Gezählt wird vor allem gemeinsame Bewegung; unabhängiges Eckenrauschen bleibt größtenteils im
+Restfehler der Anpassung. $Z_k$ ist die Tiefe der Engine-Pose, $f_x$ die Brennweite der Farbkamera
+(1356,59\,px), $g_t = 2$, $g_r = 0{,}5^{\circ}$ je px/Bild; sind weniger als vier Ecken zuzuordnen, gilt
+$\nu_1 = 40$\,px/Bild, und der Prior ist praktisch offen. Bei $Z = 410$\,mm kommt in Ruhe je Bild
+Prozessrauschen mit der Standardabweichung 0,02\,mm und 0,008° hinzu (die Varianzen addieren sich), bei
+$\nu_k = 4$\,px/Bild (etwa $\nu_1 = 5$\,px/Bild) 2,42\,mm und 2°. Das Prinzip, in Ruhe stark zu glätten und bei
+Bewegung zu öffnen, kennt man vom 1\,€-Filter \cite{casiez2012oneeuro} und aus der Instrumentenverfolgung: Cai et
+al.\ filtern Markermitte und Instrumentenspitze und schalten hart vom statischen auf ein dynamisches Filtermodell
+um, sobald sich diese Punkte über drei Bilder um mehr als 10\,mm bewegen \cite[S.~279--280]{cai2024distributed}.
+Die konkrete Öffnung ist eine eigene, auf TUNE abgestimmte Heuristik.
+
+\subsection{Messmodell: alle Farbecken und alle IR-Paare}
+
+Jede Ecke $i$ der Farbpose (Modellecke $\mathbf{P}_i$, gemessene entzerrte normierte Bildkoordinate
+$\mathbf{u}_i$) und jedes IR-Paar $j$ (triangulierter Punkt $\Pir$) liefert ein Residuum,
+\begin{equation}
+  \mathbf{r}^{\mathrm{c}}_i(\mathbf{x}) = f_x\bigl(\pi(\mathbf{R}\mathbf{P}_i + \mathbf{t}) - \mathbf{u}_i\bigr),
+  \quad \sigma_{\mathrm{c},k} = s_{\mathrm{c}}\,\spx;
+  \qquad
+  \mathbf{r}^{\mathrm{ir}}_j(\mathbf{x}) = \mathbf{R}\mathbf{P}_j + \mathbf{t} - \Pir,
+  \quad \Sir = \frac{s_{\mathrm{ir}}^2}{w}\,\mathbf{S}_j .
+  \label{eq:meas}
+\end{equation}
+Die $\mathbf{u}_i$ sind die Ecken, die die Engine ausgibt, also schon vom Kalman-Filter je Ecke geglättet. $\spx$
+ist die Eckenunsicherheit, die die Engine je Bild ansetzt (0,10\,px in Ruhe, größer bei Bildbewegung),
+$\mathbf{S}_j$ die Stereo-Kovarianz der Engine ($\boldsymbol{\Sigma}_i$ in Gl.~(3.27) der Arbeit), quer zum
+IR-Sehstrahl eng und entlang weit wie der Triangulationsfehler \cite[§II]{matthies1987error}. Anders als in
+Gl.~(3.27) der Arbeit ist $\sigma_{\mathrm{c},k}$ hier die skalierte Unsicherheit, $\rho$ wirkt auf den Betrag des
+normierten Rests statt auf sein Quadrat, und die Reste sind vorhergesagt minus gemessen; der Markerrahmen ist der
+Werkzeugrahmen d ($\mathbf{T}_{\mathrm{cd}} = \Tcm$, Abschnitt~3.3.8 der Arbeit). Gewichtete
+Fehlerquadrate mit inversen Kovarianzen sind die negative Log-Likelihood bei Gaußschem Rauschen, robust bewertet
+wird je Ecke und je Punktpaar als Einheit \cite[§3.2--3.3]{triggs2000bundle}. Ein Vorbild für Farb- und
+Stereomessungen in \emph{einer} kovarianzgewichteten Huber-Kostenfunktion ist die Posenschätzung von ORB-SLAM2
+\cite[Abschn.~III-C]{murartal2017orbslam2}; eine chirurgische Arbeit mit Farbecken und IR-Stereo in einer
+Kostenfunktion wurde nicht gefunden.
+
+\textbf{Skalen aus den echten Resten.} Für dieses Modell sind die Engine-Unsicherheiten zu klein: Auf sechs
+TUNE-Takes mit ruhender Spitze (die eingespannten D01, D02, D04, D05, H03 der ersten Aufnahme und der
+handgeführte BN3 im Sitz; 1112
+Bilder mit Fusion) liegt der Median des normierten Farbrests bei 8,909 und der des IR-Rests bei 17,044, bei
+passender Unsicherheit wären es etwa 1,18 bzw.\ 1,54. Weil schon der Median weit über der Huber-Schwelle
+$c = 1{,}5$ (Abschnitt~\ref{sec:update}) liegt, fiele die Mehrheit der Messungen in den linearen Bereich des
+Huber-Kerns: Der Kern dämpfte die meisten Messungen statt nur die Ausreißer, und weder das Verhältnis von Prior zu
+Messungen noch die Posterior-Kovarianz wären interpretierbar. Geteilt durch den Median der $\chi_2$- bzw.\
+$\chi_3$-Verteilung (1,1774 bzw.\ 1,5382) ergeben die Mediane $s_{\mathrm{c}} = 7{,}57$ und
+$s_{\mathrm{ir}} = 11{,}08$. Das ist die Übertragung der robusten Median-Skala \cite[Gl.~(28)]{zhang1997parameter}
+auf 2D- und 3D-Reste; eine Referenz braucht man dafür nicht. \textbf{Zwei Zusätze:} Liegt der Fit-RMS der
+Engine-Fusion über 6\,mm, wird die Standardabweichung der IR-Paare des Bildes mit 1000 multipliziert (Kovarianz
+$\times\,10^6$), IR ist dann praktisch aus. Ab 3\,px/Bild
+medianer Bildbewegung werden Farbecken und IR-Punkte auf die Belichtungszeit der medianen Eckenzeile geschoben,
+weil beim Rolling Shutter jede Zeile zu einer anderen Zeit belichtet wird \cite[§2]{meingast2005geometric}.
+
+\subsection{Robustes iteriertes Update}
+\label{sec:update}
+
+Das Update sucht je Bild die Pose, die Prior und Messungen zusammen am besten erklärt (MAP).
+
+\begin{mybox}{MAP-Update des neuen Schätzers}
+\begin{equation}
+  \begin{aligned}
+  &\xh_k = \arg\min_{\mathbf{x}}\;
+  \tfrac12\,\bigl\lVert \mathbf{x} \boxminus \xb \bigr\rVert^2_{\Lb}
+  + \sum_i \rho\bigl(e_i(\mathbf{x})\bigr)
+  + \sum_j \rho\bigl(e_j(\mathbf{x})\bigr),\\
+  &e_i = \frac{\lVert \mathbf{r}^{\mathrm{c}}_i \rVert}{\sigma_{\mathrm{c},k}}, \qquad
+  e_j = \sqrt{\mathbf{r}^{\mathrm{ir}\top}_j \bigl(\Sir\bigr)^{-1} \mathbf{r}^{\mathrm{ir}}_j}\,,
+  \end{aligned}
+  \label{eq:map}
+\end{equation}
+mit $\lVert\mathbf{v}\rVert^2_{\boldsymbol{\Lambda}} = \mathbf{v}^{\top}\boldsymbol{\Lambda}\,\mathbf{v}$,
+$\Lb = \Sb^{-1}$, dem Huber-Kern $\rho(e) = \tfrac12 e^2$ für $e \le c$ und $c\,e - \tfrac12 c^2$ darüber,
+$c = 1{,}5$, und dem Gewicht $\kappa(e) = \min(1, c/e)$. Gelöst wird mit drei Gauß-Newton-Schritten ab der
+Engine-Pose, in jedem Schritt mit neu berechneten Gewichten, Jacobi-Matrizen und Resten:
+\begin{equation}
+  \mathbf{H} = \Lb + \sum_i \frac{\kappa(e_i)}{\sigma_{\mathrm{c},k}^2}\,\mathbf{J}^{\mathrm{c}\top}_i\mathbf{J}^{\mathrm{c}}_i
+     + \sum_j \kappa(e_j)\,\mathbf{J}^{\mathrm{ir}\top}_j \bigl(\Sir\bigr)^{-1}\mathbf{J}^{\mathrm{ir}}_j ,
+  \qquad
+  \boldsymbol{\xi} = -\mathbf{H}^{-1}\mathbf{g}, \qquad \mathbf{x} \leftarrow \mathbf{x} \boxplus \boldsymbol{\xi},
+  \label{eq:gn}
+\end{equation}
+$\mathbf{g}$ entsprechend mit den Resten, $\mathbf{J}^{\mathrm{ir}}_j = [\,-\mathbf{R}\cross{\mathbf{P}_j} \mid
+\mathbf{R}\,]$ und $\mathbf{J}^{\mathrm{c}}_i$ dazu die Ableitung der Projektion. Die neue Kovarianz ist
+\begin{equation}
+  \boldsymbol{\Sigma}_k = \bigl(\Lb + \mathbf{H}_{\mathrm{m}}(\xh_k)\bigr)^{-1},
+  \qquad \mathbf{H}_{\mathrm{m}} = \text{Messanteil von } \mathbf{H}\text{, ausgewertet am Ergebnis.}
+  \label{eq:post}
+\end{equation}
+\end{mybox}
+
+Das ist ein iterierter erweiterter Kalman-Filter (IEKF): Ohne Huber-Kern ist das iterierte Kalman-Update ein
+Gauß-Newton-Verfahren auf der quadratischen Kostenfunktion aus Prior und Messungen
+\cite[S.~30]{lepetit2005monocular}, \cite{bell1993iterated}, sein Ergebnis eine lokale MAP-Schätzung des
+Korrekturschritts \cite[§4.2.5--4.2.6]{barfoot2017state}; mit Huber-Gewichten wird daraus ein iterativ neu
+gewichtetes Kleinste-Quadrate-Verfahren (IRLS) \cite[§9.4]{zhang1997parameter}, \cite[§5.3.2]{barfoot2017state}.
+Der Prior in den Normalgleichungen verhindert Sprünge, seine Kovarianz bestimmt, wie stark er gegen die Bildreste
+wiegt \cite[Abschn.~IV-B]{kerl2013robust}. Drummond und Cipolla rechnen nur eine robuste Iteration je Bild und
+lassen die Konvergenz über die Bildfolge laufen \cite[S.~937]{drummond2002realtime}; gemessen ändern 10 statt 3
+Schritte die Klassenwerte kaum (eingespannt TUNE 0,186 gegen 0,188\,mm), einzelne Bilder aber um bis zu 9,2\,mm.
+Für C++ gelten die validierten 3 Schritte. Eigene Entscheidungen sind der Start an der Engine-Pose statt am Prior-Mittel und die
+Näherung der Jacobi-Matrix des Prior-Terms durch die Einheitsmatrix.
+
+\subsection{Unsicherheit der Spitze, Einrasten und Neustart}
+
+Die Spitze ist ein Punkt, kein Frame. Ihre Unsicherheit folgt aus der Posenkovarianz durch Fortpflanzung erster
+Ordnung \cite[Gl.~55]{sola2018micro},
+\begin{equation}
+  \Ptc = \hat{\mathbf{R}}_k\,\Ptd + \hat{\mathbf{t}}_k, \qquad
+  \mathbf{J}_{\mathrm{tip}} = \bigl[\,-\hat{\mathbf{R}}_k\cross{\Ptd} \mid \hat{\mathbf{R}}_k\,\bigr], \qquad
+  \stip = \sqrt{\operatorname{tr}\bigl(\mathbf{J}_{\mathrm{tip}}\,\boldsymbol{\Sigma}_k\,\mathbf{J}_{\mathrm{tip}}^{\top}\bigr)} ;
+  \label{eq:tip}
+\end{equation}
+$\stip$ ist ein 3D-RMS-Wert. Nach dem Einrasten bleibt die Spitze verborgen, bis $\stip \le 2$\,mm ist, höchstens
+5 Bilder lang (etwa 167\,ms). Eine bis zur Spitze fortgepflanzte und angezeigte Unsicherheit beeinträchtigte die
+Leistung von Chirurgen nicht \cite{simpson2014computation}; in einer AR-geführten Bohraufgabe (24 Laien, dann
+4 Chirurgen) verbesserte eine Anzeige der Tracking-Unsicherheit die Bohrgenauigkeit um 24\,\%, verlängerte aber
+die Aufgabenzeit um 76\,\% \cite{acherki2026visualization}. Eine validierte Schwelle zum Ausblenden fand sich
+nicht.
+
+Eine neue Kette (ein zusammenhängender Filterlauf seit dem letzten Neustart) beginnt nach einem Reset oder einer
+Lücke von mindestens 0,5\,s und nur mit mindestens 12 Farbecken. Am Kettenanfang gibt es keinen Prior
+($\Lb = \mathbf{0}$), das Update ist dann die robuste Einzelbild-Lösung aus allen Messungen; scheitert die
+Inversion in Gl.~\eqref{eq:post}, startet die Kette neu. Ein Wächter über die normierte Innovation (den Abstand
+der Messungen zur Vorhersage in Einheiten ihrer Unsicherheit) ist aus, weil er auf TUNE falsche Neustarts
+auslöste. Tabelle~\ref{tab:param}
+fasst die Einstellung zusammen, samt drei empfohlenen, nur auf TUNE und synthetisch geprüften Zusätzen.
+
+\begin{table}[!htb]
+\centering\footnotesize
+\caption{Einstellung des neuen Schätzers, eingefroren vor dem Testlauf. Die Engine läuft mit ihrer heutigen
+Live-Konfiguration (IR an, Ausgabe-KF aus).}
+\label{tab:param}
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}Xl>{\raggedright\arraybackslash}X@{}}
+  \toprule
+  \multicolumn{2}{@{}l}{Bewegung und Löser} & \multicolumn{2}{l@{}}{Messung, Kette und Anzeige} \\
+  \midrule
+  Modell & Random Walk auf $\Tcm$
+    & Farbecken $s_{\mathrm{c}}$ & 7,57 (mal $\spx$) \\
+  Grundrauschen $\sigma_t$, $\sigma_r$ & 0,02\,mm, 0,008° je 1/30\,s
+    & IR-Paare $s_{\mathrm{ir}}$, $w$ & 11,08; 4 \\
+  Totzonen für $\nu_1$, $\nu_3$ & 1,0\,px/Bild, 0,3\,px/Bild
+    & Huber-Schwelle $c$ & 1,5 (beide Messarten) \\
+  Verstärkungen $g_t$, $g_r$ & 2 (mal $Z/f_x$), 0,5° je px/Bild
+    & IR eines Bildes aus & Engine-Fit-RMS über 6\,mm \\
+  $\nu_1$ ohne 4 zugeordnete Ecken & 40\,px/Bild
+    & Rolling Shutter & ab 3\,px/Bild \\
+  Start, Schritte & Engine-Pose, 3 Schritte
+    & neue Kette & Reset, Lücke $\ge$~0,5\,s; $\ge$~12~Ecken \\
+  Innovations-Wächter & aus
+    & Startgate & bis $\stip \le 2$\,mm, $\le$~5~Bilder \\
+  \midrule
+  \multicolumn{4}{@{}l@{}}{empfohlen, nicht auf TEST geprüft: Lücke 0,2\,s; Neustart bei $\sigma_{t,k} > 20$\,mm; verbergen bei $\stip > 5$\,mm} \\
+  \bottomrule
+\end{tabularx}
+\end{table}
+
+%==========================================================================================
+\section{Warum das die Probleme löst}
+\label{sec:warum}
+
+Tabelle~\ref{tab:warum} ordnet den Problemen aus Abschnitt~\ref{sec:problem} und zwei weiteren Fällen
+(Verdeckung; Nachlauf als Preis des Glättens) den Mechanismus, die Messung und die Literatur zu; die Zahlen gelten,
+wo nicht anders vermerkt, für TEST. Die \glqq dem Labortest ähnlichen Bilder\grqq{} sind Replay-Bilder mit
+verworfener Fusion oder \emph{carry} trotz mindestens 6 IR-Paaren, deren Farbpose mehr als 4\,mm von der
+Einzelbild-Lösung aller Messungen abwich; Referenz ist dort diese Einzelbild-Lösung, keine Ground Truth. Auswahl
+und Referenz begünstigen den neuen Schätzer: Die Referenz stammt aus seinem eigenen Messmodell, und A liegt auf
+diesen Bildern schon durch die Auswahl weit daneben. Die Zeile zeigt also vor allem, dass er auf solchen Bildern
+bei der IR-gestützten Einzelbild-Lösung bleibt, statt wie A der Farbpose zu folgen. An der Brett-Referenz (94
+dieser Bilder, Abstand samt Bias) ist der Gewinn kleiner: Median 3,06\,$\to$\,2,34\,mm, p90
+6,59\,$\to$\,3,87\,mm. Die Bilder stammen zudem überwiegend aus handgeführten und bewegten Takes, 53 davon aus
+Take BN1, anders als im ruhenden Labortest. Ein chirurgisches Vorbild für Bildmessungen direkt im rekursiven
+Filter: Bei Gsaxner et al.\ war ein SCAAT-EKF statisch in der Translation deutlich genauer als die
+Einzelbild-Stereopose, in der Rotation nicht (1,70 gegen 8,07\,mm, 1,11 gegen 0,90°
+\cite[Tab.~1]{gsaxner2021insideout}); gemessen ist dort der Fehler gegen ein Referenz-Tracking, nicht die
+Streuung, und die Stereokameras waren nicht synchron.
+
+\begin{table}[!htb]
+\centering\small
+\caption{Problem, Mechanismus im neuen Schätzer, Messbeleg und Literatur. Präzision: RMS der Abweichung vom
+Take-Mittel; Pfeile: heute $\to$ neu; Nachlauf ohne die vom neuen Schätzer verborgenen Bilder.}
+\label{tab:warum}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{30mm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{58mm}>{\raggedright\arraybackslash}p{15mm}@{}}
+  \toprule
+  Problem heute & Mechanismus im neuen Schätzer & Messbeleg & Literatur \\
+  \midrule
+  Jedes Bild für sich, Ruhe ungenutzt
+    & Random-Walk-Prior mit kleinem Grundrauschen mittelt in Ruhe über viele Bilder
+    & eingespannt 0,657\,$\to$\,0,215\,mm; still (TUNE) 0,485\,$\to$\,0,156\,mm
+    & \cite{saerkkae2013bayesian, lepetit2005monocular} \\
+  Wechsel zwischen fusionierter Pose und Farbpose
+    & ein Schätzer, eine Ausgabe; jede Messung wirkt nach ihrer Unsicherheit
+    & D05 der Wiederholung: Sprünge über 1\,mm 29\,$\to$\,0; Take BN1 (TUNE): Sprung-p99 8,01\,$\to$\,1,81\,mm
+    & \cite{tobergte2009robust, murartal2017orbslam2} \\
+  Sprung-Gate verwirft gute IR-Daten
+    & IR-Paare gehen immer ein (außer Fit über 6\,mm), Huber wertet einzelne ab
+    & dem Labortest ähnliche Bilder (TUNE, 121), p90 gegen die Einzelbild-Lösung 8,68\,$\to$\,1,79\,mm, gegen das
+      Brett (94 Bilder) 6,59\,$\to$\,3,87\,mm
+    & \cite{triggs2000bundle, kerl2013robust, zhang1997parameter} \\
+  Erstes Bild nach dem Einrasten
+    & erstes Update aus allen Messungen; Startgate: verborgen, bis $\stip \le 2$\,mm
+    & eingespannt Maximum 6,07\,$\to$\,1,07\,mm, ohne das Verbergen 2,07\,mm
+    & eigene Regel \\
+  Verdeckung, wenige Ecken
+    & der Prior trägt, die verbliebenen Ecken korrigieren
+    & Verdeckung (TUNE) 1,344\,$\to$\,0,390\,mm
+    & \cite{welch1996scaatdiss} \\
+  Keine Unsicherheit für die Anzeige
+    & Posterior-Kovarianz, daraus $\stip$
+    & ordnet die Fehler (Korrelation 0,43), unterschätzt aber die Ausläufer
+    & \cite{sola2018micro, simpson2014computation} \\
+  Preis des Glättens: Nachlauf
+    & Vorhersage öffnet sich mit der kohärenten Bildbewegung
+    & Bewegung, gemeinsame Referenz: TEST A +1,4, neu +16,4, GTSAM-Basis +15,2\,ms; TUNE +1,5, +1,5, +29,4\,ms;
+      neu je Take gegen die eigene Einzelbild-Referenz 1,0--12,6\,ms, außer K04 (Farbtiefe springt bei ruhendem
+      Bild)
+    & \cite{casiez2012oneeuro, cai2024distributed} \\
+  \bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Filter oder Fixed-Lag-Smoother?}
+\label{sec:smoother}
+
+Die GTSAM-Basis (intern \emph{c\_a2}) war ein Fixed-Lag-Smoother mit GTSAM, der die Posen eines kurzen
+Zeitfensters gemeinsam optimiert und dabei vergangene Posen neu linearisiert. Für die \emph{neueste} Pose, die
+allein angezeigt wird, bringt das wenig. Im linear-Gaußschen Fall und bei gleichen Modellen ist sie exakt die des
+Filters, sofern der Smoother die Zustände vor dem Fenster marginalisiert und nicht verwirft: Eliminiert man die
+älteren Posen nacheinander, entsteht über das Schur-Komplement genau die Vorhersage
+$\Sb = \boldsymbol{\Sigma}_{k-1} + \mathbf{Q}_k$; Filtern ist die Vorwärtsreduktion des Glättungsproblems
+\cite[§8.2]{triggs2000bundle}, und Glätter und Filter stimmen im letzten Zeitschritt überein
+\cite[Thm.~8.2]{saerkkae2013bayesian}. Im nichtlinearen Fall legt der Filter ältere Posen auf ihre damalige
+Linearisierung fest, während der Glätter sie im Fenster neu linearisieren kann
+\cite[§8.2, S.~334--335]{triggs2000bundle}, vgl.\ \cite[Abschn.~VII]{kaess2012concurrent}; dabei bestimmt er
+auch ihre Huber-Gewichte neu. Dazu kommen kleine Näherungen des Filters (Einheits-Jacobi-Matrix des Prior-Terms). Gemessen wurde das auf 26 TUNE-Takes
+(5529 Bilder, Fenster 0,5\,s) mit einem GTSAM-Smoother, der genau das Mess- und Bewegungsmodell einer früheren
+Filterfassung verwendet (Grundrauschen 0,05\,mm / 0,02°, ohne Rolling-Shutter-Korrektur, IR-Abschaltung und
+12-Ecken-Regel; Bewegungsfaktor in GTSAM auf $\mathrm{SE}(3)$ statt $\mathrm{T}(3)\times\mathrm{SO}(3)$): Die
+Spitzen von Smoother und Filter liegen im Median 0,0044\,mm und im p99 0,225\,mm auseinander, nur in schneller
+Bewegung bis 24,52\,mm (Take M03, mit grob falschen IR-Paaren, die der empfohlene Schätzer abschaltet). Ein
+zweiter Vergleich mit einer anderen Zwischenstufe des Modells ergab p50 0,0075\,mm und p99 4,9\,mm, die großen
+Werte ebenfalls in schneller Bewegung. Der Smoother brauchte in Python mit eigenen Faktoren 41,4\,ms je Bild
+(Median; mit nativen GTSAM-Faktoren in einem Ersatzgraphen gleicher Struktur 1,7--6,3\,ms), der Filter in
+derselben Auswertung 2,93\,ms. Gewinnen könnte ein Smoother nur mit verzögerter Anzeige; Fixed-Lag-Glättung ist
+Filtern mit einer tolerierten festen Verzögerung \cite[S.~160]{saerkkae2013bayesian}. Eine Modellrechnung
+(skalarer Random Walk an der Spitze, Prozessrauschen 0,032\,mm je Bild aus 0,02\,mm und 0,008° bei 179\,mm
+Hebel, Messrauschen 0,23--1,0\,mm je Bild; nicht gemessen) ergibt in Ruhe mit 2 Bildern (67\,ms) Verzögerung 3
+bis 11\,\% weniger Streuung, mit 20 Bildern (0,67\,s) 20 bis 27\,\%, mit beliebig langem Fenster höchstens
+29\,\% -- für die Live-Anzeige am Patienten kein lohnender Tausch.
+
+Die GTSAM-Basis selbst unterscheidet sich vom neuen Schätzer nicht nur als Smoother, sondern auch im
+Bewegungsmodell und in den Regeln: Grundrauschen 0,05\,mm / 0,02°, Öffnung über den Median der Eckenbewegung mit
+Verstärkung 1 bzw.\ 0,25° je px/Bild ohne die Totzone über 3 Bilder, kein Startgate, keine
+Rolling-Shutter-Korrektur und keine IR-Abschaltung. Die Unterschiede in
+Tabelle~\ref{tab:ergebnis} gehen daher auf das Modell zurück; dass ein Fenster für die neueste Pose nichts bringt,
+zeigt der Vergleich mit gleichem Modell oben. In eingespannter Ruhe liegen beide gleichauf (Bootstrap über Takes:
+Wahrscheinlichkeit, dass der neue besser ist, 0,33 auf TUNE, 0,55 auf TEST; verbirgt die GTSAM-Basis ebenfalls das
+erste Bild jeder Kette, erreicht sie auf TEST 0,214 / 0,48 / 0,83\,mm für Präzision / p99 / Maximum); bei still und hand\_seat ist der neue
+Schätzer robust besser (je 1,00). Er läuft auf TUNE deutlich weniger nach (+1,5 gegen +29,4\,ms), auf TEST etwa
+gleich (+16,4 gegen +15,2\,ms, bestimmt von K04). Barfoot erwartet von Fenster-Verfahren bei sehr nichtlinearen
+Systemen deutliche Vorteile gegenüber dem IEKF \cite[§4.3.4]{barfoot2017state}; für die neueste Pose tritt das
+hier nicht ein, vermutlich weil jedes Bild sehr viele Messungen liefert. Auch in Triggs' Versuchen mit einem
+Fenster-Filter hatte die Fenstergröße bei starken Daten wenig Einfluss \cite[Abb.~7]{triggs2000bundle}.
+
+%==========================================================================================
+\section{Ergebnisse in Zahlen}
+\label{sec:ergebnis}
+
+Alle Entscheidungen fielen auf TUNE; TEST lief einmal nach dem Einfrieren. Nur die Wahl, die Engine unverändert
+zu lassen, fiel danach, weil eine ebenfalls vor TEST eingefrorene Engine-Variante mit engeren Schwellen in Take M04
+einen Ausreißer von 79\,mm zeichnete; diese Wahl ist aber schon mit TUNE allein begründbar, weil die
+Engine-Variante dort nur in zwei Takes (O02, W01) gewann. Der empfohlene Schätzer war vor TEST mit eingefroren;
+seine TEST-Zahlen sind daher Hold-out-Zahlen bis auf diese Wahl zwischen zwei Varianten, die auf TEST gleichauf
+liegen (eingespannt 0,216 gegen 0,215\,mm). Tabelle~\ref{tab:ergebnis} vergleicht ihn mit A, B, dem billigen
+Gegenkandidaten \glqq Halten + bewegungsabhängige Glättung\grqq{} (ebenfalls vor TEST eingefroren) und der
+GTSAM-Basis.
+
+\begin{table}[!htb]
+\centering\small
+\caption{Kennzahlen der Spitze in mm, Nachlauf in ms. Präzision: RMS der Abweichung vom Take-Mittel; Sprung:
+Abstand zwischen aufeinanderfolgenden gezeichneten Bildern, gerechnet auf der Abweichung von der lokalen
+Sitzreferenz; Nachlauf: Zeitversatz eines Punkts 50\,mm hinter der Spitze gegen eine gemeinsame
+Einzelbild-Referenz, nur auf bewegten und gezeichneten Bildern, positiv = läuft nach. Der neue Schätzer zeigt nach
+dem Einrasten erst ab $\stip \le 2$\,mm (eingespannt verborgen: TEST 5 von 1389, TUNE 4 von 942 Bildern),
+Halten + Glättung verbirgt die ersten 2 Bilder jeder Kette, A, B und GTSAM-Basis zeigen alle Bilder. Auf gleichen
+Bildern (eingespannt TEST) liegen GTSAM-Basis und neuer Schätzer bei 0,216 / 0,48 / 0,83 / 0,26 gegen
+0,215 / 0,53 / 1,07 / 0,42\,mm (Präzision / p99 / Maximum / Sprung p99). Fett: bester Wert der Zeile, beim
+Nachlauf ohne Wertung.}
+\label{tab:ergebnis}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{@{}llrrrrr@{}}
+  \toprule
+  Klasse (Split) & Größe & A heute & B Halten & Halten + Glättung & GTSAM-Basis & neu \\
+  \midrule
+  eingespannt (TEST) & Präzision     & 0,657 & 0,478 & 0,277 & 0,241 & \textbf{0,215} \\
+                     & p99           & 2,96  & 1,44  & 0,84  & \textbf{0,49}  & 0,53 \\
+                     & Maximum       & 6,07  & 6,11  & 1,78  & 3,07  & \textbf{1,07} \\
+                     & Sprung p99    & 3,48  & 1,59  & 0,52  & \textbf{0,29}  & 0,42 \\
+                     & Bias          & \textbf{1,80} & 1,82 & 1,83 & 1,96 & 1,96 \\
+  hand\_seat (TEST)  & Präzision     & 0,652 & 0,636 & 0,590 & 0,523 & \textbf{0,482} \\
+  Pivot (TEST)       & Präzision     & 1,454 & 1,454 & 1,436 & 0,819 & \textbf{0,769} \\
+  Verdeckung (TUNE)  & Präzision     & 1,344 & 1,336 & 1,015 & 0,514 & \textbf{0,390} \\
+                     & Maximum       & 5,81  & 5,81  & 4,29  & 2,34  & \textbf{1,19} \\
+  still (TUNE)       & Präzision     & 0,485 & 0,485 & 0,285 & 0,262 & \textbf{0,156} \\
+  Bewegung (TEST)    & Nachlauf      & +1,4  & +1,4  & +8,9  & +15,2 & +16,4 \\
+  Bewegung (TUNE)    & Nachlauf      & +1,5  & +1,5  & +4,5  & +29,4 & +1,5 \\
+  \bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Lesart.} In allen Zeilen der Tabelle hat der neue Schätzer die beste Präzision; auf TUNE liegen bei
+hand\_seat Halten + Glättung (1,620 gegen 1,649\,mm) und bei Pivot die GTSAM-Basis (1,641 gegen 1,667\,mm) knapp
+vorn. Je Take ist er besser als A eingespannt in 14 von 14, still in 5 von 5 und hand\_seat in 14 von 16 Takes;
+gegen B ist das eingespannt und still robust, bei hand\_seat nur auf TEST. Den Bias ändert kein Kandidat;
+GTSAM-Basis und neuer Schätzer haben auf TEST sogar 0,16\,mm mehr Bias als A, vermutlich weil Qualitätsgewichte
+und MAD-Trimmen der Engine in ihren Messdaten fehlen. Beim Nachlauf ist A am schnellsten, weil es nicht glättet.
+Den TEST-Wert des neuen Schätzers bestimmt Take K04, ein reiner Farb-Take wie alle K-Takes, in dem sich das
+Etikett im Bild kaum bewegt, während die Tiefe der Farbpose springt: Je Take läuft er gegen seine eigene
+Einzelbild-Referenz 1,0 bis 12,6\,ms nach (auch in den drei anderen Takes ohne IR), nur in K04 166,6\,ms; die
+GTSAM-Basis gegen die gemeinsame Referenz bis 90,7\,ms (TEST) bzw.\ 200,0\,ms (TUNE). Gerechnet ist ohne die vom
+Schätzer verborgenen Bilder; zählt man sie mit, ginge dort die Referenz selbst ein und senkte den Wert.
+\textbf{Zeitreihen:} Im eingespannten Take D05 der Wiederholung (TEST, Abb.~\ref{fig:zeitreihe}a) sind 27 der 173 Bilder
+\emph{carry}; A springt 29-mal um mehr als 1\,mm, B einmal, der neue Schätzer nie (Präzision 0,867, 0,312 bzw.\
+0,153\,mm). Im handgeführten TUNE-Take BN1 mit dem Etikett am oberen Bildrand (Abb.~\ref{fig:zeitreihe}b), dem
+Analogon zum Labortest, sinken der größte Abstand zur Referenz von 11,93 auf 5,26\,mm und das p99 der Sprünge von
+8,01 auf 1,81\,mm; die großen Sprünge verschwinden (über 5\,mm: 16\,$\to$\,0; über 1\,mm: 142\,$\to$\,20). Die
+Präzision bleibt aber bei 2,97\,mm, und der Median des Abstands zur Referenz steigt von 2,42 auf 3,06\,mm. Das
+kommt aus dem Anfang des Takes: Bis 4,2\,s, solange A durchweg fusioniert ist (93 Bilder), liegt der neue Schätzer
+im Median 1,3\,mm weiter von der Referenz als A (4,10 gegen 2,82\,mm), danach liegen beide etwa gleichauf (2,23
+gegen 2,15\,mm); die Ursache ist offen.
+
+%==========================================================================================
+\section{Grenzen und offene Punkte}
+\label{sec:grenzen}
+
+\begin{itemize}
+  \item \textbf{Nur Farbe.} Ohne IR ist die Tiefe die schwächste Richtung. Im TEST-Take K04 bewegte sich das
+        Etikett im Bild nur 0,1--0,4\,px/Bild, während die Tiefe der Farbpose 1--7\,mm je Bild sprang; der Schätzer
+        lief 166,6\,ms nach, Einzelbilder wichen bis 11,59\,mm von der eigenen Einzelbild-Lösung ab (keine Ground
+        Truth; deren Tiefe springt selbst), bei $\stip$ von 0,55\,mm. In den drei anderen Farb-Takes auf TEST lief
+        er höchstens 12,6\,ms nach. Für die Nutzerstudie muss IR an sein.
+  \item \textbf{Langsame Rampen.} Synthetisch läuft der Rückpunkt bei 2\,mm/s Vorschub 61\,ms nach
+        (RMS-Abweichung 0,15\,mm) und bei 1\,mm/s Drift 37\,ms; mit 0,05\,mm / 0,02° Grundrauschen wären es 18 bzw.\
+        5\,ms, bei mehr Streuung in Ruhe (still TUNE 0,180 statt 0,156\,mm). Gerechnet mit denselben
+        Schätzer-Parametern auf der verworfenen Engine-Variante mit engeren Schwellen (Abschnitt~\ref{sec:ergebnis}).
+  \item \textbf{$\stip$ unterschätzt die Ausläufer.} $\stip$ ordnet die Fehler (Korrelation von $\log\stip$ zum
+        Fehler 0,54 auf TUNE, 0,43 auf TEST), aber bei $\stip$ von 2 bis 3\,mm lag das p95 des Fehlers auf TUNE bei
+        8,92\,mm. Eine bekannte Ursache zu kleiner Posterior-Kovarianzen ist, dass Messungen als unabhängig
+        behandelt werden, die es nicht sind, etwa Punkte derselben Fläche \cite[S.~30]{lepetit2005monocular}; ob das
+        hier die Ursache ist, ist nicht geprüft. Eine Anzeigeregel über $\stip$ ist nicht validiert; 2\,mm und
+        5\,mm sind Setzungen.
+  \item \textbf{Empfohlene Zusätze nur auf TUNE.} Im synthetischen Ausfalltest senken sie das Maximum nach der
+        Lücke von 14,59 auf 1,49\,mm (sauberes erstes Bild), bei 94,9 statt 98,1\,\% gezeigten Bildern. Die Prior-Grenze hängt über $Z_k$
+        von der Tiefe ab (unter etwa 348\,mm kein Neustart bei unbekannter Bewegung, aus der Formel); in C++ besser
+        direkt über zu wenige zugeordnete Ecken formulieren.
+  \item \textbf{Eingespannt nicht besser als die GTSAM-Basis} (p99 0,53 gegen 0,49\,mm, Sprung-p99 0,42 gegen
+        0,29\,mm): Die Öffnung reagiert auf ein kohärentes Bildzittern von 0,3--0,8\,px/Bild unbekannter Ursache.
+  \item \textbf{Anfang von Take BN1.} Solange die Engine dort durchweg fusioniert, liegt der neue Schätzer im Median
+        etwa 1,3\,mm weiter von der Referenz als die fusionierte Pose (Abschnitt~\ref{sec:ergebnis}); ungeklärt.
+  \item \textbf{Bias.} Der Abstand von etwa 1,5--2\,mm zur Referenz bleibt; im Labortest lag die gezeichnete Spitze
+        gegenüber der aus AP- und Lateralbild triangulierten Schattenspitze 2,6\,mm voraus entlang der Bohrerachse.
+        Einen festen Messbias kann ein Filter ohne zusätzliche Information nicht schätzen, er ist unbeobachtbar
+        \cite[§5.1.3]{barfoot2017state}; das ist ein eigenes Thema.
+  \item \textbf{Prüfumfang.} TEST prüft nur innerhalb derselben Sitzungen, ohne Verdeckung und still; bewegte
+        Ground Truth fehlt, Licht ist ungeprüft, der Labortest ist ohne Rohbilder nicht bewertbar. Nötig sind
+        neue Rohaufnahmen (Etikett am Bildrand, lange Ruhe, bewegte Referenz, Licht).
+  \item \textbf{Ohne Literaturbeleg}, also eigene empirische Entscheidungen: die Öffnung über die Bildbewegung,
+        die Werte 7,57 und 11,08 (das Verfahren ist belegt, die Werte sind auf sechs TUNE-Takes bestimmt), die
+        Huber-Schwelle 1,5 auf der Norm der normierten 2D- bzw.\ 3D-Reste (der Standardwert 1,345
+        \cite[§9.4]{zhang1997parameter} gilt für skalare Reste und ist nicht direkt vergleichbar; bei 1,5 liegen bei
+        $\chi$-verteilten Resten etwa ein Drittel der Farbecken und gut die Hälfte der IR-Paare im abgewerteten
+        Bereich), die harten Regeln (6\,mm, 12 Ecken, Lücke, Startgate) und die konkrete
+        Rolling-Shutter-Korrektur.
+\end{itemize}
+
+%==========================================================================================
+\section{Umsetzung in der C++-Engine}
+\label{sec:cpp}
+
+Stand 13.11.2026: Der Schätzer ist in die Engine eingebaut, an die Python-Anzeige angeschlossen (Panel-Ansicht in
+beiden Live-Abläufen, Rail-Ansicht, Snapshot, Protokolle) und auf der Live-Seite der neue Standard. Wo die
+Abschnitte~\ref{sec:heute} bis~\ref{sec:grenzen} von \glqq heute\grqq{} sprechen, meinen sie den Ausgabepfad vor dem
+Schätzer (A); er läuft weiter, wenn der Schalter unten aus ist.
+
+\textbf{Eine Engine.} Seit dem 13.11. liegt in \code{cpp/build/Release} die geprüfte .pyd mit dem Schätzer (MD5
+\code{402cf296\ldots}). Sie hat dort die bisherige .pyd (K1, MD5 \code{0d6b72c3\ldots}) ersetzt, und der normale Lader
+lädt sie ohne weitere Einstellung; die übrigen Dateien in \code{cpp/build/Release}, darunter die 22 DLLs, sind
+unverändert. Beide .pyd liegen schreibgeschützt in Sicherungen, die neue samt Quellstand. Die Nachweise in diesem
+Abschnitt gelten für diese .pyd; die Prüfungen vor dem Tausch liefen mit einer Kopie derselben Datei (gleiche MD5). Die
+Umgebungsvariable \code{HYDRAMARKER\_CPP\_PYD} bleibt nur als Testhaken: Prüfläufe laden darüber eine andere .pyd,
+etwa K1 aus der Sicherung, und der Lader meldet Pfad und MD5. \textbf{Rückweg:} Für das Verhalten vor dem Schätzer
+genügt der Schalter auf \code{False}; die Rechnung ist dann auch mit der neuen .pyd bitgleich zu K1 (unten). Wer K1
+selbst zurückholt, kopiert es aus der Sicherung zurück und setzt zusätzlich den Schalter auf \code{False}; sonst
+meldet die Seite bei jedem Start rot, das Aufnahmewerkzeug \glqq OFF although requested\grqq, und gerechnet wird wie
+mit Schalter aus.
+
+\textbf{Ort und eigene Felder.} In \code{processFrame} läuft er als eigene Stufe \code{applyDrillEstimator}
+zwischen der IR-Fusion (\code{applyIrRefinement}) und dem Ausgabe-KF (\code{applyPoseFilter}); den Kern bildet die
+eigene Klasse \code{DrillPoseEstimator}. Die Stufe nimmt die dann gültige Engine-Pose (fusioniert oder Farbe) als
+Startwert, liest nur und schreibt nur eigene Ergebnisfelder \code{drill\_est\_*} in \code{TrackerFrameResult}:
+Posterior-Pose (\code{rvec}, \code{tvec} und $4\times4$-Matrix), Spitze $\Ptc$, $\stip$, Flag \glqq zeigen\grqq,
+Kettenzähler und $\boldsymbol{\Sigma}_k$, dazu eigene Einträge in \code{timings\_ms} (Rechenzeiten, Ereignis,
+Neustartgrund, Zahl der Ecken und IR-Paare; 21 Einträge auf frischen Bildern, 4 auf den übrigen). \code{rvec},
+\code{tvec}, \code{T\_marker\_camera} und \code{pose\_covariance} bleiben die Engine-Pose. Überschriebe der Schätzer
+sie, wie zunächst geplant, korrigierte \emph{carry} in Python die Schätzerpose zusätzlich um seinen gemerkten Versatz,
+und \code{rvec} in Logs, \code{snapshot.json} und Auswertedaten bekäme eine andere Bedeutung; mit eigenen Feldern
+laufen A und Schätzer nebeneinander. Vorsicht bei der Konvention: $\boldsymbol{\Sigma}_k$ (\code{drill\_est\_cov})
+gilt für die Störung rechts im Markerrahmen mit $[\boldsymbol{\omega}; \boldsymbol{\tau}]$ (Gl.~\eqref{eq:boxplus}),
+die MAP-Fusion der Engine stört links im Kamerarahmen mit $[\delta\mathbf{t}; \delta\boldsymbol{\omega}]$, und
+\code{pose\_covariance} gilt für $[\mathbf{rvec}; \mathbf{tvec}]$ des Ausgabe-KF.
+
+\textbf{Schalter.} Ob die Live-Seite und das Aufnahmewerkzeug \code{test\_tracker\_tool\_eval.py} den Schätzer
+verwenden, entscheidet die Variable \code{LIVE\_DRILL\_ESTIMATOR} in \code{config.py}, Vorgabe \code{True}. Gelesen
+wird sie über \code{drill\_est\_requested()} jedes Mal, wenn eine der beiden ihren Tracker baut; hat sich der Wert
+geändert, wird der Tracker neu gebaut, sonst wiederverwendet. Weil \code{config.py} nur einmal importiert wird, wirkt
+eine Änderung der Datei erst nach einem Neustart des Programms. Mit \code{True} laufen der Schätzer mit den
+Live-Zusätzen und die Startprüfungen. Mit \code{False} entsteht genau der Tracker von vorher:
+\code{make\_live\_tracker\_config()} mit IR an und Ausgabe-KF aus, ohne Startprüfung, ohne gesetzte Spitze, ohne
+Schätzerzweig in \code{ToolPoints} und ohne Zählerzeile. Rechnung und Anzeige sind damit wie vor dem Schätzer; neu
+sind in den Protokollen die Startzeile mit Aus-Text, Pfad und MD5 der .pyd und das Evaluation-Log in Version 3, mit
+zusätzlichen Spalten (in \code{est\_*} Vorgabewerte) und mit \code{run\_meta}. Das Engine-Feld
+\code{drill\_est\_enabled} behält in C++ und in \code{config.py} die Vorgabe
+aus, und \code{make\_live\_tracker\_config()} ist unverändert; aus heißt in der Engine keine Rechnung und keine neuen
+Einträge in \code{timings\_ms}. Die frühere Umgebungsvariable liest der Code nicht mehr. Dem
+Schalter folgen nicht: das ältere synchrone Aufnahmewerkzeug \code{test\_tracker\_tool\_eval\_sync.py}, das immer ohne
+Schätzer rechnet, und \code{record\_tracker\_debug.py}, das keinen Tracker baut.
+
+\textbf{Schalter aus wie vorher, Schalter an ohne Rückwirkung.} Geprüft ist das auf einem Gate-Satz aus acht Takes
+(2400 Bilder, darunter Takes mit Reset, mit Verlusten und ohne IR), jeder Lauf in einem eigenen Prozess mit genau
+einer .pyd, K1 aus der Sicherung gegen die Engine in \code{cpp/build/Release}, beide mit demselben Python-Stand. Mit
+Schalter aus rechnen beide je Bild bitgleich, im rohen C++-Ergebnis und im Python-Ergebnis in allen Feldern außer den
+Dauern, im Engine-Zustand (Startwert der nächsten PnP, zuletzt angenommene Pose) und in der zurückgelesenen
+Konfiguration; die neuen Felder stehen auf ihren Vorgaben. Das gilt auch, wenn die echte Live-Seite bzw.\ das
+Aufnahmewerkzeug den Tracker mit \code{LIVE\_DRILL\_ESTIMATOR = False} baut, bis zu den Werten, die das
+Evaluation-Log in die Spalten \code{est\_*} schreibt. Gegen K1 mit dem Python-Stand vor dem Einbau ist der alte Weg
+über die Felder des Python-Ergebnisses belegt, nicht über das rohe C++-Ergebnis. Mit Schalter an und den
+Live-Zusätzen sind alle bisherigen Felder ebenfalls bitgleich zu K1, und neu sind je Bild genau die geplanten
+Einträge; der Schätzer wirkt also nicht zurück. Seine Felder sind bitgleich zu den vor dem Tausch geprüften Läufen,
+auch über die echte Seite und über das Aufnahmewerkzeug (dort bis auf den gewollten Export der Schätzer-Eingabe). Dass
+der Vergleich greift, zeigt eine Positivkontrolle: Eine Änderung um eine Einheit im letzten Bit (1\,ulp) meldet er in
+jedem verglichenen Bereich, bei Ja/Nein-Feldern ein gekippter Wert. Die Schätzerfelder der korrigierten .pyd sind zudem auf allen acht Takes bitgleich zu
+denen der .pyd vor der Korrektur; die Korrektur ändert den Normalweg also nicht.
+
+\textbf{Auswertungen der Masterarbeit und des Papers.} Sie bauen ihre Konfiguration selbst aus
+\code{make\_live\_tracker\_config()} oder \code{TrackerConfig()} und folgen dem Schalter nicht: Mit
+\code{LIVE\_DRILL\_ESTIMATOR = True} lasen alle 272 Läufe der Prüfmatrix und 15 echte Konfigurationsbauer der
+Thesis-Wege \code{drill\_est\_enabled} in Python als False zurück, in C++ ebenso (bei K1 fehlt das Feld). Auf dem
+Gate-Satz rechenbar sind 17 Konfigurationen, darunter IR aus, IR-Fusion, Ausgabe-KF an, Eckenverfolgung mit
+Debug-Ausgabe, Spitzenkalibrierung und die Läufe von \code{hydratracker\_baseline}. Nach dem Tausch und auf dem neuen
+Python-Stand sind alle 136 Paare (17 Konfigurationen $\times$ 8 Takes) K1 gegen die neue .pyd bitgleich, samt
+\code{pose\_covariance} auf den 15\,270 Bildern mit Ausgabe-KF und samt Engine-Zustand; ebenso die Einzelbausteine
+der Detektor-Abbildungen (8 von 8 Takes) und \code{filter\_replay.py} über seinen eigenen Lader (3 von 3 Varianten).
+Skripte mit eigener Kopie der .pyd, etwa die eingefrorene Code-Kopie der Auswertung zur Spitzenposition, berührt der
+Tausch nicht. Ungeprüft bleiben der flache Marker mit den Bildern vom 30.07., \code{filter\_replay.py} auf den eigenen
+GUI-Logs, Farbbilder mit ungleichen Kanälen und der Betrieb mit Kamera.
+
+\textbf{Ausgabe-KF zwingend aus.} Ist der Schätzer eingeschaltet, schaltet die Engine den Ausgabe-KF ab: Ihr
+Konstruktor setzt dann \code{pose\_kf\_enabled = false}, bevor er den Filter konfiguriert, und meldet das über
+\code{pose\_kf\_forced\_off}; \code{applyPoseFilter} läuft so genau den Weg ohne Filter. Der Schätzer liest die
+Pose vor dem KF, und der KF schreibt nur Ausgabefelder; auf den Schätzer wirkte er also ohnehin nicht, aber neben
+der Schätzerpose liefe eine zweite, anders geglättete Engine-Pose. Fordert Python den KF trotzdem an, liest es
+\code{pose\_kf\_enabled = false} zurück und schreibt eine Warnzeile ins Protokoll; die bisherigen Felder sind dann
+bitgleich zu K1 mit KF aus, und die Schätzerfelder sind bitgleich zum Lauf ohne KF-Anforderung. Ohne Schätzer bleibt
+der KF wie bisher schaltbar, weil Auswertungen der Masterarbeit ihn nutzen; mit KF an und Schätzer aus ist die
+Ausgabe samt \code{pose\_covariance} bitgleich zu K1. Beides ist auf allen acht Takes des Gate-Satzes geprüft. Live
+ist der KF ohnehin aus; mit der Engine in \code{cpp/build/Release} und Schalter an meldet die echte Seite auf allen
+acht Takes \code{pose\_kf\_forced\_off}.
+
+\textbf{Startprüfungen.} Beim Bau des Trackers prüft Python, ob die geladene .pyd die Felder kennt, ob alle Parameter so
+zurückgelesen werden, wie sie gesetzt wurden, ob sie gültig sind und ob die Spitze gesetzt ist; scheitert eine dieser
+Prüfungen, wird der Tracker ohne Schätzer neu gebaut, und das Tracking läuft weiter, auf der Seite mit roter Meldung. IR aus, eine gegenüber dem
+Validierungsstand geänderte Engine-Einstellung oder IR-Kalibrierung, verschiedene Farbkamera-Intrinsiken in GUI und
+IR-Datei oder eine Debug-.pyd ergeben nur eine Warnung. Mit der Engine in \code{cpp/build/Release} schlägt auf dem
+Gate-Satz keine Prüfung an, ebenso nicht mit den Dateien, die die Seite im Labor lädt (Kalibrierung, IR-Datei und
+Werkzeug wie in der Laborsitzung vom 11.11.); ob am Labortag andere Dateien gewählt werden, zeigt \code{run\_meta} je Lauf. Mit K1 über den Testhaken und Schalter an meldet die Seite rot, das Aufnahmewerkzeug \glqq OFF although
+requested\grqq, und die Rechnung ist auf allen acht Takes (Aufnahmewerkzeug: drei) in allen Feldern bitgleich zu
+Schalter aus.
+
+\textbf{Python und Anzeige.} Bei aktivem Schätzer zeichnet \code{ToolPoints} über einen eigenen Zweig aus den Feldern
+\code{drill\_est\_*}, ohne \emph{carry}; verborgene Bilder liefern keine Punkte. In der Panel-Ansicht bleiben dann
+die letzten Marken wie bei einem kurzen Ausfall 0,25\,s stehen, und die Statuszeile meldet \glqq settling\grqq; in
+der Rail-Ansicht wird wie bei fehlender Pose nichts gezeichnet. A läuft parallel (auf der Live-Seite im
+Evaluation-Modus, im Aufnahmewerkzeug bei aktivem Schätzer immer) und wird protokolliert. Das Evaluation-Log
+(Version 3) führt die Schätzerfelder und A, das Aufnahmewerkzeug zusätzlich je frischem Bild die Schätzer-Eingabe; in
+\code{snapshot.json} bleibt \code{tool.pose} die Engine-Pose, die gezeichnete Pose steht in \code{tool.drill\_est}.
+Die Startzeile auf der Konsole und, im Evaluation-Modus, im Profil-Log nennt die Zusätze so, wie die Engine sie zurückliest, dazu Pfad und
+MD5 der geladenen .pyd. Eine Meldung der Startprüfungen steht in der Panel-Ansicht 5\,s in der Statuszeile, danach
+wieder die übliche Statusanzeige; dauerhaft steht sie in der Startzeile. Die Umwandlung in Python liest die
+Vektorfelder nur auf Bildern mit gültiger Schätzung. Wirft im Aufnahmewerkzeug das Auslesen der Schätzer-Eingabe,
+fehlt nur die Eingabe dieses Bildes; ein Zähler zählt mit, und einmal erscheint eine Warnzeile. Die Fusions-Gates
+wirken nur noch über den Startwert des Schätzers.
+
+\textbf{Rail-Ansicht.} Sie hat keine Statuszeile; eine Meldung der Startprüfungen steht dort als Kennung \glqq est
+OFF\grqq{} (rot) bzw.\ \glqq est warning\grqq{} (gelb) vor dem Status der Tracking-Karte, die Karte hat die
+Meldungsfarbe, und die volle Meldung steht im Tooltip, über den ganzen Lauf. Ohne Meldung bleibt die Karte unberührt.
+Behoben ist der Fehler, dass die Schrift nach dem Stopp und in jedem späteren Lauf in der Meldungsfarbe blieb: Beim
+Löschen der Meldung wendet die Seite das Stylesheet der Karte neu an (Qt \code{unpolish}/\code{polish}). Der
+zugehörige Test prüft jetzt die wirksame Farbe und Schrift statt nur das Stylesheet und scheitert mit dem alten Code.
+Die unabhängige Nachprüfung bestand 52 von 52 Prüfungen, offscreen, mit dem Stylesheet der App und in einem
+verborgenen Windows-Fenster; mit dem alten Code scheiterten 28. An der echten Seite mit der Engine in
+\code{cpp/build/Release} ist die Karte ohne Meldung weiß und ohne Kennung; mit K1 und Schalter an ist sie im Lauf rot
+und nach dem Stopp und im Folgelauf ohne Meldung wieder weiß. Zwei kleinere Abweichungen bleiben: Die Meldung \glqq camera not
+restored\grqq{}, die erscheint, wenn die Markerbelichtung im Lauf ausgeschaltet wird oder scheitert, steht bis zum
+nächsten Statuswechsel ohne Kennung, und mit \glqq est warning\grqq{} werden die zwei längsten Statuszeilen am Ende
+abgeschnitten; die Kennung selbst blieb in allen 48 geprüften Fällen lesbar. Wie die Karte im echten Fenster mit
+Kamera aussieht, ist ungeprüft.
+
+\textbf{Fehlerzähler.} Bei aktivem Schätzer schreibt der Stopp fünf Zähler, die alle 0 sein sollen: gültige
+Schätzerergebnisse ohne brauchbare Pose (über Resets des Trackers aufsummiert), Fehler im parallelen A, Fehler beim Bau
+der Panel-Marken, Ausnahmen der Schätzerstufe in der Engine und Fehler beim Export der Schätzer-Eingabe. Die Live-Seite
+gibt sie als eine Zeile auf der Konsole und im Evaluation-Modus im Profil-Log aus und legt sie im Evaluation-Log in \code{run\_meta} ab, das
+Aufnahmewerkzeug in \code{run.json}; ohne Schätzer entsteht nichts davon. Die Engine-Ausnahmen und die Exportfehler
+zählen seit dem Bau des Trackers, nicht je Lauf: Seite und Aufnahmewerkzeug behalten den Tracker über Läufe, solange
+sich der Schalter nicht ändert und die Seite nicht verlassen wird. Auf der Seite bleibt der Exportzähler 0, weil nur das Aufnahmewerkzeug die Eingabe
+exportiert. Mit der Engine in \code{cpp/build/Release} und einem Reset im Lauf standen auf der Seite und im
+Aufnahmewerkzeug alle Zähler auf 0; dass ein Wert über 0 über einen Reset hinweg aufsummiert wird, ist nur mit
+Stellvertretern für die Engine geprüft.
+
+\textbf{Prüfung der Anzeige.} Mit echter Engine, aber ohne Kamera geprüft sind die Live-Seite und das
+Aufnahmewerkzeug: Schalter an, aus und Wechsel, Startprüfungen mit K1 (auf der Seite mit roter Meldung), Zusätze und Rücklesung; in
+die Engine zurückgespeist rechnet die gespeicherte Schätzer-Eingabe eines nachgestellten Takes die Online-Kette
+bitgleich nach. Auf dem Gate-Satz liefert die Umwandlung je Bild dieselben Werte wie vor der Korrektur, und mit 330
+absichtlich ausgelösten Fehlern beim Auslesen der Eingabe lief jeder Lauf durch, mit unveränderten Schätzerfeldern.
+Die Testmodule der Anzeige bestehen alle 47 Prüfungen, mit dem normalen Lader, mit K1 über den Testhaken und mit
+beiden Werten des Schalters, laden dabei aber keine Engine; ein Testfall mit echter Engine fehlt.
+
+\textbf{Eingaben} wie im validierten Prototyp: (1)~alle nicht vorhergesagten Ecken aus \code{result.corners}, auch
+die jüngeren als 5 Bilder, die die Engine aus dem PnP hält, mit den Kalman-gefilterten $\mathbf{u}_i$ (mit der
+PnP-Intrinsik \code{K\_} der Engine entzerrt), Rohzeile, Modellecke $\mathbf{P}_i$ und Identität; (2)~$\spx$ aus der
+IR-Stufe, auf Bildern ohne IR-Stufe wie validiert der feste Wert 0,10\,px (die Berechnung vorzuziehen hätte die
+Engine verändert), und die mediane Eckenbewegung nach der Prototyp-Definition aus einem eigenen Hilfszustand (die
+Bildbewegung der Engine ist anders definiert); (3)~die IR-Paare $\Pir$ nur auf Bildern mit mindestens 6 gültigen
+Paaren nach den Paar-Gates der Engine, über eine neue \code{const}-Methode aus den gespeicherten Paaren der Fusion
+neu trianguliert, \emph{vor} der Zeitversatz-Korrektur der Engine und mit $\mathbf{S}_j$ \emph{ohne}
+Qualitätsskalierung; die Fusion selbst ist unverändert; (4)~Fit-RMS der Fusion, Bildzeit, Reset und $\Ptd$ über
+\code{set\_tool\_tip}. Für die IR-Gewichtung $w$, die IR-Pixelunsicherheit und die Zeilenzeit des Rolling Shutter
+hält der Schätzer eigene Kopien der Engine-Werte, damit eine spätere Änderung an der Engine $s_{\mathrm{c}}$ und
+$s_{\mathrm{ir}}$ nicht still verschiebt. Fälle, die in den 50 Takes nie vorkamen (nicht endliche Eingaben,
+Rückwärtssprung der Bildzeit, Posensprung über 90°, gescheiterte Inversion, ungültige Parameter), lassen einzelne
+Messungen weg, starten die Kette neu oder liefern für das Bild keine Pose; jeder dieser Fälle ist synthetisch
+geprüft. Die Stufe fängt alle Ausnahmen selbst ab.
+
+\textbf{Ausnahmen und Grenzfälle.} Jede Ausnahme in der Stufe, ob im Adapter oder im Kern, beendet die Kette
+(Ereignis 7) und löscht den Hilfszustand der Bildbewegung; das Bild bekommt keine Schätzerpose, und der Zähler
+\code{drill\_est\_exceptions} zählt mit. In einem eigenen Testbau des Stands vor der Korrektur liefen mit 62 im Adapter absichtlich
+ausgelösten Ausnahmen alle Läufe des Gate-Satzes durch, Ereignis 7 stand genau auf diesen Bildern, und alle bisherigen
+Felder blieben bitgleich. Zwei Zweige kamen erst mit der Korrektur hinzu, kommen in keinem Datensatz vor und sind nur
+am Code geprüft: das Zurücksetzen und Zählen bei einer Ausnahme, die der Kern selbst abfängt, und das Verwerfen von
+Ecken mit sehr großer Zeilennummer (ab 2\,097\,151), damit der Schlüssel aus Zeile und Spalte nicht überläuft; auf dem
+Gate-Satz verwirft die Stufe keine Ecke. Bei Ereignis 7 zeigen einige Diagnosewerte die Herkunft: Kommt es aus dem
+Kern, stehen Rechenzeiten, verworfene Ecken und Bildbewegung des Bildes in \code{timings\_ms}, und seine Eingabe wird
+exportiert; kommt es aus dem Adapter, stehen dort 0 bzw.\ NaN, und nichts wird exportiert.
+
+\textbf{Gleichheit mit dem Prototyp.} Der Kern liefert auf allen 50 Takes (12\,530 frische Bilder) dieselben
+Spitzen wie \code{smoother3.py} bis auf $8{,}1\cdot10^{-13}$\,mm, mit den Zusätzen wie \code{rl\_smoother3.py} bis
+auf $1{,}22\cdot10^{-12}$\,mm. In der Engine sind auf dem Gate-Satz alle Eingaben bitgleich zu den Messdateien des
+Prototyps, bis auf die IR-Punkte (höchstens $5{,}7\cdot10^{-14}$\,mm) und ihre Kovarianzen (relativ höchstens
+$8{,}8\cdot10^{-16}$); die Spitzen weichen von der Python-Fassung, mit eingefrorener Einstellung wie mit den
+Zusätzen, um höchstens $6{,}5\cdot10^{-13}$\,mm ab, ohne einen Zweigwechsel. Beides ist mit der korrigierten .pyd
+wiederholt.
+
+\textbf{Laufzeit (offline gemessen).} Gemessen ist vor dem Tausch mit derselben .pyd im Replay des Gate-Satzes,
+Messreihe für Messreihe nacheinander, ohne andere Python- oder Bauprozesse auf der Maschine. Das p99 der Stufe auf
+frischen Bildern, je Lauf über alle acht Takes, lag in vier Läufen in getrennten Prozessen (eingefrorene Einstellung)
+bei höchstens 0,211\,ms und in vier gepaarten Läufen mit den Live-Zusätzen bei höchstens 0,210\,ms, also unter der
+Grenze von 0,33\,ms (1\,\% des Budgets von 33\,ms je Bild); der Median lag bei 0,066 bis 0,076\,ms, davon der Kern
+0,023\,ms und die zweite Triangulation 0,037\,ms (gepaart, frische Bilder). Gepaart, also mit Schalter an und aus auf
+denselben Bildern im selben Prozess, wuchs die Wandzeit des Engine-Aufrufs im Median um 0,048\,ms; erlaubt war der
+Median der Stufe plus 0,05\,ms, hier 0,114\,ms. Ein einzelnes Bild brauchte in einem Lauf 1,736\,ms, in den sieben
+übrigen Läufen 0,055 bis 0,300\,ms; über alle gepaarten Läufe lagen 4 von 6656 frischen Bildern über 0,33\,ms. In
+Python kostet der Schätzerzweig von \code{ToolPoints} im Median 6,0\,µs (Grenze 15\,µs), der Zweig A 12,4\,µs. Die
+Umwandlung der neuen Ergebnisfelder hält ihre Grenze von 20\,µs, über alle Ergebnisse gewertet, knapp (19,7\,µs,
+Wiederholung 19,4\,µs); nur auf Bildern mit gültiger Schätzung gerechnet lag sie im ersten Messsatz bei 20,2\,µs, also
+0,2\,µs darüber, in der Wiederholung bei 19,7\,µs, und wäre so nicht sicher bestanden. Etwa 12 dieser 20\,µs kostet die
+Größenrechnung im vorhandenen Helfer \code{\_cpp\_vector\_to\_array}. Netto kommen in Python je Ergebnis etwa
+12\,µs dazu (ohne den parallelen Zweig A), 0,04\,\% des Budgets. Der eigenständige Prototyp \code{iekf\_bench.cpp}
+(7--19\,µs je Bild, Median je Take; ein Warmwert aus einer heißen Messschleife) bekam entzerrte Ecken und
+triangulierte IR-Punkte fertig aus den Messdateien. Im laufenden Betrieb ist die Stufe noch nicht gemessen.
+
+\textbf{Zusätze live an.} Die drei Zusätze aus Tabelle~\ref{tab:param} sind Parameter mit der eingefrorenen
+Einstellung als C++-Vorgabe; Seite und Aufnahmewerkzeug setzen bei eingeschaltetem Schalter Lücke 0,2\,s, Neustart bei
+$\sigma_{t,k} > 20$\,mm und Verbergen bei $\stip > 5$\,mm. Die Prior-Grenze steht wie freigegeben in der geprüften Form
+über Gl.~\eqref{eq:Q}; die Umformulierung aus Abschnitt~\ref{sec:grenzen} ist nicht umgesetzt.
+Tabelle~\ref{tab:param} und Abschnitt~\ref{sec:grenzen} beschreiben den Stand vor einer TEST-Auswertung der Zusätze.
+Danach wurden sie einmal auf TEST ausgewertet (Python-Fassung, kein Wert geändert, die Entscheidung für live an fiel
+vorher): In den Klassen mit der Spitze im Sitz ändern sie dort nichts (Präzision eingespannt 0,215, hand\_seat 0,482,
+Pivot 0,769\,mm, wie ohne Zusätze); den Gewinn auf TUNE bei hand\_seat und Pivot (1,649 auf 1,572 bzw.\ 1,667 auf
+1,522\,mm) zeigt TEST nicht, wobei TEST nur einen Pivot-Take hat. In Bewegung sinkt der RMS-Abstand zur Engine-Spitze
+der \emph{fused}-Bilder nur von 1,952 auf 1,938\,mm, das Maximum bleibt 11,50\,mm (auf TUNE sank es von 8,67 auf
+5,99\,mm), und verborgen sind 140 statt 35 von 1600 Bildern (8,8 statt 2,2\,\%; TUNE 8,2\,\%).
+
+\textbf{Labortest.} Er läuft nur im Evaluation-Modus der Live-Seite und wird so ausgewertet, wie er angezeigt wurde.
+Dieser Modus speichert weder Rohbilder noch Schätzer-Eingaben; ein Nachrechnen ist deshalb nicht möglich, ausgewertet
+werden die Schätzerfelder und daneben A aus dem Evaluation-Log. Die neuen Rohaufnahmen aus
+Abschnitt~\ref{sec:grenzen} entstehen dabei nicht.
+
+\textbf{Ausstehend} ist der Labortest und mit ihm alles, was eine Kamera braucht: die Anzeige im echten Fenster und
+die Laufzeit im laufenden Betrieb. Die 20-µs-Teilprüfung der Umwandlung ist über alle Bilder gewertet; nur über Bilder
+mit gültiger Schätzung wäre sie nicht sicher bestanden. Committet ist noch nichts; ein Commit folgt nur auf Auftrag.
+
+\textbf{Offen zu entscheiden} sind:
+\begin{itemize}
+  \item \textbf{Engine:} neue Eingaberegeln im Kern (Brennweiten prüfen, $\stip$ auf Endlichkeit prüfen); ob zwei
+        außerhalb des Testbaus ungenutzte Member gestrichen werden; ob die Fehlerinjektion des Testbaus (nur unter
+        einem Präprozessor-Schalter übersetzt) im Quelltext bleibt und ob der Zweig für Ausnahmen im Kern dafür eine
+        eigene Injektion bekommt oder die Prüfung am Code genügt; ein Quell-Hash in \code{BUILD\_INFO}.
+  \item \textbf{Anzeige:} ob die Rail-Ansicht bei verborgenen Bildern anders reagieren soll (nach dem Code flackert
+        sie dann); eine kürzere Warnkennung und die Kennung bei \glqq camera not restored\grqq.
+  \item \textbf{Tests:} ein Testfall mit echter Engine in den Testmodulen der Anzeige und der Fall \glqq
+        settling\grqq{} im Multi-Ablauf mit gesetzter Ebene und gehaltenen Ergebnissen.
+\end{itemize}
+
+\begin{otherlanguage}{english}
+\begin{multicols}{2}[\section*{Literatur}]
+\footnotesize
+\bibliographystyle{unsrt}
+\bibliography{Tracking_Schaetzer}
+\end{multicols}
+\end{otherlanguage}
+
+\end{document}

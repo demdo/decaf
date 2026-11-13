@@ -1,0 +1,601 @@
+\documentclass[11pt,a4paper,fleqn]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english,ngerman]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,calc,positioning,shapes.geometric,babel}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\pgfplotsset{compat=1.18}
+\usepackage{tcolorbox}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multicol}
+\usepackage{enumitem}
+\usepackage{etoolbox}
+\usepackage[font=small,labelfont=bf,hypcap=false]{caption}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{parskip}
+\usepackage[compact]{titlesec}
+\titlespacing*{\section}{0pt}{2.2ex plus .6ex minus .4ex}{1ex plus .2ex}
+\titlespacing*{\subsection}{0pt}{1.6ex plus .5ex minus .3ex}{0.6ex plus .2ex}
+\usepackage{fancyhdr}
+\setlength{\headheight}{14pt}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small DeCAF --- Bohrer-Tracking: Problem und Lösung (verständlich)}
+\rhead{\small Stand 13.11.2026}
+\cfoot{\thepage}
+\setlist[itemize]{leftmargin=*, itemsep=2pt, parsep=0pt, topsep=2pt}
+\setlist[enumerate]{leftmargin=*, itemsep=2pt, parsep=0pt, topsep=2pt}
+\emergencystretch=2em
+% keine einzelnen Zeilen am Seitenanfang oder -ende
+\widowpenalty=10000
+\clubpenalty=10000
+\hyphenation{kur-zen Roh-auf-nah-men}
+% Literaturverzeichnis kompakt und zweispaltig (Ueberschrift ausserhalb der Spalten)
+\patchcmd{\thebibliography}{\section*{\refname}}{}{}{}
+\apptocmd{\thebibliography}{\setlength{\itemsep}{0.5pt}\setlength{\parsep}{0pt}}{}{}
+
+% Formelbox wie in der Arbeit (Header.tex, mybox)
+\newtcolorbox{mybox}[1]{colback=red!5!white,colframe=red!75!black,fonttitle=\bfseries,title={#1}}
+
+% Farben wie im Langdokument; Beschriftungen schwarz
+\definecolor{ColA}{RGB}{224,0,0}          % heute (rot)
+\colorlet{ColB}{blue!65!black}            % Halten (hier nicht gezeichnet)
+\definecolor{ColN}{RGB}{31,163,31}        % neuer Schaetzer (gruen wie die gezeichnete Spitze)
+\colorlet{CarryC}{orange!85!black}        % carry-Bilder
+
+% Notation wie in der Arbeit (Methods 3.3.7, 3.4)
+\newcommand{\Tcm}{\mathbf{T}_{\mathrm{cm}}}
+\newcommand{\Ptd}{\mathbf{P}^{\mathrm{tip}}_{\mathrm{d}}}
+\newcommand{\Ptc}{\mathbf{P}^{\mathrm{tip}}_{\mathrm{c}}}
+\newcommand{\stip}{\sigma_{\mathrm{tip}}}
+\newcommand{\xb}{\bar{\mathbf{x}}_k}
+\newcommand{\xh}{\hat{\mathbf{x}}}
+\newcommand{\Sb}{\bar{\boldsymbol{\Sigma}}_k}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE Bohrer-Tracking: Problem und Lösungsansatz}\\[2mm]
+  {\large Warum die gezeichnete Spitze springt und was ein Schätzer mit Gedächtnis daran ändert}\\[2mm]
+  {\small DeCAF --- Masterarbeit \quad$\cdot$\quad Stand 13.11.2026}
+\end{center}
+
+\begin{mybox}{Kurzfassung}
+Heute bestimmt das Tracking die Lage des Bohrers in jedem Kamerabild neu, ohne sie über die Bilder davor zu
+mitteln. Je nachdem, ob die mit IR-Punkten verbesserte, \emph{fusionierte} Pose eines Bildes vier Prüfungen
+besteht, wird entweder sie gezeichnet oder die reine Farbpose, meist plus einem gemerkten Versatz. Die Farbpose ist
+vor allem in der Tiefe unsicher und liegt von Bild zu Bild verschieden weit daneben; der gemerkte Versatz gleicht
+das nur für das Bild aus, auf dem er gemerkt wurde. Deshalb springt die Spitze auch bei stillstehendem Bohrer, im
+Labortest am 11.11.\ 83-mal um mehr als 5\,mm. Der neue Ansatz ersetzt das Umschalten durch einen einzigen
+Schätzer. Er merkt sich die letzte Lage, verwendet in jedem Bild Farbecken und IR-Punkte nach ihrer
+Zuverlässigkeit und wertet auffällige Messungen ab, statt die IR-Punkte ganzer Bilder zu verwerfen (außer bei zu
+wenigen oder grob unpassenden IR-Punkten). Mit eingespanntem Bohrer zittert die Spitze auf den Testdaten nur noch
+etwa ein Drittel so stark. Der Labortest selbst lässt sich ohne Rohbilder nicht nachrechnen. In einer ähnlichen
+Aufnahme aus den Abstimmdaten, handgeführt mit dem Etikett am Bildrand, sinken die Sprünge über 5\,mm von 16 auf 0;
+die Streuung bleibt dort aber gleich, und im Median liegt die Spitze sogar weiter von der Referenz entfernt
+(Abschnitt~\ref{sec:grenzen}). Den bleibenden Abstand der Spitze zur Referenz von etwa 1,5 bis 2\,mm, den es schon
+heute gibt, beseitigt er nicht. Der Schätzer ist in die C++-Engine eingebaut und in der Live-Anzeige voreingestellt
+an; ausgeschaltet sind Rechnung und Anzeige wie vorher.
+\end{mybox}
+
+Herleitungen, alle Einstellungen und die genauen Bedingungen jeder Zahl stehen im ausführlichen Bericht \glqq
+Bohrer-Tracking: Problem und neuer Schätzer\grqq{} im selben Ordner.
+
+%==========================================================================================
+\section{Was heute passiert}
+\label{sec:heute}
+
+Die Kamera liefert in jedem Takt ein Farbbild und, wenn ein Werkzeug geladen ist, ein Bildpaar der beiden
+IR-Kameras. Daraus bestimmt die C++-Tracking-Engine die \emph{Pose} des Bohrers, also wo das Zylinder-Etikett im
+Raum liegt und wie es gedreht ist. Die Spitze $\mathbf{P}^{\mathrm{tip}}$ ist ein Punkt, der starr am Etikett
+hängt, 179,36\,mm von dessen Ursprung entfernt. Pro Bild läuft Folgendes ab (Abb.~\ref{fig:heute}):
+
+\begin{enumerate}
+  \item \textbf{Farbpose.} Die Engine findet die Ecken des Schachbrettmusters auf dem Etikett im Farbbild, ordnet
+        sie den Modellecken zu und berechnet daraus die \emph{Farbpose}. Ein kleiner Filter je Ecke glättet die
+        Eckpositionen leicht; die Pose selbst wird nicht geglättet.
+  \item \textbf{IR-Punkte und fusionierte Pose.} Dieselben Ecken werden in beiden IR-Bildern gesucht. Eine Ecke,
+        die in beiden gefunden wird, ergibt durch Triangulation (wie beim Sehen mit zwei Augen) einen 3D-Punkt,
+        hier \emph{IR-Punkt} genannt. Aus Farbecken und IR-Punkten zusammen berechnet die Engine die
+        \emph{fusionierte Pose}. Die Farbpose ist in der Tiefe (entlang der Sichtlinie der Kamera) und in der
+        Kippung des Zylinders unsicher. Die IR-Punkte sind dagegen schon räumliche Punkte mit eigener Tiefe; mit
+        ihnen ist die fusionierte Pose in diesen Richtungen viel besser bestimmt.
+  \item \textbf{Vier Prüfungen.} Vier Ja/Nein-Prüfungen entscheiden für das ganze Bild, ob die fusionierte Pose
+        verwendet wird:
+        \begin{itemize}[topsep=0pt, partopsep=0pt, itemsep=0pt, parsep=0pt]
+          \item mindestens 6 IR-Punkte;
+          \item die IR-Punkte passen gut zum Modell (Restfehler höchstens 2,5\,mm);
+          \item die fusionierte Pose legt den Ursprung des Etiketts höchstens 6\,mm neben den der Farbpose;
+          \item die fusionierte Pose passt im Farbbild nicht wesentlich schlechter als die Farbpose.
+        \end{itemize}
+  \item \textbf{Zeichnen.} Bei bestandenen Prüfungen wird die fusionierte Pose gezeichnet; solche Bilder heißen
+        hier \emph{fused}-Bilder. Die Anzeige merkt sich dabei den Versatz zwischen fusionierter Spitze und
+        Farbspitze. Sonst wird die Farbpose gezeichnet, meist plus dem gemerkten Versatz, solange er höchstens
+        1\,s alt ist (\emph{carry}-Bilder, \glqq mitgetragen\grqq). Der Versatz ist eingefroren: Er dreht sich
+        nicht mit, wenn sich der Bohrer bewegt, und endet nach 1\,s abrupt. Ohne Versatz, etwa direkt nach dem
+        \emph{Einrasten} (dem ersten Finden des Etiketts nach dem Start oder nach einem Verlust), bleibt es bei
+        der reinen Farbpose.
+\end{enumerate}
+
+Die Engine findet die Farbpose, indem sie eine Anfangspose, den \emph{Startwert}, schrittweise verbessert. Der
+Startwert kommt immer aus der Farbpose des Bildes davor, nie aus der fusionierten Pose (in Abb.~\ref{fig:heute}
+die gestrichelte Schleife). Die fusionierte Pose wirkt also nur auf das, was gezeichnet wird; ihre bessere Tiefe
+hilft dem nächsten Bild nicht.
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  box/.style={draw, rounded corners=1.5pt, align=left, inner sep=2.5pt, fill=white, text width=#1,
+              execute at begin node={\hyphenpenalty=10000\exhyphenpenalty=10000}},
+  box/.default=26mm,
+  dec/.style={draw, diamond, aspect=1.7, align=center, inner sep=0pt, text width=21mm,
+              execute at begin node={\hyphenpenalty=10000\exhyphenpenalty=10000}},
+  arr/.style={-{Stealth[length=1.8mm]}, semithick},
+  fb/.style={-{Stealth[length=1.8mm]}, dashed, black!60},
+  lab/.style={font=\footnotesize, fill=white, inner sep=1pt, align=center}
+]
+\node[box=24mm] (F) at (0,0) {\textbf{1 Farbpose}\\ Ecken im Farbbild finden, daraus die Pose};
+\node[box=30mm, right=4mm of F] (I) {\textbf{2 IR-Fusion}\\ IR-Punkte aus beiden IR-Bildern; Pose aus Farbecken und
+IR-Punkten};
+\node[dec, right=4mm of I] (D) {\textbf{3 Prüfungen}\\ bestanden?};
+\node[box=31mm, anchor=west] (FU) at ($(D.east)+(6mm,14mm)$) {\textbf{4 fused}: fusionierte Pose zeichnen, Versatz
+zur Farbpose merken};
+\node[box=31mm, anchor=west] (CA) at ($(D.east)+(6mm,-14mm)$) {\textbf{4 carry} (meist): Farbpose plus dem gemerkten
+Versatz zeichnen};
+\node[draw, rounded corners=1.5pt, fill=white, align=center, text width=11mm, inner sep=2.5pt,
+      minimum height=38mm] (Z) at ($(FU.east)!0.5!(CA.east)+(11mm,0)$) {Spitze\\ ins Bild};
+\draw[arr] (F) -- (I);
+\draw[arr] (I) -- (D);
+\draw[arr] (D.north) |- node[lab, pos=0.25, left=0.5mm] {ja} (FU.west);
+\draw[arr] (D.south) |- node[lab, pos=0.25, left=0.5mm] {nein} (CA.west);
+\draw[arr] (FU.east) -- (FU.east -| Z.west);
+\draw[arr] (CA.east) -- (CA.east -| Z.west);
+\draw[fb] ([xshift=-5mm]FU.south east) -- node[lab, left=0.8mm, align=right, fill=none, text=black] {Versatz\\ eingefroren,\\ höchstens 1\,s} ([xshift=-5mm]CA.north east);
+\draw[fb] ([xshift=-7mm]F.south) -- ++(0,-5mm) -| ([xshift=7mm]F.south);
+\node[lab, anchor=north, align=center] at ($(F.south)+(0,-5.8mm)$) {Startwert für\\ das nächste Bild};
+\end{tikzpicture}
+\caption{Heutige Verarbeitung pro Kamerabild, vereinfacht. Je nach Ergebnis der Prüfungen wird entweder die
+fusionierte Pose aus Farbecken und IR-Punkten gezeichnet (fused) oder die Farbpose, meist plus dem eingefrorenen
+Versatz des letzten fused-Bildes (carry). Ohne gemerkten Versatz wird die reine Farbpose gezeichnet. Der Startwert
+für das nächste Bild kommt immer aus der Farbpose; über die Zeit gemittelt wird die Pose nicht.}
+\label{fig:heute}
+\end{figure}
+
+\textbf{Ein Vergleich aus dem Alltag.} Man denke an zwei Küchenwaagen: Die eine wiegt recht genau, die andere
+liegt je nach Lage des Pakets mal mehr, mal weniger daneben. Wer zwischen beiden wechselt und bei der zweiten einen
+einmal gemerkten Unterschied aufschlägt, sieht die Anzeige trotzdem springen, denn der gemerkte Unterschied stimmte
+nur für das eine Mal. So verhält sich heute die gezeichnete Spitze: Die fusionierte Pose ist die genauere Waage,
+die Farbpose die ungenaue, und der carry-Versatz ist der einmal gemerkte Unterschied.
+
+%==========================================================================================
+\section{Wo das Problem liegt}
+\label{sec:problem}
+
+\textbf{Datengrundlage.} Ausgewertet wurden Aufnahmen mit Rohbildern, die sich offline erneut durch das Tracking
+schicken lassen. Meist steckt die Spitze dabei in einem Sitz des Kalibrierbretts. Wo dieser Sitz liegt, folgt aus
+der gemessenen Lage des Bretts; das ist die \emph{Referenz}. Die Aufnahmen sind geteilt in \emph{Abstimmdaten} (zum
+Einstellen) und \emph{Testdaten} (zum Prüfen); dazu kommt das Live-Log des Labortests vom 11.11.\ ohne Rohbilder.
+Die \emph{Streuung} gibt an, wie stark die Spitze in einer Aufnahme um ihren Mittelwert zittert (RMS, das
+quadratische Mittel der Abweichungen); ein gleichbleibender Abstand zur Referenz zählt nicht mit. Ein
+\emph{Sprung} ist der Abstand der Spitze zwischen zwei aufeinanderfolgenden gezeichneten Bildern.
+
+Von den vier Problemen erklärt (a) das feine Zittern, (b) und (c) die großen Sprünge und (d) die Abweichung
+direkt nach dem Einrasten.
+
+\subsection*{(a) Jedes Bild steht für sich}
+
+Jedes Bild wird für sich ausgewertet; das Bild davor liefert nur den Startwert (Abschnitt~\ref{sec:heute}) und
+einen Vergleich für Plausibilitätsprüfungen, beides aus seiner Farbpose. Das Rauschen jedes Bildes geht deshalb fast
+ungefiltert auf die Spitze. Dazu kommt der
+lange Hebel: Weil die Spitze 179,36\,mm vom Ursprung des Etiketts entfernt liegt, wird jeder kleine Kippfehler des
+Etiketts an der Spitze vergrößert \cite[S.~535, 543]{west2004designing}. Gemessen: Mit eingespanntem Bohrer hat
+die heute gezeichnete Spitze auf den Testdaten eine Streuung von 0,657\,mm. Steht der Bohrer still, könnte man über
+viele Bilder mitteln und so das Zittern senken; das geschieht heute nicht. Ruhe ist am Patienten häufig, etwa mit
+dem Bohrer am Eintrittspunkt.
+
+\subsection*{(b) Umschalten zwischen zwei Schätzungen}
+
+Welche der beiden Posen gezeichnet wird, entscheidet jedes Bild neu, und bei jedem Wechsel kann die Spitze um den
+Unterschied der beiden Posen springen. Der carry-Versatz gleicht diesen Unterschied nur für das Bild aus, auf dem
+er gemerkt wurde; liegt die Farbpose im nächsten Bild anders daneben, bleibt ein Rest. Im Labortest am 11.11.\
+stand der Bohrer still (Bildbewegung der Ecken im Median 0,41\,px je Bild). Von den 2063 Bildern, für die die
+Engine live eine neue Pose berechnet hatte, waren 286 (13,9\,\%) carry-Bilder, meist einzeln zwischen
+fused-Bildern. Die Spitze sprang 83-mal um mehr als 5\,mm,
+75-mal davon beim Wechsel zwischen fused und carry, höchstens um 12,84\,mm. Gemessen an der typischen Lage der
+fused-Spitze (ihrem Median) lag die carry-Spitze im Median 3,67\,mm daneben, fast nur entlang der Sichtlinie der
+Kamera, also genau in der Tiefe, in der die Farbpose schwach ist. Abbildung~\ref{fig:zeitreihe} zeigt dasselbe
+Muster in einer Testaufnahme mit eingespanntem Bohrer: Die Ausschläge der heutigen Spitze fallen auf die
+carry-Bilder.
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    scale only axis, width=\linewidth-16mm, height=3.0cm,
+    /pgf/number format/use comma,
+    xlabel={Zeit [s]}, ylabel={Abstand zur Referenz [mm]},
+    tick label style={font=\footnotesize}, label style={font=\footnotesize},
+    xmin=0, xmax=6.1, ymin=0, ymax=7, ytick={0,1,2,3,4,5,6,7},
+    unbounded coords=jump, enlarge x limits=0.01, clip mode=individual,
+    axis line style={black!70}, tick style={black!70},
+    ymajorgrids, grid style={black!12},
+    legend style={font=\scriptsize, at={(0.5,1.03)}, anchor=south, legend columns=-1, draw=none,
+                  /tikz/every even column/.append style={column sep=4mm}},
+    /pgfplots/table/col sep=comma,
+    /pgfplots/table/empty cells with={nan},
+  ]
+  \addplot[ColA, line width=0.6pt] table[x=t_s, y=err_A] {daten/zeitreihe_D05.csv};
+  \addlegendentry{heute}
+  \addplot[ColN, line width=1.2pt] table[x=t_s, y=err_neu] {daten/zeitreihe_D05.csv};
+  \addlegendentry{neuer Schätzer}
+  \addlegendimage{only marks, mark=*, mark size=1.4pt, draw=CarryC, fill=CarryC}
+  \addlegendentry{heute, carry-Bild}
+  \addplot[forget plot, only marks, scatter, scatter src=explicit symbolic,
+    scatter/classes={fused={mark=none}, gate={mark=none}, rgb={mark=none},
+                     carry={mark=*, mark size=1.4pt, draw=CarryC, fill=CarryC}}]
+    table[x=t_s, y=err_A, meta=kind_A] {daten/zeitreihe_D05.csv};
+\end{axis}
+\end{tikzpicture}
+\caption{Abstand der gezeichneten Spitze von der Referenz über eine ganze Aufnahme mit eingespanntem Bohrer, heute
+(rot) und mit dem neuen Schätzer (grün). Orange Punkte: Bilder, auf denen heute die Farbpose plus dem gemerkten
+Versatz gezeichnet wird (carry-Bilder). Dass beide Kurven nicht um null liegen, ist der bleibende Abstand der
+Spitze zur Referenz. Beim ersten Bild fehlt die grüne Kurve, weil der neue Schätzer die Spitze direkt nach dem
+ersten Finden des Etiketts noch nicht zeigt.}
+\label{fig:zeitreihe}
+\end{figure}
+
+\subsection*{(c) Eine Prüfung verwirft die IR-Punkte gerade dann, wenn sie am meisten helfen würden}
+
+Eine der vier Prüfungen verwirft die Fusion, wenn die fusionierte Pose den Ursprung des Etiketts mehr als 6\,mm
+neben den der Farbpose legt. Sie misst damit den Fehler der Farbpose, nicht die Güte der IR-Messung: Liegt die
+Farbpose weit daneben, muss die Fusion weit korrigieren und wird gerade deshalb verworfen. Im Labortest lagen auf
+allen carry-Bildern 32 bis 50 IR-Punkte vor, die meist gut zum Modell passten (Restfehler im Median 0,81\,mm); auf
+78,7\,\% der carry-Bilder blieb nur die 6-mm-Prüfung als Grund für die Ablehnung. Bei einer Ablehnung gehen alle
+IR-Punkte des Bildes verloren. Üblich ist dagegen, auffällige Messungen stufenlos abzuwerten, statt sie mit harten
+Schwellen zu verwerfen \cite[§9.3--9.4]{zhang1997parameter}.
+
+\textbf{Wie (b) und (c) im Labortest zusammenwirkten.} Die Farbpose war dort schlecht bestimmt: Das Etikett lag
+links oben am Bildrand, etwa 600\,px von der Bildmitte, unscharf und mit Farbsäumen. Die 6-mm-Prüfung sortierte
+die Bilder. Auf Bildern, auf denen die Farbpose höchstens 6\,mm neben der fusionierten Pose lag, wurde fusioniert
+und der Versatz gemerkt; dort lag der Ursprung des Etiketts in der Farbpose im Median 2,53\,mm neben dem der
+fusionierten Pose. Auf Bildern, auf denen sie weiter danebenlag, wurde die Fusion verworfen und carry gezeichnet;
+dort lag der Ursprung in der Farbpose im Median 6,8\,mm neben seiner typischen Lage in den fused-Bildern (ihrem
+Median). Der gemerkte Versatz stammt also von einem Bild, auf dem die Farbpose besser war, und wird auf ein Bild
+angewandt, auf dem sie schlechter ist. Deshalb sprang die Spitze beim Wechsel zwischen fused und carry.
+
+\subsection*{(d) Unsicheres erstes Bild, keine Unsicherheit in der Anzeige}
+
+Direkt nach dem Einrasten gibt es noch keinen gemerkten Versatz. Wird die Fusion auf diesem ersten Bild nicht
+angenommen, zeichnet die Anzeige die reine Farbpose. Mit eingespanntem Bohrer trat die größte Abweichung der
+heutigen Spitze vom Mittel ihrer Aufnahme in den Abstimm- wie in den Testdaten auf einem solchen ersten Bild mit
+reiner Farbpose auf, in den Testdaten mit 6,07\,mm. Außerdem weiß die Anzeige nicht, wie sicher die Spitze ist;
+eine Unsicherheit in Millimetern gibt es live nicht. Einziges Warnsignal ist Orange statt Grün im Kamerabild (in
+der Röntgenansicht werden die Marken gedämpft), wenn weniger als 75\,\% des Etiketts sichtbar sind. Die Spitze
+erscheint so, als wäre sie exakt; genau das kritisieren Simpson et al.\ an Navigationsanzeigen
+\cite{simpson2014computation}.
+
+%==========================================================================================
+\section{Der Lösungsansatz}
+\label{sec:neu}
+
+Der neue Ansatz ersetzt das Umschalten durch \emph{einen} Schätzer, der als neue letzte Stufe hinter der heutigen
+Posenbestimmung der Engine hinzukommt; Einstellungen und Posenbestimmung der Engine bleiben unverändert. Fachlich
+ist er ein \emph{iterierter Kalman-Filter}. Ein Kalman-Filter verrechnet in jedem Bild eine Vorhersage aus den
+früheren Bildern mit den neuen Messungen, jeweils danach, wie zuverlässig beide sind; \glqq iteriert\grqq{} heißt,
+dass er seine Lösung in jedem Bild in drei kleinen Rechenschritten nachbessert. Abbildung~\ref{fig:filter} zeigt
+den Kreislauf. Was ihn von heute unterscheidet; in Klammern steht, welches Problem aus Abschnitt~\ref{sec:problem}
+der Punkt betrifft:
+
+\begin{itemize}
+  \item \textbf{Ein Gedächtnis (zu a).} Die Vorhersage für das neue Bild ist die Pose aus dem letzten Bild
+        \cite[Bsp.~4.1, 4.2]{saerkkae2013bayesian}; ihre Unsicherheit wächst dabei je Bild, in Ruhe nur wenig. In
+        Ruhe ist die Vorhersage deshalb nach einigen Bildern sicherer als ein einzelnes neues Bild, und jedes neue
+        Bild verschiebt die Schätzung nur ein kleines Stück. Das wirkt wie ein Mittel über viele Bilder, in dem
+        sich das Rauschen der einzelnen Bilder weitgehend ausgleicht. Dahinter steht die noch ungeprüfte Annahme,
+        dass sehr schnelle freie Bewegungen am Patienten unwahrscheinlich sind.
+  \item \textbf{Ein Ergebnis statt zwei (zu b).} Es gibt keinen Wechsel mehr zwischen zwei Schätzungen. Jede
+        Messung zieht die Pose so weit, wie ihre Zuverlässigkeit es rechtfertigt; ein Bild mit IR-Punkten wird
+        also nicht mehr nur ganz oder gar nicht verwendet: Gut passende IR-Punkte zählen voll, schlecht passende
+        weniger. Ein Bild ohne IR-Punkte wird von der Vorhersage und den Farbecken getragen statt von einem
+        eingefrorenen Versatz.
+  \item \textbf{Alle Messungen, nach Zuverlässigkeit gewichtet.} In jedem Bild gehen alle Farbecken und, außer in
+        den unten genannten Fällen, alle IR-Punkte ein, jede Messung mit ihrer eigenen Unsicherheit. Wie
+        zuverlässig die beiden Messarten sind, wurde aus den beobachteten Abweichungen bei ruhender Spitze
+        bestimmt.
+  \item \textbf{Abwerten statt wegwerfen (zu c).} Je schlechter eine Messung zur gemeinsamen Lösung passt, desto
+        geringer ist ihr Gewicht; so kann auch ein grober Ausreißer die Pose nur begrenzt ziehen
+        \cite[§9.4]{zhang1997parameter}. Die 6-mm-Prüfung aus Abschnitt~\ref{sec:problem}\,(c), also der Abstand
+        zwischen fusionierter Pose und Farbpose, entscheidet nicht mehr darüber, ob die IR-Punkte eines Bildes
+        eingehen; gerade die Bilder, die heute an ihr scheitern, behalten so ihre IR-Punkte. Außen vor bleiben die
+        IR-Punkte eines Bildes nur, wenn es weniger als 6 sind oder wenn sie grob nicht zum Modell passen. Diese
+        Grenze ist keine neue Abstandsprüfung: Sie misst dieselbe Größe wie die heutige 2,5-mm-Prüfung aus
+        Abschnitt~\ref{sec:heute}, nämlich wie gut die IR-Punkte zum Modell passen, lässt aber einen Restfehler bis
+        6\,mm zu.
+  \item \textbf{Folgen, wenn sich etwas bewegt.} Bewegen sich die Ecken des Etiketts im Bild gemeinsam, macht der
+        Schätzer seine Vorhersage unsicherer und folgt dann vor allem den Messungen.
+  \item \textbf{Schätzt seine Unsicherheit (zu d).} Mit der Pose führt er ihre Unsicherheit mit; daraus folgt die
+        Unsicherheit der Spitze in Millimetern. Auch auf dem ersten Bild nach dem Einrasten verrechnet er
+        Farbecken und IR-Punkte gemeinsam; eine Vorhersage gibt es dort noch nicht. Nach dem Einrasten bleibt die
+        Spitze verborgen, bis ihre Unsicherheit höchstens 2\,mm beträgt, aber höchstens 5 Bilder lang (etwa
+        167\,ms); in der geprüften Einstellung wird sie danach immer gezeichnet. Ob und wie die Unsicherheit
+        selbst angezeigt wird, legt dieser Ansatz nicht fest.
+\end{itemize}
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  st/.style={draw, rounded corners=1.5pt, align=left, text width=34mm, minimum height=27mm, inner sep=2.5pt,
+             fill=white, execute at begin node={\hyphenpenalty=10000\exhyphenpenalty=10000}},
+  inp/.style={draw, rounded corners=1.5pt, align=left, inner sep=2.5pt, fill=black!4,
+              execute at begin node={\hyphenpenalty=10000\exhyphenpenalty=10000}},
+  arr/.style={-{Stealth[length=1.8mm]}, semithick},
+  fb/.style={-{Stealth[length=1.8mm]}, dashed, black!60},
+  lab/.style={font=\footnotesize, fill=white, inner sep=1pt}
+]
+\node[st] (V) at (0,0) {\textbf{1 Vorhersage}\\[1pt] Pose wie zuvor; Unsicherheit wächst in Ruhe wenig, bei Bewegung
+im Bild stark};
+\node[st, right=5mm of V] (U) {\textbf{2 Abgleich}\\[1pt] Pose, die Vorhersage und Messungen am besten erklärt;
+schlecht passende Messungen zählen weniger};
+\node[st, right=5mm of U] (P) {\textbf{3 Neue Schätzung}\\[1pt] Pose mit Unsicherheit; daraus Spitze und
+Unsicherheit in mm};
+\node[st, right=5mm of P] (A) {\textbf{4 Anzeige}\\[1pt] Spitze zeichnen; nach dem Einrasten erst, wenn sie sicher
+genug ist (höchstens 5 Bilder Wartezeit)};
+\node[inp, text width=118mm, anchor=south west] (E) at ($(V.north west)+(0,9mm)$)
+  {\textbf{Engine, neues Kamerabild:} Pose der Engine als Ausgangspunkt der Rechnung; Farbecken und IR-Punkte,
+   jede Messung mit ihrer Unsicherheit};
+\draw[arr] (V) -- (U);
+\draw[arr] (U) -- (P);
+\draw[arr] (P) -- (A);
+\draw[arr] (E.south -| V) -- node[lab, right=0.5mm] {Bewegung im Bild} (V.north);
+\draw[arr] (E.south -| U) -- node[lab, right=0.5mm] {Messungen, Ausgangspunkt} (U.north);
+\draw[fb] (P.south) -- ++(0,-5mm) -| (V.south);
+\node[lab, anchor=north] at ($(V.south)!0.5!(P.south)+(0,-5mm)$) {nächstes Bild: die neue Schätzung wird zur
+Vorhersage};
+\end{tikzpicture}
+\caption{Ein Schritt des neuen Schätzers. Die Schätzung des letzten Bildes wird zur Vorhersage für das neue Bild;
+der Abgleich verrechnet sie mit den Messungen des neuen Bildes, jeweils nach ihrer Zuverlässigkeit. Nach dem
+Einrasten, also dem ersten Finden des Etiketts nach dem Start oder nach einem Verlust, gibt es noch keine
+Vorhersage; dann zählen nur die Messungen.}
+\label{fig:filter}
+\end{figure}
+
+Als Ausgangspunkt seiner Rechnung nimmt der Schätzer die Pose, die die Engine ausgibt: die fusionierte Pose, wenn
+sie die Prüfungen besteht, sonst die Farbpose. Die Prüfungen entscheiden also nur noch, wo seine Rechnung beginnt;
+den Startwert der Engine für die Farbpose (Abschnitt~\ref{sec:heute}) ändert er nicht. Bei nur drei
+Rechenschritten beeinflusst der Ausgangspunkt das Ergebnis aber messbar, die Prüfungen wirken so schwach weiter.
+Nach einer Lücke von
+mindestens 0,5\,s oder wenn die Engine ihr Tracking zurücksetzt, beginnt der Schätzer ohne Gedächtnis neu.
+
+\begin{mybox}{Für Interessierte: was der Schätzer in jedem Bild rechnet}
+Zustand ist allein die Pose $\mathbf{x}_k = \Tcm$ (Etikett $\to$ Farbkamera) mit ihrer Kovarianz
+$\boldsymbol{\Sigma}_k$. Die Vorhersage
+lässt die Pose gleich und vergrößert nur ihre Unsicherheit um das Prozessrauschen $\mathbf{Q}_k$, klein in Ruhe
+und groß bei Bewegung im Bild: $\xb = \xh_{k-1}$, $\Sb = \boldsymbol{\Sigma}_{k-1} + \mathbf{Q}_k$. Der Abgleich
+sucht die Pose mit den kleinsten Kosten
+\begin{equation*}
+  \xh_k = \arg\min_{\mathbf{x}}\;
+  \tfrac12\,\bigl\lVert \mathbf{x} \boxminus \xb \bigr\rVert^2_{\Sb^{-1}}
+  + \sum_i \rho(e_i) + \sum_j \rho(e_j) .
+\end{equation*}
+Der erste Term ist die Abweichung von der Vorhersage, gewichtet mit deren Unsicherheit; $e_i$ und $e_j$ sind die
+Abstände zwischen der aus der Pose $\mathbf{x}$ berechneten und der gemessenen Farbecke $i$ (im Bild) bzw.\ dem
+IR-Punkt $j$ (im Raum), normiert mit der Unsicherheit der Messung. Die Huber-Funktion $\rho$ ist quadratisch bis
+$c = 1{,}5$ und darüber linear, sodass große Abweichungen weniger zählen. Gelöst wird mit drei
+Gauß-Newton-Schritten ab der Engine-Pose, die Gewichte jedes Mal neu berechnet. Mit rein quadratischen Kosten
+statt $\rho$ ist das iterierte Kalman-Update ein Gauß-Newton-Verfahren auf solchen Kosten
+\cite{bell1993iterated}, mit $\rho$ ein iterativ neu gewichtetes Kleinste-Quadrate-Verfahren
+\cite[§9.4]{zhang1997parameter}. $\boldsymbol{\Sigma}_k$ ist die Inverse der Gauß-Newton-Näherung der Krümmung am
+Ergebnis; aus ihr folgt die Unsicherheit $\stip$ der Spitze $\Ptc = \hat{\mathbf{R}}_k\,\Ptd + \hat{\mathbf{t}}_k$;
+$\hat{\mathbf{R}}_k$ und $\hat{\mathbf{t}}_k$ sind Drehung und Verschiebung von $\xh_k$, $\Ptd$ ist die Lage der
+Spitze im Werkzeugrahmen d, hier gleich dem Etikettrahmen m.
+\end{mybox}
+
+%==========================================================================================
+\section{Was es bringt}
+\label{sec:ergebnis}
+
+\begin{table}[!htb]
+\centering\small
+\caption{Kernzahlen heute und mit dem neuen Schätzer. Streuung: RMS der Abweichung der Spitze vom Mittel ihrer
+Aufnahme; Sprung: Abstand der Spitze zwischen zwei aufeinanderfolgenden gezeichneten Bildern; Nachlauf: wie viel
+Zeit die Schätzung in Bewegung hinter einer Lösung zurückliegt, die nur das aktuelle Bild verwendet; bleibender
+Abstand: Abstand zwischen dem Mittel der Spitze und der Referenz, gemittelt über die Aufnahmen. Der Schätzer wurde
+vor der Auswertung der Testdaten eingefroren.}
+\label{tab:kern}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{24mm}>{\raggedright\arraybackslash}p{56mm}@{}}
+  \toprule
+  Größe & heute & neuer Schätzer \\
+  \midrule
+  Streuung, Bohrer eingespannt (Testdaten) & 0,657\,mm & 0,215\,mm \\
+  größte Abweichung vom Mittel, eingespannt (Testdaten) & 6,07\,mm & 1,07\,mm; ohne Verbergen nach dem Einrasten 2,07\,mm \\
+  Streuung bei Verdeckung des Etiketts (Abstimmdaten; Testdaten ohne Verdeckung) & 1,344\,mm & 0,390\,mm \\
+  Sprünge über 1\,mm, eingespannte Beispielaufnahme (Abb.~\ref{fig:zeitreihe}, Testdaten) & 29 & 0 \\
+  Sprünge über 5\,mm, handgeführt, Etikett am Bildrand (Abstimmdaten) & 16 & 0 \\
+  Nachlauf in Bewegung, je Testaufnahme & kein Nachlauf durch Glättung & höchstens 12,6\,ms; nur in einer der vier Aufnahmen ohne IR 166,6\,ms \\
+  zusätzliche Rechenzeit je Bild & --- & 7--19\,µs (C++-Prototyp, Warmwert aus einer Messschleife; eingebaut
+  mehr, Abschnitt~\ref{sec:cpp}) \\
+  bleibender Abstand zur Referenz, eingespannt (Testdaten) & 1,80\,mm & 1,96\,mm \\
+  \bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Einordnung.} Tabelle~\ref{tab:kern} fasst die Kernzahlen zusammen; alle Einstellungen des Schätzers wurden
+vor dem Testlauf auf den Abstimmdaten festgelegt. Mit eingespanntem Bohrer ist die Spitze etwa dreimal ruhiger. Der
+größte Ausschlag sinkt von
+6,07 auf 1,07\,mm, teils durch das Verbergen nach dem Einrasten (ohne es 2,07\,mm), teils durch die Schätzung
+selbst. Bei Verdeckung trägt die Vorhersage, und die verbliebenen Ecken korrigieren sie. In einer dem Labortest
+ähnlichen Aufnahme verschwinden die großen Sprünge, die Streuung bleibt aber (Abschnitt~\ref{sec:grenzen}).
+
+\textbf{Nachlauf und Rechenzeit.} Der Preis jeder Glättung ist, dass die Schätzung in Bewegung nachläuft. Die
+heutige Ausgabe glättet
+die Pose nicht und ist darum am schnellsten; der neue Schätzer läuft je Testaufnahme höchstens 12,6\,ms nach, mit
+einer Ausnahme unter den Aufnahmen ohne IR (Abschnitt~\ref{sec:grenzen}). Die Rechenzeit fällt nicht ins Gewicht: 7
+bis 19\,µs je Bild (Median je
+Aufnahme, Warmwert des Prototyps aus einer Messschleife); die Engine selbst brauchte im Labortest 10,4\,ms (Median) bei 33\,ms Zeit je Bild.
+
+%==========================================================================================
+\section{Was es nicht löst}
+\label{sec:grenzen}
+
+\begin{itemize}
+  \item \textbf{Der Abstand zur Referenz bleibt.} Die Spitze liegt im Mittel etwa 1,5 bis 2\,mm neben
+        der Referenz, mit dem neuen Schätzer auf den Testdaten sogar etwas mehr als heute. Im Labortest lag sie
+        gegenüber der Bohrerspitze, die aus dem AP- und dem Lateral-Röntgenbild bestimmt wurde, 2,6\,mm
+        voraus entlang der Bohrerachse. Einen gleichbleibenden Messfehler erkennt ein Filter ohne zusätzliche
+        Information nicht \cite[§5.1.3]{barfoot2017state}; das ist ein eigenes Thema.
+  \item \textbf{Ohne IR ist die Tiefe schwach.} Von den vier Testaufnahmen ohne IR lief der Schätzer gegenüber der
+        Lösung aus dem jeweiligen Bild allein in dreien höchstens 12,6\,ms nach, in einer 166,6\,ms. Dort bewegte
+        sich das Etikett im Bild nur 0,1 bis 0,4\,px je Bild, während die Tiefe der Farbpose um 1 bis 7\,mm je
+        Bild sprang; die Vorhersage öffnet sich aber nur bei Bewegung der Ecken im Bild. Ob sich die
+        Spitze so bewegte, ist offen: Es gab keine Brett-Referenz, und die Tiefe der Einzelbildlösung
+        springt selbst. Für die Nutzerstudie muss IR an sein.
+  \item \textbf{Handgeführt am Bildrand nur teilweise besser.} In einer handgeführten Aufnahme mit dem Etikett am
+        oberen Bildrand (Abstimmdaten), ähnlich wie im Labortest, verschwinden die großen Sprünge (über 5\,mm: von
+        16 auf 0), und der größte Abstand zur Referenz sinkt von 11,93 auf 5,26\,mm. Die Streuung bleibt aber
+        gleich (2,968 bzw.\ 2,970\,mm), und der Median des Abstands zur Referenz steigt aus offener Ursache von
+        2,42 auf 3,06\,mm, vor allem am Anfang.
+  \item \textbf{Die Unsicherheit ist eine Orientierung, keine Garantie.} Größere angegebene Unsicherheit geht mit
+        größeren Fehlern einher, seltene große Fehler unterschätzt sie aber. Die Schwelle von 2\,mm für das erste
+        Anzeigen nach dem Einrasten ist gesetzt, nicht validiert.
+  \item \textbf{Neue Aufnahmen nötig.} Die Testdaten stammen aus denselben Sitzungen wie die Abstimmdaten. Nötig
+  sind neue Rohaufnahmen mit dem Etikett am
+        Bildrand wie im Labortest, mit langer Ruhe, mit bewegter Referenz und unter anderen Lichtverhältnissen.
+\end{itemize}
+
+%==========================================================================================
+\section{Warum nicht einfacher, warum nicht aufwendiger?}
+\label{sec:smoother}
+
+\textbf{Einfacher: die letzte fused-Spitze halten.} Die einfachste Abhilfe wäre, auf carry-Bildern bei ruhigem
+Bild die letzte fused-Spitze stehen zu lassen. Weil das Halten nur Größen braucht, die das Live-Log des Labortests
+enthält, lässt es sich dort nachrechnen: Die Sprünge über 5\,mm sinken von 83 auf 0. Den neuen Schätzer kann man
+dort nicht nachrechnen, weil er die Rohbilder braucht. Das Halten hilft aber nicht beim ersten Bild nach dem
+Einrasten, nicht bei Verdeckung und nicht in Bewegung, und in einer Aufnahme mit Sprüngen auch zwischen zwei
+fused-Bildern nur teilweise.
+
+\textbf{Vorhanden: der Ausgabe-Filter der Engine.} Die Engine hat schon einen Kalman-Filter, der die fertige Pose
+glättet. Er ist live aus: Er zog die Pose in Bewegung vom Bild weg und brachte auch nach einer Reparatur keinen
+belastbaren Gewinn gegenüber carry. Er sieht nur die fertige Pose und kann
+nicht erkennen, welche Ecken oder IR-Punkte gut sind. Der neue Schätzer arbeitet dagegen mit den einzelnen
+Messungen; man spricht von enger Kopplung \cite[S.~493]{tobergte2009robust}.
+
+\textbf{Aufwendiger: ein Glätter über ein Zeitfenster (Fixed-Lag-Smoother).} Ein solcher Glätter rechnet die Posen
+eines kurzen Zeitfensters, etwa der letzten 0,5\,s, gemeinsam neu. Ältere Posen kann er verbessern, weil er für sie
+auch die späteren Bilder kennt. Live gezeigt wird aber nur die \emph{neueste} Pose, und für sie gibt es noch kein
+späteres Bild. Im idealisierten Fall (lineare Modelle, gaußsches Rauschen, in Glätter und Filter dieselben Modelle)
+liefert er für sie genau dasselbe wie der Filter, sofern er die Information der Bilder vor dem Fenster nicht
+verwirft, sondern weiterführt \cite[Thm.~8.2]{saerkkae2013bayesian}. Gemessen wurde das gegen eine frühere Fassung
+des Filters, mit der der Glätter dasselbe Modell teilte: Auf den Abstimmdaten lagen die neuesten Spitzen beider im
+Median 0,0044\,mm und in 99\,\% der Bilder höchstens 0,225\,mm auseinander. Der größte Unterschied, 24,52\,mm, trat
+in schneller Bewegung in einer Aufnahme mit grob falschen IR-Punkten auf; solche IR-Punkte lässt der neue Schätzer
+außen vor. Gewinnen könnte ein Glätter vor allem mit verzögerter Anzeige;
+Fixed-Lag-Glättung ist Filtern mit einer tolerierten festen Verzögerung \cite[S.~160]{saerkkae2013bayesian}. Nach
+einer einfachen Modellrechnung brächten 20 Bilder (0,67\,s) Verzögerung in Ruhe nur 20 bis 27\,\% weniger
+Streuung. Für die Live-Anzeige am Patienten lohnt sich das nicht.
+
+%==========================================================================================
+\section{Stand der Umsetzung}
+\label{sec:cpp}
+
+Stand 13.11.2026: Der Schätzer ist in die C++-Engine eingebaut, an die Anzeige angeschlossen und in der
+Live-Anzeige eingeschaltet. Wo die Abschnitte davor \glqq heute\grqq{} sagen, meinen sie den Stand vor dem Schätzer. In
+der Engine sitzt er zwischen der IR-Fusion (Abb.~\ref{fig:heute}) und dem Ausgabe-Filter aus
+Abschnitt~\ref{sec:smoother}. Er nimmt die Pose der Engine als Ausgangspunkt, bekommt von ihr die einzelnen Messungen
+und schreibt seine Pose, die Spitze, deren Unsicherheit und die Angabe, ob gezeichnet wird, in eigene Ergebnisfelder.
+Die Pose der Engine überschreibt er nicht: Sonst schlüge die bisherige Anzeige auf carry-Bildern ihren gemerkten
+Versatz zusätzlich auf die Schätzung auf, und die Pose in Protokollen und Auswertungen bekäme eine andere Bedeutung. So
+kann die bisherige Spitze zum Vergleich mitlaufen; im Evaluation-Modus der Anzeige wird sie mitprotokolliert.
+
+\textbf{Eine Engine.} Es gibt nur noch eine Fassung der Engine: Die geprüfte neue Fassung hat am 13.11. die bisherige
+ersetzt und wird ohne weitere Einstellung geladen. Die bisherige Fassung ist gesichert.
+
+\textbf{Schalter.} Ein- und ausgeschaltet wird der Schätzer mit \texttt{LIVE\_DRILL\_ESTIMATOR}. Das ist eine
+Einstellung in der Konfigurationsdatei des Trackings; sie steht auf True (Schätzer an) oder False (Schätzer aus).
+Voreingestellt ist True. Die Einstellung gilt für die Live-Anzeige und für das Werkzeug, mit dem Testaufnahmen gemacht
+werden; eine Änderung wirkt nach einem Neustart des Programms. Mit False sind Rechnung und Anzeige wie vor dem
+Schätzer; das Evaluation-Log der Live-Anzeige hat aber das neue Format (Version 3), mit Vorgabewerten in den Spalten des Schätzers. Belegt
+ist das auf acht Aufnahmen mit zusammen 2400 Bildern: Alle Ergebnisse bis auf die gemessenen Rechenzeiten sind
+bitgleich zur bisherigen Engine, also bis aufs letzte Bit gleich, auch über die echte Live-Anzeige. Mit True bleiben
+die bisherigen Ergebnisse der Engine ebenfalls bitgleich; der Schätzer kommt nur hinzu und wirkt nicht auf ihre
+Posenbestimmung zurück. Dass der Vergleich selbst funktioniert, ist eigens geprüft: Er meldet schon eine absichtlich
+eingebaute Änderung im letzten Bit. Die frühere Einstellung, die vor dem Programmstart gesetzt werden musste, gibt es
+nicht mehr.
+
+\textbf{Auswertungen der Masterarbeit.} Ihre Skripte legen die Einstellungen des Trackings selbst fest und rechnen
+auch mit \texttt{LIVE\_DRILL\_ESTIMATOR} auf True ohne Schätzer. Auf den acht Aufnahmen rechnen mit der neuen Engine
+alle 17 dort nachrechenbaren Einstellungen bitgleich zur bisherigen, aus Masterarbeit, Paper und der Live-Anzeige mit
+ausgeschaltetem Schätzer.
+Skripte mit einer eigenen Kopie der bisherigen Engine sind ohnehin nicht betroffen.
+
+\textbf{Zurück zum alten Stand.} Für das Verhalten von vorher genügt \texttt{LIVE\_DRILL\_ESTIMATOR} auf False. Wer
+die bisherige Engine-Fassung aus der Sicherung zurückholt, muss die Einstellung zusätzlich auf False setzen; sonst
+meldet jeder Start, dass der Schätzer aus bleibt (die Live-Anzeige rot), und gerechnet wird wie mit ausgeschaltetem
+Schätzer.
+
+\textbf{Ausgabe-Filter.} Ist der Schätzer eingeschaltet, schaltet die Engine den Ausgabe-Filter zwingend ab, damit nur
+der Schätzer glättet. Ohne Schätzer bleibt der Filter wie bisher schaltbar, weil Auswertungen der Masterarbeit ihn
+verwenden, und er rechnet dann genau wie bisher; live ist er ohnehin aus. Beides ist auf den acht Aufnahmen geprüft.
+
+\textbf{Anzeige.} Bei eingeschaltetem Schätzer zeichnet die Anzeige seine Spitze, ohne carry; die vier Prüfungen
+bestimmen nur noch, wo seine Rechnung beginnt. Ist die Spitze verborgen, verhält sich die Anzeige wie bei einem Bild
+ohne Pose. Beim Start prüft das Programm, ob die geladene Engine den Schätzer kennt und richtig eingestellt ist; wenn
+nicht, läuft das Tracking wie vorher, mit einer roten Meldung. In der Ansicht mit der schmalen Bedienleiste am Rand,
+die keine Statuszeile hat, steht diese Meldung als roter Vermerk vor dem Status, eine Warnung als gelber; die ganze
+Meldung erscheint, wenn man mit der Maus darauf zeigt. Der Fehler, dass dieser Status nach dem Stoppen rot oder gelb
+blieb, ist behoben. Auf den acht Aufnahmen liefert der eingebaute Schätzer dieselben Spitzen wie die geprüfte
+Python-Fassung, bis auf Rundungsunterschiede unter $10^{-12}$\,mm.
+
+\textbf{Fehlerzähler.} Beim Stoppen schreibt das Programm bei eingeschaltetem Schätzer eine Zeile mit fünf
+Fehlerzählern ins Protokoll, etwa wie oft der Schätzer keine brauchbare Pose lieferte. Erwartet ist überall null; in
+allen Prüfungen ohne absichtlich ausgelöste Fehler war es so. Zwei der Zähler, Fehler in der Schätzerstufe der Engine
+und beim Speichern der
+Schätzer-Eingabe, zählen seit dem Aufbau des Trackers und nicht je Lauf, denn das Programm behält den Tracker über
+mehrere Läufe.
+
+\textbf{Labortest.} Er läuft im Evaluation-Modus der Live-Anzeige und wird so ausgewertet, wie er angezeigt wurde.
+Dieser Modus speichert keine Rohbilder. Nachrechnen lässt sich der Labortest also nicht, und die neuen Rohaufnahmen aus
+Abschnitt~\ref{sec:grenzen} entstehen dabei nicht.
+
+\textbf{Rechenzeit.} Gemessen beim Nachrechnen der acht Aufnahmen: In jedem Messlauf brauchte die ganze Stufe in 99 von
+100 Bildern höchstens 0,211\,ms; erlaubt sind 0,33\,ms, also 1\,\% der 33\,ms, die für ein Bild zur Verfügung stehen.
+Im Median sind es etwa 0,07\,ms je Bild, mehr als beim Prototyp in Tabelle~\ref{tab:kern}, weil die Stufe die
+Messungen erst aufbereitet. Das Umwandeln der neuen Ergebnisse auf der Python-Seite dauert etwa 20\,µs je Bild. Über
+alle Bilder gewertet hält es seine Grenze von 20\,µs knapp; für Bilder mit Schätzung lag es in einer Messreihe
+0,2\,µs darüber. Neben den 33\,ms je Bild fällt das nicht ins Gewicht. Im laufenden Betrieb ist die Rechenzeit noch
+nicht gemessen.
+
+\textbf{Zusätze live.} Live laufen drei Zusätze mit, die von der geprüften Einstellung abweichen: Der Schätzer
+beginnt schon nach einer Lücke von 0,2\,s statt 0,5\,s neu, ebenso, wenn die Unsicherheit, die seine Vorhersage in
+einem Bild hinzubekommt, 20\,mm übersteigt (bei starker oder unbekannter Bewegung im Bild), und die Spitze bleibt
+verborgen, solange ihre Unsicherheit über 5\,mm liegt. Festgelegt wurden die Zusätze auf den Abstimmdaten und an
+einem nachgestellten Ausfall; dort verringerten sie vor allem die größten Abweichungen. Auf den Testdaten, die danach
+einmal ohne Änderung eines Werts ausgewertet wurden, bewirken sie mit der Spitze im Sitz nichts und in Bewegung kaum
+etwas; dort bleibt die Spitze dafür in 8,8 statt 2,2\,\% der Bilder verborgen.
+
+\textbf{Was noch aussteht.} Noch aus steht der Labortest; mit echter Kamera sind die Anzeige und die Rechenzeit bisher
+nicht geprüft. Offen sind außerdem einige kleinere Entscheidungen, etwa zusätzliche Prüfungen der Eingaben in der
+Engine und ein Test der Anzeige mit der echten Engine. In die Versionsverwaltung übernommen (committet) ist noch
+nichts; das geschieht nur auf Auftrag.
+
+\begin{otherlanguage}{english}
+\begin{multicols}{2}[\section*{Literatur}]
+\raggedcolumns
+\footnotesize
+\raggedright
+\bibliographystyle{unsrt}
+\bibliography{Tracking_Schaetzer}
+\end{multicols}
+\end{otherlanguage}
+
+\end{document}

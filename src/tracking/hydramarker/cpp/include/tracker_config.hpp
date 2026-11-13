@@ -411,6 +411,46 @@ struct TrackerConfig {
     int occlusion_guard_mode = 2;
     double occlusion_guard_max_rot_deg = 15.0;
     double occlusion_guard_max_trans_mm = 25.0;
+
+    // ---- Drill pose estimator (output stage; drill_pose_estimator.hpp) ----
+    // Iterated EKF over the reported pose with its own result fields
+    // drill_est_* (TrackerFrameResult); rvec / tvec / T_marker_camera /
+    // pose_covariance stay the engine's. Off: no computation, no result
+    // fields, no timings keys (the old path is unchanged). On: the output
+    // pose filter is forced off in the TrackerEngine constructor
+    // (config().pose_kf_enabled reads back false, poseKfForcedOff()).
+    // Defaults = the validated frozen state (frozen_config.json "estimator",
+    // variant co_alt_eb); drill_est_gap_s 0.5, drill_est_prior_max_mm 0 and
+    // drill_est_hide_sig_mm 0 keep it, the live additions are set by the
+    // caller. drill_est_w3d, drill_est_sigma_ir_px and drill_est_row_ms are
+    // the estimator's own copies of ir_w3d, ir_sigma_ir_px and
+    // ir_time_offset_row_ms: s_rgb / s_ir were fitted with these values, a
+    // later change of the engine fields must not shift them silently.
+    bool drill_est_enabled = false;
+    double drill_est_sig_t_mm = 0.02;        // base noise per T0 = 1/30 s [mm]
+    double drill_est_sig_r_deg = 0.008;      // base noise per T0 [deg]
+    double drill_est_adapt_px = 1.0;         // dead band of nu1 [px/frame]; <= 0: no opening
+    double drill_est_db3_px = 0.3;           // dead band of nu3 [px/frame]; <= 0: nu3 off
+    double drill_est_gain_t = 2.0;           // [-]; term gain_t * nu * Z / f in mm
+    double drill_est_gain_r_deg = 0.5;       // [deg per px/frame]
+    int drill_est_vmin = 4;                  // matched corners for nu
+    double drill_est_s_rgb = 7.57;           // RGB sigma scale
+    double drill_est_s_ir = 11.08;           // IR sigma scale
+    double drill_est_huber_k = 1.5;          // Huber threshold
+    int drill_est_n_iter = 3;                // Gauss-Newton steps (stop also at |step| < 1e-7)
+    double drill_est_gap_s = 0.5;            // chain break after a gap >= gap_s [s]
+    double drill_est_rs_px = 3.0;            // rolling-shutter dead band [px/frame]; < 0: off
+    double drill_est_ir_gated = 1.0;         // sigma factor of IR pairs of a not applied fusion
+    double drill_est_ir_fit_max_mm = 6.0;    // IR switch-off above the engine fit RMS; 0: off
+    double drill_est_ir_fit_fac = 1000.0;    // sigma factor of switched-off IR pairs
+    int drill_est_min_start = 12;            // RGB corners for a chain start; 0: off
+    int drill_est_warm = 5;                  // start-up gate at most [frames]
+    double drill_est_sig_tip_max_mm = 2.0;   // start-up gate ends at sigma_tip <= [mm]
+    double drill_est_w3d = 4.0;              // copy of ir_w3d
+    double drill_est_sigma_ir_px = 0.05;     // copy of ir_sigma_ir_px
+    double drill_est_row_ms = 0.0278;        // copy of ir_time_offset_row_ms
+    double drill_est_prior_max_mm = 0.0;     // chain restart above the prior sigma [mm]; 0: off
+    double drill_est_hide_sig_mm = 0.0;      // hide frames with sigma_tip above [mm]; 0: off
 };
 
 } // namespace hydramarker
